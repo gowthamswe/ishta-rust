@@ -93,10 +93,10 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 370 |
-| run-vs-build | 342 |
+| run-vs-build | 343 |
 | leak | 265 |
 | missing-feature | 194 |
-| double-free | 184 |
+| double-free | 185 |
 | codegen-gap | 166 |
 | diagnostics | 123 |
 | false-positive | 106 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1474 |
-| interp | 357 |
+| codegen | 1475 |
+| interp | 358 |
 | typecheck | 293 |
 | ownership | 74 |
 | other | 73 |
@@ -144,7 +144,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-02-9 | 2026-09-02 | runtime | low | OVER-ALIGNED ALLOCATION IS UNSUPPORTED ON WINDOWS -- `karac_alloc_aligned_or_panic` aborts there rather than honoring an alignment above `malloc`'s 16-byte guarantee, because the MSVC CRT has no `free`-compatible aligned allocator and every release path assumes plain `free`. | — |
 | B-2026-09-02-16 | 2026-09-02 | interp+codegen | low | A NEVER-READ SHADOWED NAME'S TWO GENERATIONS FIRE IN THE WRONG ORDER UNDER AUTO-PAR because each is branch-local and fires inside its own outlined branch at its own `let`, while the interpreter fires both at the single name-keyed endpoint in LIFO order -- `dR3 dR4 mid` vs `dR4 dR3 mid`; the position is now right on every surface and only the order between the two generations differs | — |
 | B-2026-09-02-22 | 2026-09-02 | codegen | low | A DOUBLY-NESTED `Option[Option[String]]` ARGUMENT LEAKS ITS INNER PAYLOAD -- 45 B in 3 blocks over a three-iteration loop, unmoved by all THREE of B-2026-09-01-29's fixes. The payload is 3 words, so `Option[Option[String]]` exceeds the 3-word boxing limit `optres_param_entry_copied_te` gates on: the param is never ADMITTED to the by-value copy convention, so neither the callee's entry copy nor any caller-side ownership predicate applies and no frame is ever offered the temp | — |
-| B-2026-09-02-24 | 2026-09-02 | interp+codegen | medium | A MATCH ARM THAT HANDS ITS ELEMENT/PAYLOAD OUT OF THE FUNCTION RUNS THE `Drop` BODY TWICE ON ALL FOUR SURFACES -- `dR4 got4 dR4` where one is due. The scrutinee's walk still fires at the callee's scope exit on a value the arm already gave away. The ENUM spelling is wrong identically, so this is about the ESCAPE, not about tuples; an arm that moves into a BY-VALUE CALLEE is correct everywhere | — |
 | B-2026-09-02-31 | 2026-09-02 | codegen | low | THE BARE-ARM SPELLING OF B-2026-09-01-26 STILL LEAKS -- `match mkVe(9) { Ve.A(s) => s, .. }` in a nested expression position loses 15 B per evaluation at both opt levels where the BRACED `=> { s }` spelling is now clean. Excluded by that fix's block-bodied-arm condition, which is load-bearing: dropping it fails BOTH `asan_generic_enum_heap_payload_bind_return_no_leak_or_double_free` and `selfhost_codegen_matches_seed_run`, because a bare-armed match is also how the generic-enum debox hands a value out of its frame | — |
 | B-2026-09-02-41 | 2026-09-02 | interp+codegen | medium | THE TWO-STEP DESTRUCTURE OF A NESTED TUPLE FIELD SPLITS THE BACKENDS -- `let (inner, y) = h.pe; let (r, x) = inner; let m = r;` runs ONE `Drop` body under `--interp` and TWO on `karac run` / `karac build` / `KARAC_AUTO_PAR=0`. The interpreter is right; the compiled side records nothing for the tuple-typed leaf under an owner-runs-bodies source | — |
 | B-2026-09-03-4 | 2026-09-03 | interp+codegen | medium | A MATCH ARM (OR `let`) THAT RETURNS ITS ELEMENT WRAPPED IN AN ENUM CONSTRUCTOR RUNS THE `Drop` BODY TWICE AND THE CALLER'S BINDING NEVER RUNS ITS OWN -- `fn f(t: (R, i64)) -> Option[R] { match t { (r, k) => { Some(r) } } }` prints `dR4 dR4 got` on all four surfaces where one body is due and it should fire at the CALLER's binding. SPELLING-INDEPENDENT: the `let (r, k) = t; Some(r)` form measures identically, which is what separates it from B-2026-09-02-24 | — |
@@ -162,6 +161,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-23 | 2026-09-05 | runtime | medium | kata:288's AUTO-PAR LANE GENERATES SYSTEM TIME LINEAR IN WORKER COUNT -- 1.11ms at N=1 rising to 1267.64ms at N=18 (~70ms of kernel time per added worker, 11.7 cores' worth against a 108.71ms wall), while kata:282 stays FLAT at 3.81 -> 9.41ms across the identical sweep | none |
 | B-2026-09-05-24 | 2026-09-05 | cli | medium | `karac run` LEAVES ITS `karac_jit_runner` CHILD ALIVE WHEN THE PARENT IS SIGNALLED -- SIGINT (Ctrl-C), SIGTERM and SIGKILL each kill `karac run` and leave the spawned runner spinning at 100% CPU indefinitely, so a hung Kara program cannot be stopped by interrupting the command that started it, and any harness that TIMES OUT a `karac run` (mutation testing, CI, the Mend loop) silently accumulates orphans that contaminate every later timing measurement on the host | — |
 | B-2026-09-05-26 | 2026-09-05 | codegen | medium | A USER ENUM'S STRUCT PAYLOAD LEAKS ITS INTERIOR HEAP -- `let w = Wrap.T(Two { a: mk(4), b: mk(104) })` over `Two { a: R, b: R }` (`R` holds a `String` and a `Vec`) runs both bodies and loses 22 B in 4 blocks at scope exit, with no `match` at all or through a `_` arm; and an arm BINDING the `Option[R]`-field twin (`Wrap.W(h)` over `Ho2 { a: R, b: Option[R] }`) loses the 88 B boxed payload on every path, bound-and-unread or destructured | — |
+| B-2026-09-05-27 | 2026-09-05 | codegen | high | A MATCH ARM HANDING AN OWNED-PARAM ELEMENT/PAYLOAD OUT OF THE FUNCTION DOUBLE-FREES ITS HEAP WHEN THE HEAP-BEARING SHAPE IS CALLED TWICE -- `fn p4(t: (R, i64)) -> R { match t { (r, k) => r } }` over `R { id, tag: String, xs: Vec[i64] }` is clean called ONCE (one body) but aborts `free(): double free detected in tcache 2` called TWICE (`let a = p4((mk(3),0)); let b = p4((mk(6),0));`). The no-heap body-count sibling is B-2026-09-02-24 (fixed); this is the MEMORY channel and pre-existing to that fix | — |
+| B-2026-09-05-28 | 2026-09-05 | interp | medium | A MATCH ARM OVER AN OWNED BY-VALUE PARAM THAT MOVES ITS ELEMENT INTO A BY-VALUE CALLEE LOSES THE ELEMENT'S `Drop` BODY UNDER `--interp` -- `fn p(t: (R, i64)) -> i64 { match t { (r, k) => consume(r) } }` prints NOTHING for `r` under the interpreter and the due single `dR` under every compiled backend; the RETURN and field-READ spellings of the same arm are correct on all four | — |
 
 ### Relocated
 
@@ -2150,6 +2151,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-02-20 | codegen | high | A LOOP-DECLARED LOCAL WHOSE `Drop`-BEARING STRUCT OWNS TWO HEAP FIELDS SEGFAULTS THE JIT WHEN A CONDITIONAL PARAM-VIEW ASSIGNMENT TARGETS IT -- `kara… | f1d28a4 |
 | B-2026-09-02-21 | codegen | high | THE `for`-RANGE SPELLING OF THE SAME SHAPE NEVER TERMINATES ON THE JIT: the induction variable stops advancing at the iteration that performs the con… | f1d28a4 |
 | B-2026-09-02-23 | codegen | high | A BARE-TUPLE ELEMENT BINDING IS REGISTERED AS A SECOND OWNER OF THE TUPLE'S ELEMENT, SO `match t { (r, k) => .. | a08960b1 |
+| B-2026-09-02-24 | interp+codegen | medium | A MATCH ARM THAT HANDS ITS ELEMENT/PAYLOAD OUT OF THE FUNCTION RUNS THE `Drop` BODY TWICE ON ALL FOUR SURFACES -- `dR4 got4 dR4` where one is due | 7892a47 |
 | B-2026-09-02-25 | interp+codegen | medium | THE `let (r, k) = t` SPELLING OF B-2026-08-31-7 STILL DOUBLES THE ELEMENT'S `Drop` BODY on all four surfaces -- `b5 dR5 dR5` where one is due, while… | 1bd23f1f |
 | B-2026-09-02-26 | interp+codegen | medium | A LOCAL TUPLE SCRUTINEE'S ELEMENT REBIND STILL DOUBLES THE `Drop` BODY on all four surfaces -- `b6 dR6 dR6` where one is due, while the owned-PARAM s… | 3a2c1cf |
 | B-2026-09-02-27 | codegen | high | MOVING A HEAP FIELD OUT OF A BARE-TUPLE ELEMENT BINDING DOUBLE-FREES IT -- `match t { (r, k) => { let n = r.name; .. | e49aa9e8 |
