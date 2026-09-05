@@ -59060,6 +59060,43 @@ fn main() {
     );
 }
 
+/// B-2026-09-05-27 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_match_arm_handing_out_a_tuple_element_frees_it_once`, same program and
+/// string. The interpreter was the correct reference throughout.
+#[test]
+fn test_match_arm_handing_out_a_tuple_element_frees_it_once() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+struct S1 { id: i64, tag: String }
+impl Drop for S1 { fn drop(mut ref self) { println(f"dS{self.id}") } }
+enum E { A(R), B }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn mk1(i: i64) -> S1 { return S1 { id: i, tag: f"t{i}" } }
+fn p4(t: (R, i64)) -> R { match t { (r, k) => { r } } }
+fn p4r(t: (R, i64)) -> R { match t { (r, k) => { return r } } }
+fn p1(t: (S1, i64)) -> S1 { match t { (r, k) => { r } } }
+fn pe(e: E) -> R { match e { E.A(r) => { r }, E.B => mk(0) } }
+fn pd(t: (R, i64)) -> R { let x: R = match t { (r, k) => r }; return x }
+fn pl() -> R { let t: (R, i64) = (mk(13), 0); match t { (r, k) => { r } } }
+fn pc(t: (R, i64)) -> R { match t { (r, k) => { let g: R = r; g } } }
+fn main() {
+    { let a: R = p4((mk(3), 0)); println(f"got{a.id}"); println("one") }
+    { let a: R = p4((mk(3), 0)); let b: R = p4((mk(6), 0)); println(f"got{a.id}{b.id}"); println("two") }
+    { let a: R = p4r((mk(4), 0)); let b: R = p4r((mk(7), 0)); println(f"got{a.id}{b.id}"); println("three") }
+    { let a: S1 = p1((mk1(5), 0)); let b: S1 = p1((mk1(8), 0)); println(f"got{a.id}{b.id}"); println("four") }
+    { let a: R = pe(E.A(mk(9))); let b: R = pe(E.A(mk(10))); println(f"got{a.id}{b.id}"); println("five") }
+    { let t: (R, i64) = (mk(11), 0); let a: R = p4(t); let u: (R, i64) = (mk(12), 0); let b: R = p4(u); println(f"got{a.id}{b.id}"); println("six") }
+    { let a: R = pd((mk(14), 0)); println(f"got{a.id}"); println("seven") }
+    { let a: R = pl(); println(f"got{a.id}"); println("eight") }
+    { let a: R = pc((mk(15), 0)); println(f"got{a.id}"); println("nine") }
+    println("end")
+}
+"#),
+        "got3\ndR3\none\ngot36\ndR6\ndR3\ntwo\ngot47\ndR7\ndR4\nthree\ngot58\ndS8\ndS5\nfour\ngot910\ndR10\ndR9\nfive\ngot1112\ndR12\ndR11\nsix\ngot14\ndR14\nseven\ngot13\ndR13\neight\ngot15\ndR15\nnine\nend\n"
+    );
+}
+
 /// B-2026-09-03-25 — A WILDCARD TUPLE LEAF OVER AN `Option`/`Result`
 /// ELEMENT OWNS ITS PAYLOAD'S `Drop` BODY.
 ///

@@ -1370,6 +1370,11 @@ impl<'ctx> super::Codegen<'ctx> {
                 if let ExprKind::Identifier(nm) = &arm.body.kind {
                     let nm = nm.clone();
                     self.suppress_map_cleanup_for_tail_identifier(&nm);
+                    self.zero_bare_tuple_elem_source_for_moved(&nm);
+                }
+                if let ExprKind::Identifier(nm) = &Self::block_tail_expr(&arm.body).kind {
+                    let nm = nm.clone();
+                    self.zero_bare_tuple_elem_source_for_moved(&nm);
                 }
                 // Move-aware, f-string variant: when the arm's tail
                 // expression is an f-string (`Some(name) => f"[{name}]"`),
@@ -2377,6 +2382,44 @@ impl<'ctx> super::Codegen<'ctx> {
     /// stops. `field_chain_place_ptr` bails on a `ref` root, which is the same
     /// rule from the other direction: a borrowed source's owner is the caller
     /// and the callee must not write into it.
+    /// B-2026-09-05-27 — a bare-tuple element binding handed OUT of its arm
+    /// (`(r, k) => r`, or `return r` inside the arm) is a bit-copy of the
+    /// scrutinee's element: the arm's tail hooks zero the BINDING's caps, but
+    /// the scrutinee keeps its element live and its tuple drop at the merge
+    /// frees the buffers the handed-out value still holds — two invalid frees
+    /// per call, and glibc's `free(): double free detected` on the second.
+    /// The rebind and by-value-argument paths already consult
+    /// `bare_tuple_elem_slots`; this is the same neutralization for the
+    /// hand-out: cap-zero the SOURCE element so the tuple drop skips it.
+    pub(super) fn zero_bare_tuple_elem_source_for_moved(&mut self, name: &str) {
+        let Some(slot) = self.variables.get(name).copied() else {
+            return;
+        };
+        let Some(elem_ptr) = self
+            .payload_vars
+            .bare_tuple_elem_slots
+            .get(&(name.to_string(), slot.ptr))
+            .copied()
+        else {
+            return;
+        };
+        let Some(tn) = self.var_types.var_type_names.get(name).cloned() else {
+            return;
+        };
+        if !self.type_decls.struct_types.contains_key(&tn)
+            || self.type_decls.shared_types.contains_key(&tn)
+        {
+            return;
+        }
+        let subst = self
+            .type_decls
+            .enum_inst_var_types
+            .get(name)
+            .cloned()
+            .map(|i| self.generic_struct_subst_from_inst(&tn, &i));
+        self.zero_struct_move_caps_mono(elem_ptr, &tn, subst.as_ref());
+    }
+
     pub(super) fn record_bare_tuple_elem_sources(&mut self, pattern: &Pattern, scrutinee: &Expr) {
         if !matches!(&pattern.kind, PatternKind::Tuple(_)) {
             return;

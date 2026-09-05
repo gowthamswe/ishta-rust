@@ -17933,6 +17933,59 @@ done
         assert_eq!(out, "dR101\ndR1\none\nn\ndR102\ndR2\ntwo\nin\ndR103\ndR3\nthree\ndR104\ndR4\nfour\nn\ndR105\ndR5\nfive\nin\ndR106\ndR6\nsix\ndR107\ndR7\nin\nseven\nin\ndR8\neight\ndR9\nnine\nn\nten\nend\n");
     }
 
+    /// B-2026-09-05-27 — a match arm handing a bare-tuple ELEMENT out of its
+    /// arm frees each buffer once. The arm's binding is a bit-copy of the
+    /// scrutinee's element; the hand-out zeroed the BINDING's caps and left
+    /// the scrutinee's element live, so the tuple drop at the merge freed the
+    /// buffers the handed-out value still held: two invalid frees per call on
+    /// every compiled backend (glibc aborts on the second call, valgrind
+    /// flags the first). The arm-tail and `return` hooks now cap-zero the
+    /// SOURCE element through `bare_tuple_elem_slots`, the map the rebind and
+    /// by-value-argument paths already consult.
+    ///
+    /// `one`/`two` are the row's cells (one call, two calls), `three` the
+    /// explicit `return`, `four` a single-heap-field element, `five` the enum
+    /// spelling that was always clean, `six` named tuple locals, `seven` the
+    /// hand-out bound to a local (`let x = match ..`), `eight` a LOCAL
+    /// scrutinee, `nine` the rebind spelling that was always clean. The
+    /// bodies are unchanged from B-2026-09-02-24; the ASAN twin runs this
+    /// program under the sanitizer.
+    #[test]
+    fn e2e_match_arm_handing_out_a_tuple_element_frees_it_once() {
+        let Some(out) = run_program(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             struct S1 { id: i64, tag: String }\n\
+             impl Drop for S1 { fn drop(mut ref self) { println(f\"dS{self.id}\") } }\n\
+             enum E { A(R), B }\n\
+             fn mk(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] } }\n\
+             fn mk1(i: i64) -> S1 { return S1 { id: i, tag: f\"t{i}\" } }\n\
+             fn p4(t: (R, i64)) -> R { match t { (r, k) => { r } } }\n\
+             fn p4r(t: (R, i64)) -> R { match t { (r, k) => { return r } } }\n\
+             fn p1(t: (S1, i64)) -> S1 { match t { (r, k) => { r } } }\n\
+             fn pe(e: E) -> R { match e { E.A(r) => { r }, E.B => mk(0) } }\n\
+             fn pd(t: (R, i64)) -> R { let x: R = match t { (r, k) => r }; return x }\n\
+             fn pl() -> R { let t: (R, i64) = (mk(13), 0); match t { (r, k) => { r } } }\n\
+             fn pc(t: (R, i64)) -> R { match t { (r, k) => { let g: R = r; g } } }\n\
+             fn main() {\n\
+             \x20   { let a: R = p4((mk(3), 0)); println(f\"got{a.id}\"); println(\"one\") }\n\
+             \x20   { let a: R = p4((mk(3), 0)); let b: R = p4((mk(6), 0)); println(f\"got{a.id}{b.id}\"); println(\"two\") }\n\
+             \x20   { let a: R = p4r((mk(4), 0)); let b: R = p4r((mk(7), 0)); println(f\"got{a.id}{b.id}\"); println(\"three\") }\n\
+             \x20   { let a: S1 = p1((mk1(5), 0)); let b: S1 = p1((mk1(8), 0)); println(f\"got{a.id}{b.id}\"); println(\"four\") }\n\
+             \x20   { let a: R = pe(E.A(mk(9))); let b: R = pe(E.A(mk(10))); println(f\"got{a.id}{b.id}\"); println(\"five\") }\n\
+             \x20   { let t: (R, i64) = (mk(11), 0); let a: R = p4(t); let u: (R, i64) = (mk(12), 0); let b: R = p4(u); println(f\"got{a.id}{b.id}\"); println(\"six\") }\n\
+             \x20   { let a: R = pd((mk(14), 0)); println(f\"got{a.id}\"); println(\"seven\") }\n\
+             \x20   { let a: R = pl(); println(f\"got{a.id}\"); println(\"eight\") }\n\
+             \x20   { let a: R = pc((mk(15), 0)); println(f\"got{a.id}\"); println(\"nine\") }\n\
+             \x20   println(\"end\")\n\
+             }\n\
+             ",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "got3\ndR3\none\ngot36\ndR6\ndR3\ntwo\ngot47\ndR7\ndR4\nthree\ngot58\ndS8\ndS5\nfour\ngot910\ndR10\ndR9\nfive\ngot1112\ndR12\ndR11\nsix\ngot14\ndR14\nseven\ngot13\ndR13\neight\ngot15\ndR15\nnine\nend\n");
+    }
+
     /// B-2026-09-03-12 — a tuple bound out of a PLACE (`let x = h.pe;`) records its
     /// element types, so the binding runs the element's `Drop` body and can be
     /// projected.
