@@ -5096,6 +5096,59 @@ fn main() {
         }
     }
 
+    /// B-2026-09-02-24 — a `match` arm over an OWNED by-value param that hands
+    /// its bound-out element/payload straight back out of the function runs that
+    /// value's `Drop` body exactly ONCE.
+    ///
+    /// The tuple spelling `fn p4(t: (R, i64)) -> R { match t { (r, k) => r } }`
+    /// and the enum spelling `fn e4(t: E) -> R { match t { E.A(r) => r … } }`
+    /// both printed `dR4 got4 dR4` — TWO bodies where one is due — against the
+    /// interpreter's `got4 dR4`. The first body fired caller-side: the fresh-temp
+    /// argument's own bodies walk ran the element/payload's `Drop` on a value the
+    /// callee had already returned, and the result's binding ran it again. The
+    /// caller could not skip it because the escape analysis
+    /// (`fn_returns_param_part_paths`) never recorded a MATCH ARM's leaf bindings
+    /// as denoting the scrutinee's parts — only a `let` destructure did — so the
+    /// tuple element looked non-escaping; the enum payload rode a separate skip
+    /// (`callee_returns_enum_arg_payload`) that the fresh-temp enum arg registrar
+    /// never consulted.
+    ///
+    /// `pf` is the non-escaping control (a field READ, `r.id`), whose single body
+    /// must survive the fix — masking it too would trade a double for a lost
+    /// one — and `pr` pins the explicit-`return` spelling beside the tail one.
+    /// A no-heap `R` on purpose: the row is a body-COUNT defect (valgrind-clean,
+    /// the entry copy gives each fire its own buffer); the heap-payload spelling
+    /// is a distinct MEMORY double-free tracked separately.
+    #[test]
+    fn test_e2e_match_arm_returns_owned_param_element_runs_one_body() {
+        let out = run_program(
+            r#"
+struct R { id: i64 }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+enum E { A(R), B }
+fn p4(t: (R, i64)) -> R { match t { (r, k) => { r } } }
+fn e4(t: E) -> R { match t { E.A(r) => { r } E.B => { R { id: 99 } } } }
+fn pf(t: (R, i64)) -> i64 { match t { (r, k) => { r.id } } }
+fn pr(t: (R, i64)) -> R { match t { (r, k) => { return r; } } }
+fn main() {
+  let a = p4((R { id: 4 }, 0)); println(f"got{a.id}");
+  let b = e4(E.A(R { id: 7 })); println(f"got{b.id}");
+  let c = pf((R { id: 1 }, 0)); println(f"r{c}");
+  let d = pr((R { id: 5 }, 0)); println(f"got{d.id}");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "got4\ndR4\ngot7\ndR7\ndR1\nr1\ngot5\ndR5\nend\n",
+                "an escaping match-arm element/payload dies once (at the result's \
+                 owner), the non-escaping field-read control keeps its single \
+                 body inside the call; got {out:?}"
+            );
+        }
+    }
+
     /// B-2026-08-08-30 — mapping a BORROWED SCALAR payload.
     ///
     /// `Vec[T].first()` / `.get(i)` are typed `Option[ref T]` (`Map.get` is owned

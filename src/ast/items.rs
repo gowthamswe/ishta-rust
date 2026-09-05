@@ -2533,8 +2533,48 @@ pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamP
                     grow_expr(x, aliases);
                 }
             }
-            ExprKind::Match { arms, .. } => {
+            ExprKind::Match { scrutinee, arms } => {
+                // B-2026-09-02-24 — a match arm destructures the scrutinee
+                // exactly as a `let` does, so its leaf bindings denote the
+                // scrutinee's path extended by their own position. Recording
+                // them here (mirroring the `let`-destructure arms in
+                // `grow_block`) is what lets `yielded` recognize
+                // `match t { (r, k) => r }` as handing back `t.0`; without it the
+                // arm binding was an unknown name, the returned element was never
+                // seen to escape, and the caller ran that element's `Drop` body a
+                // SECOND time on top of the result's owner. The enum-variant
+                // PAYLOAD spelling is `fn_returns_param_payload`'s separate answer
+                // (`ParamPart` cannot name an enum payload).
+                let base = denote(scrutinee, aliases);
                 for a in arms {
+                    if let Some(base) = &base {
+                        match &a.pattern.kind {
+                            PatternKind::Tuple(pats) => {
+                                for (i, p) in pats.iter().enumerate() {
+                                    if let PatternKind::Binding(n) = &p.kind {
+                                        let mut path = base.clone();
+                                        path.push(ParamPart::TupleIndex(i));
+                                        set_alias(aliases, n, path);
+                                    }
+                                }
+                            }
+                            PatternKind::Struct { fields, .. } => {
+                                for fp in fields {
+                                    let mut path = base.clone();
+                                    path.push(ParamPart::Field(fp.name.clone()));
+                                    match &fp.pattern {
+                                        None => set_alias(aliases, &fp.name, path),
+                                        Some(p) => {
+                                            if let PatternKind::Binding(n) = &p.kind {
+                                                set_alias(aliases, n, path);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     grow_expr(&a.body, aliases);
                 }
             }

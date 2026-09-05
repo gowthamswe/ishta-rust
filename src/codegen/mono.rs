@@ -2562,6 +2562,11 @@ impl<'ctx> super::Codegen<'ctx> {
                     mono_agg[i].0,
                     &escaping_parts,
                     declared_tes.as_deref(),
+                    // The enum-payload escape skip (B-2026-09-02-24) is threaded
+                    // only on the free-fn path; the monomorph path keeps its prior
+                    // behaviour (the generic enum-payload-return shape is tracked
+                    // separately under the B-2026-09-05-18 family).
+                    false,
                 );
             }
         }

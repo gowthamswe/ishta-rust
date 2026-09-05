@@ -2182,12 +2182,18 @@ impl<'ctx> super::Codegen<'ctx> {
             {
                 let escaping_parts = self.callee_returned_param_parts(&name, i);
                 let declared_tes = self.callee_tuple_param_elem_type_exprs(&name, i);
+                // B-2026-09-02-24 — the enum-payload sibling of `escaping_parts`,
+                // for a fresh-temp enum arg whose payload a `match e { E.A(r) =>
+                // r }` callee hands back (see the fresh-temp enum arm in the
+                // registrar).
+                let payload_escapes = self.callee_returns_enum_arg_payload(&name, i);
                 self.track_inline_owned_aggregate_arg_parts(
                     val,
                     &a.value,
                     escapes_frame,
                     &escaping_parts,
                     declared_tes.as_deref(),
+                    payload_escapes,
                 );
             }
             // B-2026-08-28-16 — a PLACE tuple argument (`take(q)`) whose
@@ -4269,6 +4275,7 @@ impl<'ctx> super::Codegen<'ctx> {
             false,
             &[],
             None,
+            false,
         )
     }
 
@@ -4285,6 +4292,7 @@ impl<'ctx> super::Codegen<'ctx> {
         arg_escapes_frame: bool,
         escaping_paths: &[crate::ast::ParamPath],
         declared_elem_tes: Option<&[TypeExpr]>,
+        payload_escapes_frame: bool,
     ) {
         self.track_inline_owned_aggregate_arg_inst(
             val,
@@ -4294,6 +4302,7 @@ impl<'ctx> super::Codegen<'ctx> {
             false,
             escaping_paths,
             declared_elem_tes,
+            payload_escapes_frame,
         )
     }
 
@@ -4550,6 +4559,13 @@ impl<'ctx> super::Codegen<'ctx> {
         callee_entry_copies_mono: bool,
         escaping_paths: &[crate::ast::ParamPath],
         declared_elem_tes: Option<&[TypeExpr]>,
+        // B-2026-09-02-24 — the enum sibling of `escaping_paths`: the named
+        // callee returns THIS fresh-temp enum arg's PAYLOAD (a `match e { E.A(r)
+        // => r }` handing `r` back). `ParamPart` cannot name an enum payload, so
+        // it never enters `escaping_paths`; this bool carries it instead, and the
+        // fresh-temp enum arm below skips the caller-side payload-bodies walker so
+        // the result's consumer is the payload body's only owner.
+        payload_escapes_frame: bool,
     ) {
         let inkwell::types::BasicTypeEnum::StructType(agg_ty) = val.get_type() else {
             return;
@@ -4591,6 +4607,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 callee_entry_copies_mono,
                 escaping_paths,
                 declared_elem_tes,
+                payload_escapes_frame,
             );
             return;
         }
@@ -4907,7 +4924,18 @@ impl<'ctx> super::Codegen<'ctx> {
             // enum whole (a destructuring callee's arm channel is now
             // param-gated, so this caller-side fire is the single owner).
             // Option/Result stay with their own payload machinery.
-            let walker = if !shared && enum_name != "Option" && enum_name != "Result" {
+            // B-2026-09-02-24 — skip the payload-bodies walker when the callee
+            // hands THIS arg's payload back out (`match e { E.A(r) => r }`): the
+            // result's binding then owns the body, so registering it here too ran
+            // it twice (`dR4 got4 dR4` where `got4 dR4` is due), the enum twin of
+            // the tuple-element skip a few arms down. Memory is untouched: a
+            // heap payload's buffer left with the returned value, so there is
+            // nothing here to free either.
+            let walker = if !payload_escapes_frame
+                && !shared
+                && enum_name != "Option"
+                && enum_name != "Result"
+            {
                 self.emit_enum_payload_user_drop_bodies_fn(&enum_name)
             } else {
                 None
