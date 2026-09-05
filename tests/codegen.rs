@@ -17710,6 +17710,52 @@ done
         assert_eq!(out, "dR101\ndR1\none\ndR2\ndR102\ntwo\ndR103\ndR3\nthree\ndR104\nuse4\ndR4\nfour\ndR105\ndR5\nfive\ndR106\ndR6\nsix\nin\ndR107\ndR7\nseven\ndR108\ndR8\ndR109\ndR9\neight\ndR110\ndR10\nnine\ndR11\ndR111\nten\nend\n");
     }
 
+    /// B-2026-09-03-34 — a match arm's STRUCT payload binding whose type has
+    /// Drop-bearing FIELDS (and no `Drop` of its own) runs those bodies on the
+    /// compiled backends, whatever the arm does with it.
+    ///
+    /// The arm disarms the enum's payload walk in the binding's favour, and
+    /// the binding got `track_struct_var` — memory alone — so every field body
+    /// was lost: unread (`two`, `nine`), read (`seven`), destructured (`one`,
+    /// the row's cell, where the destructure transfers bodies only off a
+    /// source that owns a walk; `four`, `five`, `six`, `three` the `if let`
+    /// spelling). Only the `Option` field's payload body survived, through
+    /// B-2026-09-03-24's registrar, which is what made the row read as a
+    /// destructure defect. The binding now registers the field-bodies walk
+    /// beside its memory, as a local of the same type has, and every shape
+    /// prints the interpreter's lines. `eight` (rebind) and `ten` (`_` arm)
+    /// were always right and pin that the walk moves with a rebind and that
+    /// the enum's own walk still runs when nothing binds the payload.
+    #[test]
+    fn e2e_match_arm_struct_payload_binding_runs_its_field_bodies() {
+        let Some(out) = run_program(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             struct Ho2 { a: R, b: Option[R] }\n\
+             struct Two { a: R, b: R }\n\
+             struct Nest { inner: Two, z: i64 }\n\
+             enum Wrap { W(Ho2), T(Two), Nn(Nest), N }\n\
+             fn mk(k: i64) -> R { return R { id: k, tag: f\"t{k}\", xs: [k] } }\n\
+             fn main() {\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(52), b: Option.Some(mk(152)) }); match w { Wrap.W(h) => { let Ho2 { a, b } = h; println(\"in\") }, _ => println(\"n\") } println(\"one\") }\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(55), b: Option.Some(mk(155)) }); match w { Wrap.W(h) => { println(\"in\") }, _ => println(\"n\") } println(\"two\") }\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(56), b: Option.Some(mk(156)) }); if let Wrap.W(h) = w { let Ho2 { a, b } = h; println(\"in\") } println(\"three\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(57), b: mk(157) }); match w { Wrap.T(h) => { let Two { a, b } = h; println(\"in\") }, _ => println(\"n\") } println(\"four\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(58), b: mk(158) }); match w { Wrap.T(h) => { let Two { a, b: _ } = h; println(\"in\") }, _ => println(\"n\") } println(\"five\") }\n\
+             \x20   { let w: Wrap = Wrap.Nn(Nest { inner: Two { a: mk(59), b: mk(159) }, z: 1 }); match w { Wrap.Nn(h) => { let Nest { inner, z } = h; println(\"in\") }, _ => println(\"n\") } println(\"six\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(60), b: mk(160) }); match w { Wrap.T(h) => { println(f\"use{h.a.id}\") }, _ => println(\"n\") } println(\"seven\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(61), b: mk(161) }); match w { Wrap.T(h) => { let g: Two = h; println(\"in\") }, _ => println(\"n\") } println(\"eight\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(62), b: mk(162) }); match w { Wrap.T(h) => { println(\"in\") }, _ => println(\"n\") } println(\"nine\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(63), b: mk(163) }); match w { _ => println(\"n\") } println(\"ten\") }\n\
+             \x20   println(\"end\")\n\
+             }\n\
+             ",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dR152\ndR52\nin\none\nin\ndR155\ndR55\ntwo\ndR156\ndR56\nin\nthree\ndR157\ndR57\nin\nfour\ndR158\ndR58\nin\nfive\ndR159\ndR59\nin\nsix\nuse60\ndR160\ndR60\nseven\ndR161\ndR61\nin\neight\nin\ndR162\ndR62\nnine\nn\ndR163\ndR63\nten\nend\n");
+    }
+
     /// B-2026-09-03-12 — a tuple bound out of a PLACE (`let x = h.pe;`) records its
     /// element types, so the binding runs the element's `Drop` body and can be
     /// projected.

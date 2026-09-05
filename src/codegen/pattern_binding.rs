@@ -1149,6 +1149,34 @@ impl<'ctx> super::Codegen<'ctx> {
                                     // the tuple's own drop frees. See
                                     // `current_bare_tuple_bindings`.
                                     self.track_struct_var(tn, alloca);
+                                    // B-2026-09-03-34 — a payload struct with
+                                    // Drop-bearing FIELDS and no `Drop` of its
+                                    // own got memory alone here, while the arm
+                                    // had already disarmed the enum's payload
+                                    // walk in the binding's favour: every field
+                                    // body was lost — unread, read, or
+                                    // destructured (which transfers bodies
+                                    // only off a source that owns a walk).
+                                    // Register the field-bodies walk beside the
+                                    // memory, as a local of this type has.
+                                    let tn_owned = tn.to_string();
+                                    let subst = std::collections::HashMap::new();
+                                    if !self.drop_rc.user_drop_wrapper_fns.contains_key(&tn_owned)
+                                        && self.type_runs_user_drop_mono(&tn_owned, &subst)
+                                    {
+                                        if let Some(bodies) =
+                                            self.emit_user_drop_field_bodies_fn(&tn_owned, &subst)
+                                        {
+                                            let name_owned = name.clone();
+                                            self.track_user_drop_var_with_fn(
+                                                &tn_owned,
+                                                &name_owned,
+                                                alloca,
+                                                bodies,
+                                                UserDropKind::StructFieldBodies,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             // B-2026-07-30-11 (boxed-payload bodies): a
