@@ -19525,39 +19525,73 @@ impl<'ctx> super::Codegen<'ctx> {
         self.close_cond_move_guard(guard);
     }
 
-    /// Peel value-position block wrappers to the expression that actually
-    /// produces the assignment's value (B-2026-08-29-51).
+    /// Collect every value-producing tail of an assignment's RHS: peel
+    /// value-position block wrappers (B-2026-08-29-51), and flatten
+    /// `if` / `if let` / `match` to ONE TAIL PER ARM (B-2026-09-01-1).
     ///
     /// `{ let z = 1; println(..); pass(e) }` yields exactly what `pass(e)`
     /// yields; the statements before the tail change nothing about the
-    /// assignment's ownership. Recursive, because a tail can itself be a block.
-    /// A block with no tail expression produces no value and is returned
-    /// unchanged, so the `Call` match below simply fails on it.
+    /// assignment's ownership. Recursive, because a tail can itself be a block
+    /// or a branch — which is what makes the nested spelling
+    /// `e = { let z = 1; if c { pass(e) } else { pass(e) } }` resolve to the two
+    /// arms rather than stopping at the block (measured leaking pre-fix at
+    /// 12 allocs / 11 frees, the same as the bare branch).
     ///
-    /// Deliberately NOT peeling `If` / `Match`: those have SEVERAL tails that
-    /// need not agree (`e = if c { pass(e) } else { mk() }`), so admitting them
-    /// means deciding what to do when the arms disagree. That is a different
-    /// question from this one and is measured in the row rather than guessed
-    /// at here.
-    fn assign_rhs_value_tail(value: &Expr) -> &Expr {
+    /// WHY ONE TAIL PER ARM IS ENOUGH, where the row that filed this expected to
+    /// have to reconcile disagreeing arms. Exactly one arm runs, and the caller
+    /// requires ALL tails to classify the same way, so a branch is admitted only
+    /// when every path it can take is independently safe — no arm ever has to be
+    /// reconciled with another. The reconciliation problem the row anticipated
+    /// comes from emitting the cleanup BEFORE the branch, where a freed field
+    /// would then be read by the arm that roundtrips it; the caller emits it
+    /// AFTER `compile_expr(value)` has already produced the branch's value, so
+    /// the arms have run by then and per-arm emission buys nothing.
+    ///
+    /// A construct that does not produce a value on EVERY path pushes ITSELF, so
+    /// the caller's `Call` match fails on it and the whole RHS is declined: a
+    /// block with no tail expression, an `if` with no `else`, an empty `match`.
+    /// Declining is the pre-existing behaviour, so those shapes are unchanged.
+    fn assign_rhs_value_tails<'e>(value: &'e Expr, out: &mut Vec<&'e Expr>) {
         match &value.kind {
             ExprKind::Block(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) => match &b.final_expr {
-                Some(tail) => Self::assign_rhs_value_tail(tail),
-                None => value,
+                Some(tail) => Self::assign_rhs_value_tails(tail, out),
+                None => out.push(value),
             },
-            _ => value,
+            ExprKind::If {
+                then_block,
+                else_branch,
+                ..
+            }
+            | ExprKind::IfLet {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                match &then_block.final_expr {
+                    Some(tail) => Self::assign_rhs_value_tails(tail, out),
+                    None => out.push(value),
+                }
+                match else_branch {
+                    Some(eb) => Self::assign_rhs_value_tails(eb, out),
+                    None => out.push(value),
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                if arms.is_empty() {
+                    out.push(value);
+                }
+                for arm in arms {
+                    Self::assign_rhs_value_tails(&arm.body, out);
+                }
+            }
+            _ => out.push(value),
         }
     }
 
-    fn assign_rhs_is_owned_user_call(&self, value: &Expr) -> bool {
-        // B-2026-08-29-51 — match the RHS's VALUE-PRODUCING tail, not just a
-        // bare `Call` at the root. `e = { let z = 1; pass(e) };` reached here as
-        // an `ExprKind::Block` and answered false, so `roundtrip_frees_old` was
-        // false; with `rhs_mentions_lhs` true, the caller's whole
-        // overwrite-cleanup branch was skipped and the old value's field heap
-        // was never freed. The unwrapped `e = pass(e);` was clean, which is
-        // what localized it to the wrapper rather than to the roundtrip.
-        let value = Self::assign_rhs_value_tail(value);
+    /// One tail's half of `assign_rhs_is_owned_user_call` — a call to a
+    /// top-level USER function (not a ctor, not a method, not shadowed by a
+    /// local) whose return is not a borrow.
+    fn tail_is_owned_user_call(&self, value: &Expr) -> bool {
         let ExprKind::Call { callee, .. } = &value.kind else {
             return false;
         };
@@ -19578,6 +19612,38 @@ impl<'ctx> super::Codegen<'ctx> {
                     Some(crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_))
                 ))
         })
+    }
+
+    fn assign_rhs_is_owned_user_call(&self, value: &Expr) -> bool {
+        // B-2026-08-29-51 — match the RHS's VALUE-PRODUCING tail, not just a
+        // bare `Call` at the root. `e = { let z = 1; pass(e) };` reached here as
+        // an `ExprKind::Block` and answered false, so `roundtrip_frees_old` was
+        // false; with `rhs_mentions_lhs` true, the caller's whole
+        // overwrite-cleanup branch was skipped and the old value's field heap
+        // was never freed. The unwrapped `e = pass(e);` was clean, which is
+        // what localized it to the wrapper rather than to the roundtrip.
+        //
+        // B-2026-09-01-1 — and require EVERY tail, so an `if` / `if let` /
+        // `match` RHS is admitted exactly when each arm independently qualifies.
+        // `e = if c { pass(e) } else { pass(e) }` lost the same block as the
+        // wrapper shape above (12 allocs / 11 frees at `KARAC_OPT_LEVEL=0`), and
+        // so did the `match`, `if let`, else-if and nested-in-a-block spellings.
+        // MIXED arms (`else { mk(9) }`) are not a separate case: an arm that
+        // mints a fresh value is a qualifying owned user call too, and the old
+        // value it displaces is orphaned by the store just the same.
+        //
+        // The one shape this still DECLINES is an arm that hands the binding
+        // back unchanged (`e = if c { pass(e) } else { e }`): its value IS the
+        // old value, so the cleanup would free the very buffer about to be
+        // stored back — a leak traded for a use-after-free. A bare identifier is
+        // not a `Call`, so it fails here and the whole branch is declined,
+        // leaving that spelling exactly as it was (still leaking, measured
+        // 12 / 11 both before and after this change; tracked separately).
+        let mut tails = Vec::new();
+        Self::assign_rhs_value_tails(value, &mut tails);
+        // Never vacuously true: every arm of the walk pushes at least one tail,
+        // and `all` over an empty set would admit an RHS nothing classified.
+        !tails.is_empty() && tails.iter().all(|t| self.tail_is_owned_user_call(t))
     }
 
     /// True if `expr` is a `String[a..b]` / `String[a..=b]` range-index slice

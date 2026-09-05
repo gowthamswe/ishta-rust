@@ -2953,6 +2953,135 @@ fn main() {
         );
     }
 
+    /// B-2026-09-01-1 — a self-assignment whose RHS is an `if` / `if let` /
+    /// `match` frees the value it overwrites, the branch sibling of
+    /// `asan_self_assign_block_tail_frees_the_overwritten_value` above.
+    ///
+    /// That fix taught `assign_rhs_is_owned_user_call` to peel value-position
+    /// BLOCK wrappers to their single tail. A branch has several tails, so it
+    /// stayed unpeeled and answered false: `roundtrip_frees_old` was false, and
+    /// with `rhs_mentions_lhs` true the caller's whole overwrite-cleanup branch
+    /// was skipped and the old value's field heap was never freed. Measured
+    /// UNTOUCHED by that fix at the time — 12 allocs / 11 frees before and
+    /// after — so it was filed separately rather than folded in.
+    ///
+    /// WHY THE ARMS NEVER HAVE TO AGREE, which is what the row expected to be
+    /// the hard part: the cleanup is emitted AFTER `compile_expr(value)` has
+    /// already produced the branch's value, so the arm has run by then. Only
+    /// "may this old value be freed at all" is left, and requiring EVERY arm to
+    /// qualify answers it per path. `bmix` / `bmix2` are the pair that pins
+    /// this: one runs the arm that roundtrips, the other the arm that mints a
+    /// fresh value, and the displaced old value is orphaned identically by both.
+    ///
+    /// The shapes, each measured at 12 allocs / 11 frees pre-fix and 12 / 12
+    /// after:
+    ///
+    ///   `bif`     `if` / `else`, both arms roundtrip
+    ///   `bmatch`  the `match` spelling
+    ///   `bmix`    MIXED arms, roundtripping arm taken
+    ///   `bmix2`   MIXED arms, fresh-value arm taken
+    ///   `bnest`   a BLOCK whose tail is an `if` — the two peels composing
+    ///   `bil`     the `if let` spelling
+    ///   `belif`   an else-if CHAIN, i.e. an `if` nested in an else branch
+    ///   `ben`     enum `String` payload — the value-enum leg, not just structs
+    ///   `bnod`    no `impl Drop` at all — not limited to Drop types
+    ///
+    /// `bnest`, `bil` and `belif` were all listed NOT MEASURED on the row and
+    /// were confirmed to leak identically while fixing it.
+    ///
+    /// NOT FIXED, and deliberately left as it was: an arm that hands the
+    /// binding back UNCHANGED (`e = if c { pass(e) } else { e }`). Its value IS
+    /// the old value, so the cleanup would free the buffer about to be stored
+    /// back — a leak traded for a use-after-free. A bare identifier is not a
+    /// `Call`, so the predicate declines the whole branch and that spelling is
+    /// byte-for-byte unchanged (measured 12 / 11 both before and after, with no
+    /// new ASAN error). Tracked on its own row; it is absent here because this
+    /// fixture asserts a CLEAN run and that shape still leaks.
+    ///
+    /// COVERAGE, weaker than it looks and stated for the same reason the
+    /// sibling states it: the leak is OPTIMIZATION-DEPENDENT. Measured pre-fix
+    /// at 12 allocs / 11 frees under `KARAC_OPT_LEVEL=0` and CLEAN at the
+    /// default `-O2` (10 / 10), where LLVM deletes the redundant allocation. So
+    /// the MEMORY half here is carried by the `-O0` leg
+    /// (`scripts/asan-o0-leg.sh`, B-2026-08-04-17); the default leg asserts the
+    /// OUTPUT, and a leak traded for a lost or doubled `Drop` body fails at
+    /// either level. That dependence is why the row is low severity and why a
+    /// release build never showed it.
+    #[test]
+    fn asan_self_assign_branch_arms_free_the_overwritten_value() {
+        assert_clean_asan_run(
+            r#"
+struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"drop {self.id}") } }
+
+struct P { id: i64, name: String }
+
+enum E { A(String), B }
+impl Drop for E { fn drop(mut ref self) { println("dropE") } }
+
+fn pass(r: R) -> R { return r; }
+fn passp(p: P) -> P { return p; }
+fn passe(x: E) -> E { return x; }
+fn mk(n: i64) -> R { return R { id: n, name: f"mk-aaaaaaaaaaaaaaaaaaaaaaaa" }; }
+
+fn main() {
+    let n: i64 = env.args().len();
+    let c = n > 0;
+    let d = n > 5;
+
+    let mut bif = R { id: 1, name: f"bif-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    bif = if c { pass(bif) } else { pass(bif) };
+    println(f"bif {bif.id}");
+
+    let mut bmatch = R { id: 2, name: f"bmatch-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    bmatch = match c { true => pass(bmatch), false => pass(bmatch) };
+    println(f"bmatch {bmatch.id}");
+
+    let mut bmix = R { id: 3, name: f"bmix-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    bmix = if c { pass(bmix) } else { mk(30) };
+    println(f"bmix {bmix.id}");
+
+    let mut bmix2 = R { id: 4, name: f"bmix2-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    bmix2 = if d { pass(bmix2) } else { mk(40) };
+    println(f"bmix2 {bmix2.id}");
+
+    let mut bnest = R { id: 5, name: f"bnest-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    bnest = { let z: i64 = n; if c { pass(bnest) } else { pass(bnest) } };
+    println(f"bnest {bnest.id}");
+
+    let mut bil = R { id: 6, name: f"bil-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    let o: Option[i64] = Option.Some(n);
+    bil = if let Option.Some(k) = o { pass(bil) } else { pass(bil) };
+    println(f"bil {bil.id}");
+
+    let mut belif = R { id: 7, name: f"belif-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    belif = if d { pass(belif) } else if c { mk(70) } else { pass(belif) };
+    println(f"belif {belif.id}");
+
+    let mut ben: E = E.A(f"ben-aaaaaaaaaaaaaaaaaaaaaaaa");
+    ben = if c { passe(ben) } else { passe(ben) };
+    println("ben done");
+
+    let mut bnod = P { id: 9, name: f"bnod-aaaaaaaaaaaaaaaaaaaaaaaa" };
+    bnod = if c { passp(bnod) } else { passp(bnod) };
+    println(f"bnod {bnod.id}");
+}
+"#,
+            // Each body fires at its binding's LAST USE, not at scope exit, so
+            // the drops interleave with the printlns. Both backends produce
+            // this sequence identically — checked, since the fix moves where a
+            // free happens and an order change would be the interesting kind of
+            // regression. `bmix2` and `belif` print the MINTED id (40, 70)
+            // because the fresh-value arm is the one taken there.
+            &[
+                "bif 1", "drop 1", "bmatch 2", "drop 2", "bmix 3", "drop 3", "bmix2 40", "drop 40",
+                "bnest 5", "drop 5", "bil 6", "drop 6", "belif 70", "drop 70", "dropE", "ben done",
+                "bnod 9",
+            ],
+            "asan_self_assign_branch_arms_free_the_overwritten_value",
+        );
+    }
+
     #[test]
     fn asan_branch_tail_owned_temp_frees_once() {
         assert_clean_asan_run(
