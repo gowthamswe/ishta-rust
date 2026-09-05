@@ -4510,6 +4510,61 @@ fn main() {
         );
     }
 
+    /// B-2026-09-05-29 — the MEMORY gate for the discarded generic whole-param
+    /// return. The E2E twin sees a body count; this one sees the 11 B in 2
+    /// blocks (a `String` and a `Vec` buffer) that valgrind measured lost per
+    /// evaluation pre-fix, unbounded in a loop — and, in the other direction,
+    /// it is what would catch the fix overshooting into a DOUBLE FREE, which
+    /// is the failure mode the row warned about: the registrar this feeds
+    /// takes ownership of what it names, so naming an object that already has
+    /// an owner is strictly worse than the leak it replaces. Three rounds so a
+    /// per-round imbalance accumulates rather than cancelling.
+    ///
+    /// THE NAMED-LOCAL CELL IS DELIBERATELY ABSENT, and its absence is a
+    /// finding rather than an oversight. `let g = mk(82); let _ = passG(g);`
+    /// runs its body exactly once on all four surfaces — which is all the row
+    /// measured, and why it is described there as correct — but it LEAKS 10 B
+    /// in 2 blocks, on the pre-fix tree and on this one alike, while its
+    /// concrete twin `passN(g)` is 13 allocs / 13 frees clean. That is a
+    /// generic-only memory miss on the BINDING's registration, untouched by
+    /// this fix and not fixable from here (registering an owner for it is the
+    /// double free above), so it is filed as its own row. Under LSan on Linux
+    /// including the cell would fail this test for a reason it does not own.
+    #[test]
+    fn asan_generic_whole_param_discarded_temp_frees_once() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+struct H { r: R, z: i64 }
+fn passG[T](x: T) -> T { println("inP"); return x; }
+fn passN(x: R) -> R { println("inN"); return x; }
+fn pickB[T](a: T, b: T) -> T { println("inB"); return b; }
+fn wrapG[T](x: T) -> H { println("inW"); return H { r: x, z: 1 }; }
+fn scalarG[T](x: T) -> i64 { println("inS"); return 3; }
+fn round() {
+  let _ = passG(mk(80)); println("a");
+  let _ = passN(mk(81)); println("b");
+  let _ = pickB(mk(83), mk(84)); println("d");
+  let _ = wrapG(mk(85)); println("e");
+  let _ = scalarG(mk(86)); println("f");
+  let k = passG(mk(87)); println(f"k{k.id}");
+}
+fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); }
+"#,
+            &[
+                "inP", "dR80", "a", "inN", "dR81", "b", "inB", "dR83", "dR84", "d", "inW", "dR85",
+                "e", "inS", "dR86", "f", "inP", "k87", "dR87", "inP", "dR80", "a", "inN", "dR81",
+                "b", "inB", "dR83", "dR84", "d", "inW", "dR85", "e", "inS", "dR86", "f", "inP",
+                "k87", "dR87", "inP", "dR80", "a", "inN", "dR81", "b", "inB", "dR83", "dR84", "d",
+                "inW", "dR85", "e", "inS", "dR86", "f", "inP", "k87", "dR87", "done",
+            ],
+            "b0905-29-generic-whole-param-discarded-temp",
+            48,
+        );
+    }
+
     #[test]
     fn asan_place_struct_arg_escaping_field_frees_once() {
         assert_clean_asan_run_min_allocs(

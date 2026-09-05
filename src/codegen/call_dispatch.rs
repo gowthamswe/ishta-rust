@@ -3857,6 +3857,114 @@ impl<'ctx> super::Codegen<'ctx> {
         subst.get(declared.as_deref()?).and_then(Self::te_head_name)
     }
 
+    /// B-2026-09-05-29 — the WHOLE-PARAM leg of the miss
+    /// [`Self::discarded_escaped_part_type_name`] closes for a PART: name the
+    /// concrete type of a discarded GENERIC call's result when the callee's
+    /// return type IS one of its own type parameters and argument `i` is
+    /// declared at that same parameter — `fn passG[T](x: T) -> T` under
+    /// `let _ = passG(mk(80));`, which ran no `Drop` body on any compiled
+    /// surface (nor at `-O0`) against the interpreter's, and lost 11 B in
+    /// 2 blocks.
+    ///
+    /// Resolved from the SIGNATURE rather than from the body, which is the one
+    /// thing to keep straight about this arm. `fn_returns_param` is the
+    /// obvious predicate and is the wrong instrument HERE: it is deliberately
+    /// conservative and answers `true` for a return site that WRAPS the param
+    /// (`return Holder { xs: v };`), whose result is a `Holder` and not the
+    /// argument's type at all — right for the ownership question its eight
+    /// consumers ask it, wrong for naming a layout the registrar will free
+    /// through. `-> T` over `x: T` is instead a type-level identity: whatever
+    /// the body does, the result's concrete type is the argument's. `ref T` /
+    /// `mut ref T` cannot reach it because `te_head_name` answers only for a
+    /// `Path`, and a borrow-returning callee must never hand the caller an
+    /// owner.
+    ///
+    /// A FRESH TEMPORARY argument only, and that gate — not the name lookup —
+    /// is the substance of the fix. The registrar this feeds takes OWNERSHIP
+    /// of what it names, so the question is not "what type is the result" but
+    /// "does this object already have an owner". A NAMED LOCAL supplies its
+    /// own, which is exactly why `let g = mk(82); let _ = passG(g);` is already
+    /// correct on all four surfaces; naming it here would register a SECOND
+    /// owner over one object and trade the leak for a double free — the
+    /// direction B-2026-09-05-18's first defect went. A temporary has no owner
+    /// at all: `call_arg_flows_into_return` stands the caller-side argument
+    /// drop down precisely because the RESULT is supposed to carry it, and
+    /// with the result unnamed nothing did. So this registration is the only
+    /// one, which is what the non-generic twin (`fn passN(x: R) -> R`) has had
+    /// all along through `fn_return_type_names`.
+    fn discarded_whole_param_type_name(
+        &self,
+        callee_name: &str,
+        args: &[CallArg],
+    ) -> Option<String> {
+        let program = self.program_snapshot.as_deref()?;
+        let f = program.items.iter().find_map(|item| match item {
+            crate::ast::Item::Function(f) if f.name == callee_name => Some(f),
+            _ => None,
+        })?;
+        let ret = Self::te_head_name(f.return_type.as_ref()?)?;
+        // A TEMPLATE only. A concrete `-> R` is `declare_function`'d and
+        // answers through `fn_return_type_names` above; this arm exists for the
+        // name that table cannot hold.
+        if !f
+            .generic_params
+            .as_ref()
+            .is_some_and(|g| g.params.iter().any(|p| !p.is_const && p.name == ret))
+        {
+            return None;
+        }
+        // Collected rather than returned on first hit, for the reason the
+        // sibling resolver states: a call returns ONE value, so two candidates
+        // that disagree mean this has misread the signature, and the name
+        // decides which layout the registrar frees through.
+        // Labels are NOT normalized before codegen — `bce_interproc`'s
+        // interprocedural gate declines on this same test, for this same
+        // reason — so `args[i]` is not `params[i]` once one is written, and
+        // this resolver pairs the two to decide which layout the registrar
+        // frees through. Pair by NAME when every argument carries a label, by
+        // position when none does, and decline a MIXED list rather than guess
+        // where the positional run ends: `passG(x: mk(5))` is the same defect
+        // in another spelling and is worth closing, but not at the cost of a
+        // free at the wrong type.
+        let labelled = args.iter().filter(|a| a.label.is_some()).count();
+        if labelled != 0 && labelled != args.len() {
+            return None;
+        }
+        let mut found: Option<String> = None;
+        for (i, a) in args.iter().enumerate() {
+            let p = match &a.label {
+                Some(l) => f.params.iter().find(
+                    |p| matches!(&p.pattern.kind, crate::ast::PatternKind::Binding(n) if n == l),
+                ),
+                None => f.params.get(i),
+            };
+            let Some(p) = p else { continue };
+            if Self::te_head_name(&p.ty).as_deref() != Some(ret.as_str()) {
+                continue;
+            }
+            if !self.expr_yields_fresh_owned_temp(&a.value) {
+                continue;
+            }
+            let ExprKind::Call { callee, .. } = &a.value.kind else {
+                continue;
+            };
+            let ExprKind::Identifier(arg_fn) = &callee.kind else {
+                continue;
+            };
+            let Some(name) = self.fn_sig.fn_return_type_names.get(arg_fn.as_str()) else {
+                continue;
+            };
+            if !self.names_a_drop_type(name.as_str()) {
+                continue;
+            }
+            match &found {
+                Some(prev) if prev != name => return None,
+                _ => found = Some(name.clone()),
+            }
+        }
+        found
+    }
+
     pub(super) fn try_track_discarded_user_drop_temp(
         &mut self,
         tail: &Expr,
@@ -3916,8 +4024,14 @@ impl<'ctx> super::Codegen<'ctx> {
                     } else {
                         // Strictly additive: the escaped-part route only ever
                         // ANSWERS where the old lookup could not, and falls back
-                        // to whatever it used to return.
+                        // to whatever it used to return. B-2026-09-05-29's
+                        // whole-param route is chained the same way and sits
+                        // AFTER it: the part resolver reads a place argument,
+                        // this one a fresh temporary, so the two cannot both
+                        // answer for one slot — the order is for legibility,
+                        // not disambiguation.
                         self.discarded_escaped_part_type_name(fn_name, args)
+                            .or_else(|| self.discarded_whole_param_type_name(fn_name, args))
                             .or(declared)
                     }
                 }

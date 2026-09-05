@@ -60944,6 +60944,50 @@ fn main() {
 /// cell here, so it is the oracle the other three are measured against. It
 /// guards the oracle itself against a later regression — the shape B-2026-09-05-6
 /// needed an interpreter-side arm for, one channel over.
+/// B-2026-09-05-29 — a discarded GENERIC call whose callee returns its WHOLE
+/// by-value param, called on a TEMPORARY: `fn passG[T](x: T) -> T` under
+/// `let _ = passG(mk(80));`. Every compiled surface ran no `Drop` body for the
+/// result and lost 11 B in 2 blocks; the interpreter was right on every cell.
+///
+/// This pin PASSES on the pre-fix tree, and that is the point rather than a
+/// gap — it is the ORACLE the three compiled siblings are measured against, so
+/// it guards the oracle itself against a later regression. Same role, and same
+/// reason, as the interpreter twin of B-2026-09-05-18 above.
+///
+/// Cells: the row's own shape (`a`); its NON-GENERIC twin (`b`); the
+/// NAMED-LOCAL argument (`c`); two temporaries where only the second escapes
+/// (`d`); the WRAPPING return (`e`) and the SCALAR return (`f`); the BOUND
+/// result (`g`); the LABELLED spelling (`h`); and the LOOP.
+#[test]
+fn generic_whole_param_discarded_temp_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+struct H { r: R, z: i64 }
+fn passG[T](x: T) -> T { println("inP"); return x; }
+fn passN(x: R) -> R { println("inN"); return x; }
+fn pickB[T](a: T, b: T) -> T { println("inB"); return b; }
+fn wrapG[T](x: T) -> H { println("inW"); return H { r: x, z: 1 }; }
+fn scalarG[T](x: T) -> i64 { println("inS"); return 3; }
+fn main() {
+  let _ = passG(mk(80)); println("a");
+  let _ = passN(mk(81)); println("b");
+  let g = mk(82); let _ = passG(g); println("c");
+  let _ = pickB(mk(83), mk(84)); println("d");
+  let _ = wrapG(mk(85)); println("e");
+  let _ = scalarG(mk(86)); println("f");
+  let k = passG(mk(87)); println(f"k{k.id}");
+  let _ = passG(x: mk(88)); println("h");
+  let mut i = 0; while i < 3 { let _ = passG(mk(90 + i)); i = i + 1; } println("g");
+  println("end");
+}
+"#),
+        "inP\ndR80\na\ninN\ndR81\nb\ninP\ndR82\nc\ninB\ndR83\ndR84\nd\ninW\ndR85\ne\ninS\ndR86\nf\ninP\nk87\ndR87\ninP\ndR88\nh\ninP\ndR90\ninP\ndR91\ninP\ndR92\ng\nend\n",
+        "the interpreter is the oracle here: one body per object on every cell"
+    );
+}
+
 #[test]
 fn generic_tuple_param_element_is_owned_once() {
     assert_eq!(

@@ -12972,6 +12972,65 @@ fn main() {
         }
     }
 
+    /// B-2026-09-05-29 — a discarded GENERIC call whose callee returns its WHOLE
+    /// by-value param, called on a TEMPORARY: `fn passG[T](x: T) -> T` under
+    /// `let _ = passG(mk(80));`. No `Drop` body ran on ANY compiled surface —
+    /// `karac run`, `karac build`, `KARAC_AUTO_PAR=0`, and `-O0` all printed
+    /// `inP after` against the interpreter's `inP dR80 after` — and valgrind
+    /// measured 12 allocs / 10 frees, 11 B definitely lost in 2 blocks.
+    ///
+    /// `try_track_discarded_user_drop_temp` names a discarded call's type
+    /// through `fn_return_type_names`, which only `declare_function` fills; a
+    /// generic TEMPLATE is never declared, so the table held no entry and the
+    /// registrar declined. The result was left with NO owner at all:
+    /// `call_arg_flows_into_return` had already stood the caller-side argument
+    /// drop down on the reasoning that the RESULT would carry it.
+    ///
+    /// Cells: the row's own shape (`a`); its NON-GENERIC twin (`b`); the
+    /// NAMED-LOCAL argument (`c`), which supplies its own owner and must NOT
+    /// gain a second; two temporaries where only the second escapes (`d`); the
+    /// WRAPPING return (`e`) and the SCALAR return (`f`), both declined; the
+    /// BOUND result (`g`); and the LOOP, where the miss was unbounded.
+    ///
+    /// The auto-par column is a distinct surface for this family — an
+    /// effect-analysis miss shows up here and nowhere else — and it carries
+    /// the same one-body-per-object debt as the other three.
+    #[test]
+    fn test_e2e_auto_par_generic_whole_param_discarded_temp_runs_one_body() {
+        let out = run_program(
+            r#"
+struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+struct H { r: R, z: i64 }
+fn passG[T](x: T) -> T { println("inP"); return x; }
+fn passN(x: R) -> R { println("inN"); return x; }
+fn pickB[T](a: T, b: T) -> T { println("inB"); return b; }
+fn wrapG[T](x: T) -> H { println("inW"); return H { r: x, z: 1 }; }
+fn scalarG[T](x: T) -> i64 { println("inS"); return 3; }
+fn main() {
+  let _ = passG(mk(80)); println("a");
+  let _ = passN(mk(81)); println("b");
+  let g = mk(82); let _ = passG(g); println("c");
+  let _ = pickB(mk(83), mk(84)); println("d");
+  let _ = wrapG(mk(85)); println("e");
+  let _ = scalarG(mk(86)); println("f");
+  let k = passG(mk(87)); println(f"k{k.id}");
+  let _ = passG(x: mk(88)); println("h");
+  let mut i = 0; while i < 3 { let _ = passG(mk(90 + i)); i = i + 1; } println("g");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "inP\ndR80\na\ninN\ndR81\nb\ninP\ndR82\nc\ninB\ndR83\ndR84\nd\ninW\ndR85\ne\ninS\ndR86\nf\ninP\nk87\ndR87\ninP\ndR88\nh\ninP\ndR90\ninP\ndR91\ninP\ndR92\ng\nend\n",
+                "the auto-par column owes the same single body per object as the \
+                 other three; got {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_e2e_auto_par_place_struct_arg_escaping_field_runs_one_body() {
         let out = run_program(
