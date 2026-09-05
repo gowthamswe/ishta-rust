@@ -10326,6 +10326,70 @@ impl<'ctx> super::Codegen<'ctx> {
             // word region: every inner `cap > 0` guard then skips and the
             // tag-dispatch lands on an all-zero variant, making the nested
             // drop a no-op. The bound binding's own cleanup frees it once.
+            // B-2026-09-05-26 — a struct payload WIDER than its allotted words
+            // is heap-BOXED, and the word about to be zeroed is the box
+            // pointer. The arm's binding holds a bit-copy of the box's
+            // CONTENTS (the deboxing binder), so the contents are its to free;
+            // the ENVELOPE belongs to nobody once this word is zero. Free it
+            // here, null-guarded, before the zeroing hides it — 88 B per
+            // destructuring arm otherwise.
+            let boxed_struct = matches!(
+                kind,
+                super::state::EnumDropKind::NestedStruct
+                    | super::state::EnumDropKind::NestedOwnedStruct
+            ) && self
+                .enum_variant_field_type_exprs(enum_name)
+                .into_iter()
+                .find(|(_, v, _)| v == &variant_name)
+                .and_then(|(_, _, tes)| tes.get(pos).cloned())
+                .and_then(|te| match &te.kind {
+                    crate::ast::TypeKind::Path(p) => p.segments.first().cloned(),
+                    _ => None,
+                })
+                .and_then(|sname| self.type_decls.struct_types.get(&sname).copied())
+                .is_some_and(|st| Self::llvm_type_word_count(st.into()) > num_words);
+            if boxed_struct {
+                if let (Ok(word_ptr), Some(cur_fn)) = (
+                    self.builder.build_struct_gep(
+                        layout.llvm_type,
+                        slot_ptr,
+                        (start_word + 1) as u32,
+                        "match.dest.suppress.box.wp",
+                    ),
+                    self.current_fn,
+                ) {
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let bp = self
+                        .builder
+                        .build_load(ptr_ty, word_ptr, "match.dest.suppress.box.p")
+                        .unwrap()
+                        .into_pointer_value();
+                    let is_null = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            bp,
+                            ptr_ty.const_null(),
+                            "match.dest.suppress.box.isnull",
+                        )
+                        .unwrap();
+                    let free_bb = self
+                        .context
+                        .append_basic_block(cur_fn, "match.dest.suppress.box.free");
+                    let join_bb = self
+                        .context
+                        .append_basic_block(cur_fn, "match.dest.suppress.box.join");
+                    self.builder
+                        .build_conditional_branch(is_null, join_bb, free_bb)
+                        .unwrap();
+                    self.builder.position_at_end(free_bb);
+                    self.builder
+                        .build_call(self.runtime_fns.free_fn, &[bp.into()], "")
+                        .unwrap();
+                    self.builder.build_unconditional_branch(join_bb).unwrap();
+                    self.builder.position_at_end(join_bb);
+                }
+            }
             for w in 0..num_words {
                 let word_index = (start_word + 1 + w) as u32;
                 if let Ok(word_ptr) = self.builder.build_struct_gep(

@@ -5646,6 +5646,18 @@ impl<'ctx> super::Codegen<'ctx> {
                     {
                         EnumDropKind::NestedStruct
                     }
+                    // B-2026-09-05-26 — a word-aligned user struct payload the
+                    // two arms above decline (not copy-supported: a
+                    // Drop-bearing or `Map` field) still owns heap below it;
+                    // give it a kind the drop switch frees and the copy paths
+                    // never copy.
+                    other
+                        if self.type_decls.struct_field_type_exprs.contains_key(other)
+                            && !self.type_decls.shared_types.contains_key(other)
+                            && self.struct_payload_word_aligned(other, &mut Vec::new()) =>
+                    {
+                        EnumDropKind::NestedOwnedStruct
+                    }
                     _ => EnumDropKind::None,
                 }
             }

@@ -73064,4 +73064,62 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-05-26 — the memory half of
+    /// `e2e_user_enum_struct_payload_owns_its_heap`: every cell is one free
+    /// per buffer (valgrind: every block freed at -O0 and -O2), including the
+    /// boxed `Ho2` payload's envelope on the unbound, `_`-arm, bound and
+    /// destructured paths. Before the fix the `Two` cells lost 22 B each and
+    /// the `Ho2` cells 88 B each, and LSan on Linux CI is the gate for this.
+    #[test]
+    fn asan_user_enum_struct_payload_owns_its_heap_clean() {
+        let label = "user_enum_struct_payload_owns_its_heap";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"
+struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+struct Two { a: R, b: R }
+struct Ho2 { a: R, b: Option[R] }
+enum Wrap { W(Ho2), T(Two), N }
+enum E { V(R), N }
+fn mk(k: i64) -> R { return R { id: k, tag: f"t{k}", xs: [k] } }
+fn main() {
+    { let w: Wrap = Wrap.T(Two { a: mk(1), b: mk(101) }); println("one") }
+    { let w: Wrap = Wrap.T(Two { a: mk(2), b: mk(102) }); match w { _ => println("n") } println("two") }
+    { let w: Wrap = Wrap.T(Two { a: mk(3), b: mk(103) }); match w { Wrap.T(h) => { println("in") }, _ => println("n") } println("three") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(4), b: Option.Some(mk(104)) }); println("four") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(5), b: Option.Some(mk(105)) }); match w { _ => println("n") } println("five") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(6), b: Option.Some(mk(106)) }); match w { Wrap.W(h) => { println("in") }, _ => println("n") } println("six") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(7), b: Option.Some(mk(107)) }); match w { Wrap.W(h) => { let Ho2 { a, b } = h; println("in") }, _ => println("n") } println("seven") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(8), b: Option.None }); match w { Wrap.W(h) => { println("in") }, _ => println("n") } println("eight") }
+    { let e: E = E.V(mk(9)); println("nine") }
+    { let w: Wrap = Wrap.N; match w { Wrap.W(h) => { println("in") }, _ => println("n") } println("ten") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "dR101", "dR1", "one", "n", "dR102", "dR2", "two", "in", "dR103", "dR3", "three",
+                "dR104", "dR4", "four", "n", "dR105", "dR5", "five", "in", "dR106", "dR6", "six",
+                "dR107", "dR7", "in", "seven", "in", "dR8", "eight", "dR9", "nine", "n", "ten",
+                "end",
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

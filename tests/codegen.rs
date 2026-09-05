@@ -17885,6 +17885,54 @@ done
         assert_eq!(out, "dR152\ndR52\nin\none\nin\ndR155\ndR55\ntwo\ndR156\ndR56\nin\nthree\ndR157\ndR57\nin\nfour\ndR158\ndR58\nin\nfive\ndR159\ndR59\nin\nsix\nuse60\ndR160\ndR60\nseven\ndR161\ndR61\nin\neight\nin\ndR162\ndR62\nnine\nn\ndR163\ndR63\nten\nend\n");
     }
 
+    /// B-2026-09-05-26 — a user enum's STRUCT payload owns its heap, inline or
+    /// boxed, on every path: unbound (`one`, `four`), through a `_` arm
+    /// (`two`, `five`), bound and unread (`three`, `six`, `eight`), and
+    /// destructured (`seven`).
+    ///
+    /// `Two { a: R, b: R }` and `Ho2 { a: R, b: Option[R] }` are not
+    /// copy-supported (a `Drop`-bearing field), so the drop-kind classifier
+    /// answered `None` and the enum synthesized no memory drop: the bodies
+    /// walk ran and every `String`/`Vec` inside leaked. The new
+    /// `NestedOwnedStruct` kind frees them through the struct's own drop
+    /// synthesis and is never deep-copied. `Ho2` is wider than its allotted
+    /// words and is heap-BOXED at construction; the bodies walker and the
+    /// drop switch read the box pointer as the struct, which is why the
+    /// unbound `Ho2` cells printed a garbage `id` before — both now walk and
+    /// drop through the box and free the envelope. `seven`'s envelope was
+    /// then hidden from the enum's drop by the destructure-consume zeroing,
+    /// which now frees it first. `nine` (a bare `R` payload) and `ten` (no
+    /// payload) are controls. The ASAN twin runs the same program under LSan.
+    #[test]
+    fn e2e_user_enum_struct_payload_owns_its_heap() {
+        let Some(out) = run_program(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             struct Two { a: R, b: R }\n\
+             struct Ho2 { a: R, b: Option[R] }\n\
+             enum Wrap { W(Ho2), T(Two), N }\n\
+             enum E { V(R), N }\n\
+             fn mk(k: i64) -> R { return R { id: k, tag: f\"t{k}\", xs: [k] } }\n\
+             fn main() {\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(1), b: mk(101) }); println(\"one\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(2), b: mk(102) }); match w { _ => println(\"n\") } println(\"two\") }\n\
+             \x20   { let w: Wrap = Wrap.T(Two { a: mk(3), b: mk(103) }); match w { Wrap.T(h) => { println(\"in\") }, _ => println(\"n\") } println(\"three\") }\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(4), b: Option.Some(mk(104)) }); println(\"four\") }\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(5), b: Option.Some(mk(105)) }); match w { _ => println(\"n\") } println(\"five\") }\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(6), b: Option.Some(mk(106)) }); match w { Wrap.W(h) => { println(\"in\") }, _ => println(\"n\") } println(\"six\") }\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(7), b: Option.Some(mk(107)) }); match w { Wrap.W(h) => { let Ho2 { a, b } = h; println(\"in\") }, _ => println(\"n\") } println(\"seven\") }\n\
+             \x20   { let w: Wrap = Wrap.W(Ho2 { a: mk(8), b: Option.None }); match w { Wrap.W(h) => { println(\"in\") }, _ => println(\"n\") } println(\"eight\") }\n\
+             \x20   { let e: E = E.V(mk(9)); println(\"nine\") }\n\
+             \x20   { let w: Wrap = Wrap.N; match w { Wrap.W(h) => { println(\"in\") }, _ => println(\"n\") } println(\"ten\") }\n\
+             \x20   println(\"end\")\n\
+             }\n\
+             ",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dR101\ndR1\none\nn\ndR102\ndR2\ntwo\nin\ndR103\ndR3\nthree\ndR104\ndR4\nfour\nn\ndR105\ndR5\nfive\nin\ndR106\ndR6\nsix\ndR107\ndR7\nin\nseven\nin\ndR8\neight\ndR9\nnine\nn\nten\nend\n");
+    }
+
     /// B-2026-09-03-12 — a tuple bound out of a PLACE (`let x = h.pe;`) records its
     /// element types, so the binding runs the element's `Drop` body and can be
     /// projected.

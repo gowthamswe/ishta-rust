@@ -59028,6 +59028,38 @@ fn main() {
     );
 }
 
+/// B-2026-09-05-26 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_user_enum_struct_payload_owns_its_heap`, same program and string. The
+/// interpreter was the correct reference throughout (the leak and the garbage
+/// `id` were codegen's alone).
+#[test]
+fn test_user_enum_struct_payload_owns_its_heap() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+struct Two { a: R, b: R }
+struct Ho2 { a: R, b: Option[R] }
+enum Wrap { W(Ho2), T(Two), N }
+enum E { V(R), N }
+fn mk(k: i64) -> R { return R { id: k, tag: f"t{k}", xs: [k] } }
+fn main() {
+    { let w: Wrap = Wrap.T(Two { a: mk(1), b: mk(101) }); println("one") }
+    { let w: Wrap = Wrap.T(Two { a: mk(2), b: mk(102) }); match w { _ => println("n") } println("two") }
+    { let w: Wrap = Wrap.T(Two { a: mk(3), b: mk(103) }); match w { Wrap.T(h) => { println("in") }, _ => println("n") } println("three") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(4), b: Option.Some(mk(104)) }); println("four") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(5), b: Option.Some(mk(105)) }); match w { _ => println("n") } println("five") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(6), b: Option.Some(mk(106)) }); match w { Wrap.W(h) => { println("in") }, _ => println("n") } println("six") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(7), b: Option.Some(mk(107)) }); match w { Wrap.W(h) => { let Ho2 { a, b } = h; println("in") }, _ => println("n") } println("seven") }
+    { let w: Wrap = Wrap.W(Ho2 { a: mk(8), b: Option.None }); match w { Wrap.W(h) => { println("in") }, _ => println("n") } println("eight") }
+    { let e: E = E.V(mk(9)); println("nine") }
+    { let w: Wrap = Wrap.N; match w { Wrap.W(h) => { println("in") }, _ => println("n") } println("ten") }
+    println("end")
+}
+"#),
+        "dR101\ndR1\none\nn\ndR102\ndR2\ntwo\nin\ndR103\ndR3\nthree\ndR104\ndR4\nfour\nn\ndR105\ndR5\nfive\nin\ndR106\ndR6\nsix\ndR107\ndR7\nin\nseven\nin\ndR8\neight\ndR9\nnine\nn\nten\nend\n"
+    );
+}
+
 /// B-2026-09-03-25 — A WILDCARD TUPLE LEAF OVER AN `Option`/`Result`
 /// ELEMENT OWNS ITS PAYLOAD'S `Drop` BODY.
 ///

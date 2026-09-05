@@ -266,6 +266,17 @@ pub(crate) enum EnumDropKind {
     /// enums aren't in `enum_layouts` yet at `declare_enums` time) — tracked
     /// separately, not in this slice.
     NestedStruct,
+    /// B-2026-09-05-26: payload field is a named non-shared user struct that
+    /// the two `NestedStruct` admissions DECLINE — not copy-supported (a
+    /// `Drop`-bearing field, a `Map` field) and owning no shared field — yet
+    /// carrying heap somewhere below it. The drop switch frees it through the
+    /// struct's own drop synthesis exactly as `NestedStruct`; the entry-copy
+    /// and channel paths, which read `NestedStruct` as "copyable", never see
+    /// it, so a value of this kind is MOVED, never duplicated. Without it the
+    /// classifier answered `None`, the enum synthesized no memory drop, and
+    /// `let w = Wrap.T(Two { a: R, b: R })` ran both bodies at scope exit and
+    /// leaked every `String` and `Vec` inside.
+    NestedOwnedStruct,
     /// B-2026-07-23-11: payload field is a `Map`/`Set`(-family) collection —
     /// `Map[K,V]` / `Set[T]` / `SortedMap[K,V]` / `SortedSet[T]`, laid out as a
     /// single heap-handle word (`payload_word_count_for_type_expr` → 1). Dropped

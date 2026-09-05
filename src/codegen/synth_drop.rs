@@ -117,7 +117,12 @@ impl FieldSkipTree {
 /// slots)` row for `emit_enum_payload_user_drop_bodies_fn`, where each payload
 /// slot is `(LLVM field index within the enum's unified type, payload struct
 /// name)`. Aliased because the inline tuple trips `clippy::type_complexity`.
-type EnumPayloadBodyTargets = Vec<(u64, String, Vec<(u32, String)>)>;
+/// One struct-typed payload field the enum bodies walker visits: LLVM field
+/// index of its first word, the struct's name, and the words the layout allots
+/// it (B-2026-09-05-26 — wider than that and the payload is heap-boxed).
+type EnumPayloadBodyField = (u32, String, usize);
+type EnumPayloadBodyTargets = Vec<(u64, String, Vec<EnumPayloadBodyField>)>;
+type EnumPayloadBodyCase<'ctx> = (BasicBlock<'ctx>, Vec<EnumPayloadBodyField>);
 
 impl<'ctx> super::Codegen<'ctx> {
     /// Phase 7.2 Slice DP — synthesize (or reuse) the per-enum drop
@@ -504,7 +509,7 @@ impl<'ctx> super::Codegen<'ctx> {
                                 self.builder.position_at_end(skip_bb);
                             }
                         }
-                        EnumDropKind::NestedStruct => {
+                        EnumDropKind::NestedStruct | EnumDropKind::NestedOwnedStruct => {
                             // The inline struct payload starts at word
                             // `start_word`; its first LLVM field index is
                             // `start_word + 1` (tag is field 0). Pass that
@@ -554,6 +559,52 @@ impl<'ctx> super::Codegen<'ctx> {
                                 // drop frees; running the struct drop first would
                                 // leave the drain reading freed memory (SEGV /
                                 // use-after-free).
+                                // B-2026-09-05-26 — a struct payload WIDER than
+                                // its allotted words was heap-boxed at
+                                // construction (`coerce_to_payload_words`): the
+                                // word holds the box pointer. Drop THROUGH the
+                                // box, null-guarded, then free the box itself;
+                                // the inline GEP read the pointer as the struct.
+                                let boxed = self
+                                    .type_decls
+                                    .struct_types
+                                    .get(&sname)
+                                    .copied()
+                                    .is_some_and(|st| {
+                                        Self::llvm_type_word_count(st.into()) > *_num_words
+                                    });
+                                let mut box_join: Option<(BasicBlock<'ctx>, PointerValue<'ctx>)> =
+                                    None;
+                                let field_ptr = if boxed {
+                                    let bp = self
+                                        .builder
+                                        .build_load(ptr_ty, field_ptr, "drop.nstruct.box.p")
+                                        .unwrap()
+                                        .into_pointer_value();
+                                    let is_null = self
+                                        .builder
+                                        .build_int_compare(
+                                            IntPredicate::EQ,
+                                            bp,
+                                            ptr_ty.const_null(),
+                                            "drop.nstruct.box.isnull",
+                                        )
+                                        .unwrap();
+                                    let free_bb = self
+                                        .context
+                                        .append_basic_block(drop_fn, "drop.nstruct.box.free");
+                                    let next_bb = self
+                                        .context
+                                        .append_basic_block(drop_fn, "drop.nstruct.box.next");
+                                    self.builder
+                                        .build_conditional_branch(is_null, next_bb, free_bb)
+                                        .unwrap();
+                                    self.builder.position_at_end(free_bb);
+                                    box_join = Some((next_bb, bp));
+                                    bp
+                                } else {
+                                    field_ptr
+                                };
                                 self.emit_nested_struct_shared_rc_decs(
                                     field_ptr, &sname, drop_fn, false,
                                 );
@@ -566,6 +617,13 @@ impl<'ctx> super::Codegen<'ctx> {
                                     self.builder
                                         .build_call(struct_drop_fn, &[field_ptr.into()], "")
                                         .unwrap();
+                                }
+                                if let Some((next_bb, bp)) = box_join {
+                                    self.builder
+                                        .build_call(self.runtime_fns.free_fn, &[bp.into()], "")
+                                        .unwrap();
+                                    self.builder.build_unconditional_branch(next_bb).unwrap();
+                                    self.builder.position_at_end(next_bb);
                                 }
                             }
                         }
@@ -8569,9 +8627,9 @@ impl<'ctx> super::Codegen<'ctx> {
             let Some(offsets) = layout.field_word_offsets.get(&vname) else {
                 continue;
             };
-            let mut fields: Vec<(u32, String)> = Vec::new();
+            let mut fields: Vec<EnumPayloadBodyField> = Vec::new();
             for (fi, te) in tes.iter().enumerate() {
-                let Some((start_word, _)) = offsets.get(fi).copied() else {
+                let Some((start_word, num_words)) = offsets.get(fi).copied() else {
                     continue;
                 };
                 let TypeKind::Path(p) = &te.kind else {
@@ -8592,7 +8650,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     continue;
                 }
                 if self.type_runs_user_drop(&name, &mut Vec::new()) {
-                    fields.push(((start_word + 1) as u32, name));
+                    fields.push(((start_word + 1) as u32, name, num_words));
                 }
             }
             if !fields.is_empty() {
@@ -8638,7 +8696,7 @@ impl<'ctx> super::Codegen<'ctx> {
             .into_int_value();
 
         let mut switch_cases: Vec<(inkwell::values::IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
-        let case_bbs: Vec<(BasicBlock<'ctx>, Vec<(u32, String)>)> = targets
+        let case_bbs: Vec<EnumPayloadBodyCase<'ctx>> = targets
             .into_iter()
             .map(|(tag, vname, fields)| {
                 let bb = self
@@ -8658,11 +8716,46 @@ impl<'ctx> super::Codegen<'ctx> {
             // walk over `EnumData::Tuple` / `Struct`. (Struct FIELDS drop in
             // reverse declaration order; a variant's payload SLOTS do not, and
             // both backends agree on that split — same rule as tuple elements.)
-            for (field_idx, sname) in fields {
+            for (field_idx, sname, num_words) in fields {
                 let fp = self
                     .builder
                     .build_struct_gep(layout.llvm_type, p_arg, field_idx, "de.payload.p")
                     .unwrap();
+                // B-2026-09-05-26 — a struct payload WIDER than its allotted
+                // words was heap-boxed at construction
+                // (`coerce_to_payload_words`): the word holds the box pointer,
+                // not the struct. Walk the box, null-guarded, as the arm's
+                // deboxing binder does; reading the word as the struct printed
+                // a garbage `id` for every unbound boxed payload.
+                let mut box_next: Option<BasicBlock<'ctx>> = None;
+                let fp = match self.type_decls.struct_types.get(&sname).copied() {
+                    Some(st) if Self::llvm_type_word_count(st.into()) > num_words => {
+                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                        let bp = self
+                            .builder
+                            .build_load(ptr_ty, fp, "de.box.p")
+                            .unwrap()
+                            .into_pointer_value();
+                        let is_null = self
+                            .builder
+                            .build_int_compare(
+                                IntPredicate::EQ,
+                                bp,
+                                ptr_ty.const_null(),
+                                "de.box.isnull",
+                            )
+                            .unwrap();
+                        let walk_bb = self.context.append_basic_block(walker, "de.box.walk");
+                        let next_bb = self.context.append_basic_block(walker, "de.box.next");
+                        self.builder
+                            .build_conditional_branch(is_null, next_bb, walk_bb)
+                            .unwrap();
+                        self.builder.position_at_end(walk_bb);
+                        box_next = Some(next_bb);
+                        bp
+                    }
+                    _ => fp,
+                };
                 let owns_body = self
                     .program_snapshot
                     .as_deref()
@@ -8676,6 +8769,10 @@ impl<'ctx> super::Codegen<'ctx> {
                     self.emit_user_drop_field_bodies_fn(&sname, &std::collections::HashMap::new())
                 {
                     self.builder.build_call(f, &[fp.into()], "").unwrap();
+                }
+                if let Some(nb) = box_next {
+                    self.builder.build_unconditional_branch(nb).unwrap();
+                    self.builder.position_at_end(nb);
                 }
             }
             self.builder.build_unconditional_branch(exit).unwrap();
