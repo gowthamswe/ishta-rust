@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 370 |
 | run-vs-build | 343 |
-| leak | 265 |
+| leak | 266 |
 | missing-feature | 194 |
 | double-free | 185 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1475 |
+| codegen | 1476 |
 | interp | 358 |
 | typecheck | 293 |
 | ownership | 74 |
@@ -156,12 +156,12 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-14 | 2026-09-05 | codegen | medium | A DISCARDED `Option`/`Result` TEMPORARY WHOSE PAYLOAD IS AN AGGREGATE CARRYING A `Drop` TYPE (`let _ = f();` where `f -> Option[(R, i64)]`) LOSES THE NESTED `Drop` BODY ON THE COMPILED BACKENDS -- the discard-drop walker descends one payload level but not into a tuple/struct nested inside the ctor; `--interp` runs it, so it is a run-vs-build divergence | — |
 | B-2026-09-05-15 | 2026-09-05 | codegen | medium | A NESTED GENERIC-INSTANTIATION FIELD WITH ITS OWN `impl[T] Drop` LOSES THAT FIELD'S BODY UNDER AN OWN-`Drop` PARENT -- `oOwn(Gouter[R] { inner: Go[R] { r: mk(1), z: 51 }, z: 52 })` prints `in dOut52 dR1` on all three compiled backends against `--interp`'s `in dOut52 dGo51 dR1`. The grandchild `dR1` still fires, so the walk reaches THROUGH the nested field and fails only to run the body AT it; the fully non-generic nesting is correct on all four surfaces. Sibling of B-2026-09-05-16, which is the LLJIT double free the same shape shows under a non-generic parent | — |
 | B-2026-09-05-17 | 2026-09-05 | interp+codegen | medium | A FORWARDING CALLEE DEFEATS THE ESCAPING-FIELD MASK, so a place struct argument whose field is handed back THROUGH ANOTHER CALL still runs that field's `Drop` body TWICE -- `fn fwd(g: Cd) -> R { return cEsc(g); }` over `fn cEsc(h: Cd) -> R { let Cd { r, z } = h; return r; }`, called as `let g = Cd { r: mk(61), z: 9 }; let out = fwd(g);`, prints `in dR61 got61 dR61` on `--interp`, `karac run`, `karac build` and `KARAC_AUTO_PAR=0` alike, against one `R` ever constructed; calling `cEsc(g)` DIRECTLY prints `in got61 dR61`, once, on all four | — |
-| B-2026-09-05-18 | 2026-09-05 | codegen | high | A GENERIC CALLEE'S TUPLE ELEMENT HANDED BACK TO A PLACE ARGUMENT DOUBLE-FREES UNDER `karac run` and runs two `Drop` bodies under `karac build`, against a correct interpreter -- `fn kEsc[T](p: (T, i64)) -> T { let (r, z) = p; return r; }` called as `let g = (mk(95), 9); let out = kEsc(g);` aborts with `free(): double free detected in tcache 2` (exit 134, no output) under the JIT, prints `in dR95 got95 dR95` under `karac build` and `KARAC_AUTO_PAR=0`, and prints the due `in got95 dR95` under `--interp`; the NON-generic spelling of the same call is correct on all four | — |
 | B-2026-09-05-22 | 2026-09-05 | runtime | medium | THE AUTO-PAR WORKER POOL AT N=2 IS SLOWER THAN AT N=1 AND BURNS 3.6x THE CPU -- kata:282 under HOMOGENEOUS all-E placement: N=1 4329.73ms/4272ms user, N=2 7710.74ms/15191ms user, sd 38% of mean; N=4 recovers, so the N>=2 general dispatch path has a degenerate TWO-WORKER case | none |
 | B-2026-09-05-23 | 2026-09-05 | runtime | medium | kata:288's AUTO-PAR LANE GENERATES SYSTEM TIME LINEAR IN WORKER COUNT -- 1.11ms at N=1 rising to 1267.64ms at N=18 (~70ms of kernel time per added worker, 11.7 cores' worth against a 108.71ms wall), while kata:282 stays FLAT at 3.81 -> 9.41ms across the identical sweep | none |
 | B-2026-09-05-26 | 2026-09-05 | codegen | medium | A USER ENUM'S STRUCT PAYLOAD LEAKS ITS INTERIOR HEAP -- `let w = Wrap.T(Two { a: mk(4), b: mk(104) })` over `Two { a: R, b: R }` (`R` holds a `String` and a `Vec`) runs both bodies and loses 22 B in 4 blocks at scope exit, with no `match` at all or through a `_` arm; and an arm BINDING the `Option[R]`-field twin (`Wrap.W(h)` over `Ho2 { a: R, b: Option[R] }`) loses the 88 B boxed payload on every path, bound-and-unread or destructured | — |
 | B-2026-09-05-27 | 2026-09-05 | codegen | high | A MATCH ARM HANDING AN OWNED-PARAM ELEMENT/PAYLOAD OUT OF THE FUNCTION DOUBLE-FREES ITS HEAP WHEN THE HEAP-BEARING SHAPE IS CALLED TWICE -- `fn p4(t: (R, i64)) -> R { match t { (r, k) => r } }` over `R { id, tag: String, xs: Vec[i64] }` is clean called ONCE (one body) but aborts `free(): double free detected in tcache 2` called TWICE (`let a = p4((mk(3),0)); let b = p4((mk(6),0));`). The no-heap body-count sibling is B-2026-09-02-24 (fixed); this is the MEMORY channel and pre-existing to that fix | — |
 | B-2026-09-05-28 | 2026-09-05 | interp | medium | A MATCH ARM OVER AN OWNED BY-VALUE PARAM THAT MOVES ITS ELEMENT INTO A BY-VALUE CALLEE LOSES THE ELEMENT'S `Drop` BODY UNDER `--interp` -- `fn p(t: (R, i64)) -> i64 { match t { (r, k) => consume(r) } }` prints NOTHING for `r` under the interpreter and the due single `dR` under every compiled backend; the RETURN and field-READ spellings of the same arm are correct on all four | — |
+| B-2026-09-05-29 | 2026-09-05 | codegen | medium | A DISCARDED GENERIC CALL RESULT RUNS NO `Drop` BODY AND LEAKS when the callee returns its WHOLE by-value param and the argument is a TEMPORARY -- `fn passG[T](x: T) -> T { return x; }` with `let _ = passG(mk(80));` prints `inP after` on all three compiled surfaces and at `-O0`, against the interpreter's `inP dR80 after`, and loses 11 B in 2 blocks under valgrind; the NON-GENERIC twin and the NAMED-LOCAL argument spelling are both correct on all four | — |
 
 ### Relocated
 
@@ -2254,6 +2254,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-10 | interp+codegen | medium | AN UNCONDITIONAL `return Option.Some(r)` (and the `Result.Ok(r)` spelling) OF A BY-VALUE PARAM RUNS THE `Drop` BODY TWICE -- the caller's fresh-temp… | 3000056 |
 | B-2026-09-05-12 | other | medium | THE NIGHTLY `Fuzz` WORKFLOW'S THREE libFuzzer LEGS HAVE NEVER RUN -- `fuzz/` is named by neither `workspace.members` nor `workspace.exclude`, so carg… | 20cc27f |
 | B-2026-09-05-16 | codegen | high | A NESTED GENERIC-INSTANTIATION FIELD UNDER A NON-GENERIC OWN-`Drop` PARENT DOUBLE-FREES UNDER LLJIT ONLY -- `nOwn(Nouter { inner: Go[R] { r: mk(3), z… | 0970dcb |
+| B-2026-09-05-18 | codegen | high | A GENERIC CALLEE'S TUPLE ELEMENT HANDED BACK TO A PLACE ARGUMENT DOUBLE-FREES UNDER `karac run` and runs two `Drop` bodies under `karac build`, again… | 2e0b149 |
 | B-2026-09-05-19 | codegen | high | A PARAM-VIEW ASSIGNMENT WHOSE TARGET STRUCT ONLY *CARRIES* A `Drop` FIELD DOUBLE-FREES THE MOVED-IN HEAP -- `h2 = h` over `struct Holder { r: Res }`… | d7e3b44c |
 | B-2026-09-05-20 | codegen | medium | A NON-GENERIC NESTED BY-VALUE PARAM DESTRUCTURE LEAF THAT IS READ RUNS ITS FIELD'S `Drop` BODY TWICE ON THE COMPILED BACKENDS -- `fn hLive(h: Hn) ->… | e2486f5 |
 | B-2026-09-05-21 | codegen | high | A GENERIC-INSTANTIATION LEAF BOUND OUT OF A BY-VALUE PARAM DESTRUCTURE AND MOVED INTO A LOCAL DOUBLE-FREES -- `fn gLiveLocal[T](h: Gn2[T]) -> i64 { l… | e2486f5 |
