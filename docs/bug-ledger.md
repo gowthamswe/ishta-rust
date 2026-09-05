@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 370 |
 | run-vs-build | 342 |
-| leak | 264 |
+| leak | 265 |
 | missing-feature | 194 |
 | double-free | 184 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1473 |
+| codegen | 1474 |
 | interp | 357 |
 | typecheck | 293 |
 | ownership | 74 |
@@ -148,7 +148,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-02-31 | 2026-09-02 | codegen | low | THE BARE-ARM SPELLING OF B-2026-09-01-26 STILL LEAKS -- `match mkVe(9) { Ve.A(s) => s, .. }` in a nested expression position loses 15 B per evaluation at both opt levels where the BRACED `=> { s }` spelling is now clean. Excluded by that fix's block-bodied-arm condition, which is load-bearing: dropping it fails BOTH `asan_generic_enum_heap_payload_bind_return_no_leak_or_double_free` and `selfhost_codegen_matches_seed_run`, because a bare-armed match is also how the generic-enum debox hands a value out of its frame | — |
 | B-2026-09-02-41 | 2026-09-02 | interp+codegen | medium | THE TWO-STEP DESTRUCTURE OF A NESTED TUPLE FIELD SPLITS THE BACKENDS -- `let (inner, y) = h.pe; let (r, x) = inner; let m = r;` runs ONE `Drop` body under `--interp` and TWO on `karac run` / `karac build` / `KARAC_AUTO_PAR=0`. The interpreter is right; the compiled side records nothing for the tuple-typed leaf under an owner-runs-bodies source | — |
 | B-2026-09-03-4 | 2026-09-03 | interp+codegen | medium | A MATCH ARM (OR `let`) THAT RETURNS ITS ELEMENT WRAPPED IN AN ENUM CONSTRUCTOR RUNS THE `Drop` BODY TWICE AND THE CALLER'S BINDING NEVER RUNS ITS OWN -- `fn f(t: (R, i64)) -> Option[R] { match t { (r, k) => { Some(r) } } }` prints `dR4 dR4 got` on all four surfaces where one body is due and it should fire at the CALLER's binding. SPELLING-INDEPENDENT: the `let (r, k) = t; Some(r)` form measures identically, which is what separates it from B-2026-09-02-24 | — |
-| B-2026-09-03-34 | 2026-09-03 | codegen | medium | A STRUCT DESTRUCTURED OUT OF A MATCH ARM'S PAYLOAD BINDING LOSES A PLAIN FIELD'S `Drop` BODY ON THE COMPILED BACKENDS -- `match w { Wrap.W(h) => { let Ho2 { a, b } = h; .. } }` runs `dR152 dR52` under `--interp` and only `dR152` on jit/aot/AUTO_PAR=0; the payload half was fixed by B-2026-09-03-24 and this is the residue, because the place-source body transfer is gated on the source owning a `StructFieldBodies` action and a match payload does not | — |
 | B-2026-09-04-11 | 2026-09-04 | codegen | low | THE TWO `uam_*` SPAN SETS STILL LEAK FROM THE USER PROGRAM INTO THE BAKED-STDLIB BODY PASS -- `Span` carries no file identity, so `uam_consume_sites` (seeded from the USER program's ownership result and read during expression compilation) can mark a stdlib expression as a `UseAfterMove` consume site purely because their byte offsets coincide; B-2026-09-04-5 fixed the fourteen PROGRAM-DERIVED tables and its source-scan guard cannot see these two, because they are never on the install list it scans | — |
 | B-2026-09-04-12 | 2026-09-04 | codegen | low | A BOXED TWO-`String` TUPLE PAYLOAD LOSES ITS INTERIOR ON BOTH THE GENERIC AND NON-GENERIC PATHS -- 54 B in 6 blocks over three calls, IDENTICAL for `generic[T](x: Option[T])` and `plainT(x: Option[(String, String)])`, so this is the boxed-payload interior rather than anything monomorph-specific; the `Array[String, 2]` payload through the same generic fn is clean, and that asymmetry is the thing to explain | — |
 | B-2026-09-04-32 | 2026-09-04 | codegen+other | low | EVERY COMPILED BACKEND RELEASES AN AGGREGATE-HELD `shared` FIELD AT LEXICAL SCOPE EXIT while design.md pins RC decrements at the binding's LIVE-RANGE END -- one holder splits, `struct Mx { r: R, s: S }` giving `v2 dR1 post dS2`, so the plain field obeys the spec and the shared one does not; a BARE shared binding is unaffected | — |
@@ -162,6 +161,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-22 | 2026-09-05 | runtime | medium | THE AUTO-PAR WORKER POOL AT N=2 IS SLOWER THAN AT N=1 AND BURNS 3.6x THE CPU -- kata:282 under HOMOGENEOUS all-E placement: N=1 4329.73ms/4272ms user, N=2 7710.74ms/15191ms user, sd 38% of mean; N=4 recovers, so the N>=2 general dispatch path has a degenerate TWO-WORKER case | none |
 | B-2026-09-05-23 | 2026-09-05 | runtime | medium | kata:288's AUTO-PAR LANE GENERATES SYSTEM TIME LINEAR IN WORKER COUNT -- 1.11ms at N=1 rising to 1267.64ms at N=18 (~70ms of kernel time per added worker, 11.7 cores' worth against a 108.71ms wall), while kata:282 stays FLAT at 3.81 -> 9.41ms across the identical sweep | none |
 | B-2026-09-05-24 | 2026-09-05 | cli | medium | `karac run` LEAVES ITS `karac_jit_runner` CHILD ALIVE WHEN THE PARENT IS SIGNALLED -- SIGINT (Ctrl-C), SIGTERM and SIGKILL each kill `karac run` and leave the spawned runner spinning at 100% CPU indefinitely, so a hung Kara program cannot be stopped by interrupting the command that started it, and any harness that TIMES OUT a `karac run` (mutation testing, CI, the Mend loop) silently accumulates orphans that contaminate every later timing measurement on the host | — |
+| B-2026-09-05-26 | 2026-09-05 | codegen | medium | A USER ENUM'S STRUCT PAYLOAD LEAKS ITS INTERIOR HEAP -- `let w = Wrap.T(Two { a: mk(4), b: mk(104) })` over `Two { a: R, b: R }` (`R` holds a `String` and a `Vec`) runs both bodies and loses 22 B in 4 blocks at scope exit, with no `match` at all or through a `_` arm; and an arm BINDING the `Option[R]`-field twin (`Wrap.W(h)` over `Ho2 { a: R, b: Option[R] }`) loses the 88 B boxed payload on every path, bound-and-unread or destructured | — |
 
 ### Relocated
 
@@ -2202,6 +2202,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-03-31 | codegen | medium | A STRUCT WITH ITS OWN `impl Drop` NEVER RELEASES A `shared struct` FIELD'S RC BOX -- 16 B per instance and unbounded in a loop (80 B / 5 instances),… | dc8cfe24 |
 | B-2026-09-03-32 | interp+codegen | medium | A BOUND DESTRUCTURE LEAF THAT IS IMMEDIATELY DEAD DRAINS BEFORE THE SOURCE'S RESIDUAL FIELD-BODIES WALK ON THE COMPILED BACKENDS AND AFTER IT UNDER `… | a66361a |
 | B-2026-09-03-33 | codegen | medium | A `Result[O, E]` STRUCT-FIELD DESTRUCTURE LEAF RUNS A HUSK `Drop` BODY ON THE COMPILED BACKENDS -- `let HoRes { a, b } = h;` over `{ a: R, b: Result[… | 85d34ce |
+| B-2026-09-03-34 | codegen | medium | A STRUCT DESTRUCTURED OUT OF A MATCH ARM'S PAYLOAD BINDING LOSES A PLAIN FIELD'S `Drop` BODY ON THE COMPILED BACKENDS -- `match w { Wrap.W(h) => { le… | 6a79509 |
 | B-2026-09-03-35 | codegen | medium | A GENERIC STRUCT'S `impl[T] Drop for S[T]` IS NEVER LOWERED, so ADDING IT MAKES A CLEAN PROGRAM LEAK EVERY HEAP FIELD -- `Box3[String] { v, tag }` is… | f07fab6b |
 | B-2026-09-03-36 | codegen | medium | REASSIGNING A `shared` FIELD OF A PLAIN STRUCT STRANDS THE DISPLACED RC BOX -- `n.s = Sd { m: 9 }` prints the old handle's `Drop` body, so the refcou… | ee2e697d |
 | B-2026-09-03-37 | typecheck | medium | `Vec.push` ASKS `partial_move_of_drop_struct` ABOUT THE UNRESOLVED DESTINATION SLOT, so a `Deny` rule rejects a `Copy` field -- `v.push(w.n)` over an… | 56c8950 |
