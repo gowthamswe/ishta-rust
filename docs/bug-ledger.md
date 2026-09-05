@@ -93,7 +93,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 370 |
-| run-vs-build | 343 |
+| run-vs-build | 344 |
 | leak | 266 |
 | missing-feature | 194 |
 | double-free | 185 |
@@ -111,7 +111,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | surface | total |
 |---|---|
 | codegen | 1476 |
-| interp | 358 |
+| interp | 359 |
 | typecheck | 293 |
 | ownership | 74 |
 | other | 73 |
@@ -158,9 +158,9 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-17 | 2026-09-05 | interp+codegen | medium | A FORWARDING CALLEE DEFEATS THE ESCAPING-FIELD MASK, so a place struct argument whose field is handed back THROUGH ANOTHER CALL still runs that field's `Drop` body TWICE -- `fn fwd(g: Cd) -> R { return cEsc(g); }` over `fn cEsc(h: Cd) -> R { let Cd { r, z } = h; return r; }`, called as `let g = Cd { r: mk(61), z: 9 }; let out = fwd(g);`, prints `in dR61 got61 dR61` on `--interp`, `karac run`, `karac build` and `KARAC_AUTO_PAR=0` alike, against one `R` ever constructed; calling `cEsc(g)` DIRECTLY prints `in got61 dR61`, once, on all four | — |
 | B-2026-09-05-22 | 2026-09-05 | runtime | medium | THE AUTO-PAR WORKER POOL AT N=2 IS SLOWER THAN AT N=1 AND BURNS 3.6x THE CPU -- kata:282 under HOMOGENEOUS all-E placement: N=1 4329.73ms/4272ms user, N=2 7710.74ms/15191ms user, sd 38% of mean; N=4 recovers, so the N>=2 general dispatch path has a degenerate TWO-WORKER case | none |
 | B-2026-09-05-23 | 2026-09-05 | runtime | medium | kata:288's AUTO-PAR LANE GENERATES SYSTEM TIME LINEAR IN WORKER COUNT -- 1.11ms at N=1 rising to 1267.64ms at N=18 (~70ms of kernel time per added worker, 11.7 cores' worth against a 108.71ms wall), while kata:282 stays FLAT at 3.81 -> 9.41ms across the identical sweep | none |
-| B-2026-09-05-27 | 2026-09-05 | codegen | high | A MATCH ARM HANDING AN OWNED-PARAM ELEMENT/PAYLOAD OUT OF THE FUNCTION DOUBLE-FREES ITS HEAP WHEN THE HEAP-BEARING SHAPE IS CALLED TWICE -- `fn p4(t: (R, i64)) -> R { match t { (r, k) => r } }` over `R { id, tag: String, xs: Vec[i64] }` is clean called ONCE (one body) but aborts `free(): double free detected in tcache 2` called TWICE (`let a = p4((mk(3),0)); let b = p4((mk(6),0));`). The no-heap body-count sibling is B-2026-09-02-24 (fixed); this is the MEMORY channel and pre-existing to that fix | — |
 | B-2026-09-05-28 | 2026-09-05 | interp | medium | A MATCH ARM OVER AN OWNED BY-VALUE PARAM THAT MOVES ITS ELEMENT INTO A BY-VALUE CALLEE LOSES THE ELEMENT'S `Drop` BODY UNDER `--interp` -- `fn p(t: (R, i64)) -> i64 { match t { (r, k) => consume(r) } }` prints NOTHING for `r` under the interpreter and the due single `dR` under every compiled backend; the RETURN and field-READ spellings of the same arm are correct on all four | — |
 | B-2026-09-05-29 | 2026-09-05 | codegen | medium | A DISCARDED GENERIC CALL RESULT RUNS NO `Drop` BODY AND LEAKS when the callee returns its WHOLE by-value param and the argument is a TEMPORARY -- `fn passG[T](x: T) -> T { return x; }` with `let _ = passG(mk(80));` prints `inP after` on all three compiled surfaces and at `-O0`, against the interpreter's `inP dR80 after`, and loses 11 B in 2 blocks under valgrind; the NON-GENERIC twin and the NAMED-LOCAL argument spelling are both correct on all four | — |
+| B-2026-09-05-30 | 2026-09-05 | interp | medium | A MATCH ARM OVER AN OWNED BY-VALUE TUPLE PARAM THAT NEVER USES A BOUND ELEMENT LOSES THAT ELEMENT'S `Drop` BODY UNDER `--interp` -- `fn pf(t: (R, i64)) -> i64 { match t { (r, k) => { k } } }` prints `k0` with no `dR6` interpreted and `dR6 k0` on jit/aot/AUTO_PAR=0; the sibling of B-2026-09-05-28 (element moved into a by-value callee) with the element simply unread | — |
 
 ### Relocated
 
@@ -2260,6 +2260,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-24 | cli | medium | `karac run` LEAVES ITS `karac_jit_runner` CHILD ALIVE WHEN THE PARENT IS SIGNALLED -- SIGINT (Ctrl-C), SIGTERM and SIGKILL each kill `karac run` and… | e6917e1 |
 | B-2026-09-05-25 | codegen | medium | A DESTRUCTURE'S PER-NAME MOVE MASKS OUTLIVE THEIR BLOCK, so a SIBLING block that reuses the source's name loses a wildcard field's `Drop` body outrig… | a66361a |
 | B-2026-09-05-26 | codegen | medium | A USER ENUM'S STRUCT PAYLOAD LEAKS ITS INTERIOR HEAP -- `let w = Wrap.T(Two { a: mk(4), b: mk(104) })` over `Two { a: R, b: R }` (`R` holds a `String… | 414beb8 |
+| B-2026-09-05-27 | codegen | high | A MATCH ARM HANDING AN OWNED-PARAM ELEMENT/PAYLOAD OUT OF THE FUNCTION DOUBLE-FREES ITS HEAP WHEN THE HEAP-BEARING SHAPE IS CALLED TWICE -- `fn p4(t:… | 3ba7a21 |
 
 </details>
 
