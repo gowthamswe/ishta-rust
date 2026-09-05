@@ -2589,6 +2589,14 @@ impl<'ctx> super::Codegen<'ctx> {
             // reason stated at its head: this edits CALLER-scope cleanup frames
             // and so must run with the caller's substitution restored.
             self.disarm_escaping_place_struct_field_bodies(name, i, &a.value);
+            // B-2026-09-05-18 — the TUPLE sibling of the line above, and the
+            // half that row opened on. `kEsc[T](p: (T, i64)) -> T` handed
+            // element 0 back to a place argument and the caller's element walk
+            // still fired on it: two bodies on all three compiled surfaces
+            // against the interpreter's one. Same reason as the struct arm — a
+            // generic call is dispatched here and never reaches `compile_call`'s
+            // argument loop, where B-2026-08-28-16 landed the concrete leg.
+            self.disarm_escaping_place_tuple_elem_bodies(name, i, &a.value);
         }
 
         // Slice 8y: per-call-site decision on whether the caller
@@ -4037,7 +4045,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         .iter()
                         .map(|e| {
                             self.concrete_generic_struct_inst(e)
-                                .unwrap_or_else(|| e.clone())
+                                .unwrap_or_else(|| self.subst_monomorph_type_params(e))
                         })
                         .collect();
                     self.make_tuple_param_callee_owned(&concrete, agg_ty, alloca);

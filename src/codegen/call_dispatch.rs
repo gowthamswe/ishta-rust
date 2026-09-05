@@ -2203,36 +2203,13 @@ impl<'ctx> super::Codegen<'ctx> {
             // a value the callee had handed back — two bodies for one object,
             // on every backend.
             //
-            // Reuses the `let x = t.N` move-out mask rather than adding an
-            // argument-site skip list, because a callee that returns element N
-            // IS that move, reached through a call instead of a projection.
-            // `disarm_tuple_elem_bodies_at` re-registers the walk with the
-            // index masked, so the tuple's OTHER elements keep their bodies —
-            // the distinction that makes this different from suppressing the
-            // whole walk (measured on `fn take(p: (R, R)) -> R` in
-            // B-2026-08-28-2: the coarse form loses element 1's only body).
-            //
-            // TOP-LEVEL elements only, matching the inline filter: a deeper
-            // path names something inside an element, which a per-element mask
-            // cannot express (B-2026-08-28-23).
-            if let ExprKind::Identifier(src) = &a.value.kind {
-                let src = src.clone();
-                let idxs: Vec<u32> = self
-                    .callee_returned_param_parts(&name, i)
-                    .iter()
-                    .filter_map(|path| match path.as_slice() {
-                        [crate::ast::ParamPart::TupleIndex(idx)] => Some(*idx as u32),
-                        _ => None,
-                    })
-                    .collect();
-                if !idxs.is_empty() {
-                    if let Some(tuple_ty) = self.place_chain_aggregate_llvm_type(&a.value) {
-                        for idx in idxs {
-                            self.disarm_tuple_elem_bodies_at(&src, idx, tuple_ty);
-                        }
-                    }
-                }
-            }
+            // B-2026-09-05-18 lifted the body into a shared helper so the
+            // MONOMORPH call path can reach the same arm — a generic call is
+            // dispatched from `compile_generic_call` and never reaches this
+            // loop. Behaviour here is unchanged apart from the no-op guard; the
+            // instrument choice and the top-level-only rule are documented on
+            // the helper.
+            self.disarm_escaping_place_tuple_elem_bodies(&name, i, &a.value);
             // B-2026-09-05-6 — the STRUCT sibling of the arm above, and the
             // half -16 did not land. A place STRUCT argument (`cEsc(g)`) whose
             // FIELD escapes through the callee's return has the same two owners
@@ -3762,6 +3739,124 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// The head segment of a `Path` type, or `None` for any other shape.
+    fn te_head_name(te: &TypeExpr) -> Option<String> {
+        match &te.kind {
+            TypeKind::Path(p) => p.segments.last().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Does this name resolve to a type codegen has a drop for?
+    fn names_a_drop_type(&self, name: &str) -> bool {
+        self.type_decls.struct_types.contains_key(name)
+            || self.type_decls.enum_layouts.contains_key(name)
+    }
+
+    /// B-2026-09-05-18 — name the concrete type of a discarded GENERIC call's
+    /// result, for the discarded-temp registrar below.
+    ///
+    /// That registrar resolves a call's type through `fn_return_type_names`,
+    /// which `declare_function` fills. A GENERIC template is never declared —
+    /// only its monomorphs are — so the table has NO ENTRY for one, and the
+    /// registrar fell straight through: a discarded generic result ran no
+    /// `Drop` body at all. (Even with an entry the declared name would be the
+    /// bare param `"T"`, which names no type either; both misses are covered
+    /// here.)
+    ///
+    /// This stayed invisible while the CALLER's own walk still fired on the
+    /// handed-back object and covered it — at the cost of the two-body count
+    /// this row was filed for. The escaping-part mask that fixes the count
+    /// removes the cover, so the two must land together. On the concrete path
+    /// both have always held, which is why `let _ = nEsc(g)` was right all
+    /// along and its generic twin was not.
+    ///
+    /// Resolved through the ESCAPING-PART machinery rather than by unifying the
+    /// signature: if the callee hands back part `P` of argument `i`, the result
+    /// IS that part, so the argument's own recorded type names it. Top-level
+    /// parts only, matching the masks this pairs with.
+    ///
+    /// A whole-param generic return (`fn passG[T](x: T) -> T`) has the same
+    /// miss and is NOT covered: it is reachable with no place argument at all,
+    /// so it is a different shape with a different fix, filed separately rather
+    /// than guessed at from here.
+    fn discarded_escaped_part_type_name(
+        &self,
+        callee_name: &str,
+        args: &[CallArg],
+    ) -> Option<String> {
+        // Collected rather than returned on first hit: a call returns ONE value,
+        // so two candidates that disagree mean this resolution has misread the
+        // signature, and the name decides which type's layout the registrar
+        // takes ownership of. Declining there costs the pre-existing miss;
+        // guessing costs a free at the wrong layout. (In a well-typed program
+        // every branch's part unifies with the one declared return, so
+        // disagreement is not expected — which is the reason to notice it.)
+        let mut found: Option<String> = None;
+        for (i, a) in args.iter().enumerate() {
+            for path in self.callee_returned_param_parts(callee_name, i) {
+                let resolved = match path.as_slice() {
+                    // `tuple_arg_elem_type_exprs` answers for a tuple LITERAL
+                    // or a call result; a named LOCAL — the shape the mask this
+                    // pairs with requires — is recorded in `tuple_var_elem_tes`
+                    // instead, and reaches the first resolver as `None`.
+                    [crate::ast::ParamPart::TupleIndex(idx)] => self
+                        .tuple_arg_elem_type_exprs(&a.value)
+                        .or_else(|| match &a.value.kind {
+                            ExprKind::Identifier(src) => self.tuple_var_elem_tes(src.as_str()),
+                            _ => None,
+                        })
+                        .and_then(|tes| tes.get(*idx).and_then(Self::te_head_name)),
+                    [crate::ast::ParamPart::Field(f)] => {
+                        self.place_arg_field_type_name(&a.value, f)
+                    }
+                    _ => None,
+                };
+                match resolved {
+                    Some(name) if self.names_a_drop_type(name.as_str()) => match &found {
+                        Some(prev) if *prev != name => return None,
+                        _ => found = Some(name),
+                    },
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
+    /// The struct-FIELD leg of [`Self::discarded_escaped_part_type_name`]: name
+    /// field `f` of the place argument `arg`, resolved through the binding's
+    /// recorded INSTANTIATION so a generic owner answers with the monomorph's
+    /// type rather than its own placeholder. `Gd[T] { r: T, .. }` records field
+    /// 0 as `"T"` in the declaration-keyed table, which names nothing; the
+    /// `Gd[R]` binding is what says `R`.
+    fn place_arg_field_type_name(&self, arg: &Expr, field: &str) -> Option<String> {
+        let ExprKind::Identifier(src) = &arg.kind else {
+            return None;
+        };
+        let struct_name = self.var_types.var_type_names.get(src.as_str())?;
+        let fidx = self
+            .type_decls
+            .struct_field_names
+            .get(struct_name.as_str())?
+            .iter()
+            .position(|n| n == field)?;
+        let declared = self
+            .type_decls
+            .struct_field_type_names
+            .get(struct_name.as_str())
+            .and_then(|tys| tys.get(fidx).cloned().flatten());
+        if declared
+            .as_deref()
+            .is_some_and(|d| self.names_a_drop_type(d))
+        {
+            return declared;
+        }
+        let inst = self.type_decls.enum_inst_var_types.get(src.as_str())?;
+        let subst = self.generic_struct_subst_from_inst(struct_name, inst);
+        subst.get(declared.as_deref()?).and_then(Self::te_head_name)
+    }
+
     pub(super) fn try_track_discarded_user_drop_temp(
         &mut self,
         tail: &Expr,
@@ -3810,9 +3905,21 @@ impl<'ctx> super::Codegen<'ctx> {
                     .as_deref()
                     .and_then(|t| self.discard_branch_tail_type_name(t))
             }
-            ExprKind::Call { callee, .. } => match &callee.kind {
+            ExprKind::Call { callee, args } => match &callee.kind {
                 ExprKind::Identifier(fn_name) => {
-                    self.fn_sig.fn_return_type_names.get(fn_name).cloned()
+                    let declared = self.fn_sig.fn_return_type_names.get(fn_name).cloned();
+                    if declared
+                        .as_deref()
+                        .is_some_and(|d| self.names_a_drop_type(d))
+                    {
+                        declared
+                    } else {
+                        // Strictly additive: the escaped-part route only ever
+                        // ANSWERS where the old lookup could not, and falls back
+                        // to whatever it used to return.
+                        self.discarded_escaped_part_type_name(fn_name, args)
+                            .or(declared)
+                    }
                 }
                 _ => None,
             },
@@ -4364,6 +4471,76 @@ impl<'ctx> super::Codegen<'ctx> {
     ///
     /// Interp twin: the struct leg of the identifier arm in
     /// `run_fresh_temp_arg_drops`.
+    /// B-2026-08-28-16 — a place TUPLE argument (`kEsc(g)`) whose ELEMENT the
+    /// callee hands back: mask that element out of the CALLER binding's own
+    /// element walk. The tuple sibling of
+    /// [`Self::disarm_escaping_place_struct_field_bodies`], and the original of
+    /// the pair; B-2026-09-05-18 lifted it out of `compile_call`'s argument
+    /// loop so `compile_generic_call` could call it too, since a generic callee
+    /// never reaches that loop at all.
+    ///
+    /// Reuses the `let x = t.N` move-out mask rather than an argument-site skip
+    /// list, because a callee that returns element N IS that move, reached
+    /// through a call instead of a projection. The per-element mask is what
+    /// keeps the tuple's OTHER elements armed — suppressing the whole walk
+    /// instead loses element 1's only body on `fn take(p: (R, R)) -> R`
+    /// (measured in B-2026-08-28-2).
+    ///
+    /// TOP-LEVEL elements only, matching the inline parts filter: a deeper path
+    /// names something INSIDE an element, which a per-element mask cannot
+    /// express (B-2026-08-28-23).
+    ///
+    /// THE GUARD: an element that runs no user `Drop` body is skipped rather
+    /// than masked. Masking it would be a semantic no-op, but
+    /// `disarm_tuple_elem_bodies_at` retracts and RE-REGISTERS the walker, so
+    /// where the retraction finds nothing the registration ADDS a walk and the
+    /// element's drop-bearing SIBLINGS fire twice. That is not hypothetical:
+    /// the struct sibling shipped without the guard, and `fn take3(h: Gn3) ->
+    /// i64 { return h.z; }` — a scalar handed back — doubled the neighbouring
+    /// field's body until B-2026-09-05-6 added it. `zEsc[T](p: (T, i64)) ->
+    /// i64` is the identical shape one channel over, and cell K3 of this row's
+    /// fixture pins it.
+    ///
+    /// Interp twin: the tuple leg of the identifier arm in
+    /// `run_fresh_temp_arg_drops`.
+    pub(super) fn disarm_escaping_place_tuple_elem_bodies(
+        &mut self,
+        callee_name: &str,
+        arg_index: usize,
+        arg: &Expr,
+    ) {
+        let ExprKind::Identifier(src) = &arg.kind else {
+            return;
+        };
+        let src = src.clone();
+        let idxs: Vec<u32> = self
+            .callee_returned_param_parts(callee_name, arg_index)
+            .iter()
+            .filter_map(|path| match path.as_slice() {
+                [crate::ast::ParamPart::TupleIndex(idx)] => Some(*idx as u32),
+                _ => None,
+            })
+            .collect();
+        if idxs.is_empty() {
+            return;
+        }
+        let Some(tuple_ty) = self.place_chain_aggregate_llvm_type(arg) else {
+            return;
+        };
+        // The same element `TypeExpr`s the walker is emitted from, so the
+        // membership test asks its question of exactly what would be masked.
+        let elem_tes = self.tuple_var_elem_tes(src.as_str()).unwrap_or_default();
+        for idx in idxs {
+            if !elem_tes
+                .get(idx as usize)
+                .is_some_and(|te| self.elem_te_runs_user_drop(te))
+            {
+                continue;
+            }
+            self.disarm_tuple_elem_bodies_at(&src, idx, tuple_ty);
+        }
+    }
+
     pub(super) fn disarm_escaping_place_struct_field_bodies(
         &mut self,
         callee_name: &str,

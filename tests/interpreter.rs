@@ -60828,6 +60828,83 @@ fn main() {
 /// walker never ran ADDED a second walk and doubled the SIBLING `r`'s body.
 /// That broke B-2026-09-05-5's pin (`dR7 dR7`) on a shape this row does not
 /// touch, which is why the arm is gated on `user_drop_field_indices_mono`.
+/// B-2026-09-05-18 — a GENERIC callee's by-value TUPLE param whose element
+/// carries a `Drop` type. TWO defects, and the row allowed they might be one:
+///
+///  1. NO ENTRY COPY. `make_tuple_param_callee_owned` gates on the element
+///     `TypeExpr`s, and the monomorph path resolved those with
+///     `concrete_generic_struct_inst` — a resolver for a generic struct PATH
+///     (`Bag[T]` -> `Bag[String]`) that answers `None` for a BARE type param.
+///     `(T, i64)` therefore stayed `(T, i64)`, read as heapless, and the
+///     callee got neither the entry copy nor the scope-exit drop its
+///     non-generic twin has. The CALLER had already decided otherwise — its
+///     `arg_is_entry_copied_heap_tuple` gate reads the caller's inferred
+///     `(R, i64)` — so `let (r, z) = p` handed the caller's own buffers to a
+///     callee-scope binding and both freed them. That pairing rule is the one
+///     B-2026-08-27-37 states at this very site.
+///  2. NO ESCAPING-ELEMENT MASK. B-2026-08-28-16 put the place-tuple disarm
+///     in `compile_call`'s argument loop, which a generic call never reaches.
+///
+/// The row measured `karac run` ABORTING while the AOT build merely ran two
+/// bodies and was valgrind-clean, and warned against assuming one cause. The
+/// discriminator is neither the backend nor the shape: `karac build` defaults
+/// to `-O2`, and at `-O0` the AOT binary aborts identically on every cell.
+/// `karac run` is simply the unoptimized column. One defect — "AOT is clean"
+/// was an artifact of the default opt level, which is worth remembering the
+/// next time a JIT-only abort looks like a JIT problem.
+///
+/// Cells: the escaping element (`a`); its non-generic twin (`b`), the control
+/// the row reports as always right; the SCALAR escape (`c`), the mask guard's
+/// pin — masking an element that carries no body re-registers the walker and
+/// doubles element 0's, the shape that broke a sibling row's pin when the
+/// struct arm shipped without the guard; the DISCARDED result (`d`); element
+/// 1 escaping while element 0 keeps its body (`e`); a callee that destructures
+/// and returns NOTHING (`f`), which is defect 1 with no escape at all; and the
+/// generic STRUCT discard (`g`).
+///
+/// `d` and `g` are why the fix has a third part. A discarded GENERIC result
+/// had no owner on the compiled backends at all — `fn_return_type_names` has
+/// no entry for a template, which is never `declare_function`'d — and the
+/// caller's UNMASKED walk was covering for it. Masking correctly, as the
+/// concrete path always has, removes the cover, so the two had to land
+/// together. The whole-param spelling of that same miss
+/// (`fn passG[T](x: T) -> T`) reaches no place argument and is filed apart.
+///
+/// This pin PASSES on the pre-fix tree, unlike its three compiled siblings, and
+/// that is the point rather than a gap: the interpreter was correct on every
+/// cell here, so it is the oracle the other three are measured against. It
+/// guards the oracle itself against a later regression — the shape B-2026-09-05-6
+/// needed an interpreter-side arm for, one channel over.
+#[test]
+fn generic_tuple_param_element_is_owned_once() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+struct Gd[T] { r: T, z: i64 }
+fn kEsc[T](p: (T, i64)) -> T { let (r, z) = p; println("in"); return r; }
+fn nEsc(p: (R, i64)) -> R { let (r, z) = p; println("in2"); return r; }
+fn zEsc[T](p: (T, i64)) -> i64 { let (r, z) = p; println("in3"); return z; }
+fn kEsc1[T](p: (i64, T)) -> T { let (z, r) = p; println("in5"); return r; }
+fn tOnly[T](p: (T, i64)) { let (r, z) = p; println("in6"); }
+fn gEsc[T](h: Gd[T]) -> T { let Gd { r, z } = h; println("in7"); return r; }
+fn main() {
+  let a = (mk(91), 9);  let o1 = kEsc(a);   println(f"got{o1.id}");
+  let b = (mk(92), 9);  let o2 = nEsc(b);   println(f"got{o2.id}");
+  let c = (mk(93), 7);  let o3 = zEsc(c);   println(f"gotz{o3}");
+  let d = (mk(94), 9);  let _  = kEsc(d);   println("after");
+  let e = (5, mk(95));  let o5 = kEsc1(e);  println(f"got{o5.id}");
+  let f = (mk(96), 9);  tOnly(f);           println("after6");
+  let g = Gd[R] { r: mk(97), z: 9 }; let _ = gEsc(g); println("after7");
+  println("end");
+}
+"#),
+        "in\ngot91\ndR91\nin2\ngot92\ndR92\nin3\ndR93\ngotz7\nin\ndR94\nafter\nin5\ngot95\ndR95\nin6\ndR96\nafter6\nin7\ndR97\nafter7\nend\n",
+        "the interpreter is the oracle here and was correct throughout: one body \
+         per object, at the owner that outlives the call"
+    );
+}
+
 #[test]
 fn place_struct_arg_escaping_field_runs_one_body() {
     assert_eq!(
