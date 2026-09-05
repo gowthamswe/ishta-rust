@@ -3130,6 +3130,45 @@ impl<'a> super::Interpreter<'a> {
             .unwrap_or_default()
     }
 
+    /// B-2026-09-05-28 / -30 — the top-level TUPLE ELEMENTS of by-value
+    /// argument slot `arg_index` that the named callee hands out of its frame:
+    /// the union of [`Self::callee_returned_param_parts`]'s length-1
+    /// `TupleIndex` paths (a bare / alias / aggregate-literal return, reached
+    /// through a `let` destructure or a match arm) and
+    /// [`crate::ast::fn_returns_param_tuple_arm_elems`] (a match arm over the
+    /// param, including an element FORWARDED through a call that returns it).
+    ///
+    /// The one question the two callers below ask — which elements must the
+    /// caller-side walk SKIP because their body belongs to the result's owner —
+    /// used to be answered by `fn_returns_param_payload` standing the whole
+    /// argument down, which lost every element that did die in the call
+    /// (`match t { (r, k) => { k } }` handed back `k` and `r`'s body never
+    /// ran; `(r, k) => { consume(r) }` handed nothing back and ran nothing
+    /// either, because the whole-param `yields` counts any call as an escape).
+    fn callee_escaping_tuple_elems(
+        &self,
+        callee_name: &str,
+        method_owner: Option<&str>,
+        arg_index: usize,
+    ) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .callee_returned_param_parts(callee_name, method_owner, arg_index)
+            .into_iter()
+            .filter_map(|path| match path.as_slice() {
+                [crate::ast::ParamPart::TupleIndex(idx)] => Some(*idx),
+                _ => None,
+            })
+            .collect();
+        if let Some(f) = self.callee_fn_for_ownership_guard_of(callee_name, method_owner) {
+            for idx in crate::ast::fn_returns_param_tuple_arm_elems(self.program, f, arg_index) {
+                if !out.contains(&idx) {
+                    out.push(idx);
+                }
+            }
+        }
+        out
+    }
+
     /// The FIELD paths of parameter `i` that `callee_name` hands back to its
     /// caller (B-2026-08-28-17 / -21 / -23). A path whose head is a tuple index
     /// is the tuple arm's business, not this one's.
@@ -3390,10 +3429,12 @@ impl<'a> super::Interpreter<'a> {
             // skip cannot express (B-2026-08-28-23).
             if let ExprKind::Identifier(src) = &arg.value.kind {
                 if matches!(arg_vals.get(i), Some(Value::Tuple(_))) {
-                    for path in self.callee_returned_param_parts(callee_name, method_owner, i) {
-                        if let [crate::ast::ParamPart::TupleIndex(idx)] = path.as_slice() {
-                            self.moved_out_tuple_elem_bodies.insert((src.clone(), *idx));
-                        }
+                    // B-2026-09-05-28 / -30 — the match-arm and call-forwarded
+                    // escapes join the returned-part ones here, now that the
+                    // whole-param payload predicate no longer answers for a
+                    // tuple pattern (see `callee_escaping_tuple_elems`).
+                    for idx in self.callee_escaping_tuple_elems(callee_name, method_owner, i) {
+                        self.moved_out_tuple_elem_bodies.insert((src.clone(), idx));
                     }
                 }
                 // B-2026-09-05-6 — the STRUCT sibling of the tuple arm above,
@@ -3460,17 +3501,17 @@ impl<'a> super::Interpreter<'a> {
                         // Unrolling the tuple here is otherwise identical to the
                         // `Value::Tuple` arm of `run_discarded_value_user_drops`,
                         // which is exactly this loop without the filter.
+                        // TOP-LEVEL elements only: a deeper path names
+                        // something inside an element, which this walk's
+                        // per-element skip cannot express, so it is left at
+                        // its pre-existing behaviour (B-2026-08-28-23).
+                        // B-2026-09-05-28 / -30 — a match arm's per-element
+                        // escapes (a returned element, or one forwarded
+                        // through a call that returns it) join the list.
                         let escaping =
-                            self.callee_returned_param_parts(callee_name, method_owner, i);
+                            self.callee_escaping_tuple_elems(callee_name, method_owner, i);
                         for (idx, item) in items.iter().enumerate() {
-                            // TOP-LEVEL elements only: a deeper path names
-                            // something inside an element, which this walk's
-                            // per-element skip cannot express, so it is left at
-                            // its pre-existing behaviour (B-2026-08-28-23).
-                            if escaping
-                                .iter()
-                                .any(|p| p.as_slice() == [crate::ast::ParamPart::TupleIndex(idx)])
-                            {
+                            if escaping.contains(&idx) {
                                 continue;
                             }
                             self.run_discarded_value_user_drops(item.clone());

@@ -61047,3 +61047,114 @@ fn main() {
          non-escaping sibling `b` keeps its body inside the call"
     );
 }
+
+/// B-2026-09-05-28 / B-2026-09-05-30 — a match arm over an OWNED by-value
+/// tuple parameter runs the body of every element that dies in the call
+/// exactly once, whichever the arm does with it: moves it into a by-value
+/// callee (`consume(r)`, -28), never reads it (`(r, k) => k`, -30), wildcards
+/// it, rebinds then consumes it. The caller retains an owned tuple argument
+/// and runs its elements' bodies after the call, skipping the elements the
+/// callee hands out; that skip list came from `fn_returns_param_payload`,
+/// which stood the WHOLE argument down as soon as any arm binding left the
+/// frame — and counted `k` (an `i64`) leaving, or `r` passed to ANY call, as
+/// leaving. Seventeen of the twenty-one cells here printed no `dR` under
+/// `--interp` against one on every compiled backend. The tuple pattern now
+/// answers per ELEMENT (`fn_returns_param_tuple_arm_elems`, program-aware for
+/// the forwarded-call case), and the whole-param predicate no longer answers
+/// for it — the same split codegen always had, which is why the compiled
+/// column was correct throughout.
+///
+/// `one`/`two` are the rows' cells; `three`/`four` the RETURN and field-READ
+/// spellings that were already correct; `six`/`seven`/`nine` rebind, wildcard
+/// and `let`-destructure; `ten`/`eleven`/`twentysix` the named-local argument
+/// spelling (the binding's own element walk, masked per element); `twelve` and
+/// `fourteen` a two-`Drop` tuple, where the unread sibling's body must survive
+/// the other's escape; `sixteen` a nested tuple; `seventeen`/`eighteen` the
+/// METHOD path; the rest conditional, nested-`match` and two-arm bodies, each
+/// on both paths. Codegen twin: `tests/codegen.rs`'s
+/// `e2e_match_arm_element_moved_into_a_callee_or_unread_runs_one_body`, same
+/// program and string.
+#[test]
+fn test_match_arm_element_moved_into_a_callee_or_unread_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+struct H { n: i64 }
+impl H {
+    fn m_call(ref self, t: (R, i64)) -> i64 { match t { (r, k) => { consume(r) + self.n } } }
+    fn m_unread(ref self, t: (R, i64)) -> i64 { match t { (r, k) => { k + self.n } } }
+}
+fn p_call(t: (R, i64)) -> i64 { match t { (r, k) => { consume(r) } } }
+fn p_unread(t: (R, i64)) -> i64 { match t { (r, k) => { k } } }
+fn p_ret(t: (R, i64)) -> R { match t { (r, k) => { r } } }
+fn p_read(t: (R, i64)) -> i64 { match t { (r, k) => { r.id } } }
+fn p_rebind_call(t: (R, i64)) -> i64 { match t { (r, k) => { let g: R = r; consume(g) } } }
+fn p_wild(t: (R, i64)) -> i64 { match t { (_, k) => { k } } }
+fn p_let_call(t: (R, i64)) -> i64 { let (r, k) = t; consume(r) }
+fn t_two(t: (R, R)) -> R { match t { (a, b) => { a } } }
+fn t_two_call(t: (R, R)) -> i64 { match t { (a, b) => { consume(a) } } }
+fn t_nested(t: ((R, i64), i64)) -> i64 { match t { ((r, j), k) => { k } } }
+fn t_cond(t: (R, i64), c: bool) -> i64 { match t { (r, k) => { if c { consume(r) } else { k } } } }
+fn t_nested_match(t: (R, i64)) -> i64 { match t { (r, k) => { match k { 0 => { consume(r) }, _ => { k } } } } }
+fn t_two_arms(t: (R, i64)) -> i64 { match t { (r, 0) => { consume(r) }, (r, k) => { k } } }
+fn main() {
+    let h: H = H { n: 100 };
+    { let d: i64 = p_call((mk(1), 0)); println(f"r{d}"); println("one") }
+    { let d: i64 = p_unread((mk(2), 0)); println(f"r{d}"); println("two") }
+    { let a: R = p_ret((mk(3), 0)); println(f"r{a.id}"); println("three") }
+    { let d: i64 = p_read((mk(4), 0)); println(f"r{d}"); println("four") }
+    { let d: i64 = p_rebind_call((mk(6), 0)); println(f"r{d}"); println("six") }
+    { let d: i64 = p_wild((mk(7), 0)); println(f"r{d}"); println("seven") }
+    { let d: i64 = p_let_call((mk(9), 0)); println(f"r{d}"); println("nine") }
+    { let t: (R, i64) = (mk(10), 0); let d: i64 = p_call(t); println(f"r{d}"); println("ten") }
+    { let t: (R, i64) = (mk(11), 0); let d: i64 = p_unread(t); println(f"r{d}"); println("eleven") }
+    { let a: R = t_two((mk(12), mk(13))); println(f"r{a.id}"); println("twelve") }
+    { let d: i64 = t_two_call((mk(14), mk(15))); println(f"r{d}"); println("fourteen") }
+    { let d: i64 = t_nested(((mk(16), 0), 0)); println(f"r{d}"); println("sixteen") }
+    { let d: i64 = h.m_call((mk(17), 0)); println(f"r{d}"); println("seventeen") }
+    { let d: i64 = h.m_unread((mk(18), 0)); println(f"r{d}"); println("eighteen") }
+    { let d: i64 = t_cond((mk(19), 0), true); println(f"r{d}"); println("nineteen") }
+    { let d: i64 = t_cond((mk(20), 0), false); println(f"r{d}"); println("twenty") }
+    { let d: i64 = t_nested_match((mk(21), 0)); println(f"r{d}"); println("twentyone") }
+    { let d: i64 = t_nested_match((mk(22), 5)); println(f"r{d}"); println("twentytwo") }
+    { let d: i64 = t_two_arms((mk(23), 0)); println(f"r{d}"); println("twentythree") }
+    { let d: i64 = t_two_arms((mk(24), 3)); println(f"r{d}"); println("twentyfour") }
+    { let t: (R, R) = (mk(25), mk(26)); let d: i64 = t_two_call(t); println(f"r{d}"); println("twentysix") }
+    println("end")
+}
+"#),
+        "dR1\nr1\none\ndR2\nr0\ntwo\nr3\ndR3\nthree\ndR4\nr4\nfour\ndR6\nr6\nsix\ndR7\nr0\nseven\ndR9\nr9\nnine\ndR10\nr10\nten\ndR11\nr0\neleven\ndR13\nr12\ndR12\ntwelve\ndR14\ndR15\nr14\nfourteen\ndR16\nr0\nsixteen\ndR17\nr117\nseventeen\ndR18\nr100\neighteen\ndR19\nr19\nnineteen\ndR20\nr0\ntwenty\ndR21\nr21\ntwentyone\ndR22\nr5\ntwentytwo\ndR23\nr23\ntwentythree\ndR24\nr3\ntwentyfour\ndR25\ndR26\nr25\ntwentysix\nend\n"
+    );
+}
+
+/// B-2026-09-05-28's program-aware half, on the interpreter alone: an
+/// element FORWARDED through a call that returns it (`wrap(r)`) or handed to
+/// a callee that stores it under a `mut ref` parameter (`stash(r, v)`) is
+/// owned by the result / the container, so the caller's walk must stand down
+/// for that element and no other. The coarse predicate got these right by
+/// accident (any call counted); the per-element one asks the callee. Not a
+/// four-surface twin because every compiled backend runs a SECOND body on
+/// exactly these cells (B-2026-09-05-33) — this pins the interpreter's answer
+/// so the codegen fix has a reference to meet.
+#[test]
+fn test_match_arm_element_forwarded_or_stashed_keeps_one_owner_interp() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn wrap(x: R) -> R { return x }
+fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }
+fn t_fwd(t: (R, i64)) -> R { match t { (r, k) => { wrap(r) } } }
+fn t_stash(t: (R, i64), v: mut ref Vec[R]) -> i64 { match t { (r, k) => { stash(r, v); k } } }
+fn main() {
+    { let a: R = t_fwd((mk(4), 0)); println(f"r{a.id}"); println("four") }
+    { let mut v: Vec[R] = []; let d: i64 = t_stash((mk(6), 0), mut v); println(f"r{d} n{v.len()}"); println("six") }
+    { let t: (R, i64) = (mk(14), 0); let a: R = t_fwd(t); println(f"r{a.id}"); println("fourteen") }
+    println("end")
+}
+"#),
+        "r4\ndR4\nfour\nr0 n1\ndR6\nsix\nr14\ndR14\nfourteen\nend\n"
+    );
+}

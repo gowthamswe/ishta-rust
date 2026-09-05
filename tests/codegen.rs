@@ -144662,6 +144662,72 @@ done
             "`i64.MAX` must keep lowering as an associated constant, not a path call"
         );
     }
+    /// B-2026-09-05-28 / B-2026-09-05-30 — codegen twin of
+    /// `tests/interpreter.rs`'s
+    /// `test_match_arm_element_moved_into_a_callee_or_unread_runs_one_body`,
+    /// same program and string. The compiled backends were the correct
+    /// reference throughout: the caller's per-element walk over an owned tuple
+    /// argument never consulted the whole-param payload predicate here, so an
+    /// element moved into a by-value callee (`consume(r)`) died in that callee
+    /// and an unread one (`(r, k) => k`) at the arm's end, one body each.
+    /// Pinned so the two backends stay at the interpreter's now-matching
+    /// answer; the ASAN twin runs the same program under the sanitizer.
+    #[test]
+    fn e2e_match_arm_element_moved_into_a_callee_or_unread_runs_one_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+struct H { n: i64 }
+impl H {
+    fn m_call(ref self, t: (R, i64)) -> i64 { match t { (r, k) => { consume(r) + self.n } } }
+    fn m_unread(ref self, t: (R, i64)) -> i64 { match t { (r, k) => { k + self.n } } }
+}
+fn p_call(t: (R, i64)) -> i64 { match t { (r, k) => { consume(r) } } }
+fn p_unread(t: (R, i64)) -> i64 { match t { (r, k) => { k } } }
+fn p_ret(t: (R, i64)) -> R { match t { (r, k) => { r } } }
+fn p_read(t: (R, i64)) -> i64 { match t { (r, k) => { r.id } } }
+fn p_rebind_call(t: (R, i64)) -> i64 { match t { (r, k) => { let g: R = r; consume(g) } } }
+fn p_wild(t: (R, i64)) -> i64 { match t { (_, k) => { k } } }
+fn p_let_call(t: (R, i64)) -> i64 { let (r, k) = t; consume(r) }
+fn t_two(t: (R, R)) -> R { match t { (a, b) => { a } } }
+fn t_two_call(t: (R, R)) -> i64 { match t { (a, b) => { consume(a) } } }
+fn t_nested(t: ((R, i64), i64)) -> i64 { match t { ((r, j), k) => { k } } }
+fn t_cond(t: (R, i64), c: bool) -> i64 { match t { (r, k) => { if c { consume(r) } else { k } } } }
+fn t_nested_match(t: (R, i64)) -> i64 { match t { (r, k) => { match k { 0 => { consume(r) }, _ => { k } } } } }
+fn t_two_arms(t: (R, i64)) -> i64 { match t { (r, 0) => { consume(r) }, (r, k) => { k } } }
+fn main() {
+    let h: H = H { n: 100 };
+    { let d: i64 = p_call((mk(1), 0)); println(f"r{d}"); println("one") }
+    { let d: i64 = p_unread((mk(2), 0)); println(f"r{d}"); println("two") }
+    { let a: R = p_ret((mk(3), 0)); println(f"r{a.id}"); println("three") }
+    { let d: i64 = p_read((mk(4), 0)); println(f"r{d}"); println("four") }
+    { let d: i64 = p_rebind_call((mk(6), 0)); println(f"r{d}"); println("six") }
+    { let d: i64 = p_wild((mk(7), 0)); println(f"r{d}"); println("seven") }
+    { let d: i64 = p_let_call((mk(9), 0)); println(f"r{d}"); println("nine") }
+    { let t: (R, i64) = (mk(10), 0); let d: i64 = p_call(t); println(f"r{d}"); println("ten") }
+    { let t: (R, i64) = (mk(11), 0); let d: i64 = p_unread(t); println(f"r{d}"); println("eleven") }
+    { let a: R = t_two((mk(12), mk(13))); println(f"r{a.id}"); println("twelve") }
+    { let d: i64 = t_two_call((mk(14), mk(15))); println(f"r{d}"); println("fourteen") }
+    { let d: i64 = t_nested(((mk(16), 0), 0)); println(f"r{d}"); println("sixteen") }
+    { let d: i64 = h.m_call((mk(17), 0)); println(f"r{d}"); println("seventeen") }
+    { let d: i64 = h.m_unread((mk(18), 0)); println(f"r{d}"); println("eighteen") }
+    { let d: i64 = t_cond((mk(19), 0), true); println(f"r{d}"); println("nineteen") }
+    { let d: i64 = t_cond((mk(20), 0), false); println(f"r{d}"); println("twenty") }
+    { let d: i64 = t_nested_match((mk(21), 0)); println(f"r{d}"); println("twentyone") }
+    { let d: i64 = t_nested_match((mk(22), 5)); println(f"r{d}"); println("twentytwo") }
+    { let d: i64 = t_two_arms((mk(23), 0)); println(f"r{d}"); println("twentythree") }
+    { let d: i64 = t_two_arms((mk(24), 3)); println(f"r{d}"); println("twentyfour") }
+    { let t: (R, R) = (mk(25), mk(26)); let d: i64 = t_two_call(t); println(f"r{d}"); println("twentysix") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dR1\nr1\none\ndR2\nr0\ntwo\nr3\ndR3\nthree\ndR4\nr4\nfour\ndR6\nr6\nsix\ndR7\nr0\nseven\ndR9\nr9\nnine\ndR10\nr10\nten\ndR11\nr0\neleven\ndR13\nr12\ndR12\ntwelve\ndR14\ndR15\nr14\nfourteen\ndR16\nr0\nsixteen\ndR17\nr117\nseventeen\ndR18\nr100\neighteen\ndR19\nr19\nnineteen\ndR20\nr0\ntwenty\ndR21\nr21\ntwentyone\ndR22\nr5\ntwentytwo\ndR23\nr23\ntwentythree\ndR24\nr3\ntwentyfour\ndR25\ndR26\nr25\ntwentysix\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]

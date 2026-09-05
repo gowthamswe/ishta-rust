@@ -2718,194 +2718,34 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
     let PatternKind::Binding(param_name) = &param.pattern.kind else {
         return false;
     };
-    /// Does `e` hand `name` across the frame boundary — bare, or moved into a
-    /// returned aggregate literal? A FIELD projection (`r.id`) deliberately does
-    /// not count: the payload stays behind, only a copy of one field leaves.
-    fn yields(e: &Expr, name: &str) -> bool {
-        match &e.kind {
-            ExprKind::Identifier(n) => n == name,
-            ExprKind::StructLiteral { fields, .. } => fields.iter().any(|f| yields(&f.value, name)),
-            ExprKind::Tuple(elems) => elems.iter().any(|el| yields(el, name)),
-            ExprKind::Call { args, .. } => args.iter().any(|a| yields(&a.value, name)),
-            _ => false,
-        }
-    }
-    /// Every name that aliases one of `names` through a `let` in this block, so
-    /// the `let k = r; return k;` spelling is recognized as the same escape.
-    fn grow_aliases(b: &Block, names: &mut Vec<String>) {
-        for st in &b.stmts {
-            if let StmtKind::Let { pattern, value, .. } = &st.kind {
-                if names.iter().any(|n| yields(value, n)) {
-                    if let PatternKind::Binding(dest) = &pattern.kind {
-                        if !names.iter().any(|n| n == dest) {
-                            names.push(dest.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    fn returns_any(e: &Expr, names: &[String]) -> bool {
-        match &e.kind {
-            ExprKind::Return(Some(inner)) => {
-                names.iter().any(|n| yields(inner, n)) || returns_any(inner, names)
-            }
-            ExprKind::Block(b)
-            | ExprKind::Unsafe(b)
-            | ExprKind::Try(b)
-            | ExprKind::Seq(b)
-            | ExprKind::Par(b) => returns_any_block(b, names),
-            ExprKind::If {
-                then_block,
-                else_branch,
-                ..
-            } => {
-                returns_any_block(then_block, names)
-                    || else_branch
-                        .as_deref()
-                        .is_some_and(|x| returns_any(x, names))
-            }
-            ExprKind::IfLet {
-                then_block,
-                else_branch,
-                ..
-            } => {
-                returns_any_block(then_block, names)
-                    || else_branch
-                        .as_deref()
-                        .is_some_and(|x| returns_any(x, names))
-            }
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .any(|a| names.iter().any(|n| yields(&a.body, n)) || returns_any(&a.body, names)),
-            ExprKind::While { body, .. }
-            | ExprKind::WhileLet { body, .. }
-            | ExprKind::For { body, .. }
-            | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => returns_any_block(body, names),
-            _ => false,
-        }
-    }
-    fn returns_any_block(b: &Block, names: &[String]) -> bool {
-        let mut names = names.to_vec();
-        grow_aliases(b, &mut names);
-        b.stmts.iter().any(|st| match &st.kind {
-            StmtKind::Expr(e) => returns_any(e, &names),
-            StmtKind::Let { value, .. } => returns_any(value, &names),
-            _ => false,
-        }) || b
-            .final_expr
-            .as_deref()
-            .is_some_and(|fe| names.iter().any(|n| yields(fe, n)) || returns_any(fe, &names))
-    }
-    /// B-2026-08-29-48 — the ROOTS of assignment targets inside `e` that receive
-    /// one of `names`: `out = r`, `out.slot = r`, `outs[i] = r`.
-    ///
-    /// [`grow_aliases`] already follows a payload through a `let`
-    /// (`let k = r; return k;`). It cannot follow one through an ASSIGNMENT,
-    /// and the reason is scope rather than oversight: the destination is
-    /// declared outside the arm and the `return` that carries it out sits
-    /// outside the arm too, so both ends of the route are invisible from inside
-    /// the arm body — which is all [`returns_any`] ever sees. The roots
-    /// therefore come back out to the caller, which asks the whole FUNCTION
-    /// body whether they leave.
-    ///
-    /// `MultiAssign` is deliberately not handled: [`crate::desugar`] rewrites
-    /// every one into `let` temps plus single `Assign`s before any consumer of
-    /// this predicate observes the program.
-    fn place_root(e: &Expr) -> Option<&str> {
-        match &e.kind {
-            ExprKind::Identifier(n) => Some(n),
-            ExprKind::FieldAccess { object, .. }
-            | ExprKind::TupleIndex { object, .. }
-            | ExprKind::Index { object, .. } => place_root(object),
-            _ => None,
-        }
-    }
-    fn assigned_roots(e: &Expr, names: &[String], out: &mut Vec<String>) {
-        match &e.kind {
-            ExprKind::Block(b)
-            | ExprKind::Unsafe(b)
-            | ExprKind::Try(b)
-            | ExprKind::Seq(b)
-            | ExprKind::Par(b) => assigned_roots_block(b, names, out),
-            ExprKind::Return(Some(inner)) => assigned_roots(inner, names, out),
-            ExprKind::If {
-                then_block,
-                else_branch,
-                ..
-            }
-            | ExprKind::IfLet {
-                then_block,
-                else_branch,
-                ..
-            } => {
-                assigned_roots_block(then_block, names, out);
-                if let Some(x) = else_branch.as_deref() {
-                    assigned_roots(x, names, out);
-                }
-            }
-            ExprKind::Match { arms, .. } => {
-                for a in arms {
-                    assigned_roots(&a.body, names, out);
-                }
-            }
-            ExprKind::While { body, .. }
-            | ExprKind::WhileLet { body, .. }
-            | ExprKind::For { body, .. }
-            | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => assigned_roots_block(body, names, out),
-            _ => {}
-        }
-    }
-    fn assigned_roots_block(b: &Block, names: &[String], out: &mut Vec<String>) {
-        for st in &b.stmts {
-            match &st.kind {
-                StmtKind::Assign { target, value } => {
-                    if names.iter().any(|n| yields(value, n)) {
-                        if let Some(root) = place_root(target) {
-                            if !out.iter().any(|s| s == root) {
-                                out.push(root.to_string());
-                            }
-                        }
-                    }
-                }
-                StmtKind::Expr(e) => assigned_roots(e, names, out),
-                StmtKind::Let { value, .. } => assigned_roots(value, names, out),
-                _ => {}
-            }
-        }
-        if let Some(fe) = b.final_expr.as_deref() {
-            assigned_roots(fe, names, out);
-        }
-    }
-    /// Do any of `names` reach a return site by being ASSIGNED into a place
-    /// whose root the function then returns? `fn_body` is the whole body, not
-    /// the arm's, because that is where both the destination's declaration and
-    /// the `return` live.
-    fn escapes_by_assignment(body: &Expr, names: &[String], fn_body: &Block) -> bool {
-        let mut roots: Vec<String> = Vec::new();
-        assigned_roots(body, names, &mut roots);
-        !roots.is_empty() && returns_any_block(fn_body, &roots)
-    }
-    fn escapes_by_assignment_block(body: &Block, names: &[String], fn_body: &Block) -> bool {
-        let mut roots: Vec<String> = Vec::new();
-        assigned_roots_block(body, names, &mut roots);
-        !roots.is_empty() && returns_any_block(fn_body, &roots)
-    }
+    let rule = CallYieldRule::Any;
     /// Walk for a `match` / `if let` / `while let` whose SCRUTINEE is the param,
     /// and ask whether the bindings it introduces leave the frame.
-    fn walk(e: &Expr, param: &str, fn_body: &Block) -> bool {
+    ///
+    /// B-2026-09-05-28 / -30 — a TUPLE pattern over the param is NOT this
+    /// predicate's to answer, and is skipped here. Its bindings name ELEMENTS,
+    /// so the escape is per element, which [`fn_returns_param_part_paths`]
+    /// and [`fn_returns_param_tuple_arm_elems`] report one index at a time;
+    /// standing the whole argument down from here instead lost the body of
+    /// every element that DID die in the call — `fn pf(t: (R, i64)) -> i64 {
+    /// match t { (r, k) => { k } } }` handed back only `k`, and the interpreter
+    /// never ran `r`'s body. Codegen already asked this predicate only of a
+    /// payload-carrying ENUM parameter (`callee_returns_enum_arg_payload`),
+    /// which is why it was correct on the same cells.
+    fn walk(e: &Expr, param: &str, fn_body: &Block, rule: CallYieldRule<'_>) -> bool {
         let scrutinee_is_param =
             |s: &Expr| matches!(&s.kind, ExprKind::Identifier(n) if n == param);
         match &e.kind {
             ExprKind::Match { scrutinee, arms } if scrutinee_is_param(scrutinee) => {
                 arms.iter().any(|a| {
+                    if matches!(a.pattern.kind, PatternKind::Tuple(_)) {
+                        return walk(&a.body, param, fn_body, rule);
+                    }
                     let names: Vec<String> = a.pattern.binding_names();
                     !names.is_empty()
-                        && (names.iter().any(|n| yields(&a.body, n))
-                            || returns_any(&a.body, &names)
-                            || escapes_by_assignment(&a.body, &names, fn_body))
+                        && (names.iter().any(|n| payload_yields(&a.body, n, rule))
+                            || payload_returns_any(&a.body, &names, rule)
+                            || payload_escapes_by_assignment(&a.body, &names, fn_body, rule))
                 })
             }
             ExprKind::IfLet {
@@ -2913,43 +2753,43 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
                 value,
                 then_block,
                 ..
-            } if scrutinee_is_param(value) => {
+            } if scrutinee_is_param(value) && !matches!(pattern.kind, PatternKind::Tuple(_)) => {
                 let names: Vec<String> = pattern.binding_names();
                 !names.is_empty()
-                    && (returns_any_block(then_block, &names)
-                        || escapes_by_assignment_block(then_block, &names, fn_body))
+                    && (payload_returns_any_block(then_block, &names, rule)
+                        || payload_escapes_by_assignment_block(then_block, &names, fn_body, rule))
             }
             ExprKind::WhileLet {
                 pattern,
                 value,
                 body,
                 ..
-            } if scrutinee_is_param(value) => {
+            } if scrutinee_is_param(value) && !matches!(pattern.kind, PatternKind::Tuple(_)) => {
                 let names: Vec<String> = pattern.binding_names();
                 !names.is_empty()
-                    && (returns_any_block(body, &names)
-                        || escapes_by_assignment_block(body, &names, fn_body))
+                    && (payload_returns_any_block(body, &names, rule)
+                        || payload_escapes_by_assignment_block(body, &names, fn_body, rule))
             }
             ExprKind::Match { scrutinee, arms } => {
-                walk(scrutinee, param, fn_body)
-                    || arms.iter().any(|a| walk(&a.body, param, fn_body))
+                walk(scrutinee, param, fn_body, rule)
+                    || arms.iter().any(|a| walk(&a.body, param, fn_body, rule))
             }
             ExprKind::Block(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Try(b)
             | ExprKind::Seq(b)
-            | ExprKind::Par(b) => walk_block_for(b, param, fn_body),
-            ExprKind::Return(Some(inner)) => walk(inner, param, fn_body),
+            | ExprKind::Par(b) => walk_block_for(b, param, fn_body, rule),
+            ExprKind::Return(Some(inner)) => walk(inner, param, fn_body, rule),
             ExprKind::If {
                 condition,
                 then_block,
                 else_branch,
             } => {
-                walk(condition, param, fn_body)
-                    || walk_block_for(then_block, param, fn_body)
+                walk(condition, param, fn_body, rule)
+                    || walk_block_for(then_block, param, fn_body, rule)
                     || else_branch
                         .as_deref()
-                        .is_some_and(|x| walk(x, param, fn_body))
+                        .is_some_and(|x| walk(x, param, fn_body, rule))
             }
             ExprKind::IfLet {
                 value,
@@ -2957,31 +2797,592 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
                 else_branch,
                 ..
             } => {
-                walk(value, param, fn_body)
-                    || walk_block_for(then_block, param, fn_body)
+                walk(value, param, fn_body, rule)
+                    || walk_block_for(then_block, param, fn_body, rule)
                     || else_branch
                         .as_deref()
-                        .is_some_and(|x| walk(x, param, fn_body))
+                        .is_some_and(|x| walk(x, param, fn_body, rule))
             }
             ExprKind::While { body, .. }
             | ExprKind::WhileLet { body, .. }
             | ExprKind::For { body, .. }
             | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => walk_block_for(body, param, fn_body),
+            | ExprKind::LabeledBlock { body, .. } => walk_block_for(body, param, fn_body, rule),
             _ => false,
         }
     }
-    fn walk_block_for(b: &Block, param: &str, fn_body: &Block) -> bool {
+    fn walk_block_for(b: &Block, param: &str, fn_body: &Block, rule: CallYieldRule<'_>) -> bool {
         b.stmts.iter().any(|st| match &st.kind {
-            StmtKind::Expr(e) => walk(e, param, fn_body),
-            StmtKind::Let { value, .. } => walk(value, param, fn_body),
+            StmtKind::Expr(e) => walk(e, param, fn_body, rule),
+            StmtKind::Let { value, .. } => walk(value, param, fn_body, rule),
             _ => false,
         }) || b
             .final_expr
             .as_deref()
-            .is_some_and(|fe| walk(fe, param, fn_body))
+            .is_some_and(|fe| walk(fe, param, fn_body, rule))
     }
-    walk_block_for(&f.body, param_name, &f.body)
+    walk_block_for(&f.body, param_name, &f.body, rule)
+}
+
+/// B-2026-09-05-28 / -30 — the per-ELEMENT sibling of
+/// [`fn_returns_param_payload`] for a TUPLE pattern over by-value parameter
+/// `arg_index`: which top-level element indices does `f` hand across the frame
+/// boundary through a `match` / `if let` / `while let` arm that destructures
+/// the param as a tuple?
+///
+/// ```text
+/// fn pf(t: (R, i64)) -> i64 { match t { (r, k) => { k } } }        // [1]
+/// fn p4(t: (R, i64)) -> R   { match t { (r, k) => { r } } }        // [0]
+/// fn pw(t: (R, i64)) -> R   { match t { (r, k) => { wrap(r) } } }  // [0] — `wrap` returns its param
+/// fn pc(t: (R, i64)) -> i64 { match t { (r, k) => { consume(r) } } } // []  — `consume` does not
+/// ```
+///
+/// The whole-param predicate used to answer these arms too, and its answer was
+/// a whole-argument stand-down: `pf` hands back `k`, so the caller ran NO
+/// element body and `r`'s was lost; `pc` passed `r` to a call, which the
+/// whole-param `yields` counts as an escape unconditionally, so the same. The
+/// compiled backends were right on every cell because they never asked it of a
+/// tuple. The bare / alias / aggregate-literal spellings here overlap
+/// [`fn_returns_param_part_paths`] (which reports them as length-1
+/// `TupleIndex` paths) — the two are unioned by the interpreter's
+/// `callee_escaping_tuple_elems`, and this one exists for the shape the part
+/// channel cannot classify: an element FORWARDED through a call.
+///
+/// PROGRAM-AWARE for that call, the way [`fn_returns_param_via_call`] is and
+/// for its reason: passing an element to a call proves nothing on its own, so
+/// the callee's own answer decides. ONE LEVEL, and the argument must be the
+/// element BARE; an unknown callee (a constructor path, a method, a name that
+/// resolves to nothing) counts as an escape, which is the conservative
+/// direction this family runs on — a missed escape doubles a body, a false one
+/// loses the only body that runs. A NESTED sub-pattern (`((r, j), k)`) escapes
+/// as its whole element when any of its bindings does, since a flat index list
+/// cannot name anything deeper.
+pub fn fn_returns_param_tuple_arm_elems(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> Vec<usize> {
+    let Some(param) = f.params.get(arg_index) else {
+        return Vec::new();
+    };
+    let PatternKind::Binding(param_name) = &param.pattern.kind else {
+        return Vec::new();
+    };
+    // The roots whose storage outlives the call, as
+    // `fn_moves_param_into_outliving_place` computes them: a borrowed `self`
+    // and every `ref` / `mut ref` parameter. An element stored under one of
+    // them (`v.push(r)`) is alive in the caller's own object when the call
+    // returns, so its body belongs to that object's drain, not to the walk.
+    let mut roots: Vec<&str> = Vec::new();
+    if matches!(f.self_param, Some(SelfParam::Ref) | Some(SelfParam::MutRef)) {
+        roots.push("self");
+    }
+    for p in &f.params {
+        if !matches!(
+            p.ty.kind,
+            crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+        ) {
+            continue;
+        }
+        if let PatternKind::Binding(n) = &p.pattern.kind {
+            roots.push(n.as_str());
+        }
+    }
+    let cx = TupleArmCx {
+        program,
+        fn_body: &f.body,
+        roots: &roots,
+    };
+    fn note(out: &mut Vec<usize>, i: usize) {
+        if !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    /// The arm's bindings, ELEMENT by element: does element `i`'s binding set
+    /// leave the frame through `body`? Four routes: handed back (bare, via an
+    /// alias, inside a returned aggregate, or through a call that returns
+    /// it), assigned into a place the function then returns, stored under an
+    /// outliving root directly (`v.push(r)`), or handed to a callee that
+    /// stores it (`stash(r, v)`). The last is what a STATEMENT-position call
+    /// needs: the return-site walks only look at tails and `return`s.
+    fn arm_elems(pats: &[Pattern], body: &Expr, cx: TupleArmCx<'_>, out: &mut Vec<usize>) {
+        let rule = CallYieldRule::ReturnsIt(cx.program);
+        for (i, p) in pats.iter().enumerate() {
+            let names: Vec<String> = p.binding_names();
+            if !names.is_empty()
+                && (names.iter().any(|n| payload_yields(body, n, rule))
+                    || payload_returns_any(body, &names, rule)
+                    || payload_escapes_by_assignment(body, &names, cx.fn_body, rule)
+                    || names.iter().any(|n| {
+                        outliving_store::stores(body, n, cx.roots)
+                            || stored_via_call(body, n, cx.program)
+                    }))
+            {
+                note(out, i);
+            }
+        }
+    }
+    fn block_elems(pats: &[Pattern], body: &Block, cx: TupleArmCx<'_>, out: &mut Vec<usize>) {
+        let rule = CallYieldRule::ReturnsIt(cx.program);
+        for (i, p) in pats.iter().enumerate() {
+            let names: Vec<String> = p.binding_names();
+            if !names.is_empty()
+                && (payload_returns_any_block(body, &names, rule)
+                    || payload_escapes_by_assignment_block(body, &names, cx.fn_body, rule)
+                    || names.iter().any(|n| {
+                        outliving_store::walk_block(body, n, cx.roots)
+                            || stored_via_call_block(body, n, cx.program)
+                    }))
+            {
+                note(out, i);
+            }
+        }
+    }
+    fn walk(e: &Expr, param: &str, cx: TupleArmCx<'_>, out: &mut Vec<usize>) {
+        let scrutinee_is_param =
+            |s: &Expr| matches!(&s.kind, ExprKind::Identifier(n) if n == param);
+        match &e.kind {
+            ExprKind::Match { scrutinee, arms } => {
+                walk(scrutinee, param, cx, out);
+                for a in arms {
+                    if scrutinee_is_param(scrutinee) {
+                        if let PatternKind::Tuple(pats) = &a.pattern.kind {
+                            arm_elems(pats, &a.body, cx, out);
+                        }
+                    }
+                    walk(&a.body, param, cx, out);
+                }
+            }
+            ExprKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_branch,
+            } => {
+                if scrutinee_is_param(value) {
+                    if let PatternKind::Tuple(pats) = &pattern.kind {
+                        block_elems(pats, then_block, cx, out);
+                    }
+                }
+                walk(value, param, cx, out);
+                walk_block(then_block, param, cx, out);
+                if let Some(x) = else_branch.as_deref() {
+                    walk(x, param, cx, out);
+                }
+            }
+            ExprKind::WhileLet {
+                pattern,
+                value,
+                body,
+                ..
+            } => {
+                if scrutinee_is_param(value) {
+                    if let PatternKind::Tuple(pats) = &pattern.kind {
+                        block_elems(pats, body, cx, out);
+                    }
+                }
+                walk(value, param, cx, out);
+                walk_block(body, param, cx, out);
+            }
+            ExprKind::Block(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Try(b)
+            | ExprKind::Seq(b)
+            | ExprKind::Par(b) => walk_block(b, param, cx, out),
+            ExprKind::Return(Some(inner)) => walk(inner, param, cx, out),
+            ExprKind::If {
+                condition,
+                then_block,
+                else_branch,
+            } => {
+                walk(condition, param, cx, out);
+                walk_block(then_block, param, cx, out);
+                if let Some(x) = else_branch.as_deref() {
+                    walk(x, param, cx, out);
+                }
+            }
+            ExprKind::While { body, .. }
+            | ExprKind::For { body, .. }
+            | ExprKind::Loop { body, .. }
+            | ExprKind::LabeledBlock { body, .. } => walk_block(body, param, cx, out),
+            _ => {}
+        }
+    }
+    fn walk_block(b: &Block, param: &str, cx: TupleArmCx<'_>, out: &mut Vec<usize>) {
+        for st in &b.stmts {
+            match &st.kind {
+                StmtKind::Expr(e) => walk(e, param, cx, out),
+                StmtKind::Let { value, .. } => walk(value, param, cx, out),
+                _ => {}
+            }
+        }
+        if let Some(fe) = b.final_expr.as_deref() {
+            walk(fe, param, cx, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk_block(&f.body, param_name, cx, &mut out);
+    out.sort_unstable();
+    out
+}
+
+/// What [`fn_returns_param_tuple_arm_elems`]'s walks carry: the program (for
+/// the callee lookups), the whole function body (for the assignment route),
+/// and the outliving roots (for the store routes).
+#[derive(Clone, Copy)]
+struct TupleArmCx<'a> {
+    program: &'a crate::Program,
+    fn_body: &'a Block,
+    roots: &'a [&'a str],
+}
+
+/// B-2026-09-05-28 — is `name` handed BARE, anywhere inside `e`, to a free
+/// function that moves that parameter into a place outliving ITS call
+/// ([`fn_moves_param_into_outliving_place`])? `stash(r, v)` with
+/// `fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }` — the element is alive in
+/// `v` when the arm ends, so no walk may run its body. Statement position
+/// included, which is what the return-site walks cannot see. ONE LEVEL, like
+/// every interprocedural question in this family.
+fn stored_via_call(e: &Expr, name: &str, program: &crate::Program) -> bool {
+    match &e.kind {
+        ExprKind::Call { callee, args, .. } => {
+            let direct = match &callee.kind {
+                ExprKind::Identifier(g) => program
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Function(gf) if &gf.name == g => Some(gf),
+                        _ => None,
+                    })
+                    .is_some_and(|gf| {
+                        args.iter().enumerate().any(|(j, a)| {
+                            matches!(&a.value.kind, ExprKind::Identifier(n) if n == name)
+                                && fn_moves_param_into_outliving_place(gf, j)
+                        })
+                    }),
+                _ => false,
+            };
+            direct
+                || args
+                    .iter()
+                    .any(|a| stored_via_call(&a.value, name, program))
+        }
+        ExprKind::MethodCall { object, args, .. } => {
+            stored_via_call(object, name, program)
+                || args
+                    .iter()
+                    .any(|a| stored_via_call(&a.value, name, program))
+        }
+        ExprKind::Block(b)
+        | ExprKind::Unsafe(b)
+        | ExprKind::Try(b)
+        | ExprKind::Seq(b)
+        | ExprKind::Par(b) => stored_via_call_block(b, name, program),
+        ExprKind::Return(Some(inner)) => stored_via_call(inner, name, program),
+        ExprKind::If {
+            condition,
+            then_block,
+            else_branch,
+        } => {
+            stored_via_call(condition, name, program)
+                || stored_via_call_block(then_block, name, program)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|x| stored_via_call(x, name, program))
+        }
+        ExprKind::IfLet {
+            value,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            stored_via_call(value, name, program)
+                || stored_via_call_block(then_block, name, program)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|x| stored_via_call(x, name, program))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            stored_via_call(scrutinee, name, program)
+                || arms.iter().any(|a| stored_via_call(&a.body, name, program))
+        }
+        ExprKind::While { body, .. }
+        | ExprKind::WhileLet { body, .. }
+        | ExprKind::For { body, .. }
+        | ExprKind::Loop { body, .. }
+        | ExprKind::LabeledBlock { body, .. } => stored_via_call_block(body, name, program),
+        _ => false,
+    }
+}
+
+fn stored_via_call_block(b: &Block, name: &str, program: &crate::Program) -> bool {
+    b.stmts.iter().any(|st| match &st.kind {
+        StmtKind::Expr(e) => stored_via_call(e, name, program),
+        StmtKind::Let { value, .. } => stored_via_call(value, name, program),
+        StmtKind::Assign { value, .. } => stored_via_call(value, name, program),
+        _ => false,
+    }) || b
+        .final_expr
+        .as_deref()
+        .is_some_and(|fe| stored_via_call(fe, name, program))
+}
+
+/// How the payload-escape walks below treat a CALL that takes the tracked
+/// binding as an argument (B-2026-09-05-28).
+#[derive(Clone, Copy)]
+enum CallYieldRule<'p> {
+    /// Every such call counts as an escape — [`fn_returns_param_payload`]'s
+    /// reading, kept verbatim for the enum-payload consumers it was measured
+    /// on.
+    Any,
+    /// Only a call whose callee is a KNOWN free function that hands that
+    /// parameter back (or moves it somewhere outliving the call) counts; a
+    /// consuming callee (`fn consume(x: R) -> i64 { x.id }`) does not. An
+    /// unknown callee still counts — the conservative direction.
+    ReturnsIt(&'p crate::Program),
+}
+
+/// Does `e` hand `name` across the frame boundary — bare, moved into a
+/// returned aggregate literal, or handed to a call per `rule`? A FIELD
+/// projection (`r.id`) deliberately does not count: the payload stays behind,
+/// only a copy of one field leaves.
+fn payload_yields(e: &Expr, name: &str, rule: CallYieldRule<'_>) -> bool {
+    match &e.kind {
+        ExprKind::Identifier(n) => n == name,
+        ExprKind::StructLiteral { fields, .. } => {
+            fields.iter().any(|f| payload_yields(&f.value, name, rule))
+        }
+        ExprKind::Tuple(elems) => elems.iter().any(|el| payload_yields(el, name, rule)),
+        ExprKind::Call { callee, args, .. } => args.iter().enumerate().any(|(j, a)| {
+            if !payload_yields(&a.value, name, rule) {
+                return false;
+            }
+            let CallYieldRule::ReturnsIt(program) = rule else {
+                return true;
+            };
+            // The element BARE, to a resolvable free function: its own
+            // ownership answer decides. Anything else keeps the escape.
+            if !matches!(&a.value.kind, ExprKind::Identifier(n) if n == name) {
+                return true;
+            }
+            let ExprKind::Identifier(g) = &callee.kind else {
+                return true;
+            };
+            let Some(gf) = program.items.iter().find_map(|item| match item {
+                Item::Function(gf) if &gf.name == g => Some(gf),
+                _ => None,
+            }) else {
+                return true;
+            };
+            // The whole value, or a payload / element bound out of it, or a
+            // home that outlives the call. A returned FIELD projection
+            // (`fn consume(x: R) -> i64 { x.id }`) is not counted, for the
+            // reason the bare-binding rule above gives: only a copy of one
+            // field leaves, the element itself dies in the callee.
+            fn_returns_param(gf, j)
+                || fn_always_returns_param(gf, j)
+                || fn_conditionally_returns_param_bare(gf, j)
+                || fn_returns_param_payload(gf, j)
+                || fn_returns_param_via_call(program, gf, j)
+                || fn_moves_param_into_outliving_place(gf, j)
+                || !fn_returns_param_tuple_arm_elems(program, gf, j).is_empty()
+        }),
+        _ => false,
+    }
+}
+
+/// Every name that aliases one of `names` through a `let` in this block, so
+/// the `let k = r; return k;` spelling is recognized as the same escape.
+fn payload_grow_aliases(b: &Block, names: &mut Vec<String>, rule: CallYieldRule<'_>) {
+    for st in &b.stmts {
+        if let StmtKind::Let { pattern, value, .. } = &st.kind {
+            if names.iter().any(|n| payload_yields(value, n, rule)) {
+                if let PatternKind::Binding(dest) = &pattern.kind {
+                    if !names.iter().any(|n| n == dest) {
+                        names.push(dest.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn payload_returns_any(e: &Expr, names: &[String], rule: CallYieldRule<'_>) -> bool {
+    match &e.kind {
+        ExprKind::Return(Some(inner)) => {
+            names.iter().any(|n| payload_yields(inner, n, rule))
+                || payload_returns_any(inner, names, rule)
+        }
+        ExprKind::Block(b)
+        | ExprKind::Unsafe(b)
+        | ExprKind::Try(b)
+        | ExprKind::Seq(b)
+        | ExprKind::Par(b) => payload_returns_any_block(b, names, rule),
+        ExprKind::If {
+            then_block,
+            else_branch,
+            ..
+        } => {
+            payload_returns_any_block(then_block, names, rule)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|x| payload_returns_any(x, names, rule))
+        }
+        ExprKind::IfLet {
+            then_block,
+            else_branch,
+            ..
+        } => {
+            payload_returns_any_block(then_block, names, rule)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|x| payload_returns_any(x, names, rule))
+        }
+        ExprKind::Match { arms, .. } => arms.iter().any(|a| {
+            names.iter().any(|n| payload_yields(&a.body, n, rule))
+                || payload_returns_any(&a.body, names, rule)
+        }),
+        ExprKind::While { body, .. }
+        | ExprKind::WhileLet { body, .. }
+        | ExprKind::For { body, .. }
+        | ExprKind::Loop { body, .. }
+        | ExprKind::LabeledBlock { body, .. } => payload_returns_any_block(body, names, rule),
+        _ => false,
+    }
+}
+
+fn payload_returns_any_block(b: &Block, names: &[String], rule: CallYieldRule<'_>) -> bool {
+    let mut names = names.to_vec();
+    payload_grow_aliases(b, &mut names, rule);
+    b.stmts.iter().any(|st| match &st.kind {
+        StmtKind::Expr(e) => payload_returns_any(e, &names, rule),
+        StmtKind::Let { value, .. } => payload_returns_any(value, &names, rule),
+        _ => false,
+    }) || b.final_expr.as_deref().is_some_and(|fe| {
+        names.iter().any(|n| payload_yields(fe, n, rule)) || payload_returns_any(fe, &names, rule)
+    })
+}
+
+/// B-2026-08-29-48 — the ROOTS of assignment targets inside `e` that receive
+/// one of `names`: `out = r`, `out.slot = r`, `outs[i] = r`.
+///
+/// [`payload_grow_aliases`] already follows a payload through a `let`
+/// (`let k = r; return k;`). It cannot follow one through an ASSIGNMENT,
+/// and the reason is scope rather than oversight: the destination is
+/// declared outside the arm and the `return` that carries it out sits
+/// outside the arm too, so both ends of the route are invisible from inside
+/// the arm body — which is all [`payload_returns_any`] ever sees. The roots
+/// therefore come back out to the caller, which asks the whole FUNCTION
+/// body whether they leave.
+///
+/// `MultiAssign` is deliberately not handled: [`crate::desugar`] rewrites
+/// every one into `let` temps plus single `Assign`s before any consumer of
+/// this predicate observes the program.
+fn payload_place_root(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Identifier(n) => Some(n),
+        ExprKind::FieldAccess { object, .. }
+        | ExprKind::TupleIndex { object, .. }
+        | ExprKind::Index { object, .. } => payload_place_root(object),
+        _ => None,
+    }
+}
+
+fn payload_assigned_roots(
+    e: &Expr,
+    names: &[String],
+    out: &mut Vec<String>,
+    rule: CallYieldRule<'_>,
+) {
+    match &e.kind {
+        ExprKind::Block(b)
+        | ExprKind::Unsafe(b)
+        | ExprKind::Try(b)
+        | ExprKind::Seq(b)
+        | ExprKind::Par(b) => payload_assigned_roots_block(b, names, out, rule),
+        ExprKind::Return(Some(inner)) => payload_assigned_roots(inner, names, out, rule),
+        ExprKind::If {
+            then_block,
+            else_branch,
+            ..
+        }
+        | ExprKind::IfLet {
+            then_block,
+            else_branch,
+            ..
+        } => {
+            payload_assigned_roots_block(then_block, names, out, rule);
+            if let Some(x) = else_branch.as_deref() {
+                payload_assigned_roots(x, names, out, rule);
+            }
+        }
+        ExprKind::Match { arms, .. } => {
+            for a in arms {
+                payload_assigned_roots(&a.body, names, out, rule);
+            }
+        }
+        ExprKind::While { body, .. }
+        | ExprKind::WhileLet { body, .. }
+        | ExprKind::For { body, .. }
+        | ExprKind::Loop { body, .. }
+        | ExprKind::LabeledBlock { body, .. } => {
+            payload_assigned_roots_block(body, names, out, rule)
+        }
+        _ => {}
+    }
+}
+
+fn payload_assigned_roots_block(
+    b: &Block,
+    names: &[String],
+    out: &mut Vec<String>,
+    rule: CallYieldRule<'_>,
+) {
+    for st in &b.stmts {
+        match &st.kind {
+            StmtKind::Assign { target, value } => {
+                if names.iter().any(|n| payload_yields(value, n, rule)) {
+                    if let Some(root) = payload_place_root(target) {
+                        if !out.iter().any(|s| s == root) {
+                            out.push(root.to_string());
+                        }
+                    }
+                }
+            }
+            StmtKind::Expr(e) => payload_assigned_roots(e, names, out, rule),
+            StmtKind::Let { value, .. } => payload_assigned_roots(value, names, out, rule),
+            _ => {}
+        }
+    }
+    if let Some(fe) = b.final_expr.as_deref() {
+        payload_assigned_roots(fe, names, out, rule);
+    }
+}
+
+/// Do any of `names` reach a return site by being ASSIGNED into a place
+/// whose root the function then returns? `fn_body` is the whole body, not
+/// the arm's, because that is where both the destination's declaration and
+/// the `return` live.
+fn payload_escapes_by_assignment(
+    body: &Expr,
+    names: &[String],
+    fn_body: &Block,
+    rule: CallYieldRule<'_>,
+) -> bool {
+    let mut roots: Vec<String> = Vec::new();
+    payload_assigned_roots(body, names, &mut roots, rule);
+    !roots.is_empty() && payload_returns_any_block(fn_body, &roots, rule)
+}
+
+fn payload_escapes_by_assignment_block(
+    body: &Block,
+    names: &[String],
+    fn_body: &Block,
+    rule: CallYieldRule<'_>,
+) -> bool {
+    let mut roots: Vec<String> = Vec::new();
+    payload_assigned_roots_block(body, names, &mut roots, rule);
+    !roots.is_empty() && payload_returns_any_block(fn_body, &roots, rule)
 }
 
 /// B-2026-08-26-9 — the third sibling of [`fn_returns_param`] and
