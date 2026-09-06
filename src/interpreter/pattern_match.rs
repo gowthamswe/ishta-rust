@@ -249,6 +249,27 @@ impl<'a> super::Interpreter<'a> {
                                     arms
                                 },
                             )
+                            // B-2026-09-06-27 — never for a bare owned ENUM
+                            // `self`. Read-through defers the payload body to
+                            // "the scrutinee's own walk", and an owned enum
+                            // receiver has none on this backend: the caller's
+                            // walk over a named-local receiver runs only the
+                            // shell's body (its payload is masked at the call,
+                            // exactly as codegen masks it), a temp receiver
+                            // has no caller walk at all, and the frame registers
+                            // nothing for `self`. So `fn m_read(self) -> i64 {
+                            // match self { E.A(r) => r.id, .. } }` ran `dR`
+                            // nowhere under `--interp` (`dE x1` / `x2`) against
+                            // every compiled backend's `dR1 dE x1` / `dR2 x2`,
+                            // where the arm channel owns an enum receiver's
+                            // payload by design (B-2026-08-01-6, B-2026-09-04-30).
+                            // Stashing the read-only binding is that same channel:
+                            // the body fires at the arm's end, before the shell's,
+                            // which is the compiled order for this receiver.
+                            && !scrutinee_place.is_some_and(|sp| {
+                                matches!(sp.kind, ExprKind::SelfValue)
+                                    && self.bare_self_is_owned_enum_receiver()
+                            })
                     }
                     _ => false,
                 };
@@ -855,6 +876,24 @@ impl<'a> super::Interpreter<'a> {
             .rev()
             .find_map(|s| s.get("self"))
             .is_some_and(|v| matches!(v, Value::Struct { .. }))
+    }
+
+    /// B-2026-09-06-27 — the enum sibling of
+    /// [`Self::bare_self_is_owned_struct_receiver`]: is a bare `self` an OWNED
+    /// VALUE-ENUM receiver? Where the struct receiver's arms bind views because
+    /// a caller walk runs its bodies, the enum receiver's arms are the only
+    /// place its payload body can run, so a read-only arm must still take it.
+    pub(super) fn bare_self_is_owned_enum_receiver(&self) -> bool {
+        matches!(
+            self.self_param_stack.last(),
+            Some(crate::ast::SelfParam::Owned)
+        ) && self
+            .env
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get("self"))
+            .is_some_and(|v| matches!(v, Value::EnumVariant { .. }))
     }
 
     /// Is `name` an owned parameter of a method frame that the CALLER is not

@@ -34263,6 +34263,138 @@ end
         );
     }
 
+    /// B-2026-09-06-27 — a READ-ONLY arm on an OWNED ENUM receiver lost the payload's
+    /// `Drop` body under `--interp`: `impl E { fn m_read(self) -> i64 { match self {
+    /// E.A(r) => { return r.id; } E.B => { return 0; } } } }` printed `dE x1` for a
+    /// named local and `x2` for a temp, against `dR1 dE x1` / `dR2 x2` on jit / -O0 /
+    /// -O2. The read-through gate (B-2026-08-28-67) stands the arm stash down on the
+    /// premise that "the scrutinee's own walk runs the body after the enum's own" —
+    /// true of a local scrutinee, and false of an owned enum receiver on this backend:
+    /// the caller's walk over a named-local receiver runs only the shell's body (its
+    /// payload is masked at the call, as codegen masks it), a temp receiver has no
+    /// caller walk, and the frame registers nothing for `self`. So the body ran
+    /// nowhere. The arm channel owns an enum receiver's payload by design
+    /// (B-2026-08-01-6, B-2026-09-04-30's registrar), so a bare owned enum `self`
+    /// scrutinee now keeps its stash on a read-only arm in all three legs (`match`,
+    /// `if let`, `while let`; `bare_self_is_owned_enum_receiver`), and the body fires
+    /// at the arm's end — the compiled order for this receiver.
+    ///
+    /// Controls and neighbours, all byte-identical on the four surfaces: the consuming
+    /// arm (`r/*`, hand-back) was already right; a guarded pair (`guard`), a
+    /// non-returning read (`print`), a shell-less enum (`noshell`), and the
+    /// free-function twin (`free`) agree. Two AGREED gaps are pinned as they stand and
+    /// filed on their own rows: a WILDCARD arm (`E.A(_)`, `none/*`) runs the payload
+    /// body on no surface, and a TEMP enum receiver loses the shell's own `dE` on
+    /// every surface (B-2026-09-04-30's registrar declines enum receiver bodies).
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_read_only_arm_on_owned_enum_receiver_runs_payload_body`, pinned to the same string.
+    #[test]
+    fn e2e_read_only_arm_on_owned_enum_receiver_runs_payload_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+enum P { A(R), B }
+impl E {
+    fn m_read(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_r(self) -> R { match self { E.A(r) => { return r; } E.B => { return mk(0); } } }
+    fn m_none(self) -> i64 { match self { E.A(_) => { return 1; } E.B => { return 0; } } }
+    fn m_print(self) { match self { E.A(r) => { println(f"  p{r.id}"); } E.B => { } } }
+    fn m_iflet(self) -> i64 { if let E.A(r) = self { return r.id; } else { return 0; } }
+    fn m_whilelet(self) -> i64 { while let E.A(r) = self { return r.id; } return 0; }
+    fn m_guard(self) -> i64 { match self { E.A(r) if r.id > 100 => { return 1; } E.A(r) => { return r.id + 1; } E.B => { return 0; } } }
+}
+impl P {
+    fn m_read(self) -> i64 { match self { P.A(r) => { return r.id; } P.B => { return 0; } } }
+}
+fn f_read(e: E) -> i64 { match e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+fn main() {
+    println("read/local"); let a = E.A(mk(1)); let x = a.m_read(); println(f"  x{x}");
+    println("read/temp"); let x2 = E.A(mk(2)).m_read(); println(f"  x{x2}");
+    println("r/local"); let b = E.A(mk(3)); let y = b.m_r(); println(f"  y{y.id}");
+    println("r/temp"); let y2 = E.A(mk(4)).m_r(); println(f"  y{y2.id}");
+    println("none/local"); let c = E.A(mk(5)); let z = c.m_none(); println(f"  z{z}");
+    println("none/temp"); let z2 = E.A(mk(6)).m_none(); println(f"  z{z2}");
+    println("print/local"); let d = E.A(mk(7)); d.m_print();
+    println("print/temp"); E.A(mk(8)).m_print();
+    println("noshell/local"); let g = P.A(mk(9)); let w = g.m_read(); println(f"  w{w}");
+    println("noshell/temp"); let w2 = P.A(mk(10)).m_read(); println(f"  w{w2}");
+    println("free/local"); let h = E.A(mk(11)); let v = f_read(h); println(f"  v{v}");
+    println("free/temp"); let v2 = f_read(E.A(mk(12))); println(f"  v{v2}");
+    println("iflet/local"); let i1 = E.A(mk(21)); let q1 = i1.m_iflet(); println(f"  q{q1}");
+    println("iflet/temp"); let q2 = E.A(mk(22)).m_iflet(); println(f"  q{q2}");
+    println("whilelet/local"); let i3 = E.A(mk(23)); let q3 = i3.m_whilelet(); println(f"  q{q3}");
+    println("guard/local"); let i4 = E.A(mk(24)); let q4 = i4.m_guard(); println(f"  q{q4}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"read/local
+  dR1
+  dE
+  x1
+read/temp
+  dR2
+  x2
+r/local
+  dE
+  y3
+  dR3
+r/temp
+  y4
+  dR4
+none/local
+  dE
+  z1
+none/temp
+  z1
+print/local
+  p7
+  dR7
+  dE
+print/temp
+  p8
+  dR8
+noshell/local
+  dR9
+  w9
+noshell/temp
+  dR10
+  w10
+free/local
+  dE
+  dR11
+  v11
+free/temp
+  dE
+  dR12
+  v12
+iflet/local
+  dR21
+  dE
+  q21
+iflet/temp
+  dR22
+  q22
+whilelet/local
+  dR23
+  dE
+  q23
+guard/local
+  dR24
+  dE
+  q25
+end
+"#
+        );
+    }
+
     #[test]
     fn e2e_deep_projection_scrutinee_runs_one_payload_body() {
         let hdr = "struct R { id: i64 }\n\
