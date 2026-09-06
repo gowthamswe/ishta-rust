@@ -5164,10 +5164,11 @@ fn main() {
     ///
     /// Cells: the row's own shape (`a`); its NON-GENERIC twin (`b`), correct
     /// all along through `fn_return_type_names`; the NAMED-LOCAL argument
-    /// (`c`), the row's other stated control and the fix's real constraint —
-    /// a named local supplies its own owner, so naming it here would register
-    /// a SECOND one over one object and trade the leak for a double free, the
-    /// direction B-2026-09-05-18's first defect went; TWO temporaries where
+    /// (`c`), which this row left declined — correct on the BODY count it
+    /// asserts here, and wrong on memory: B-2026-09-05-31 measured the
+    /// callee's entry copy orphaned in exactly that cell and admits it, so the
+    /// one body pinned below is now the binding's stand-down plus the copy's
+    /// registration rather than the binding alone; TWO temporaries where
     /// only the second escapes (`d`); the WRAPPING return (`e`) and the SCALAR
     /// return (`f`), both of which this arm must decline; the BOUND result
     /// (`g`), which never wanted a discard owner; and the LOOP, where the miss
@@ -5208,6 +5209,79 @@ fn main() {
                 out, "inP\ndR80\na\ninN\ndR81\nb\ninP\ndR82\nc\ninB\ndR83\ndR84\nd\ninW\ndR85\ne\ninS\ndR86\nf\ninP\nk87\ndR87\ninP\ndR88\nh\ninP\ndR90\ninP\ndR91\ninP\ndR92\ng\nend\n",
                 "the discarded generic result owes exactly one body per object on \
                  the AOT column, at every optimization level; got {out:?}"
+            );
+        }
+    }
+
+    /// B-2026-09-05-31 — the NAMED-LOCAL argument to a generic whole-param
+    /// callee, the cell B-2026-09-05-29 declined. That row read the body count
+    /// (one, on all four surfaces) as "already correct" and shipped admitting
+    /// only a fresh temporary. The body count was right; the MEMORY was not.
+    ///
+    /// The callee ENTRY-COPIES a copy-supported heap struct param, so
+    /// `let g = mk(88); let _ = passG(g);` has TWO objects and one owner: the
+    /// binding freed its original and the returned copy was orphaned. Measured
+    /// pre-fix on this exact program — 84 allocs / 69 frees, 240 B definitely
+    /// lost in 5 blocks — and at the DEFAULT optimization level, not only at
+    /// `-O0`. The payload is `Vec[String]` deliberately: with the row's
+    /// original `String` + `Vec[i64]` the dead entry copy is DCE'd at default
+    /// opt and the leak is visible only under `KARAC_OPT_LEVEL=0`, which is
+    /// how it stayed filed as a `-O0` curiosity.
+    ///
+    /// The BOUND sibling is the same defect read through the body count, and
+    /// was an unfiled A/B divergence until this row measured it: pre-fix,
+    /// `let o2 = passG(g2)` printed `dR88 k88 dR88` on all three compiled
+    /// surfaces against the interpreter's `k88 dR88`, while the concrete twin
+    /// `passN` was correct on all four. One omission explains both — the
+    /// monomorph path never performed `compile_call`'s caller-side
+    /// `suppress_user_drop_body_keeping_memory` — so the fix is one
+    /// stand-down plus the registration that receives what it gives up.
+    ///
+    /// Cells: the discarded named local (`a`); the BOUND named local (`k88`),
+    /// the divergence above; a CONDITIONAL-return generic discarded (`c`) and
+    /// bound (`m90`), the second of which diverged the same way; the CONCRETE
+    /// twin (`e`), correct throughout; the SCALAR return (`f`), which must
+    /// stay declined; a FORWARDING callee (`g`) — `D` owns a `shared` field,
+    /// so copy support declines, the callee takes the binding's own object,
+    /// and admitting it would be the double free the gate exists to prevent;
+    /// a struct with NO user `Drop` (`h`), memory-only and silent; the fresh
+    /// TEMPORARY (`dR94`), B-2026-09-05-29's shape, which must not regress;
+    /// and the LOOP, where the miss was unbounded.
+    #[test]
+    fn test_e2e_generic_whole_param_named_local_frees_the_entry_copy() {
+        let out = run_program(
+            r#"
+struct R { id: i64, names: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, names: [f"a{i}", f"b{i}"] }; }
+shared struct Sh { v: i64 }
+struct D { s: Sh, tag: String }
+impl Drop for D { fn drop(mut ref self) { println(f"dD{self.tag}") } }
+fn mkd(i: i64) -> D { return D { s: Sh { v: i }, tag: f"x{i}" }; }
+fn passG[T](x: T) -> T { println("inP"); return x; }
+fn passN(x: R) -> R { println("inN"); return x; }
+fn maybeG[T](x: T, k: bool) -> T { println("inM"); if k { return x; } return x; }
+fn scalarG[T](x: T) -> i64 { println("inS"); return 3; }
+fn main() {
+  let g1 = mk(82); let _ = passG(g1);          println("a");
+  let g2 = mk(88); let o2 = passG(g2);         println(f"k{o2.id}");
+  let g3 = mk(89); let _ = maybeG(g3, true);   println("c");
+  let g4 = mk(90); let o4 = maybeG(g4, false); println(f"m{o4.id}");
+  let g5 = mk(91); let _ = passN(g5);          println("e");
+  let g6 = mk(92); let _ = scalarG(g6);        println("f");
+  let d7 = mkd(93); let _ = passG(d7);         println("g");
+  let _ = passG(mk(94));                       println("h");
+  let mut i = 0; while i < 3 { let gl = mk(95 + i); let _ = passG(gl); i = i + 1; } println("j");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "inP\ndR82\na\ninP\nk88\ndR88\ninM\ndR89\nc\ninM\nm90\ndR90\ninN\ndR91\ne\ninS\ndR92\nf\ninP\ndDx93\ng\ninP\ndR94\nh\ninP\ndR95\ninP\ndR96\ninP\ndR97\nj\nend\n",
+                "a named local handed to a generic whole-param callee owes exactly \
+                 one body per object, and the callee's entry copy owes a free; \
+                 got {out:?}"
             );
         }
     }

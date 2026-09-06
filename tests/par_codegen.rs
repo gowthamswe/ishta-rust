@@ -12987,8 +12987,10 @@ fn main() {
     /// drop down on the reasoning that the RESULT would carry it.
     ///
     /// Cells: the row's own shape (`a`); its NON-GENERIC twin (`b`); the
-    /// NAMED-LOCAL argument (`c`), which supplies its own owner and must NOT
-    /// gain a second; two temporaries where only the second escapes (`d`); the
+    /// NAMED-LOCAL argument (`c`), declined by this row and admitted by
+    /// B-2026-09-05-31 once the callee's orphaned entry copy was measured —
+    /// the one body pinned here is unchanged either way; two temporaries where
+    /// only the second escapes (`d`); the
     /// WRAPPING return (`e`) and the SCALAR return (`f`), both declined; the
     /// BOUND result (`g`); and the LOOP, where the miss was unbounded.
     ///
@@ -13027,6 +13029,57 @@ fn main() {
                 out, "inP\ndR80\na\ninN\ndR81\nb\ninP\ndR82\nc\ninB\ndR83\ndR84\nd\ninW\ndR85\ne\ninS\ndR86\nf\ninP\nk87\ndR87\ninP\ndR88\nh\ninP\ndR90\ninP\ndR91\ninP\ndR92\ng\nend\n",
                 "the auto-par column owes the same single body per object as the \
                  other three; got {out:?}"
+            );
+        }
+    }
+
+    /// B-2026-09-05-31 — the auto-par column of the named-local shape. A
+    /// generic whole-param callee ENTRY-COPIES its argument, so a named local
+    /// handed to it leaves TWO objects with one owner: pre-fix the binding
+    /// freed its original and the returned copy was orphaned (240 B in 5
+    /// blocks on this program, at the DEFAULT optimization level), while the
+    /// BOUND spelling ran the `Drop` body twice against the interpreter's
+    /// once — an A/B divergence the sibling row did not measure.
+    ///
+    /// This column is a distinct surface for the same reason the family's
+    /// other rows carry one: the caller-side stand-down this fix adds to the
+    /// monomorph path edits scope-cleanup frames, and auto-par re-homes those
+    /// frames into branch functions. The debt is identical — one body per
+    /// object, and a free for the copy.
+    #[test]
+    fn test_e2e_auto_par_generic_whole_param_named_local_frees_the_entry_copy() {
+        let out = run_program(
+            r#"
+struct R { id: i64, names: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, names: [f"a{i}", f"b{i}"] }; }
+shared struct Sh { v: i64 }
+struct D { s: Sh, tag: String }
+impl Drop for D { fn drop(mut ref self) { println(f"dD{self.tag}") } }
+fn mkd(i: i64) -> D { return D { s: Sh { v: i }, tag: f"x{i}" }; }
+fn passG[T](x: T) -> T { println("inP"); return x; }
+fn passN(x: R) -> R { println("inN"); return x; }
+fn maybeG[T](x: T, k: bool) -> T { println("inM"); if k { return x; } return x; }
+fn scalarG[T](x: T) -> i64 { println("inS"); return 3; }
+fn main() {
+  let g1 = mk(82); let _ = passG(g1);          println("a");
+  let g2 = mk(88); let o2 = passG(g2);         println(f"k{o2.id}");
+  let g3 = mk(89); let _ = maybeG(g3, true);   println("c");
+  let g4 = mk(90); let o4 = maybeG(g4, false); println(f"m{o4.id}");
+  let g5 = mk(91); let _ = passN(g5);          println("e");
+  let g6 = mk(92); let _ = scalarG(g6);        println("f");
+  let d7 = mkd(93); let _ = passG(d7);         println("g");
+  let _ = passG(mk(94));                       println("h");
+  let mut i = 0; while i < 3 { let gl = mk(95 + i); let _ = passG(gl); i = i + 1; } println("j");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "inP\ndR82\na\ninP\nk88\ndR88\ninM\ndR89\nc\ninM\nm90\ndR90\ninN\ndR91\ne\ninS\ndR92\nf\ninP\ndDx93\ng\ninP\ndR94\nh\ninP\ndR95\ninP\ndR96\ninP\ndR97\nj\nend\n",
+                "the auto-par column owes the same one body per object, and the \
+                 same free for the callee's entry copy; got {out:?}"
             );
         }
     }

@@ -4649,16 +4649,17 @@ fn main() {
     /// an owner is strictly worse than the leak it replaces. Three rounds so a
     /// per-round imbalance accumulates rather than cancelling.
     ///
-    /// THE NAMED-LOCAL CELL IS DELIBERATELY ABSENT, and its absence is a
-    /// finding rather than an oversight. `let g = mk(82); let _ = passG(g);`
-    /// runs its body exactly once on all four surfaces — which is all the row
-    /// measured, and why it is described there as correct — but it LEAKS 10 B
-    /// in 2 blocks, on the pre-fix tree and on this one alike, while its
-    /// concrete twin `passN(g)` is 13 allocs / 13 frees clean. That is a
-    /// generic-only memory miss on the BINDING's registration, untouched by
-    /// this fix and not fixable from here (registering an owner for it is the
-    /// double free above), so it is filed as its own row. Under LSan on Linux
-    /// including the cell would fail this test for a reason it does not own.
+    /// THE NAMED-LOCAL CELL WAS DELIBERATELY ABSENT, and B-2026-09-05-31 has
+    /// since closed it — see `asan_generic_whole_param_named_local_frees_the_-
+    /// entry_copy`, which owns that shape and every cell around it. What this
+    /// row recorded stands: `let g = mk(82); let _ = passG(g);` ran its body
+    /// exactly once on all four surfaces while leaking, so no body count could
+    /// see it. What that row corrected is the DIAGNOSIS — the miss is not on
+    /// the binding's registration, and the owner it needed was not a second
+    /// one over a single object. The callee ENTRY-COPIES, so there are two
+    /// objects; the binding freed its original and the returned copy was
+    /// orphaned. Admitting it is therefore not the double free feared here,
+    /// provided the callee actually copies, which is the gate that row adds.
     #[test]
     fn asan_generic_whole_param_discarded_temp_frees_once() {
         assert_clean_asan_run_min_allocs(
@@ -4691,6 +4692,74 @@ fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); 
             ],
             "b0905-29-generic-whole-param-discarded-temp",
             48,
+        );
+    }
+
+    /// B-2026-09-05-31 — the MEMORY gate for a NAMED LOCAL handed to a generic
+    /// whole-param callee, the cell the sibling fixture above had to leave out.
+    ///
+    /// A generic callee ENTRY-COPIES a copy-supported heap struct param and
+    /// returns the COPY, so `let g = mk(88); let _ = passG(g);` leaves two
+    /// objects and one owner: the binding freed its original, nothing freed
+    /// the copy. Measured pre-fix on this exact program — 152 allocs / 134
+    /// frees, 288 B definitely lost in 6 blocks — and unbounded, three rounds
+    /// accumulating rather than cancelling.
+    ///
+    /// THE PAYLOAD IS `Vec[String]` ON PURPOSE and the fixture is worthless
+    /// without it. With the row's original `String` + `Vec[i64]` the entry
+    /// copy is dead once the result is discarded, LLVM removes the malloc, and
+    /// the whole leak is invisible at the DEFAULT optimization level — which
+    /// is why it sat filed as a `KARAC_OPT_LEVEL=0` curiosity. A `Vec[String]`
+    /// copy goes through runtime calls the optimizer will not touch, so the
+    /// leak survives to the column this test actually runs.
+    ///
+    /// In the other direction this is the DOUBLE-FREE gate, and cell `g` is
+    /// the one that matters: `D` owns a `shared` field, so copy support
+    /// declines and the callee takes the binding's own object rather than a
+    /// copy. Admitting that shape would free one object twice — strictly worse
+    /// than the leak — so the fix's registration and its caller-side
+    /// stand-down are gated on the SAME entry-copy predicate, and this cell is
+    /// what holds them together. Cell `h` is a struct with no user `Drop`,
+    /// which leaked its copy too and owes memory without a body.
+    #[test]
+    fn asan_generic_whole_param_named_local_frees_the_entry_copy() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct R { id: i64, names: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, names: [f"a{i}", f"b{i}"] }; }
+shared struct Sh { v: i64 }
+struct D { s: Sh, tag: String }
+impl Drop for D { fn drop(mut ref self) { println(f"dD{self.tag}") } }
+fn mkd(i: i64) -> D { return D { s: Sh { v: i }, tag: f"x{i}" }; }
+struct P { id: i64, tag: String }
+fn mkp(i: i64) -> P { return P { id: i, tag: f"p{i}" }; }
+fn passG[T](x: T) -> T { println("inP"); return x; }
+fn passN(x: R) -> R { println("inN"); return x; }
+fn maybeG[T](x: T, k: bool) -> T { println("inM"); if k { return x; } return x; }
+fn scalarG[T](x: T) -> i64 { println("inS"); return 3; }
+fn round() {
+  let g1 = mk(82); let _ = passG(g1);            println("a");
+  let g2 = mk(88); let o2 = passG(g2);           println(f"k{o2.id}");
+  let g3 = mk(89); let _ = maybeG(g3, true);     println("c");
+  let g4 = mk(90); let o4 = maybeG(g4, false);   println(f"m{o4.id}");
+  let g5 = mk(91); let _ = passN(g5);            println("e");
+  let g6 = mk(92); let _ = scalarG(g6);          println("f");
+  let d7 = mkd(93); let _ = passG(d7);           println("g");
+  let p8 = mkp(94); let _ = passG(p8);           println("h");
+}
+fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); }
+"#,
+            &[
+                "inP", "dR82", "a", "inP", "k88", "dR88", "inM", "dR89", "c", "inM", "m90", "dR90",
+                "inN", "dR91", "e", "inS", "dR92", "f", "inP", "dDx93", "g", "inP", "h", "inP",
+                "dR82", "a", "inP", "k88", "dR88", "inM", "dR89", "c", "inM", "m90", "dR90", "inN",
+                "dR91", "e", "inS", "dR92", "f", "inP", "dDx93", "g", "inP", "h", "inP", "dR82",
+                "a", "inP", "k88", "dR88", "inM", "dR89", "c", "inM", "m90", "dR90", "inN", "dR91",
+                "e", "inS", "dR92", "f", "inP", "dDx93", "g", "inP", "h", "done",
+            ],
+            "b0905-31-generic-whole-param-named-local",
+            100,
         );
     }
 

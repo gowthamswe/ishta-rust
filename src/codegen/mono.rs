@@ -2577,6 +2577,72 @@ impl<'ctx> super::Codegen<'ctx> {
             if transfer_ident[i] {
                 self.move_declined_copy_struct_arg(&a.value);
             }
+            // B-2026-09-05-31 — the monomorph leg of `compile_call`'s
+            // caller-side stand-down for a NAMED-LOCAL argument the callee
+            // hands back. The concrete path has retracted this body since
+            // B-2026-08-29-15; the generic path never did, and BOTH observable
+            // halves of that row follow from the one omission:
+            //
+            //   * `let g = mk(3); let o = passG(g);` ran R's `Drop` body TWICE
+            //     on all three compiled backends against the interpreter's
+            //     once, while the concrete twin `passN` was correct on all
+            //     four — an A/B divergence, unfiled until this row measured it.
+            //   * `let g = mk(3); let _ = passG(g);` ran the body once and
+            //     LEAKED the callee's entry copy, because the copy has no owner
+            //     and the registration that would give it one cannot be added
+            //     while the binding still fires the body (that would be the
+            //     first bullet's two bodies, one shape over).
+            //
+            // The callee ENTRY-COPIES, so the value the caller's binding holds
+            // and the value that comes back are two distinct objects. This
+            // retracts the BODY and keeps the MEMORY: the binding is still the
+            // only thing that will ever free the original — the same
+            // bodies-vs-memory split, and the same reasoning, as the concrete
+            // site. `discarded_whole_param_arg_type_name`'s named-local arm is
+            // the other half, and neither is sound alone.
+            //
+            // FREE FUNCTIONS ONLY. The generic METHOD sibling is left at its
+            // prior behaviour deliberately: this loop's index is
+            // receiver-inclusive while `callee_takes_over_arg_drop_body` is
+            // documented to take the non-self index, and no method shape was
+            // measured here. Retracting a body on an unmeasured path is how a
+            // divergence fix becomes a lost `Drop`, the same reason the enum
+            // sibling above stays absent.
+            if let ExprKind::Identifier(var_name) = &a.value.kind {
+                let free_fn = self
+                    .program_snapshot
+                    .as_deref()
+                    .and_then(|p| super::declarations::find_function_ast(p, name))
+                    .is_some_and(|f| f.self_param.is_none());
+                // The ENTRY-COPY condition is what pairs this retraction with
+                // the registration that replaces it, and it is load-bearing in
+                // BOTH directions. Where the callee entry-copies, the value
+                // that comes back is a second object with its own owner — the
+                // result binding, or the discard registrar — so the body this
+                // gives up is run there. Where the callee FORWARDS, there is
+                // one object and the binding is the only owner the discarded
+                // spelling has: `discarded_whole_param_arg_type_name` declines
+                // that shape (correctly — registering it would double-free),
+                // so retracting here on the wider `callee_takes_over_arg_drop_-
+                // body` alone would leave NO frame running the body at all.
+                // A lost `Drop` is strictly worse than the leak this row opened
+                // on, so the two gates are held identical rather than merely
+                // compatible.
+                let entry_copied = self
+                    .var_types
+                    .var_type_names
+                    .get(var_name.as_str())
+                    .cloned()
+                    .is_some_and(|tn| self.struct_type_is_entry_copied_heap(&tn));
+                if free_fn
+                    && entry_copied
+                    && self.call_arg_flows_into_return(name, i)
+                    && self.callee_takes_over_arg_drop_body(name, i)
+                {
+                    let var_name = var_name.clone();
+                    self.suppress_user_drop_body_keeping_memory(&var_name);
+                }
+            }
             // B-2026-09-05-6 — the monomorph leg of the place-STRUCT escaping
             // field mask. A generic call never reaches `compile_call`'s arg
             // loop, so the arm added there covered the concrete callee only and

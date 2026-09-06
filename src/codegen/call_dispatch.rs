@@ -3879,19 +3879,32 @@ impl<'ctx> super::Codegen<'ctx> {
     /// `Path`, and a borrow-returning callee must never hand the caller an
     /// owner.
     ///
-    /// A FRESH TEMPORARY argument only, and that gate — not the name lookup —
-    /// is the substance of the fix. The registrar this feeds takes OWNERSHIP
-    /// of what it names, so the question is not "what type is the result" but
-    /// "does this object already have an owner". A NAMED LOCAL supplies its
-    /// own, which is exactly why `let g = mk(82); let _ = passG(g);` is already
-    /// correct on all four surfaces; naming it here would register a SECOND
-    /// owner over one object and trade the leak for a double free — the
-    /// direction B-2026-09-05-18's first defect went. A temporary has no owner
-    /// at all: `call_arg_flows_into_return` stands the caller-side argument
-    /// drop down precisely because the RESULT is supposed to carry it, and
-    /// with the result unnamed nothing did. So this registration is the only
-    /// one, which is what the non-generic twin (`fn passN(x: R) -> R`) has had
-    /// all along through `fn_return_type_names`.
+    /// The admission test — not the name lookup — is the substance of both this
+    /// arm and B-2026-09-05-31's widening of it, and it lives in
+    /// [`Self::discarded_whole_param_arg_type_name`]. The registrar this feeds
+    /// takes OWNERSHIP of what it names, so the question is not "what type is
+    /// the result" but "does this object already have an owner".
+    ///
+    /// A FRESH TEMPORARY has none: `call_arg_flows_into_return` stands the
+    /// caller-side argument drop down precisely because the RESULT is supposed
+    /// to carry it, and with the result unnamed nothing did. So the
+    /// registration is the only one, which is what the non-generic twin
+    /// (`fn passN(x: R) -> R`) has had all along through
+    /// `fn_return_type_names`.
+    ///
+    /// CORRECTION (B-2026-09-05-31). This row shipped admitting the temporary
+    /// alone, on the reasoning that `let g = mk(82); let _ = passG(g);` "is
+    /// already correct on all four surfaces" because the named local supplies
+    /// its own owner. The body count was right and that is all this row
+    /// measured; the MEMORY was not. An entry-copying callee returns an object
+    /// INDEPENDENT of the caller's, so there are TWO objects and only one
+    /// owner — the binding freed its original and the returned copy was
+    /// orphaned, unbounded in a loop (240 B in 5 blocks on the twin fixture,
+    /// at the DEFAULT optimization level, once the payload is one LLVM cannot
+    /// dead-code away). The named local is admitted now, gated on that entry
+    /// copy, and the double free the old reasoning feared is what the gate
+    /// prevents: a FORWARDING callee hands back the binding's own object, and
+    /// that shape is still declined.
     fn discarded_whole_param_type_name(
         &self,
         callee_name: &str,
@@ -3942,27 +3955,67 @@ impl<'ctx> super::Codegen<'ctx> {
             if Self::te_head_name(&p.ty).as_deref() != Some(ret.as_str()) {
                 continue;
             }
-            if !self.expr_yields_fresh_owned_temp(&a.value) {
-                continue;
-            }
-            let ExprKind::Call { callee, .. } = &a.value.kind else {
-                continue;
-            };
-            let ExprKind::Identifier(arg_fn) = &callee.kind else {
-                continue;
-            };
-            let Some(name) = self.fn_sig.fn_return_type_names.get(arg_fn.as_str()) else {
+            let Some(name) = self.discarded_whole_param_arg_type_name(&a.value) else {
                 continue;
             };
             if !self.names_a_drop_type(name.as_str()) {
                 continue;
             }
             match &found {
-                Some(prev) if prev != name => return None,
-                _ => found = Some(name.clone()),
+                Some(prev) if prev != &name => return None,
+                _ => found = Some(name),
             }
         }
         found
+    }
+
+    /// Which TYPE does the argument at a discarded whole-param generic call
+    /// site name, and may this registrar own the value that comes back?
+    ///
+    /// Two argument spellings reach the same defect through opposite ownership
+    /// stories, so the admission test differs per arm and the answer — the
+    /// layout the registrar frees through — is the same kind of thing:
+    ///
+    ///  * a FRESH TEMPORARY (B-2026-09-05-29). Nothing else can own it: the
+    ///    argument has no binding and `call_arg_flows_into_return` stood the
+    ///    caller-side drop down on the premise that the RESULT carries it,
+    ///    which with the result unnamed is nobody. Admitted unconditionally,
+    ///    resolved through the arg call's own declared return type.
+    ///
+    ///  * a NAMED LOCAL (B-2026-09-05-31), admitted ONLY where the callee
+    ///    ENTRY-COPIES the param. That condition is the whole safety argument
+    ///    and is not a conservatism: an entry-copying callee returns an object
+    ///    INDEPENDENT of the caller's, so the binding owns the original and
+    ///    this registration owns the copy — two owners for two objects. Where
+    ///    the callee instead FORWARDS the param, the returned value IS the
+    ///    binding's, and registering it would be the double free the sibling
+    ///    row's fix is gated against. `struct_type_is_entry_copied_heap` is
+    ///    the callee's own predicate, so the two stay in lockstep by
+    ///    construction rather than by a caller-side look-alike.
+    ///
+    /// The named-local arm is HALF of that row's fix and is unsound alone: the
+    /// caller's binding still runs its `Drop` body, so registering the copy
+    /// here without the monomorph-path stand-down (`compile_mono_call`'s
+    /// `suppress_user_drop_body_keeping_memory`) takes the body count from one
+    /// to two — an A/B divergence against the interpreter traded for a leak.
+    /// The two land together; see that site's comment for the other half.
+    fn discarded_whole_param_arg_type_name(&self, arg: &Expr) -> Option<String> {
+        match &arg.kind {
+            ExprKind::Call { callee, .. } if self.expr_yields_fresh_owned_temp(arg) => {
+                let ExprKind::Identifier(arg_fn) = &callee.kind else {
+                    return None;
+                };
+                self.fn_sig
+                    .fn_return_type_names
+                    .get(arg_fn.as_str())
+                    .cloned()
+            }
+            ExprKind::Identifier(var) => {
+                let tn = self.var_types.var_type_names.get(var.as_str()).cloned()?;
+                self.struct_type_is_entry_copied_heap(&tn).then_some(tn)
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn try_track_discarded_user_drop_temp(
@@ -5996,13 +6049,30 @@ impl<'ctx> super::Codegen<'ctx> {
             }
             _ => return false,
         };
-        self.type_decls.struct_types.contains_key(name.as_str())
-            && !self.type_decls.shared_types.contains_key(name.as_str())
-            && self.aggregate_param_copy_supported_struct(&name, &mut Vec::new())
+        self.struct_type_is_entry_copied_heap(&name)
+    }
+
+    /// The TYPE-keyed half of [`Self::arg_is_entry_copied_heap_struct`]: does a
+    /// by-value param of type `name` get DEEP-COPIED at callee entry, so that a
+    /// callee returning that param hands back an object INDEPENDENT of the
+    /// caller's?
+    ///
+    /// Split out rather than duplicated because two callers now ask it of
+    /// arguments with different expression shapes — the sibling above resolves a
+    /// struct LITERAL or a fn-call temp, `discarded_whole_param_arg_type_name`
+    /// resolves a NAMED LOCAL — and the entry-copy question is about the TYPE,
+    /// not about how the argument was spelled. Keeping one body is what holds
+    /// them in the lockstep with `make_aggregate_param_callee_owned` the
+    /// sibling's doc describes: a predicate that drifted between two copies
+    /// would put caller and callee on opposite sides of the same copy.
+    pub(super) fn struct_type_is_entry_copied_heap(&self, name: &str) -> bool {
+        self.type_decls.struct_types.contains_key(name)
+            && !self.type_decls.shared_types.contains_key(name)
+            && self.aggregate_param_copy_supported_struct(name, &mut Vec::new())
             && self
                 .type_decls
                 .struct_field_type_exprs
-                .get(name.as_str())
+                .get(name)
                 .is_some_and(|ftes| {
                     ftes.iter().any(|f| {
                         // B-2026-08-07-12 root A, third site. Same blind spot as the
