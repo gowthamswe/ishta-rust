@@ -1532,6 +1532,7 @@ impl<'ctx> super::Codegen<'ctx> {
         }
         self.payload_vars.inline_option_payload_vars.clear();
         self.payload_vars.boxed_enum_payload_vars.clear();
+        self.payload_vars.boxed_struct_payload_param_vars.clear();
         self.payload_vars.boxed_payload_alias.clear();
         self.payload_vars.boxed_optres_payload_view_vars.clear();
         self.payload_vars.deboxed_payload_box_ptrs.clear();
@@ -2650,7 +2651,30 @@ impl<'ctx> super::Codegen<'ctx> {
                     for (enum_lit, variant, inner_struct) in
                         self.boxed_enum_payload_variants(&mono_ty)
                     {
-                        if enum_lit != "Option" || inner_struct.is_some() {
+                        if enum_lit != "Option" {
+                            continue;
+                        }
+                        if inner_struct.is_some() {
+                            // B-2026-09-06-50 — still no registration for a
+                            // struct payload (the box's interior is the
+                            // caller's, per the note above), but it must be
+                            // REACHABLE by
+                            // `suppress_boxed_payload_struct_destructure`. That
+                            // disarmer is gated on `boxed_enum_payload_vars`,
+                            // which is a set of things this frame OWNS, so a
+                            // param — owning nothing — bailed on its first line
+                            // and a destructuring arm's leaf bindings became a
+                            // second owner of every field they bound. Both
+                            // freed the same buffers and the program ABORTED.
+                            //
+                            // Record membership in a set that grants reach and
+                            // nothing else, rather than joining the ownership
+                            // set to buy its gate: that set's members are
+                            // subject to move rules whose premise is a box this
+                            // frame can hand over, and there is none.
+                            self.payload_vars
+                                .boxed_struct_payload_param_vars
+                                .insert(param_name.clone());
                             continue;
                         }
                         // B-2026-08-07-11 leg (a) — the box may hold a further

@@ -16205,6 +16205,164 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-50 — A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE
+    /// PARAM ABORTED WITH A DOUBLE FREE ON EVERY COMPILED BACKEND.
+    ///
+    /// `fn show(x: Option[P])` over an 8-word `P` boxes its payload. The box's
+    /// interior belongs to the CALLER (`owned_boxed_option_param_struct` arms
+    /// box AND interior), which is why the callee's owned-param loop
+    /// deliberately registers nothing for a struct payload. A destructuring arm
+    /// then gave every field it BOUND a second owner — `bind_pattern_values`
+    /// hands each heap leaf its own drop — and both freed the same buffers:
+    /// `free(): double free detected in tcache 2`, exit 134, under `karac run`
+    /// and `karac build` alike at `-O0` and `-O2`, 2 invalid frees per call
+    /// under valgrind, while the interpreter printed the right answer.
+    ///
+    /// The disarm that exists for this (`suppress_boxed_payload_struct_-
+    /// destructure`, which zeroes the bound fields' `cap` words INSIDE the box
+    /// so the owner's walk skips exactly them) was gated on
+    /// `boxed_enum_payload_vars` — a set of things the frame OWNS. A param owns
+    /// nothing, so the gate bailed on its first line. The fix is reach, not
+    /// ownership: `boxed_struct_payload_param_vars`.
+    ///
+    /// Every cell is a direction the fix has to keep straight, and three of
+    /// them are the OVER-disarm directions — a field wrongly disarmed leaks
+    /// instead of double-freeing, so a test that only pinned the abort would
+    /// pass on a fix that traded one for the other:
+    ///   - `Some(P { a, b, .. })` partial destructure — the reported abort;
+    ///   - `Some(P { a, b, c, d })` all fields bound — abort too, which is what
+    ///     ruled out `..` rest-field handling as the cause;
+    ///   - `Some(P { a: _, b, .. })` — `a` is TESTED, not bound, so the box
+    ///     must still free it;
+    ///   - `Some(P { a, .. })` whose arm MOVES `a` out to the caller — the leaf
+    ///     owns `a`, the box still owns `b`;
+    ///   - `Some(t)` whole binding — no destructure, nothing to disarm, and it
+    ///     was already clean; it must stay that way.
+    ///
+    /// The one-heap-field and `Vec`-field cells pin that the axis is the
+    /// payload being a boxed user struct at all, not the field count: a `P`
+    /// with a single `String` aborted identically.
+    ///
+    /// The NESTED cells are the second half of the fix and the reason it is not
+    /// a one-line gate change. `zero_struct_field_move_cap`'s tail arm recurses
+    /// into a user-struct field and zeroes every cap it finds, so disarming a
+    /// nested field WHOLE stopped the box freeing the nested fields the
+    /// sub-pattern never bound: `Some(P { i: Inner { s, .. }, .. })` traded the
+    /// abort for 11 B lost per call. The disarm now recurses with the same
+    /// bind-vs-test rule, and the three-level cell pins that it keeps
+    /// recursing rather than falling back to the blunt zero at depth two.
+    ///
+    /// A `Drop`-bearing payload needs no cell — the typechecker rejects a
+    /// pattern that moves fields out of a struct with its own `impl Drop`
+    /// (design.md § Part 8), so that shape cannot reach codegen.
+    #[test]
+    fn asan_boxed_struct_param_payload_destructure_no_double_free() {
+        assert_clean_asan_run(
+            r#"
+struct P { a: String, b: String, c: i64, d: i64 }
+struct Q { a: String, c: i64, d: i64, e: i64 }
+struct V { a: Vec[String], b: String, c: i64, d: i64 }
+struct J { u: String, v: String }
+struct Inner { j: J, t: String }
+struct N { i: Inner, b: String, c: i64, d: i64 }
+
+fn partial(x: Option[P]) {
+    match x { Some(P { a, b, .. }) => { println(f"p:{a}:{b}"); } None => { println("pn"); } }
+}
+
+fn allbound(x: Option[P]) {
+    match x { Some(P { a, b, c, d }) => { println(f"f:{a}:{b}:{c}{d}"); } None => { println("fn"); } }
+}
+
+fn tested(x: Option[P]) {
+    match x { Some(P { a: _, b, .. }) => { println(f"t:{b}"); } None => { println("tn"); } }
+}
+
+fn moveout(x: Option[P]) -> String {
+    match x { Some(P { a, .. }) => a, None => f"none" }
+}
+
+fn whole(x: Option[P]) {
+    match x { Some(t) => { println(f"w:{t.a}"); } None => { println("wn"); } }
+}
+
+fn onefield(x: Option[Q]) {
+    match x { Some(Q { a, .. }) => { println(f"o:{a}"); } None => { println("on"); } }
+}
+
+fn vecfield(x: Option[V]) {
+    match x { Some(V { a, b, .. }) => { println(f"v:{a.len()}:{b}"); } None => { println("vn"); } }
+}
+
+fn nested(x: Option[N]) {
+    match x { Some(N { i: Inner { t, .. }, b, .. }) => { println(f"n:{t}:{b}"); } None => { println("nn"); } }
+}
+
+fn deep(x: Option[N]) {
+    match x { Some(N { i: Inner { j: J { u, .. }, .. }, b, .. }) => { println(f"d:{u}:{b}"); } None => { println("dn"); } }
+}
+
+fn main() {
+    let mut n = 0;
+    while n < 3 {
+        partial(Some(P { a: f"pa-{n}-padpad", b: f"pb-{n}-padpad", c: 1, d: 2 }));
+        allbound(Some(P { a: f"fa-{n}-padpad", b: f"fb-{n}-padpad", c: 3, d: 4 }));
+        tested(Some(P { a: f"ta-{n}-padpad", b: f"tb-{n}-padpad", c: 5, d: 6 }));
+        let m = moveout(Some(P { a: f"ma-{n}-padpad", b: f"mb-{n}-padpad", c: 7, d: 8 }));
+        println(f"m:{m}");
+        whole(Some(P { a: f"wa-{n}-padpad", b: f"wb-{n}-padpad", c: 9, d: 0 }));
+        onefield(Some(Q { a: f"oa-{n}-padpad", c: 1, d: 2, e: 3 }));
+        let mut vs: Vec[String] = Vec.new();
+        vs.push(f"v0-{n}-padpad");
+        vs.push(f"v1-{n}-padpad");
+        vecfield(Some(V { a: vs, b: f"vb-{n}-padpad", c: 1, d: 2 }));
+        // A NAMED-BINDING argument reaches the same callee through a different
+        // caller-side owner (the let-site drop, not an arg temp) and aborted
+        // identically -- the row recorded only the fresh-temp spelling.
+        let named: Option[P] = Some(P { a: f"na-{n}-padpad", b: f"nb-{n}-padpad", c: 1, d: 2 });
+        partial(named);
+        nested(Some(N { i: Inner { j: J { u: f"nu-{n}-padpad", v: f"nv-{n}-padpad" }, t: f"nt-{n}-padpad" }, b: f"nb2-{n}-padpad", c: 1, d: 2 }));
+        deep(Some(N { i: Inner { j: J { u: f"du-{n}-padpad", v: f"dv-{n}-padpad" }, t: f"dt-{n}-padpad" }, b: f"db-{n}-padpad", c: 1, d: 2 }));
+        n = n + 1;
+    }
+}
+"#,
+            &[
+                "p:pa-0-padpad:pb-0-padpad",
+                "f:fa-0-padpad:fb-0-padpad:34",
+                "t:tb-0-padpad",
+                "m:ma-0-padpad",
+                "w:wa-0-padpad",
+                "o:oa-0-padpad",
+                "v:2:vb-0-padpad",
+                "p:na-0-padpad:nb-0-padpad",
+                "n:nt-0-padpad:nb2-0-padpad",
+                "d:du-0-padpad:db-0-padpad",
+                "p:pa-1-padpad:pb-1-padpad",
+                "f:fa-1-padpad:fb-1-padpad:34",
+                "t:tb-1-padpad",
+                "m:ma-1-padpad",
+                "w:wa-1-padpad",
+                "o:oa-1-padpad",
+                "v:2:vb-1-padpad",
+                "p:na-1-padpad:nb-1-padpad",
+                "n:nt-1-padpad:nb2-1-padpad",
+                "d:du-1-padpad:db-1-padpad",
+                "p:pa-2-padpad:pb-2-padpad",
+                "f:fa-2-padpad:fb-2-padpad:34",
+                "t:tb-2-padpad",
+                "m:ma-2-padpad",
+                "w:wa-2-padpad",
+                "o:oa-2-padpad",
+                "v:2:vb-2-padpad",
+                "p:na-2-padpad:nb-2-padpad",
+                "n:nt-2-padpad:nb2-2-padpad",
+                "d:du-2-padpad:db-2-padpad",
+            ],
+            "asan_boxed_struct_param_payload_destructure_no_double_free",
+        );
+    }
+
     #[test]
     fn asan_sorted_map_string_key_iter_no_leak() {
         // B-2026-07-09-17: `SortedMap[String, String]` ordered observation. The

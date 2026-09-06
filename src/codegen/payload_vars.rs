@@ -142,6 +142,30 @@ pub(crate) struct PayloadVars<'ctx> {
     pub(crate) boxed_payload_alias: std::collections::HashMap<String, (String, String)>,
     pub(crate) boxed_leaf_owning_depth: std::collections::HashMap<String, usize>,
     pub(crate) boxed_struct_payload_vars: std::collections::HashSet<String>,
+    /// B-2026-09-06-50 — OWNED by-value params whose `Option` payload is a
+    /// heap-BOXED user struct: the population the loop in `functions.rs`
+    /// deliberately registers NO drop for, because the box's interior belongs
+    /// to the caller.
+    ///
+    /// Membership grants exactly one thing — reach for
+    /// [`Codegen::suppress_boxed_payload_struct_destructure`] — and no
+    /// ownership at all. That separation is the safety property, the same one
+    /// `nested_boxed_payload_vars` above is kept apart for: the members of
+    /// `boxed_enum_payload_vars` are subject to MOVE rules that hand the box to
+    /// a destination, and a param owns no box to hand over. Joining that set to
+    /// buy the suppressor's gate would import those rules with it.
+    ///
+    /// The disarm has to reach this population because a destructuring arm's
+    /// leaf bindings each take a field as an owner while the caller's inner
+    /// walk still frees all of them: `match x { Some(P { a, b, .. }) => … }`
+    /// over `x: Option[P]` freed both `String`s twice and ABORTED with
+    /// `free(): double free detected in tcache 2` on every compiled backend at
+    /// both opt levels, while the interpreter printed the right answer. The
+    /// suppressor's zero travels through the BOX rather than the callee's
+    /// cleanup queue, which is what makes it visible to the caller's drop —
+    /// the channel `deboxed_payload_box_ptrs` documents for the move-out
+    /// mirror, reused here for the destructure that has no move to mirror.
+    pub(crate) boxed_struct_payload_param_vars: std::collections::HashSet<String>,
     /// B-2026-08-06-32 — bindings carrying a `NestedBoxedEnumDrop`, i.e. a box
     /// living inside the binding's INLINE payload area
     /// (`Result[Option[Wide], E]`).

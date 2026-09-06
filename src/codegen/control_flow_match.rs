@@ -13491,10 +13491,27 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::Identifier(name) = &scrutinee.kind else {
             return;
         };
+        // B-2026-09-06-50 — `boxed_struct_payload_param_vars` is the second
+        // admissible population: an owned by-value param whose `Option`
+        // payload is a boxed user struct. It is NOT in
+        // `boxed_enum_payload_vars` because the callee registers no drop for
+        // it — the box's interior is the caller's — and that absence is
+        // exactly what silenced this disarm, letting the arm's leaf bindings
+        // double-free every field they bound.
+        //
+        // Admitting it is sound because the zero below travels through the BOX
+        // and not through a cleanup queue: whoever owns the interior (the
+        // caller's arg temp, a let-site drop, an owning struct's field drop)
+        // reads the same words and skips exactly the bound fields. The
+        // membership grants no ownership and no move rules.
         if !self
             .payload_vars
             .boxed_enum_payload_vars
             .contains(name.as_str())
+            && !self
+                .payload_vars
+                .boxed_struct_payload_param_vars
+                .contains(name.as_str())
         {
             return;
         }
@@ -13663,6 +13680,32 @@ impl<'ctx> super::Codegen<'ctx> {
                     if !binds {
                         continue;
                     }
+                    // B-2026-09-06-50 — a NESTED struct sub-pattern
+                    // (`Some(P { i: Inner { s, .. }, .. })`) binds only SOME of
+                    // the nested struct's own fields, and disarming the field
+                    // WHOLE orphans the rest: the tail arm of
+                    // `zero_struct_field_move_cap` recurses into a user-struct
+                    // field and zeroes every cap it finds, so the box stopped
+                    // freeing `Inner.t` while only `Inner.s` gained a leaf
+                    // owner. Measured 11 B per call lost, on the shape whose
+                    // flat sibling this whole disarm exists for — an abort
+                    // traded for a leak, which is not a fix.
+                    //
+                    // Recurse instead, applying the same bind-vs-test rule one
+                    // level down against the nested field's own base pointer.
+                    // The named-binding path never had this hole (its box stays
+                    // in-frame and its leaf drops cover the remainder), which is
+                    // why only the param population needed it.
+                    if let Some(sub) = &field_pat.pattern {
+                        if self.suppress_nested_struct_field_destructure_at(
+                            box_ptr,
+                            sname,
+                            &field_pat.name,
+                            sub,
+                        ) {
+                            continue;
+                        }
+                    }
                     self.zero_struct_field_move_cap(box_ptr, sname, &field_pat.name);
                 }
             }
@@ -13678,6 +13721,78 @@ impl<'ctx> super::Codegen<'ctx> {
         }
         self.builder.build_unconditional_branch(join_bb).unwrap();
         self.builder.position_at_end(join_bb);
+    }
+
+    /// B-2026-09-06-50 — disarm one level DOWN, for a field whose sub-pattern
+    /// is itself a user-struct destructure.
+    ///
+    /// Returns `true` when it handled the field, so the caller skips the
+    /// whole-field zero that would otherwise orphan every nested field the
+    /// sub-pattern does not bind. Returns `false` for anything that is not a
+    /// nested user-struct pattern, leaving the caller's behaviour unchanged.
+    ///
+    /// Recursive, so a third level (`Some(P { i: I { j: J { s }, .. }, .. })`)
+    /// is handled by the same rule rather than falling back to the blunt zero
+    /// at depth two.
+    fn suppress_nested_struct_field_destructure_at(
+        &mut self,
+        base_ptr: PointerValue<'ctx>,
+        struct_name: &str,
+        field: &str,
+        sub: &Pattern,
+    ) -> bool {
+        let PatternKind::Struct {
+            path: npath,
+            fields: nfields,
+            ..
+        } = &sub.kind
+        else {
+            return false;
+        };
+        let Some(nested_name) = npath.last() else {
+            return false;
+        };
+        let Some(&nested_st) = self.type_decls.struct_types.get(nested_name.as_str()) else {
+            return false;
+        };
+        // The OUTER struct's layout is what the field offset must come from.
+        let Some(&outer_st) = self.type_decls.struct_types.get(struct_name) else {
+            return false;
+        };
+        let Some(field_names) = self.type_decls.struct_field_names.get(struct_name) else {
+            return false;
+        };
+        let Some(idx) = field_names.iter().position(|n| n == field) else {
+            return false;
+        };
+        let Ok(nested_ptr) =
+            self.builder
+                .build_struct_gep(outer_st, base_ptr, idx as u32, "boxfld.suppress.nested")
+        else {
+            return false;
+        };
+        let _ = nested_st;
+        for nfield in nfields {
+            let binds = match &nfield.pattern {
+                None => true,
+                Some(inner) => Self::pattern_binds_anything(inner),
+            };
+            if !binds {
+                continue;
+            }
+            if let Some(inner) = &nfield.pattern {
+                if self.suppress_nested_struct_field_destructure_at(
+                    nested_ptr,
+                    nested_name,
+                    &nfield.name,
+                    inner,
+                ) {
+                    continue;
+                }
+            }
+            self.zero_struct_field_move_cap(nested_ptr, nested_name, &nfield.name);
+        }
+        true
     }
 
     /// Disarm the scope-exit inline-payload free of a `?`-operand binding.
