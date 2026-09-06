@@ -190,6 +190,33 @@ impl<'a> super::Interpreter<'a> {
                         }
                     }
                 }
+                // B-2026-09-06-20 — a payload bound out of a LOCAL scrutinee
+                // at a slot the scrutinee's own mask marks as the caller's.
+                // `let w = W2.Two(r, mk(2)); match w { W2.Two(a, b) => .. }`
+                // wrapped a param VIEW into slot 0, and
+                // `mask_param_view_enum_ctor_slots` recorded exactly that in
+                // `moved_out_enum_payload_slots` — but only `w`'s WALK read
+                // the record. The arm bound `a` out of the same slot, gave it
+                // a Drop slot of its own, and ran the body the caller was
+                // already going to run: `dR2 dR1 dR1` against `dR2 dR1` on
+                // every compiled surface, rebind or not, `a` read or not.
+                //
+                // Such a binding is a view on the same terms as one bound out
+                // of an owned-param scrutinee above: it goes into the view set
+                // (so `let m = a;` inherits the story) and is kept OUT of the
+                // stash below. Per slot, so the FRESH payload in the other
+                // slot keeps its Drop slot and dies at the arm's end, where
+                // the compiled backends put it. The mask is keyed by the
+                // scrutinee binding, and a rebound scrutinee carries the
+                // inherited entry B-2026-08-31-50 transfers.
+                let masked_view_names: Vec<String> = scrutinee_place
+                    .map(|sp| self.masked_payload_view_names(&arm.pattern, sp))
+                    .unwrap_or_default();
+                for bound in &masked_view_names {
+                    if let Some(top) = self.owned_param_names_stack.last_mut() {
+                        top.insert(bound.clone());
+                    }
+                }
                 // B-2026-07-30-11 (match-arm leg): the taken arm's moved-out
                 // Drop-bearing payload bindings get REAL Drop slots. Stash
                 // them; the arm body's block executor adopts them into its
@@ -297,7 +324,9 @@ impl<'a> super::Interpreter<'a> {
                             // knew how to walk such a value once it is
                             // registered (B-2026-07-29-39).
                             let is_drop_binding = self.pattern_binding_owes_drop_body(&n);
-                            if is_drop_binding {
+                            // B-2026-09-06-20 — not for a binding out of a
+                            // masked slot; see `masked_view_names` above.
+                            if is_drop_binding && !masked_view_names.contains(&n) {
                                 self.pending_arm_drop_bindings.push(n);
                             }
                         }
@@ -1035,6 +1064,29 @@ impl<'a> super::Interpreter<'a> {
             .last()
             .is_some_and(|params| params.contains(name.as_str()));
         (!is_param_view).then_some(name)
+    }
+
+    /// B-2026-09-06-20 — the binding names a tuple-variant `pattern` binds
+    /// out of payload slots of the bare-identifier scrutinee `place` that the
+    /// scrutinee's own mask (`moved_out_enum_payload_slots`, written when a
+    /// constructor moved a param VIEW in) marks as the caller's. Empty for
+    /// any other pattern or scrutinee shape. Shared by the `match`, `if let`
+    /// and `while let` legs so the three spellings agree.
+    pub(super) fn masked_payload_view_names(&self, pattern: &Pattern, place: &Expr) -> Vec<String> {
+        let (PatternKind::TupleVariant { patterns, .. }, ExprKind::Identifier(root)) =
+            (&pattern.kind, &place.kind)
+        else {
+            return Vec::new();
+        };
+        patterns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                self.moved_out_enum_payload_slots
+                    .contains(&(root.clone(), *i))
+            })
+            .flat_map(|(_, p)| p.binding_names())
+            .collect()
     }
 
     fn match_disarms_payload_walk(&self, enum_name: &str, arms: &[MatchArm]) -> bool {

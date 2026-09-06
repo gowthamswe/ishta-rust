@@ -1149,6 +1149,18 @@ impl<'a> super::Interpreter<'a> {
                             }
                         }
                     }
+                    // B-2026-09-06-20 — the `if let` / `while let` copy of the
+                    // `match` arm's masked-slot rule in `pattern_match.rs`: a
+                    // payload bound out of a LOCAL scrutinee at a slot its own
+                    // mask marks as the caller's is a view (into the view set,
+                    // out of the stash), per slot.
+                    let masked_view_names: Vec<String> =
+                        self.masked_payload_view_names(pattern, value);
+                    for bound in &masked_view_names {
+                        if let Some(top) = self.owned_param_names_stack.last_mut() {
+                            top.insert(bound.clone());
+                        }
+                    }
                     for n in stash_names {
                         // B-2026-08-28-63 — the `if let` / `while let` copies of
                         // the `match` arm gate in `pattern_match.rs`. All three
@@ -1163,7 +1175,7 @@ impl<'a> super::Interpreter<'a> {
                         // own ran no body here while the `match` spelling ran
                         // one.
                         let is_drop_binding = self.pattern_binding_owes_drop_body(&n);
-                        if is_drop_binding {
+                        if is_drop_binding && !masked_view_names.contains(&n) {
                             self.pending_arm_drop_bindings.push(n);
                         }
                     }
@@ -1479,6 +1491,18 @@ impl<'a> super::Interpreter<'a> {
                             }
                         }
                     }
+                    // B-2026-09-06-20 — the `if let` / `while let` copy of the
+                    // `match` arm's masked-slot rule in `pattern_match.rs`: a
+                    // payload bound out of a LOCAL scrutinee at a slot its own
+                    // mask marks as the caller's is a view (into the view set,
+                    // out of the stash), per slot.
+                    let masked_view_names: Vec<String> =
+                        self.masked_payload_view_names(pattern, value);
+                    for bound in &masked_view_names {
+                        if let Some(top) = self.owned_param_names_stack.last_mut() {
+                            top.insert(bound.clone());
+                        }
+                    }
                     for n in stash_names {
                         // B-2026-08-28-63 — the `if let` / `while let` copies of
                         // the `match` arm gate in `pattern_match.rs`. All three
@@ -1493,7 +1517,7 @@ impl<'a> super::Interpreter<'a> {
                         // own ran no body here while the `match` spelling ran
                         // one.
                         let is_drop_binding = self.pattern_binding_owes_drop_body(&n);
-                        if is_drop_binding {
+                        if is_drop_binding && !masked_view_names.contains(&n) {
                             self.pending_arm_drop_bindings.push(n);
                         }
                     }

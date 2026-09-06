@@ -1111,7 +1111,14 @@ impl<'ctx> super::Codegen<'ctx> {
                                 // makes a nested `match m { .. }` take the
                                 // owned-param gates, which is the same
                                 // transitivity that set already provides.
-                                if payload_of_owned_param {
+                                // B-2026-09-06-20 — and a payload out of a
+                                // MASKED slot of a local scrutinee, on the same
+                                // terms (see `pattern_binding_masked_view_names`).
+                                let payload_of_masked_slot = self
+                                    .pattern_state
+                                    .pattern_binding_masked_view_names
+                                    .contains(name.as_str());
+                                if payload_of_owned_param || payload_of_masked_slot {
                                     self.payload_vars.param_view_locals.insert(name.clone());
                                 }
                                 // B-2026-09-02-11 — the same split for a
@@ -1131,6 +1138,7 @@ impl<'ctx> super::Codegen<'ctx> {
                                         .current_variant_payload_bindings
                                         .contains(name.as_str())
                                     && !self.pattern_state.pattern_binding_scrutinee_is_owned_param
+                                    && !payload_of_masked_slot
                                     && !self
                                         .pattern_state
                                         .pattern_binding_scrutinee_is_owned_elem_clone

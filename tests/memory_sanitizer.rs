@@ -75006,4 +75006,64 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-20 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_match_over_a_masked_wrap_slot_binds_a_view`: a payload bound out
+    /// of a masked slot goes memory-only, so its buffer is still freed
+    /// exactly once (heap `R`, `String` field) while its body is the
+    /// caller's.
+    #[test]
+    fn asan_match_over_a_masked_wrap_slot_clean() {
+        let label = "match_over_a_masked_wrap_slot";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+enum W2 { Two(R, R), None2 }
+struct S3 { a: R, b: R }
+fn m_direct(r: R) -> i64 { let w: W2 = W2.Two(r, mk(2)); match w { W2.Two(a, b) => { return b.id; } W2.None2 => { return 0; } } }
+fn m_rebind(r: R) -> i64 { let w: W2 = W2.Two(r, mk(4)); let w2: W2 = w; match w2 { W2.Two(a, b) => { return b.id; } W2.None2 => { return 0; } } }
+fn m_direct_a(r: R) -> i64 { let w: W2 = W2.Two(r, mk(6)); match w { W2.Two(a, b) => { return a.id; } W2.None2 => { return 0; } } }
+fn m_unread(r: R) -> i64 { let w: W2 = W2.Two(r, mk(8)); match w { W2.Two(a, b) => { return 1; } W2.None2 => { return 0; } } }
+fn m_iflet(r: R) -> i64 { let w: W2 = W2.Two(r, mk(10)); if let W2.Two(a, b) = w { return b.id; } return 0; }
+fn m_rebind_in_arm(r: R) -> i64 { let w: W2 = W2.Two(r, mk(12)); match w { W2.Two(a, b) => { let m: R = a; return m.id; } W2.None2 => { return 0; } } }
+fn m_swap(r: R) -> i64 { let w: W2 = W2.Two(mk(14), r); match w { W2.Two(a, b) => { return a.id; } W2.None2 => { return 0; } } }
+fn t_direct(r: R) -> i64 { let t: (R, R) = (r, mk(21)); match t { (a, b) => { return b.id; } } }
+fn main() {
+    { let v: i64 = m_direct(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = m_rebind(mk(3)); println(f"v={v}"); println("two") }
+    { let v: i64 = m_direct_a(mk(5)); println(f"v={v}"); println("three") }
+    { let v: i64 = m_unread(mk(7)); println(f"v={v}"); println("four") }
+    { let v: i64 = m_iflet(mk(9)); println(f"v={v}"); println("five") }
+    { let v: i64 = m_rebind_in_arm(mk(11)); println(f"v={v}"); println("six") }
+    { let v: i64 = m_swap(mk(13)); println(f"v={v}"); println("seven") }
+    { let v: i64 = t_direct(mk(20)); println(f"v={v}"); println("ten") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "dR2", "dR1", "v=2", "one", "dR4", "dR3", "v=4", "two", "dR6", "dR5", "v=5",
+                "three", "dR8", "dR7", "v=1", "four", "dR10", "dR9", "v=10", "five", "dR12",
+                "dR11", "v=11", "six", "dR14", "dR13", "v=14", "seven", "dR20", "v=21", "ten",
+                "end"
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

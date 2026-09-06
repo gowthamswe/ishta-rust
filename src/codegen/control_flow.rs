@@ -1291,6 +1291,9 @@ impl<'ctx> super::Codegen<'ctx> {
         // B-2026-08-01-13 — see `compile_match`'s twin derivation.
         self.pattern_state.pattern_binding_scrutinee_is_owned_param =
             self.scrutinee_is_owned_param_binding(scrutinee);
+        // B-2026-09-06-20 — see `compile_match`'s twin derivation.
+        self.pattern_state.pattern_binding_masked_view_names =
+            self.masked_payload_view_names_for(scrutinee, &[pattern]);
         // B-2026-09-02-11 — see `compile_match`'s twin derivation.
         self.pattern_state
             .pattern_binding_scrutinee_is_owned_elem_clone = self.expr_is_heap_vec_index(scrutinee)
@@ -1334,6 +1337,9 @@ impl<'ctx> super::Codegen<'ctx> {
         self.pattern_state
             .pattern_binding_scrutinee_is_fresh_owning_temp = saved.3;
         self.pattern_state.pattern_binding_scrutinee_is_owned_param = saved.4;
+        // B-2026-09-06-20 — cleared rather than restored: the enclosing
+        // construct's arm bindings were bound before this one compiled.
+        self.pattern_state.pattern_binding_masked_view_names.clear();
         self.pattern_state
             .pattern_binding_scrutinee_payload_bodies_src = saved.5;
         self.pattern_state.pattern_binding_scrutinee_optres_slot = saved.6;
@@ -1493,6 +1499,49 @@ impl<'ctx> super::Codegen<'ctx> {
     /// and so failed the inline-payload registration, while the same payload is
     /// INLINE in `Result`'s 5-word area). Field / tuple-index chains are the
     /// only widening: an index or call in the chain is not a plain view.
+    /// B-2026-09-06-20 — the names `patterns` bind out of payload slots of
+    /// the bare-identifier scrutinee `scrutinee` that the scrutinee binding's
+    /// stored slot mask (`enum_ctor_moved_payload_slots`) marks as the
+    /// caller's: a mixed wrap moved a param VIEW into that slot, so whoever
+    /// binds it out again binds a view. `let w = W2.Two(r, mk(2)); match w {
+    /// W2.Two(a, b) => { let m = a; .. } }` gave `m` a full body beside the
+    /// caller's walk on every compiled surface (`a` itself was right through
+    /// the arm's own disarm); with `a` a view, the rebind inherits it. Empty
+    /// for any other scrutinee shape. The interpreter twin is
+    /// `masked_payload_view_names` in `pattern_match.rs`.
+    pub(super) fn masked_payload_view_names_for(
+        &self,
+        scrutinee: &Expr,
+        patterns: &[&Pattern],
+    ) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let ExprKind::Identifier(src) = &scrutinee.kind else {
+            return out;
+        };
+        let Some(slots) = self.enum_ctor_moved_payload_slots.get(src.as_str()) else {
+            return out;
+        };
+        for pat in patterns {
+            let PatternKind::TupleVariant {
+                path,
+                patterns: subs,
+                ..
+            } = &pat.kind
+            else {
+                continue;
+            };
+            let Some(variant) = path.last() else {
+                continue;
+            };
+            for (i, sub) in subs.iter().enumerate() {
+                if slots.contains(&(variant.clone(), i)) {
+                    out.extend(sub.binding_names());
+                }
+            }
+        }
+        out
+    }
+
     pub(super) fn scrutinee_is_owned_param_binding(&self, e: &Expr) -> bool {
         let mut cur = e;
         let mut hops = 0usize;

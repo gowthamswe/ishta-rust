@@ -131,6 +131,15 @@ pub(crate) struct PatternState<'ctx> {
     /// runs it twice.
     pub(crate) pattern_binding_arm_borrowed_only_names: std::collections::HashSet<String>,
     pub(crate) pattern_binding_scrutinee_is_owned_param: bool,
+    /// B-2026-09-06-20 — the binding names the pattern(s) being bound take
+    /// out of payload slots that the scrutinee BINDING's own mask
+    /// (`enum_ctor_moved_payload_slots`, a param VIEW moved in by the
+    /// constructor) marks as the caller's. Such a binding is a view exactly
+    /// like a payload of an owned-param scrutinee: memory only, and into
+    /// `param_view_locals` so `let m = a;` in the arm inherits the story.
+    /// Set beside `pattern_binding_scrutinee_is_owned_param` by the `match`
+    /// and `if let` / `while let` compilers, cleared with it.
+    pub(crate) pattern_binding_masked_view_names: HashSet<String>,
     /// B-2026-09-02-11 — true while binding a pattern whose scrutinee is a
     /// heap `Vec`/`Array` INDEX read (`match v[i] { … }`, `match h.xs[i] { … }`).
     ///

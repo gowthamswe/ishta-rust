@@ -62759,3 +62759,50 @@ fn main() {
         "dR2\ndR1\nv=7\none\ndR4\ndR3\nv=7\ntwo\ndR5\nv=7\nthree\ndR8\ndR7\nv=7\nfour\ndR10\ndR9\nv=7\nfive\nend\n"
     );
 }
+
+/// B-2026-09-06-20 — a `match` (or `if let`) that destructures a mixed
+/// wrap's VIEW slot runs the view's `Drop` body once. `let w = W2.Two(r,
+/// mk(2)); match w { W2.Two(a, b) => .. }` bound `a` out of the slot the
+/// scrutinee's own mask (`moved_out_enum_payload_slots`) marks as the
+/// caller's and gave it a Drop slot of its own — `dR2 dR1 dR1` here against
+/// `dR2 dR1` on every compiled surface. Such a binding is now a view
+/// (`masked_payload_view_names`, shared by the `match`, `if let` and
+/// `while let` legs): into the view set, out of the stash, per slot. Twin of
+/// `tests/codegen.rs`'s `e2e_match_over_a_masked_wrap_slot_binds_a_view`,
+/// same program and string.
+///
+/// `one`..`four` direct / rebound / `a` read / unread, `five` the `if let`
+/// spelling, `six` `let m = a` inside the arm (the compiled side needed the
+/// view mark for this one), `seven` the view in the other slot, `eight` the
+/// tuple sibling (always right).
+#[test]
+fn test_match_over_a_masked_wrap_slot_binds_a_view() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+enum W2 { Two(R, R), None2 }
+struct S3 { a: R, b: R }
+fn m_direct(r: R) -> i64 { let w: W2 = W2.Two(r, mk(2)); match w { W2.Two(a, b) => { return b.id; } W2.None2 => { return 0; } } }
+fn m_rebind(r: R) -> i64 { let w: W2 = W2.Two(r, mk(4)); let w2: W2 = w; match w2 { W2.Two(a, b) => { return b.id; } W2.None2 => { return 0; } } }
+fn m_direct_a(r: R) -> i64 { let w: W2 = W2.Two(r, mk(6)); match w { W2.Two(a, b) => { return a.id; } W2.None2 => { return 0; } } }
+fn m_unread(r: R) -> i64 { let w: W2 = W2.Two(r, mk(8)); match w { W2.Two(a, b) => { return 1; } W2.None2 => { return 0; } } }
+fn m_iflet(r: R) -> i64 { let w: W2 = W2.Two(r, mk(10)); if let W2.Two(a, b) = w { return b.id; } return 0; }
+fn m_rebind_in_arm(r: R) -> i64 { let w: W2 = W2.Two(r, mk(12)); match w { W2.Two(a, b) => { let m: R = a; return m.id; } W2.None2 => { return 0; } } }
+fn m_swap(r: R) -> i64 { let w: W2 = W2.Two(mk(14), r); match w { W2.Two(a, b) => { return a.id; } W2.None2 => { return 0; } } }
+fn t_direct(r: R) -> i64 { let t: (R, R) = (r, mk(21)); match t { (a, b) => { return b.id; } } }
+fn main() {
+    { let v: i64 = m_direct(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = m_rebind(mk(3)); println(f"v={v}"); println("two") }
+    { let v: i64 = m_direct_a(mk(5)); println(f"v={v}"); println("three") }
+    { let v: i64 = m_unread(mk(7)); println(f"v={v}"); println("four") }
+    { let v: i64 = m_iflet(mk(9)); println(f"v={v}"); println("five") }
+    { let v: i64 = m_rebind_in_arm(mk(11)); println(f"v={v}"); println("six") }
+    { let v: i64 = m_swap(mk(13)); println(f"v={v}"); println("seven") }
+    { let v: i64 = t_direct(mk(20)); println(f"v={v}"); println("ten") }
+    println("end")
+}
+"#),
+        "dR2\ndR1\nv=2\none\ndR4\ndR3\nv=4\ntwo\ndR6\ndR5\nv=5\nthree\ndR8\ndR7\nv=1\nfour\ndR10\ndR9\nv=10\nfive\ndR12\ndR11\nv=11\nsix\ndR14\ndR13\nv=14\nseven\ndR20\nv=21\nten\nend\n"
+    );
+}

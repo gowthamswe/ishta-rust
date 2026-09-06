@@ -6570,6 +6570,7 @@ impl<'ctx> Codegen<'ctx> {
                 pattern_binding_arm_only_borrows: false,
                 pattern_binding_arm_borrowed_only_names: std::collections::HashSet::new(),
                 pattern_binding_scrutinee_is_owned_param: false,
+                pattern_binding_masked_view_names: HashSet::new(),
                 pattern_binding_scrutinee_is_owned_elem_clone: false,
                 pattern_binding_scrutinee_payload_bodies_src: None,
                 pattern_binding_scrutinee_optres_slot: None,
