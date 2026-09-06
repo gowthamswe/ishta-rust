@@ -54877,6 +54877,63 @@ fn main() {
     );
 }
 
+/// B-2026-09-05-13 — the INTERPRETER twin of
+/// `e2e_rebound_param_returned_in_ctor_runs_one_body`, same program and same
+/// string, landed in the same commit so the two backends cannot be fixed to
+/// different answers. On this backend the rebind site stops marking `m` a
+/// param VIEW when the frame owns `r`'s body per path (`cond_store_param_names`)
+/// and lets `m` take an ordinary slot instead, and the named-argument gate
+/// gains `fn_always_returns_param` — the `named-top` cell is the pre-existing
+/// interpreter-only double that exposed.
+#[test]
+fn test_rebound_param_returned_in_ctor_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"drop {self.id} {self.name}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}" }; }
+fn uncond_rebind(r: R) -> Option[R] { let m = r; return Option.Some(m); }
+fn rebind(r: R, keep: bool) -> Option[R] { let m = r; if keep { return Option.Some(m); } return Option.None; }
+fn rebind_ok(r: R, keep: bool) -> Result[R, i64] { let m = r; if keep { return Result.Ok(m); } return Result.Err(0); }
+fn bare_rebind(r: R) -> R { let m = r; return m; }
+fn top(r: R) -> Option[R] { return Option.Some(r); }
+fn chain(r: R, keep: bool) -> Option[R] { let m = r; let n = m; if keep { return Option.Some(n); } return Option.None; }
+fn inbranch(r: R, keep: bool) -> Option[R] { if keep { let m = r; return Option.Some(m); } println("after"); return Option.None; }
+fn tail(r: R, keep: bool) -> Option[R] { let m = r; if keep { Option.Some(m) } else { Option.None } }
+fn shadow(r: R, keep: bool) -> Option[R] { let m = r; if keep { return Option.Some(m); } let m = mk(99); println(f"sh {m.id}"); return Option.None; }
+struct K { n: i64 }
+impl K {
+    fn mrebind(ref self, r: R, keep: bool) -> Option[R] { let m = r; if keep { return Option.Some(m); } return Option.None; }
+    fn muncond(ref self, r: R) -> Option[R] { let m = r; return Option.Some(m); }
+}
+fn main() {
+    let k = K { n: 0 };
+    println("u-rebind"); let _ = uncond_rebind(mk(2));
+    println("rb-f");     let _ = rebind(mk(3), false);
+    println("rb-t");     let _ = rebind(mk(4), true);
+    println("ok-f");     let _ = rebind_ok(mk(5), false);
+    println("ok-t");     let _ = rebind_ok(mk(6), true);
+    println("bare");     let _ = bare_rebind(mk(7));
+    println("named-u");  let a = mk(8); let _ = uncond_rebind(a);
+    println("named-top"); let b = mk(9); let _ = top(b);
+    println("named-rb-f"); let c = mk(10); let _ = rebind(c, false);
+    println("named-rb-t"); let d = mk(11); let _ = rebind(d, true);
+    println("chain-f");  let _ = chain(mk(12), false);
+    println("chain-t");  let _ = chain(mk(13), true);
+    println("inbr-f");   let _ = inbranch(mk(14), false);
+    println("inbr-t");   let _ = inbranch(mk(15), true);
+    println("tail-f");   let _ = tail(mk(16), false);
+    println("tail-t");   let _ = tail(mk(17), true);
+    println("shadow-f"); let _ = shadow(mk(18), false);
+    println("m-rb-f");   let _ = k.mrebind(mk(20), false);
+    println("m-rb-t");   let _ = k.mrebind(mk(21), true);
+    println("m-u");      let _ = k.muncond(mk(22));
+    println("done")
+}"#),
+        "u-rebind\ndrop 2 h2\nrb-f\ndrop 3 h3\nrb-t\ndrop 4 h4\nok-f\ndrop 5 h5\nok-t\ndrop 6 h6\nbare\ndrop 7 h7\nnamed-u\ndrop 8 h8\nnamed-top\ndrop 9 h9\nnamed-rb-f\ndrop 10 h10\nnamed-rb-t\ndrop 11 h11\nchain-f\ndrop 12 h12\nchain-t\ndrop 13 h13\ninbr-f\nafter\ndrop 14 h14\ninbr-t\ndrop 15 h15\ntail-f\ndrop 16 h16\ntail-t\ndrop 17 h17\nshadow-f\nsh 99\ndrop 99 h99\ndrop 18 h18\nm-rb-f\ndrop 20 h20\nm-rb-t\ndrop 21 h21\nm-u\ndrop 22 h22\ndone\n",
+        "a rebound by-value param handed back through a ctor runs one body"
+    );
+}
+
 /// B-2026-08-29-31 — the INTERPRETER twin of
 /// `e2e_wildcard_let_discard_owns_what_its_arm_hands_out`, landed in the same
 /// commit with the SAME shapes in the same order, so the two backends cannot

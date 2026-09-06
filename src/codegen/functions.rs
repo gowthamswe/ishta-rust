@@ -1511,6 +1511,7 @@ impl<'ctx> super::Codegen<'ctx> {
         // with the binding of that name here.
         self.drop_rc.loop_decl_rearm_anchors.clear();
         self.drop_rc.cond_store_flag_params.clear();
+        self.drop_rc.cond_returned_body_params.clear();
         self.drop_rc.field_view_flags.clear();
         // B-2026-08-30-2 — same reasoning one map over: `branch_tail_owner_slots`
         // holds ALLOCAS, so an entry surviving into the next function names a
@@ -2965,6 +2966,12 @@ impl<'ctx> super::Codegen<'ctx> {
                                         bodies,
                                         crate::codegen::state::UserDropKind::StructFieldBodies,
                                     );
+                                    // B-2026-09-05-13 — remember who carries
+                                    // this body, so a whole rebind (`let m =
+                                    // r;`) can hand it on; see the set's doc.
+                                    self.drop_rc
+                                        .cond_returned_body_params
+                                        .insert(param_name.clone());
                                 }
                             }
                         }

@@ -6204,6 +6204,7 @@ impl<'ctx> Codegen<'ctx> {
                 param_view_callee_owned: HashSet::new(),
                 loop_decl_rearm_anchors: HashMap::new(),
                 cond_store_flag_params: std::collections::HashSet::new(),
+                cond_returned_body_params: std::collections::HashSet::new(),
                 field_view_flags: HashMap::new(),
                 deep_copy_rc_inc_bare_shared: false,
                 enum_drop_fns: HashMap::new(),

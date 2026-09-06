@@ -2740,6 +2740,8 @@ impl<'ctx> super::Codegen<'ctx> {
             let saved_optres_bodies_flags =
                 std::mem::take(&mut self.drop_rc.optres_payload_bodies_flags);
             let saved_cond_store_params = std::mem::take(&mut self.drop_rc.cond_store_flag_params);
+            let saved_cond_returned_body_params =
+                std::mem::take(&mut self.drop_rc.cond_returned_body_params);
             let saved_field_view_flags = std::mem::take(&mut self.drop_rc.field_view_flags);
             let saved_decl_anchors = std::mem::take(&mut self.drop_rc.loop_decl_rearm_anchors);
 
@@ -2765,6 +2767,7 @@ impl<'ctx> super::Codegen<'ctx> {
             self.drop_rc.cond_move_drop_flags = saved_cond_move_flags;
             self.drop_rc.optres_payload_bodies_flags = saved_optres_bodies_flags;
             self.drop_rc.cond_store_flag_params = saved_cond_store_params;
+            self.drop_rc.cond_returned_body_params = saved_cond_returned_body_params;
             self.drop_rc.field_view_flags = saved_field_view_flags;
             self.drop_rc.loop_decl_rearm_anchors = saved_decl_anchors;
             self.accel.soa_return_locals = saved_soa_return_locals;
@@ -3543,6 +3546,8 @@ impl<'ctx> super::Codegen<'ctx> {
         let saved_optres_bodies_flags =
             std::mem::take(&mut self.drop_rc.optres_payload_bodies_flags);
         let saved_cond_store_params = std::mem::take(&mut self.drop_rc.cond_store_flag_params);
+        let saved_cond_returned_body_params =
+            std::mem::take(&mut self.drop_rc.cond_returned_body_params);
         let saved_field_view_flags = std::mem::take(&mut self.drop_rc.field_view_flags);
         let saved_decl_anchors = std::mem::take(&mut self.drop_rc.loop_decl_rearm_anchors);
 
@@ -3553,6 +3558,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.drop_rc.cond_move_drop_flags = saved_cond_move_flags;
         self.drop_rc.optres_payload_bodies_flags = saved_optres_bodies_flags;
         self.drop_rc.cond_store_flag_params = saved_cond_store_params;
+        self.drop_rc.cond_returned_body_params = saved_cond_returned_body_params;
         self.drop_rc.field_view_flags = saved_field_view_flags;
         self.drop_rc.loop_decl_rearm_anchors = saved_decl_anchors;
         self.accel.soa_return_locals = saved_soa_return_locals;
@@ -3801,6 +3807,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.drop_rc.cond_move_drop_flags.clear();
         self.drop_rc.optres_payload_bodies_flags.clear();
         self.drop_rc.cond_store_flag_params.clear();
+        self.drop_rc.cond_returned_body_params.clear();
         self.drop_rc.field_view_flags.clear();
         self.drop_rc.loop_decl_rearm_anchors.clear();
         if let Some(tail) = func.body.final_expr.as_deref() {
@@ -4231,6 +4238,11 @@ impl<'ctx> super::Codegen<'ctx> {
                                     bodies,
                                     crate::codegen::state::UserDropKind::StructFieldBodies,
                                 );
+                                // B-2026-09-05-13 — same hand-on record as the
+                                // non-generic prologue; see the set's doc.
+                                self.drop_rc
+                                    .cond_returned_body_params
+                                    .insert(param_name.clone());
                             }
                         }
                     }

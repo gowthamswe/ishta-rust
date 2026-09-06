@@ -2846,6 +2846,28 @@ impl<'a> super::Interpreter<'a> {
                     .last()
                     .is_some_and(|params| params.contains(src.as_str()));
                 if src_is_view {
+                    // B-2026-09-05-13 — unless THIS frame owns the source's
+                    // `Drop` body per path (a conditionally-returned param
+                    // adopted through `cond_returned_param_drop_names`, kept
+                    // in `cond_store_param_names` for the frame). The admission
+                    // predicate now follows this rebind, so the caller has
+                    // stood down for `let m = r; if k { return Option.Some(m);
+                    // } …`; marking `m` a view here left the value with no
+                    // owner on the non-escaping path — `disarm_cond_store_
+                    // param_on_handover` had already marked `r` moved out at
+                    // this very statement, and a view registers no slot.
+                    // Measured: `drop 3` lost under `--interp` the moment the
+                    // predicate admitted the shape. Hand the ownership on
+                    // instead: `m` takes an ordinary slot (returning `false`
+                    // lets `push_drops_for_stmt` register it) and joins the
+                    // per-frame set, so the same hand-over disarm that covers
+                    // `r` — `return Option.Some(m)`, a store, a further rebind
+                    // — covers `m` on the escaping path. Codegen's twin moves
+                    // the bodies-only action at its `let` param-view arm.
+                    if self.cond_store_param_names.contains(src.as_str()) {
+                        self.cond_store_param_names.insert(bname.clone());
+                        return false;
+                    }
                     let bname = bname.clone();
                     if let Some(top) = self.owned_param_names_stack.last_mut() {
                         top.insert(bname);
@@ -5793,9 +5815,19 @@ impl<'a> super::Interpreter<'a> {
                 // in a constructor. Without it this gate short-circuited before
                 // `callee_owns_body` below could ever ask the conditional
                 // predicate, and the named binding kept firing.
+                // B-2026-09-05-13 — and the ALL-paths hand-back that
+                // `fn_returns_param` cannot see: a constructor wrap (`return
+                // Option.Some(r)`, B-2026-09-05-10's shape) or a whole rebind
+                // (`let m = r; return Option.Some(m)`). Codegen's named gate
+                // reaches its stand-down through `callee_hands_arg_off`, which
+                // asks this predicate; without it here the NAMED spelling ran
+                // two bodies under `--interp` against one compiled — measured
+                // on `let b = mk(7); let _ = top(b);` before this row touched
+                // anything, a divergence the fresh-temp pin never saw.
                 let is_passthrough = callee.is_some_and(|f| {
                     crate::ast::fn_returns_param(f, i)
                         || crate::ast::fn_returns_param_payload(f, i)
+                        || crate::ast::fn_always_returns_param(f, i)
                         || crate::ast::fn_conditionally_returns_param_bare(f, i)
                 });
                 if !is_passthrough && !escapes_into_outliving_place {

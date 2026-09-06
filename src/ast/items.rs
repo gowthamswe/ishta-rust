@@ -1599,6 +1599,204 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
     walk_block(&f.body)
 }
 
+/// B-2026-09-05-13 — the names by-value parameter `param_name` is REBOUND to,
+/// whole and unchanged, by a plain `let m = r;` — transitively, so `let m = r;
+/// let n = m;` yields `[r, m, n]`. The parameter itself is always element 0.
+///
+/// The passthrough family is name-keyed: every predicate below asks whether a
+/// return leaf IS the parameter's identifier, so `fn f(r: R) -> Option[R] {
+/// let m = r; return Option.Some(m); }` answered "does not return `r`" while
+/// `m` carried the caller-retained value out — and the caller, never stood
+/// down, ran the `Drop` body a second time over the result binding
+/// (measured on all four surfaces, unconditional and conditional alike — the
+/// coverage limit B-2026-09-05-10 split out rather than reach for). This is the
+/// one alias walk those predicates share, so they follow the same rebinds.
+///
+/// A rebind is admitted as an alias only when it is provably the SAME VALUE
+/// under a new name on every path that can reach a leaf naming it:
+///
+///  * the pattern is a bare, IMMUTABLE binding and the initializer is a bare
+///    identifier already in the set — a whole-value move, nothing built
+///    around it. `mut` is declined because a later `m = other;` would leave
+///    `m` naming a different value than the one the parameter brought in;
+///  * the target name is BOUND EXACTLY ONCE in the body (params counted), by
+///    any `let` / `let … else` / `if let` / `while let` / `for` / match-arm
+///    pattern the leaf walkers can see. A name bound twice — a shadow, or the
+///    same spelling in two branches — is declined outright, so a leaf that
+///    names it can never be read as the parameter when it holds something
+///    else. Closures are not entered, exactly as the leaf walkers do not enter
+///    them: a binding inside one is not visible at any of `f`'s exits.
+///
+/// Declining keeps today's behaviour for that function, which is the
+/// direction this whole family runs on: a missed alias is a body that keeps
+/// firing where it always did, never a new silent loss.
+///
+/// CONSUMERS must follow the alias through the callee-side per-path flip as
+/// well as through the admission predicate — a one-predicate alias fix was
+/// measured to stand the caller down and then drop the parameter by NAME on
+/// the non-escaping path while the value lived in the rebound local, losing
+/// that body. Both backends hand the flip's registration from `r` to `m` at
+/// the rebind site (codegen: `compile_let`'s param-view arm; interpreter:
+/// `let_destructures_owned_param`), which is what keeps the caller's
+/// stand-down and the callee's per-path drop naming the same binding on
+/// every path.
+pub fn param_rebind_aliases(f: &Function, param_name: &str) -> Vec<String> {
+    use std::collections::HashMap;
+    /// `(target, source)` of every candidate whole-value rebind, and how many
+    /// times each name is bound anywhere the walk reaches.
+    struct Walk {
+        rebinds: Vec<(String, String)>,
+        bound: HashMap<String, usize>,
+    }
+    impl Walk {
+        fn bind(&mut self, pat: &Pattern) {
+            for n in pat.binding_names() {
+                *self.bound.entry(n).or_insert(0) += 1;
+            }
+        }
+        fn block(&mut self, b: &Block) {
+            for st in &b.stmts {
+                match &st.kind {
+                    StmtKind::Let {
+                        is_mut,
+                        pattern,
+                        value,
+                        ..
+                    } => {
+                        self.bind(pattern);
+                        if let (false, PatternKind::Binding(x), ExprKind::Identifier(y)) =
+                            (*is_mut, &pattern.kind, &value.kind)
+                        {
+                            self.rebinds.push((x.clone(), y.clone()));
+                        }
+                        self.expr(value);
+                    }
+                    StmtKind::LetElse {
+                        pattern,
+                        value,
+                        else_block,
+                        ..
+                    } => {
+                        self.bind(pattern);
+                        self.expr(value);
+                        self.block(else_block);
+                    }
+                    StmtKind::LetUninit { name, .. } => {
+                        *self.bound.entry(name.clone()).or_insert(0) += 1;
+                    }
+                    StmtKind::Assign { value, .. } | StmtKind::CompoundAssign { value, .. } => {
+                        self.expr(value)
+                    }
+                    StmtKind::Expr(e) => self.expr(e),
+                    _ => {}
+                }
+            }
+            if let Some(fe) = b.final_expr.as_deref() {
+                self.expr(fe);
+            }
+        }
+        fn expr(&mut self, e: &Expr) {
+            match &e.kind {
+                ExprKind::Block(b)
+                | ExprKind::Unsafe(b)
+                | ExprKind::Try(b)
+                | ExprKind::Seq(b)
+                | ExprKind::Par(b) => self.block(b),
+                ExprKind::If {
+                    condition,
+                    then_block,
+                    else_branch,
+                } => {
+                    self.expr(condition);
+                    self.block(then_block);
+                    if let Some(x) = else_branch.as_deref() {
+                        self.expr(x);
+                    }
+                }
+                ExprKind::IfLet {
+                    pattern,
+                    value,
+                    then_block,
+                    else_branch,
+                } => {
+                    self.bind(pattern);
+                    self.expr(value);
+                    self.block(then_block);
+                    if let Some(x) = else_branch.as_deref() {
+                        self.expr(x);
+                    }
+                }
+                ExprKind::Match { scrutinee, arms } => {
+                    self.expr(scrutinee);
+                    for a in arms {
+                        self.bind(&a.pattern);
+                        if let Some(g) = &a.guard {
+                            self.expr(g);
+                        }
+                        self.expr(&a.body);
+                    }
+                }
+                ExprKind::While {
+                    condition, body, ..
+                } => {
+                    self.expr(condition);
+                    self.block(body);
+                }
+                ExprKind::WhileLet {
+                    pattern,
+                    value,
+                    body,
+                    ..
+                } => {
+                    self.bind(pattern);
+                    self.expr(value);
+                    self.block(body);
+                }
+                ExprKind::For {
+                    pattern,
+                    iterable,
+                    body,
+                    ..
+                } => {
+                    self.bind(pattern);
+                    self.expr(iterable);
+                    self.block(body);
+                }
+                ExprKind::Loop { body, .. } | ExprKind::LabeledBlock { body, .. } => {
+                    self.block(body)
+                }
+                ExprKind::Return(Some(inner)) => self.expr(inner),
+                _ => {}
+            }
+        }
+    }
+    let mut w = Walk {
+        rebinds: Vec::new(),
+        bound: HashMap::new(),
+    };
+    for p in &f.params {
+        if let Some(n) = p.name() {
+            *w.bound.entry(n.to_string()).or_insert(0) += 1;
+        }
+    }
+    w.block(&f.body);
+    let mut aliases = vec![param_name.to_string()];
+    loop {
+        let before = aliases.len();
+        for (x, y) in &w.rebinds {
+            if aliases.iter().any(|a| a == y)
+                && !aliases.iter().any(|a| a == x)
+                && w.bound.get(x.as_str()) == Some(&1)
+            {
+                aliases.push(x.clone());
+            }
+        }
+        if aliases.len() == before {
+            return aliases;
+        }
+    }
+}
+
 /// B-2026-08-28-70 — does `f` hand parameter `arg_index` back to its caller on
 /// EVERY exit?
 ///
@@ -1666,7 +1864,11 @@ pub fn fn_always_returns_param(f: &Function, arg_index: usize) -> bool {
     let PatternKind::Binding(name) = &param.pattern.kind else {
         return false;
     };
-    let name = name.as_str();
+    // B-2026-09-05-13 — the param under every name it is rebound to whole
+    // (`let m = r;`), so `return Option.Some(m)` reads as handing `r` back.
+    // See `param_rebind_aliases` for what qualifies and why declining is safe.
+    let aliases = param_rebind_aliases(f, name);
+    let name: &[String] = &aliases;
 
     /// The same test [`fn_returns_param`] applies at a return site: the bare
     /// identifier, or an aggregate literal that moves the param into itself.
@@ -1680,9 +1882,9 @@ pub fn fn_always_returns_param(f: &Function, arg_index: usize) -> bool {
     /// provably owns the value on every path — there is no dies-inside path
     /// left to lose a body on. `option_result_ctor_payload` is the same shape
     /// test the conditional flip and both backends' tail walkers already share.
-    fn yields(e: &Expr, name: &str) -> bool {
+    fn yields(e: &Expr, name: &[String]) -> bool {
         match &e.kind {
-            ExprKind::Identifier(n) => n == name,
+            ExprKind::Identifier(n) => name.iter().any(|a| a == n),
             ExprKind::StructLiteral { fields, .. } => fields.iter().any(|f| yields(&f.value, name)),
             ExprKind::Tuple(elems) => elems.iter().any(|el| yields(el, name)),
             _ => crate::ast::option_result_ctor_payload(e).is_some_and(|p| yields(p, name)),
@@ -1974,15 +2176,22 @@ pub fn fn_conditionally_returns_param_bare(f: &Function, arg_index: usize) -> bo
     let PatternKind::Binding(param_name) = &param.pattern.kind else {
         return false;
     };
-    let name = param_name.as_str();
+    // B-2026-09-05-13 — the param under every name it is rebound to whole
+    // (`let m = r;`): a leaf `Option.Some(m)` yields it, and a leaf that
+    // mentions `m` any other way declines exactly as one mentioning `r` does.
+    // The per-path flip this predicate admits follows the same rebind at the
+    // callee side, so the caller's stand-down and the callee's drop keep
+    // naming one binding per path — see `param_rebind_aliases`.
+    let aliases = param_rebind_aliases(f, param_name);
+    let name: &[String] = &aliases;
 
     /// May `e` mention `name`? Conservative in the DECLINING direction: any
     /// shape not explicitly recognized answers `true`, which fails condition 3
     /// and leaves that function on today's behaviour. Adding a shape here can
     /// only ever admit more programs, never silently widen an escape route.
-    fn may_mention(e: &Expr, name: &str) -> bool {
+    fn may_mention(e: &Expr, name: &[String]) -> bool {
         match &e.kind {
-            ExprKind::Identifier(n) => n == name,
+            ExprKind::Identifier(n) => name.iter().any(|a| a == n),
             ExprKind::Integer(..)
             | ExprKind::Float(..)
             | ExprKind::CharLit(_)
@@ -2050,8 +2259,8 @@ pub fn fn_conditionally_returns_param_bare(f: &Function, arg_index: usize) -> bo
             _ => true,
         }
     }
-    fn is_bare(e: &Expr, name: &str) -> bool {
-        matches!(&e.kind, ExprKind::Identifier(n) if n == name)
+    fn is_bare(e: &Expr, name: &[String]) -> bool {
+        matches!(&e.kind, ExprKind::Identifier(n) if name.iter().any(|a| a == n))
     }
     /// The leaf tails of an escaping tail position, following exactly the
     /// branch structure `note_escaping_site` pushes escaping-ness down through.

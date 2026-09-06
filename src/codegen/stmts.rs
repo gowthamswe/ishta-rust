@@ -9549,7 +9549,31 @@ impl<'ctx> super::Codegen<'ctx> {
                                     shared_info.is_none(),
                                 );
                             } else if has_user_drop {
-                                self.suppress_user_drop_for_var(source_name);
+                                // B-2026-09-05-13 — PER PATH where the source is
+                                // a parameter whose body this frame owns under
+                                // the conditional-return flip
+                                // (`cond_returned_body_params`) and the `let` is
+                                // itself nested. `if k { let m = r; return
+                                // Option.Some(m); } return Option.None;` reached
+                                // this all-paths removal from inside the branch
+                                // and deleted `r`'s flag-guarded registration on
+                                // the path that never rebound it — measured as
+                                // the not-taken call's body vanishing on every
+                                // compiled surface while `--interp`, per path by
+                                // construction, ran it. Same rule as the nested
+                                // `return` arm (B-2026-08-28-65): the enclosing-
+                                // frame guard mints the flag and stores `false`
+                                // in this block; a top-level rebind finds the
+                                // action in the innermost frame, the guard
+                                // declines, and the static removal stands. The
+                                // param-view arm below then hands the body to
+                                // `m` on the path that did rebind.
+                                let per_path =
+                                    self.drop_rc.cond_returned_body_params.contains(source_name)
+                                        && self.guard_user_drop_for_nested_return(source_name);
+                                if !per_path {
+                                    self.suppress_user_drop_for_var(source_name);
+                                }
                                 // B-2026-08-09-16 — retract the source's MEMORY
                                 // action too, not just its body.
                                 //
@@ -9829,6 +9853,53 @@ impl<'ctx> super::Codegen<'ctx> {
                                         self.drop_rc
                                             .param_view_callee_owned
                                             .insert(var_name.to_string());
+                                    }
+                                    // B-2026-09-05-13 — and the per-path BODY,
+                                    // where THIS frame owns it. A parameter the
+                                    // prologue registered under
+                                    // `fn_conditionally_returns_param_bare`
+                                    // carries a bodies-only `UserDrop` armed on
+                                    // its own name; that predicate now follows
+                                    // this very rebind, so the caller has stood
+                                    // down for `let m = r; if k { return
+                                    // Option.Some(m); } …` and the value that
+                                    // dies inside lives in `m`, not `r`. Left
+                                    // on `r`, the non-escaping path ran no body
+                                    // at all (measured: `drop 3` gone on every
+                                    // compiled surface). Move the registration
+                                    // to the rebind: retract `r`'s — per path
+                                    // where the `let` is itself nested, exactly
+                                    // as a nested `return` would — and register
+                                    // the same bodies-only walker on `m`'s slot,
+                                    // whose own nested `return` then mints `m`'s
+                                    // flag through `guard_user_drop_for_nested_
+                                    // return`. Memory is untouched: the
+                                    // memory-only tracking above already frees
+                                    // the entry copy this binding received.
+                                    // Recorded in turn so a further `let n = m;`
+                                    // hands it on again.
+                                    if self
+                                        .drop_rc
+                                        .cond_returned_body_params
+                                        .contains(src.as_str())
+                                    {
+                                        if let Some(bodies) =
+                                            self.emit_struct_user_drop_bodies_only_fn(&struct_name)
+                                        {
+                                            if !self.guard_user_drop_for_nested_return(src) {
+                                                self.suppress_user_drop_for_var(src);
+                                            }
+                                            self.track_user_drop_var_with_fn(
+                                                "",
+                                                var_name,
+                                                alloca,
+                                                bodies,
+                                                crate::codegen::state::UserDropKind::StructFieldBodies,
+                                            );
+                                            self.drop_rc
+                                                .cond_returned_body_params
+                                                .insert(var_name.to_string());
+                                        }
                                     }
                                 }
                             } else if has_user_drop

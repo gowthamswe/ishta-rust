@@ -158,6 +158,28 @@ pub(crate) struct DropRc<'ctx> {
     /// ones this row's registration created, so no pre-existing retraction
     /// changes behaviour.
     pub(crate) cond_store_flag_params: std::collections::HashSet<String>,
+    /// B-2026-09-05-13 — the bindings that currently CARRY a conditionally-
+    /// returned parameter's per-path `Drop` body: the parameter itself, as
+    /// registered by the prologue (`compile_function` / `compile_mono_function`
+    /// under `fn_conditionally_returns_param_bare`), and every local it is
+    /// since REBOUND to whole (`let m = r;`), which takes the registration over
+    /// at the rebind site.
+    ///
+    /// The predicate follows the rebind alias (`param_rebind_aliases`), so the
+    /// caller stands down for `fn f(r: R, k: bool) -> Option[R] { let m = r;
+    /// if k { return Option.Some(m); } … }` exactly as for the bare spelling.
+    /// The flip's registration, though, is keyed by NAME and armed on `r`,
+    /// while after the rebind the value lives in `m`: left there, the
+    /// non-escaping path drops `r`'s moved-from slot (or nothing at all, once
+    /// the move retracts it) and `m`'s memory-only tracking runs no body —
+    /// measured as `drop 3` vanishing on every compiled surface. Membership
+    /// here is what lets the `let` hand the bodies-only action to `m`, whose
+    /// own nested `return` then mints the per-path flag through the same
+    /// `guard_user_drop_for_nested_return` the bare parameter uses.
+    ///
+    /// Per function, like `cond_store_flag_params`: cleared with it and saved
+    /// and restored around a closure or mono body with it.
+    pub(crate) cond_returned_body_params: std::collections::HashSet<String>,
     /// B-2026-08-30-54 / B-2026-09-02-10 — for each base binding a FIELD of
     /// which received a param view, that field's OWN per-path flag: `true`
     /// while the base still owns the field's value, `false` on a path where a

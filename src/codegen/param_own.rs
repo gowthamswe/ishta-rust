@@ -693,7 +693,7 @@ impl<'ctx> super::Codegen<'ctx> {
         }
         // THE TARGET'S DROP MUST ACTUALLY BE THE ONE-ACTION KIND, which is the
         // premise this whole registration rests on and the one it did not
-        // check (B-2026-09-05-13).
+        // check (B-2026-09-05-19).
         //
         // The doc above argues that withholding the body withholds the free
         // "for a type with an `impl Drop`", because `karac_drop_<T>` runs the
