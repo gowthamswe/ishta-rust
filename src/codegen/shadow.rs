@@ -430,6 +430,7 @@ impl<'ctx> super::Codegen<'ctx> {
             self.type_decls.struct_moved_nested_field_bodies.remove(n);
             self.tuple_moved_elem_bodies.remove(n);
             self.tuple_moved_elem_payload_bodies.remove(n);
+            self.tuple_moved_nested_elem_bodies.remove(n);
         }
         self.variables = snap.variables;
         self.borrow_vars.owned_vecstr_params = snap.owned_vecstr_params;

@@ -20553,6 +20553,45 @@ impl<'ctx> super::Codegen<'ctx> {
         skip: &[usize],
         temp_name: &str,
     ) {
+        let tree = super::synth_drop::FieldSkipTree {
+            here: skip.iter().copied().collect(),
+            ..Default::default()
+        };
+        self.track_discarded_tuple_elem_bodies_tree(elems, val, &tree, temp_name);
+    }
+
+    /// B-2026-09-06-11 — [`Self::track_discarded_tuple_elem_bodies_named`]
+    /// with the callee's escaping PATHS: each is resolved over the literal's
+    /// element types into a skip tree (`insert_tuple_skip_path`, one `nested`
+    /// level per tuple crossed, a struct element re-entering the field
+    /// resolver), so a part handed back BELOW the top level (`p.0.0`, `p.0.r`)
+    /// is masked at the depth it names. A path that does not resolve is
+    /// dropped whole, the under-approximating direction.
+    pub(super) fn track_discarded_tuple_elem_bodies_paths(
+        &mut self,
+        elems: &[Expr],
+        val: BasicValueEnum<'ctx>,
+        paths: &[crate::ast::ParamPath],
+        temp_name: &str,
+    ) {
+        let elem_tes: Vec<crate::ast::TypeExpr> = elems
+            .iter()
+            .map(|e| self.infer_discard_elem_te(e))
+            .collect();
+        let mut tree = super::synth_drop::FieldSkipTree::default();
+        for path in paths {
+            self.insert_tuple_skip_path(&mut tree, &elem_tes, path);
+        }
+        self.track_discarded_tuple_elem_bodies_tree(elems, val, &tree, temp_name);
+    }
+
+    fn track_discarded_tuple_elem_bodies_tree(
+        &mut self,
+        elems: &[Expr],
+        val: BasicValueEnum<'ctx>,
+        tree: &super::synth_drop::FieldSkipTree,
+        temp_name: &str,
+    ) {
         let inkwell::types::BasicTypeEnum::StructType(agg_ty) = val.get_type() else {
             return;
         };
@@ -20560,7 +20599,8 @@ impl<'ctx> super::Codegen<'ctx> {
             .iter()
             .map(|e| self.infer_discard_elem_te(e))
             .collect();
-        let Some(bodies) = self.emit_discarded_tuple_elem_bodies_fn(agg_ty, &elem_tes, skip) else {
+        let Some(bodies) = self.emit_discarded_tuple_elem_bodies_fn_tree(agg_ty, &elem_tes, tree)
+        else {
             return;
         };
         let Some(cur_fn) = self
@@ -20648,18 +20688,25 @@ impl<'ctx> super::Codegen<'ctx> {
     /// nested tuples recurse. Frees NOTHING. `None` when no element carries
     /// user-Drop work. Memoized by the element-type signature, like its
     /// memory sibling `synthesize_tuple_drop_fn_te`.
-    fn emit_discarded_tuple_elem_bodies_fn(
+    ///
+    /// Driven by a whole [`FieldSkipTree`] level (B-2026-09-06-11): `here`
+    /// is the top-level skip, `nested[i]` the sub-mask for element `i` — a
+    /// nested tuple recurses into this emitter under it, a struct takes the
+    /// masked field walker. Folded into the symbol name so a deep-masked
+    /// walker never aliases a flat-masked one.
+    fn emit_discarded_tuple_elem_bodies_fn_tree(
         &mut self,
         agg_ty: inkwell::types::StructType<'ctx>,
         elem_tes: &[crate::ast::TypeExpr],
-        skip: &[usize],
+        tree: &super::synth_drop::FieldSkipTree,
     ) -> Option<inkwell::values::FunctionValue<'ctx>> {
         use crate::ast::TypeKind;
         enum ElemWork<'ctx2> {
-            Struct(String),
+            Struct(String, super::synth_drop::FieldSkipTree),
             UserEnum(String),
             Walker(inkwell::values::FunctionValue<'ctx2>),
         }
+        let skip: Vec<usize> = tree.here.iter().copied().collect();
         let mut work: Vec<(u32, ElemWork<'ctx>)> = Vec::new();
         for (i, te) in elem_tes.iter().enumerate() {
             // B-2026-08-28-2 — this element escapes through the callee's
@@ -20667,6 +20714,7 @@ impl<'ctx> super::Codegen<'ctx> {
             if skip.contains(&i) {
                 continue;
             }
+            let sub = tree.nested.get(&i).cloned().unwrap_or_default();
             let i = i as u32;
             match &te.kind {
                 TypeKind::Tuple(inner) => {
@@ -20676,7 +20724,8 @@ impl<'ctx> super::Codegen<'ctx> {
                     else {
                         continue;
                     };
-                    if let Some(f) = self.emit_discarded_tuple_elem_bodies_fn(inner_ty, inner, &[])
+                    if let Some(f) =
+                        self.emit_discarded_tuple_elem_bodies_fn_tree(inner_ty, inner, &sub)
                     {
                         work.push((i, ElemWork::Walker(f)));
                     }
@@ -20694,7 +20743,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         }
                     } else if self.type_decls.struct_types.contains_key(&name) {
                         if self.type_runs_user_drop(&name, &mut Vec::new()) {
-                            work.push((i, ElemWork::Struct(name)));
+                            work.push((i, ElemWork::Struct(name, sub)));
                         }
                     } else if self.type_decls.enum_layouts.contains_key(&name) {
                         let owns_body = self
@@ -20732,8 +20781,18 @@ impl<'ctx> super::Codegen<'ctx> {
                     .join("_")
             )
         };
+        // B-2026-09-06-11 — the deep masks, if any, in the name as well.
+        let nested_sig = if tree.nested.values().all(|s| s.is_empty()) {
+            String::new()
+        } else {
+            let t = super::synth_drop::FieldSkipTree {
+                nested: tree.nested.clone(),
+                ..Default::default()
+            };
+            format!("$t{}", t.mangle())
+        };
         let fn_name = format!(
-            "__karac_dropbodies_tuple_te_{}{skip_sig}",
+            "__karac_dropbodies_tuple_te_{}{skip_sig}{nested_sig}",
             Self::tuple_te_sig(elem_tes)
         );
         if let Some(f) = self.module.get_function(&fn_name) {
@@ -20755,7 +20814,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 .build_struct_gep(agg_ty, p, i, &format!("tupbody.e{i}"))
                 .unwrap();
             match w {
-                ElemWork::Struct(sname) => {
+                ElemWork::Struct(sname, sub) => {
                     let owns_body = self
                         .program_snapshot
                         .as_deref()
@@ -20765,9 +20824,13 @@ impl<'ctx> super::Codegen<'ctx> {
                             self.builder.build_call(f, &[elem_ptr.into()], "").unwrap();
                         }
                     }
-                    if let Some(f) = self
-                        .emit_user_drop_field_bodies_fn(&sname, &std::collections::HashMap::new())
-                    {
+                    // B-2026-09-06-11 — the field walker under this element's
+                    // sub-mask; an empty one is the unmasked walker exactly.
+                    if let Some(f) = self.emit_user_drop_field_bodies_fn_skipping(
+                        &sname,
+                        &std::collections::HashMap::new(),
+                        &sub,
+                    ) {
                         self.builder.build_call(f, &[elem_ptr.into()], "").unwrap();
                     }
                 }

@@ -1181,6 +1181,29 @@ impl<'a> super::Interpreter<'a> {
             .filter(|(n, _)| n == name)
             .map(|(_, i)| *i)
             .collect();
+        // B-2026-09-06-11 — parts moved out BELOW the top level (`t.0.0`,
+        // `t.0.r`, handed back through a callee): the path-keyed store, tuple
+        // hops spelled `#<i>`, applied to the VALUE the way the struct walk
+        // applies its nested paths, so the walk finds a unit where the leaf
+        // was and every sibling still dies here.
+        let nested: Vec<Vec<String>> = self
+            .moved_out_nested_field_bodies
+            .iter()
+            .filter(|(n, p)| n == name && p.first().is_some_and(|h| h.starts_with('#')))
+            .map(|(_, p)| p.clone())
+            .collect();
+        let elems: Vec<Value> = if nested.is_empty() {
+            elems
+        } else {
+            let mut tv = Value::Tuple(elems);
+            for path in &nested {
+                Self::remove_field_at_path(&mut tv, path);
+            }
+            match tv {
+                Value::Tuple(items) => items,
+                _ => Vec::new(),
+            }
+        };
         for (ei, e) in elems.into_iter().enumerate() {
             if moved.contains(&ei) {
                 continue;

@@ -2303,6 +2303,14 @@ pub(super) struct Codegen<'ctx> {
     /// element's own `impl Drop` body still runs (the enum object did not move,
     /// only its payload), so masking it through that map would lose it.
     pub(crate) tuple_moved_elem_payload_bodies: HashMap<String, std::collections::HashSet<u32>>,
+    /// B-2026-09-06-11 — per-binding element masks BELOW the top level of a
+    /// tuple binding, keyed by the index path of the node they apply to (the
+    /// tuple peer of `struct_moved_nested_field_bodies`): `[0] -> {0}` masks
+    /// `t.0.0`, `[0] -> {r's index}` masks `t.0.r`. Read by
+    /// `tuple_skip_tree_for_var`, which folds it with the two flat sets above
+    /// into the `FieldSkipTree` the tree-driven tuple walker consumes.
+    pub(crate) tuple_moved_nested_elem_bodies:
+        HashMap<String, std::collections::BTreeMap<Vec<usize>, std::collections::BTreeSet<usize>>>,
     /// The synthesized `void __karac_static_init()` function, declared
     /// in `declare_module_bindings` when `map_set_module_inits` is
     /// non-empty so `main`'s entry can emit a forward `call` to it, and
@@ -6638,6 +6646,7 @@ impl<'ctx> Codegen<'ctx> {
             user_ref_method_inner: std::collections::HashMap::new(),
             tuple_moved_elem_bodies: HashMap::new(),
             tuple_moved_elem_payload_bodies: HashMap::new(),
+            tuple_moved_nested_elem_bodies: HashMap::new(),
             mod_bindings: ModBindings {
                 consts: HashMap::new(),
                 module_bindings: HashMap::new(),

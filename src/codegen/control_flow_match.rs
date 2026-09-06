@@ -10040,15 +10040,18 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(slot) = self.variables.get(var_name).copied() else {
             return;
         };
-        let skip = self
-            .tuple_moved_elem_bodies
+        self.tuple_moved_elem_bodies
             .entry(var_name.to_string())
-            .or_default();
-        skip.insert(index);
-        let skip = skip.clone();
+            .or_default()
+            .insert(index);
+        // B-2026-09-06-11 — re-read EVERY mask from its map so this composes
+        // with the payload and nested kinds rather than replacing them: the
+        // discipline `field_skip_tree_for_var` enforces for a struct binding,
+        // now enforced for a tuple one by `tuple_skip_tree_for_var`.
+        let tree = self.tuple_skip_tree_for_var(var_name);
         self.suppress_container_elem_bodies_for_var(var_name);
         if let Some(bodies) =
-            self.emit_tuple_elem_user_drop_bodies_fn_skipping(tuple_ty, &elem_tes, &skip)
+            self.emit_tuple_elem_user_drop_bodies_fn_tree(tuple_ty, &elem_tes, &tree)
         {
             self.track_user_drop_var_with_fn(
                 "",
@@ -10058,6 +10061,76 @@ impl<'ctx> super::Codegen<'ctx> {
                 UserDropKind::ContainerElemBodies,
             );
         }
+    }
+
+    /// B-2026-09-06-11 — [`Self::disarm_tuple_elem_bodies_at`] for an element
+    /// BELOW the top level: `prefix` is the index path of the node the mask
+    /// applies to (`[0]` for `t.0.<idx>`), and `index` the element (or struct
+    /// field index) masked there. Written to the path-keyed
+    /// `tuple_moved_nested_elem_bodies` and re-registered through the same
+    /// tree the flat sibling now builds, so the two compose.
+    pub(super) fn disarm_tuple_elem_bodies_at_path(
+        &mut self,
+        var_name: &str,
+        prefix: &[usize],
+        index: usize,
+        tuple_ty: inkwell::types::StructType<'ctx>,
+    ) {
+        let Some(elem_tes) = self.var_types.tuple_var_elem_tes.get(var_name).cloned() else {
+            return;
+        };
+        let Some(slot) = self.variables.get(var_name).copied() else {
+            return;
+        };
+        self.tuple_moved_nested_elem_bodies
+            .entry(var_name.to_string())
+            .or_default()
+            .entry(prefix.to_vec())
+            .or_default()
+            .insert(index);
+        let tree = self.tuple_skip_tree_for_var(var_name);
+        self.suppress_container_elem_bodies_for_var(var_name);
+        if let Some(bodies) =
+            self.emit_tuple_elem_user_drop_bodies_fn_tree(tuple_ty, &elem_tes, &tree)
+        {
+            self.track_user_drop_var_with_fn(
+                "",
+                var_name,
+                slot.ptr,
+                bodies,
+                UserDropKind::ContainerElemBodies,
+            );
+        }
+    }
+
+    /// B-2026-09-06-11 — the COMPLETE skip tree for a tuple binding: the flat
+    /// element mask (`tuple_moved_elem_bodies`) as `here`, the payload mask
+    /// (`tuple_moved_elem_payload_bodies`) as `payload_here`, and the deep
+    /// masks (`tuple_moved_nested_elem_bodies`) one `nested` level per hop.
+    /// The tuple peer of `field_skip_tree_for_var`, for the same reason: every
+    /// site that rebuilds the binding's walker replaces it wholesale, so each
+    /// must assemble every kind or silently drop another's.
+    pub(super) fn tuple_skip_tree_for_var(
+        &self,
+        var_name: &str,
+    ) -> super::synth_drop::FieldSkipTree {
+        let mut tree = super::synth_drop::FieldSkipTree::default();
+        if let Some(s) = self.tuple_moved_elem_bodies.get(var_name) {
+            tree.here.extend(s.iter().map(|i| *i as usize));
+        }
+        if let Some(s) = self.tuple_moved_elem_payload_bodies.get(var_name) {
+            tree.payload_here.extend(s.iter().map(|i| *i as usize));
+        }
+        if let Some(m) = self.tuple_moved_nested_elem_bodies.get(var_name) {
+            for (path, inner) in m {
+                let mut cur = &mut tree;
+                for hop in path {
+                    cur = cur.nested.entry(*hop).or_default();
+                }
+                cur.here.extend(inner.iter().copied());
+            }
+        }
+        tree
     }
 
     /// B-2026-08-29-33 — the PAYLOAD-ONLY sibling of
@@ -10083,23 +10156,11 @@ impl<'ctx> super::Codegen<'ctx> {
             .entry(var_name.to_string())
             .or_default()
             .insert(index);
-        let skip = self
-            .tuple_moved_elem_bodies
-            .get(var_name)
-            .cloned()
-            .unwrap_or_default();
-        let payload_skip = self
-            .tuple_moved_elem_payload_bodies
-            .get(var_name)
-            .cloned()
-            .unwrap_or_default();
+        // B-2026-09-06-11 — every mask kind from its map (flat, payload,
+        // deep), through the one builder.
+        let tree = self.tuple_skip_tree_for_var(var_name);
         // In-place swap for the same reason as the struct sibling above.
-        match self.emit_tuple_elem_user_drop_bodies_fn_masked(
-            tuple_ty,
-            &elem_tes,
-            &skip,
-            &payload_skip,
-        ) {
+        match self.emit_tuple_elem_user_drop_bodies_fn_tree(tuple_ty, &elem_tes, &tree) {
             Some(bodies) => {
                 // No fallback registration — see the struct sibling above.
                 let _ = self.replace_user_drop_fn_for_var(
@@ -10168,6 +10229,16 @@ impl<'ctx> super::Codegen<'ctx> {
             let e = self
                 .type_decls
                 .struct_moved_nested_field_bodies
+                .entry(dst.to_string())
+                .or_default();
+            for (path, inner) in v {
+                e.entry(path).or_default().extend(inner);
+            }
+        }
+        // B-2026-09-06-11 — the deep tuple masks travel with the flat ones.
+        if let Some(v) = self.tuple_moved_nested_elem_bodies.get(src).cloned() {
+            let e = self
+                .tuple_moved_nested_elem_bodies
                 .entry(dst.to_string())
                 .or_default();
             for (path, inner) in v {

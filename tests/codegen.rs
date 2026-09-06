@@ -146033,6 +146033,63 @@ fn main() {
         };
         assert_eq!(out, "got1\ndR1\none\ngot2\ndR2\ntwo\ngot3\ndR3\nthree\ngot4\ndR4\nfour\ngot5\ndR5\nfive\nin\nmid\nout\ngot6\ndR6\nsix\nin\nmid\nout\ngot7\ndR7\nh1\nseven\ngot8\ndR8\neight\ngot9\ndR9\nnine\ndR10\ngot11\ndR11\nten\nend\n");
     }
+
+    /// B-2026-09-06-11 — a TUPLE argument whose callee hands back a part
+    /// BELOW its top-level elements (`fn tv_ret(t: ((R, i64), i64)) -> R {
+    /// let (inner, y) = t; let (r, x) = inner; return r; }`) runs that
+    /// part's `Drop` body ONCE, for a named local and a fresh tuple literal
+    /// alike. Every tuple-argument mask was a flat top-level element index
+    /// (`tuple_indices_of`, `disarm_tuple_elem_bodies_at`), so the deeper
+    /// path was dropped and the body fired at the argument's death beside
+    /// the result's owner — `dR1 got1 dR1` on all four surfaces. The
+    /// fresh-temp registrar now resolves the callee's whole paths into a
+    /// skip tree over the literal's element types and the discarded-tuple
+    /// emitter is tree-driven; the named local gets a path-keyed store
+    /// (`tuple_moved_nested_elem_bodies`) folded with the flat masks by
+    /// `tuple_skip_tree_for_var`.
+    ///
+    /// `one` the named two-level shape, `two` the one-level control, `three`
+    /// a struct under a tuple, `four`/`five` the fresh-temp spellings of one
+    /// and three, `six` the projection spelling, `seven` the local kept live
+    /// past the call, `eight` three levels, `nine`/`ten` a two-`R` inner
+    /// tuple handing back element 1 (the sibling's body stays the callee's),
+    /// `eleven`/`twelve` a SCALAR read handed back (`r.id`), which the part
+    /// channel reports too and which must NOT be masked out of the value.
+    #[test]
+    fn e2e_tuple_argument_handing_back_a_nested_part_runs_one_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct S { r: R, n: i64 }
+fn tv_ret(t: ((R, i64), i64)) -> R { let (inner, y) = t; let (r, x) = inner; return r; }
+fn tv_proj(t: ((R, i64), i64)) -> R { return t.0.0; }
+fn flat_t(t: (R, i64)) -> R { let (r, k) = t; return r; }
+fn ts_ret(t: (S, i64)) -> R { let (s, k) = t; return s.r; }
+fn t3_ret(t: (((R, i64), i64), i64)) -> R { let (mid, a) = t; let (inner, b) = mid; let (r, c) = inner; return r; }
+fn tb_ret1(t: ((R, R), i64)) -> R { let (inner, y) = t; let (a, b) = inner; return b; }
+fn tv_read(t: ((R, i64), i64)) -> i64 { let (inner, y) = t; let (r, x) = inner; return r.id; }
+fn main() {
+    { let t: ((R, i64), i64) = ((mk(1), 1), 2); let a: R = tv_ret(t); println(f"got{a.id}"); println("one") }
+    { let t: (R, i64) = (mk(2), 2); let a: R = flat_t(t); println(f"got{a.id}"); println("two") }
+    { let t: (S, i64) = (S { r: mk(3), n: 1 }, 2); let a: R = ts_ret(t); println(f"got{a.id}"); println("three") }
+    { let a: R = tv_ret(((mk(4), 1), 2)); println(f"got{a.id}"); println("four") }
+    { let a: R = ts_ret((S { r: mk(5), n: 1 }, 2)); println(f"got{a.id}"); println("five") }
+    { let t: ((R, i64), i64) = ((mk(6), 1), 2); let a: R = tv_proj(t); println(f"got{a.id}"); println("six") }
+    { let t: ((R, i64), i64) = ((mk(7), 1), 2); let a: R = tv_ret(t); println(f"got{a.id}"); println(f"k{t.1}"); println("seven") }
+    { let t: (((R, i64), i64), i64) = (((mk(8), 1), 2), 3); let a: R = t3_ret(t); println(f"got{a.id}"); println("eight") }
+    { let t: ((R, R), i64) = ((mk(9), mk(10)), 2); let a: R = tb_ret1(t); println(f"got{a.id}"); println("nine") }
+    { let a: R = tb_ret1(((mk(11), mk(12)), 2)); println(f"got{a.id}"); println("ten") }
+    { let d: i64 = tv_read(((mk(13), 1), 2)); println(f"r{d}"); println("eleven") }
+    { let t: ((R, i64), i64) = ((mk(14), 1), 2); let d: i64 = tv_read(t); println(f"r{d}"); println("twelve") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "got1\ndR1\none\ngot2\ndR2\ntwo\ngot3\ndR3\nthree\ngot4\ndR4\nfour\ngot5\ndR5\nfive\ngot6\ndR6\nsix\ngot7\ndR7\nk2\nseven\ngot8\ndR8\neight\ndR9\ngot10\ndR10\nnine\ndR11\ngot12\ndR12\nten\ndR13\nr13\neleven\ndR14\nr14\ntwelve\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]

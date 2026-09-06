@@ -3253,6 +3253,53 @@ impl<'a> super::Interpreter<'a> {
             .collect()
     }
 
+    /// B-2026-09-06-10 / -11 — a part path as the NAME path the value-side
+    /// masks speak: a field by name, a tuple hop as `#<i>`.
+    fn param_path_names(path: &[crate::ast::ParamPart]) -> Vec<String> {
+        path.iter()
+            .map(|p| match p {
+                crate::ast::ParamPart::Field(n) => n.clone(),
+                crate::ast::ParamPart::TupleIndex(i) => format!("#{i}"),
+            })
+            .collect()
+    }
+
+    /// Can a leaf VALUE own something a `Drop` body observes? A scalar, unit
+    /// or `shared` leaf cannot, so declining a mask for it loses no owner
+    /// while removing it could hand a parent's own body a hole to read.
+    fn value_leaf_can_own(leaf: &Value) -> bool {
+        !matches!(
+            leaf,
+            Value::Int(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::Char(_)
+                | Value::Unit
+                | Value::SharedStruct(_)
+        )
+    }
+
+    /// B-2026-09-06-11 — the escaping paths of parameter `i` that go BELOW
+    /// the top level, as name paths. `tuple_root` selects paths whose head is
+    /// a tuple index (a tuple-typed argument); otherwise field-headed ones.
+    fn deep_escaping_paths(
+        &self,
+        callee_name: &str,
+        method_owner: Option<&str>,
+        i: usize,
+        tuple_root: bool,
+    ) -> Vec<Vec<String>> {
+        self.callee_returned_param_parts(callee_name, method_owner, i)
+            .into_iter()
+            .filter(|path| {
+                path.len() >= 2
+                    && matches!(path.first(), Some(crate::ast::ParamPart::TupleIndex(_)))
+                        == tuple_root
+            })
+            .map(|path| Self::param_path_names(&path))
+            .collect()
+    }
+
     /// `value` with each escaping PATH removed, for handing to
     /// [`Self::drop_user_drop_fields_of_value`].
     ///
@@ -3524,6 +3571,22 @@ impl<'a> super::Interpreter<'a> {
                     for idx in self.callee_escaping_tuple_elems(callee_name, method_owner, i) {
                         self.moved_out_tuple_elem_bodies.insert((src.clone(), idx));
                     }
+                    // B-2026-09-06-11 — a part BELOW the top level (`t.0.0`,
+                    // `t.0.r`), which the flat set above cannot express: the
+                    // path-keyed `moved_out_nested_field_bodies`, tuple hops
+                    // spelled `#<i>`, which `run_array_element_user_drops`
+                    // now applies to a tuple binding's elements. Same leaf
+                    // gate as the struct arm below.
+                    for names in self.deep_escaping_paths(callee_name, method_owner, i, true) {
+                        let leaf_owns = arg_vals
+                            .get(i)
+                            .and_then(|v| Self::value_at_name_path(v, &names))
+                            .is_some_and(Self::value_leaf_can_own);
+                        if leaf_owns {
+                            self.moved_out_nested_field_bodies
+                                .insert((src.clone(), names));
+                        }
+                    }
                 }
                 // B-2026-09-05-6 — the STRUCT sibling of the tuple arm above,
                 // and missing since -16 landed that one: `cEsc(g)` over
@@ -3578,27 +3641,11 @@ impl<'a> super::Interpreter<'a> {
                         if !matches!(path.first(), Some(crate::ast::ParamPart::Field(_))) {
                             continue;
                         }
-                        let names: Vec<String> = path
-                            .iter()
-                            .map(|p| match p {
-                                crate::ast::ParamPart::Field(n) => n.clone(),
-                                crate::ast::ParamPart::TupleIndex(i) => format!("#{i}"),
-                            })
-                            .collect();
+                        let names = Self::param_path_names(&path);
                         let leaf_owns = arg_vals
                             .get(i)
                             .and_then(|v| Self::value_at_name_path(v, &names))
-                            .is_some_and(|leaf| {
-                                !matches!(
-                                    leaf,
-                                    Value::Int(_)
-                                        | Value::Float(_)
-                                        | Value::Bool(_)
-                                        | Value::Char(_)
-                                        | Value::Unit
-                                        | Value::SharedStruct(_)
-                                )
-                            });
+                            .is_some_and(Self::value_leaf_can_own);
                         if leaf_owns {
                             self.moved_out_nested_field_bodies
                                 .insert((src.clone(), names));
@@ -3652,11 +3699,32 @@ impl<'a> super::Interpreter<'a> {
                         // through a call that returns it) join the list.
                         let escaping =
                             self.callee_escaping_tuple_elems(callee_name, method_owner, i);
-                        for (idx, item) in items.iter().enumerate() {
+                        // B-2026-09-06-11 — and the parts BELOW the top level
+                        // (`p.0.0`, `p.0.r`), masked out of the VALUE before
+                        // the walk through the same `mask_struct_fields` the
+                        // struct arm uses, whose tuple arm speaks `#<i>`.
+                        // Under the same leaf gate as the named arm: the
+                        // channel also reports a SCALAR read handed back
+                        // (`(r, k) => r.id`), and masking that out of the
+                        // value would hand `R`'s own body a hole to read.
+                        let whole = Value::Tuple(items.clone());
+                        let deep: Vec<Vec<String>> = self
+                            .deep_escaping_paths(callee_name, method_owner, i, true)
+                            .into_iter()
+                            .filter(|names| {
+                                Self::value_at_name_path(&whole, names)
+                                    .is_some_and(Self::value_leaf_can_own)
+                            })
+                            .collect();
+                        let masked = Self::mask_struct_fields(&whole, &deep);
+                        let Value::Tuple(masked_items) = masked else {
+                            continue;
+                        };
+                        for (idx, item) in masked_items.into_iter().enumerate() {
                             if escaping.contains(&idx) {
                                 continue;
                             }
-                            self.run_discarded_value_user_drops(item.clone());
+                            self.run_discarded_value_user_drops(item);
                         }
                     }
                 }

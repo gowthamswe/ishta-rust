@@ -1643,6 +1643,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.var_types.array_var_elem_te.clear();
         self.tuple_moved_elem_bodies.clear();
         self.tuple_moved_elem_payload_bodies.clear();
+        self.tuple_moved_nested_elem_bodies.clear();
         self.type_decls.struct_moved_field_bodies.clear();
         self.type_decls.struct_moved_nested_field_bodies.clear();
         self.type_decls.struct_moved_field_payload_bodies.clear();

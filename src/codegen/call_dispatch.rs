@@ -20,6 +20,14 @@ use inkwell::values::{
 };
 use inkwell::{AddressSpace, IntPredicate};
 
+/// B-2026-09-06-11 — the type a part path is being resolved against at one
+/// level of `param_path_index_hops_from`.
+enum HopCur {
+    Struct(String),
+    Tuple(Vec<TypeExpr>),
+    Opaque,
+}
+
 use super::declarations::KARAC_PARK_ON_FD;
 use super::helpers::{expr_as_type_expr_codegen, match_with_provider_call, match_with_span_call};
 use super::state::{LayoutId, UserDropKind};
@@ -4891,15 +4899,22 @@ impl<'ctx> super::Codegen<'ctx> {
             return;
         };
         let src = src.clone();
-        let idxs: Vec<u32> = self
-            .callee_returned_param_parts(callee_name, arg_index)
+        let parts = self.callee_returned_param_parts(callee_name, arg_index);
+        let idxs: Vec<u32> = parts
             .iter()
             .filter_map(|path| match path.as_slice() {
                 [crate::ast::ParamPart::TupleIndex(idx)] => Some(*idx as u32),
                 _ => None,
             })
             .collect();
-        if idxs.is_empty() {
+        let deep: Vec<&crate::ast::ParamPath> = parts
+            .iter()
+            .filter(|path| {
+                path.len() >= 2
+                    && matches!(path.first(), Some(crate::ast::ParamPart::TupleIndex(_)))
+            })
+            .collect();
+        if idxs.is_empty() && deep.is_empty() {
             return;
         }
         let Some(tuple_ty) = self.place_chain_aggregate_llvm_type(arg) else {
@@ -4916,6 +4931,23 @@ impl<'ctx> super::Codegen<'ctx> {
                 continue;
             }
             self.disarm_tuple_elem_bodies_at(&src, idx, tuple_ty);
+        }
+        // B-2026-09-06-11 — a part BELOW the top level (`t.0.0`, `t.0.r`).
+        // Resolved to index hops through the recorded element types and
+        // written through the path-keyed sibling, under the same leaf gate
+        // as the flat arm and for its reason.
+        for path in deep {
+            let Some((hops, leaf_te)) = self.param_path_index_hops_from_tuple(&elem_tes, path)
+            else {
+                continue;
+            };
+            if !self.elem_te_runs_user_drop(&leaf_te) {
+                continue;
+            }
+            let Some((last, prefix)) = hops.split_last() else {
+                continue;
+            };
+            self.disarm_tuple_elem_bodies_at_path(&src, prefix, *last, tuple_ty);
         }
     }
 
@@ -5033,13 +5065,30 @@ impl<'ctx> super::Codegen<'ctx> {
         struct_name: &str,
         path: &[crate::ast::ParamPart],
     ) -> Option<(Vec<usize>, TypeExpr)> {
+        self.param_path_index_hops_from(HopCur::Struct(struct_name.to_string()), path)
+    }
+
+    /// B-2026-09-06-11 — [`Self::param_path_index_hops`] rooted at a TUPLE
+    /// whose element types are `elem_tes` (a tuple binding's recorded
+    /// `tuple_var_elem_tes`), for a path that starts with a `TupleIndex`.
+    pub(super) fn param_path_index_hops_from_tuple(
+        &self,
+        elem_tes: &[TypeExpr],
+        path: &[crate::ast::ParamPart],
+    ) -> Option<(Vec<usize>, TypeExpr)> {
+        self.param_path_index_hops_from(HopCur::Tuple(elem_tes.to_vec()), path)
+    }
+
+    fn param_path_index_hops_from(
+        &self,
+        mut cur: HopCur,
+        path: &[crate::ast::ParamPart],
+    ) -> Option<(Vec<usize>, TypeExpr)> {
         let mut hops = Vec::with_capacity(path.len());
-        let mut cur: Option<TypeExpr> = None;
-        let mut cur_struct: Option<String> = Some(struct_name.to_string());
+        let mut last: Option<TypeExpr> = None;
         for part in path {
-            match part {
-                crate::ast::ParamPart::Field(name) => {
-                    let sname = cur_struct.take()?;
+            match (part, std::mem::replace(&mut cur, HopCur::Opaque)) {
+                (crate::ast::ParamPart::Field(name), HopCur::Struct(sname)) => {
                     let idx = self
                         .type_decls
                         .struct_field_names
@@ -5053,63 +5102,48 @@ impl<'ctx> super::Codegen<'ctx> {
                         .get(idx)?
                         .clone();
                     hops.push(idx);
-                    cur_struct = Self::user_struct_name_of_te(self, &te);
-                    cur = Some(te);
+                    cur = self.hop_cur_of_te(&te);
+                    last = Some(te);
                 }
-                crate::ast::ParamPart::TupleIndex(i) => {
-                    let te = cur.take()?;
-                    let TypeKind::Tuple(elems) = &te.kind else {
-                        return None;
-                    };
+                (crate::ast::ParamPart::TupleIndex(i), HopCur::Tuple(elems)) => {
                     let ete = elems.get(*i)?.clone();
                     hops.push(*i);
-                    cur_struct = Self::user_struct_name_of_te(self, &ete);
-                    cur = Some(ete);
+                    cur = self.hop_cur_of_te(&ete);
+                    last = Some(ete);
                 }
+                _ => return None,
             }
         }
-        Some((hops, cur?))
+        Some((hops, last?))
     }
 
-    /// The non-shared user struct `te` names, if any — the type the next
-    /// `Field` hop of [`Self::param_path_index_hops`] resolves against.
-    fn user_struct_name_of_te(&self, te: &TypeExpr) -> Option<String> {
-        let TypeKind::Path(p) = &te.kind else {
-            return None;
-        };
-        let name = p.segments.first()?;
-        if self.type_decls.struct_types.contains_key(name)
-            && !self.type_decls.shared_types.contains_key(name)
-        {
-            Some(name.clone())
-        } else {
-            None
+    /// What the next hop of [`Self::param_path_index_hops_from`] resolves
+    /// against: a non-shared user struct by name, a tuple by its element
+    /// types, or nothing (a scalar, a `shared`, a generic parameter, a
+    /// container — none of which this channel descends into).
+    fn hop_cur_of_te(&self, te: &TypeExpr) -> HopCur {
+        match &te.kind {
+            TypeKind::Tuple(elems) => HopCur::Tuple(elems.clone()),
+            TypeKind::Path(p) => match p.segments.first() {
+                Some(name)
+                    if self.type_decls.struct_types.contains_key(name)
+                        && !self.type_decls.shared_types.contains_key(name) =>
+                {
+                    HopCur::Struct(name.clone())
+                }
+                _ => HopCur::Opaque,
+            },
+            _ => HopCur::Opaque,
         }
-    }
-
-    /// The tuple-INDEX half of a [`Self::callee_returned_param_parts`] answer,
-    /// in the shape `track_discarded_tuple_elem_bodies` takes its skip list.
-    /// Struct-field parts are not tuple elements; they are resolved by
-    /// [`Self::escaping_field_indices`] instead.
-    pub(super) fn tuple_indices_of(paths: &[crate::ast::ParamPath]) -> Vec<usize> {
-        paths
-            .iter()
-            .filter_map(|path| match path.as_slice() {
-                // TOP-LEVEL tuple elements only. A deeper path (`p.0.1`) names
-                // something inside an element, which this channel's skip list —
-                // a flat element index — cannot express; dropping it leaves that
-                // shape at its pre-existing behaviour, the safe direction.
-                [crate::ast::ParamPart::TupleIndex(i)] => Some(*i),
-                _ => None,
-            })
-            .collect()
     }
 
     /// The struct-FIELD half of a [`Self::callee_returned_param_parts`] answer:
     /// resolve each escaping PATH against the declared field order at every
     /// level, into the tree the bodies walker masks with (B-2026-08-28-17, made
-    /// nested by B-2026-08-28-23). Tuple-index parts are not struct fields; the
-    /// tuple channel resolves those through [`Self::tuple_indices_of`].
+    /// nested by B-2026-08-28-23). A path whose HEAD is a tuple index is the
+    /// tuple channel's business (`insert_tuple_skip_path` from a tuple root);
+    /// one that crosses a tuple BELOW a field is resolved here since
+    /// B-2026-09-06-5.
     ///
     /// A path is resolved level by level through the field's own declared type,
     /// and the WHOLE path is dropped the moment one level does not resolve —
@@ -5216,7 +5250,7 @@ impl<'ctx> super::Codegen<'ctx> {
     /// descends into the element — a nested tuple through this fn again, a
     /// struct through `insert_skip_path` — and the path is dropped whole the
     /// moment a level does not resolve.
-    fn insert_tuple_skip_path(
+    pub(super) fn insert_tuple_skip_path(
         &self,
         tree: &mut super::synth_drop::FieldSkipTree,
         elem_tes: &[TypeExpr],
@@ -5795,16 +5829,22 @@ impl<'ctx> super::Codegen<'ctx> {
                     // instead loses the bodies of the elements that really do
                     // die in the call, so the escaping ones are skipped
                     // individually. Interp twin: `run_fresh_temp_arg_drops`.
-                    let skip = Self::tuple_indices_of(escaping_paths);
+                    // B-2026-09-06-11 — the WHOLE paths, not their top-level
+                    // indices: `tv_ret(((mk(4), 1), 2))` hands back `p.0.0`,
+                    // which a flat index list could not express, so the leaf's
+                    // body ran here and again at the result's owner. The
+                    // registrar resolves each path into a skip TREE over the
+                    // literal's element types and the emitter masks at the
+                    // depth it names.
                     // B-2026-08-28-19 — the ARGUMENT temporary's own name, so
                     // `drain_statement_temp_user_drops` retires it at statement
                     // end the way the interpreter fires it at the call. The
                     // shared `__disc_tup_tmp` name also serves a `let` whose
                     // value outlives the statement, which must not.
-                    self.track_discarded_tuple_elem_bodies_named(
+                    self.track_discarded_tuple_elem_bodies_paths(
                         tuple_elems,
                         val,
-                        &skip,
+                        escaping_paths,
                         "__disc_tup_arg",
                     );
                 }

@@ -61981,3 +61981,46 @@ fn main() {
         "got1\ndR1\none\ngot2\ndR2\ntwo\ngot3\ndR3\nthree\ngot4\ndR4\nfour\ngot5\ndR5\nfive\nin\nmid\nout\ngot6\ndR6\nsix\nin\nmid\nout\ngot7\ndR7\nh1\nseven\ngot8\ndR8\neight\ngot9\ndR9\nnine\ndR10\ngot11\ndR11\nten\nend\n"
     );
 }
+
+/// B-2026-09-06-11 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_tuple_argument_handing_back_a_nested_part_runs_one_body`, same
+/// program and string, and a real pin: this backend doubled every deep cell
+/// too, named local and fresh temp alike, because every tuple-argument mask
+/// it had was a flat top-level element index. The named local's deeper
+/// path now goes to the path-keyed `moved_out_nested_field_bodies` and the
+/// tuple binding's walk applies it; the fresh temp masks it out of the
+/// value through `mask_struct_fields`. Both under the leaf gate
+/// (`value_leaf_can_own`) — cells `eleven`/`twelve` are that gate's shape.
+#[test]
+fn test_tuple_argument_handing_back_a_nested_part_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct S { r: R, n: i64 }
+fn tv_ret(t: ((R, i64), i64)) -> R { let (inner, y) = t; let (r, x) = inner; return r; }
+fn tv_proj(t: ((R, i64), i64)) -> R { return t.0.0; }
+fn flat_t(t: (R, i64)) -> R { let (r, k) = t; return r; }
+fn ts_ret(t: (S, i64)) -> R { let (s, k) = t; return s.r; }
+fn t3_ret(t: (((R, i64), i64), i64)) -> R { let (mid, a) = t; let (inner, b) = mid; let (r, c) = inner; return r; }
+fn tb_ret1(t: ((R, R), i64)) -> R { let (inner, y) = t; let (a, b) = inner; return b; }
+fn tv_read(t: ((R, i64), i64)) -> i64 { let (inner, y) = t; let (r, x) = inner; return r.id; }
+fn main() {
+    { let t: ((R, i64), i64) = ((mk(1), 1), 2); let a: R = tv_ret(t); println(f"got{a.id}"); println("one") }
+    { let t: (R, i64) = (mk(2), 2); let a: R = flat_t(t); println(f"got{a.id}"); println("two") }
+    { let t: (S, i64) = (S { r: mk(3), n: 1 }, 2); let a: R = ts_ret(t); println(f"got{a.id}"); println("three") }
+    { let a: R = tv_ret(((mk(4), 1), 2)); println(f"got{a.id}"); println("four") }
+    { let a: R = ts_ret((S { r: mk(5), n: 1 }, 2)); println(f"got{a.id}"); println("five") }
+    { let t: ((R, i64), i64) = ((mk(6), 1), 2); let a: R = tv_proj(t); println(f"got{a.id}"); println("six") }
+    { let t: ((R, i64), i64) = ((mk(7), 1), 2); let a: R = tv_ret(t); println(f"got{a.id}"); println(f"k{t.1}"); println("seven") }
+    { let t: (((R, i64), i64), i64) = (((mk(8), 1), 2), 3); let a: R = t3_ret(t); println(f"got{a.id}"); println("eight") }
+    { let t: ((R, R), i64) = ((mk(9), mk(10)), 2); let a: R = tb_ret1(t); println(f"got{a.id}"); println("nine") }
+    { let a: R = tb_ret1(((mk(11), mk(12)), 2)); println(f"got{a.id}"); println("ten") }
+    { let d: i64 = tv_read(((mk(13), 1), 2)); println(f"r{d}"); println("eleven") }
+    { let t: ((R, i64), i64) = ((mk(14), 1), 2); let d: i64 = tv_read(t); println(f"r{d}"); println("twelve") }
+    println("end")
+}
+"#),
+        "got1\ndR1\none\ngot2\ndR2\ntwo\ngot3\ndR3\nthree\ngot4\ndR4\nfour\ngot5\ndR5\nfive\ngot6\ndR6\nsix\ngot7\ndR7\nk2\nseven\ngot8\ndR8\neight\ndR9\ngot10\ndR10\nnine\ndR11\ngot12\ndR12\nten\ndR13\nr13\neleven\ndR14\nr14\ntwelve\nend\n"
+    );
+}
