@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 392 |
+| miscompile | 393 |
 | run-vs-build | 360 |
 | leak | 280 |
 | double-free | 197 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1536 |
-| interp | 394 |
+| codegen | 1537 |
+| interp | 395 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -160,11 +160,11 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-55 | 2026-09-06 | interp+codegen | low | A DEEP-CHAIN FIELD MOVE-OUT STILL LOSES THE MOVED HOP'S SIBLING ONE LEVEL DOWN, ON EVERY SURFACE -- `let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r;` prints `dR1 dR3` on `--interp` / jit / aot / `KARAC_AUTO_PAR=0` alike; `q`'s body (`dR2`) runs nowhere | — |
 | B-2026-09-06-56 | 2026-09-06 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-50 LEAKS ITS WHOLE BOXED STRUCT PAYLOAD -- 192 B in 3 blocks over three calls for `fn show(x: Result[P, i64])` matched `Ok(P { a, b, .. })`, because NEITHER frame owns the box: the caller-side arm is `Option`-only by construction and the callee's loop skips every non-`Option` enum | — |
-| B-2026-09-06-58 | 2026-09-06 | interp+codegen | medium | THE `String`-PARAMETER SIBLING OF B-2026-09-06-53 STILL LOSES THE RETURNED VALUE'S `Drop` BODY -- `fn mk2(i: i64, s: String) -> R { return R { id: i, name: s }; }` called as `let x = mk2(i, nm)` from a function holding `nm: String` prints `v=4` and never `dR4`, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; a `String` is not a scalar, so B-2026-09-06-53's test admits it, and it carries no user `Drop` body, so the view mark defers the `R`'s body to an owner that runs none | — |
 | B-2026-09-06-59 | 2026-09-06 | codegen | low | READING A DECLINED-COPY PARAM AFTER A WHOLE REBIND LEAVES ITS `String` UNOWNED -- `fn f(r: R) -> String { let m = r; return f"{r.name}"; }` over a struct with a `shared` field loses 3 B in 1 block at KARAC_OPT_LEVEL=0 (clean at -O2, correct output on every surface). INTRODUCED BY B-2026-09-06-52's fix, which correctly stopped the destination registering a second owner for buffers the caller still holds; on that fix's parent this same cell was a use-after-free of the `shared` handle's refcount block with no leak, so the trade is UAF -> 3-byte leak. The sibling that does NOT read the source after the rebind is fully clean on the fix and double-freed before it. The trigger is the read alone -- an i64 return, a non-heap field read and a named-binding argument all leak identically | — |
 | B-2026-09-06-60 | 2026-09-06 | codegen | high | A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `Map` FIELD DOUBLE-FREES WITH NO REBIND AT ALL -- `fn norebind(q: Q) -> i64 { return q.id; }` over `struct Q { id: i64, name: String, tbl: Map[i64, i64] }` aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (10 valgrind errors from 10 contexts) and SEGFAULTS at the default -O2 (9 errors from 9 contexts), while `--interp` prints `dQ43 nq=43 end` correctly. A `Map` field declines copy support but is NOT shared-owning, so the param is owned BY TRANSFER (B-2026-08-05-33) -- whose safety argument is a caller-side retraction held in lockstep. Passing the struct by value is the whole trigger; the same struct built and dropped in `main` is clean | — |
 | B-2026-09-06-61 | 2026-09-06 | codegen | high | RETURNING A WHOLE REBIND OF A DECLINED-COPY PARAM DOUBLE-FREES -- `fn rebret(r: R) -> R { let m = r; return m; }` over a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (3 valgrind errors from 3 contexts), and at the default -O2 survives as an invalid read of the freed 16-byte refcount block while printing the right answer; `--interp` is correct. The SAME function without the rebind (`return r;`) is clean on every surface, so one binding separates sound from unsound. B-2026-09-06-52's fix gives the frame-local answer (the destination takes the borrow-alias edge) and leaves the ESCAPING one unanswered: the caller then owns the returned value and its own argument temp | — |
 | B-2026-09-06-62 | 2026-09-06 | codegen | high | THE OWNED-`self` RECEIVER SPELLING OF B-2026-09-06-52 IS STILL RED -- `impl R { fn take(self) -> i64 { let m = self; return m.inner.v; } }` over a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (3 valgrind errors from 3 contexts) and survives at -O2 as an invalid read of the freed refcount block, while the byte-identical FREE FUNCTION `fn top(r: R) -> i64 { let m = r; return m.inner.v; }` is clean on all five surfaces after that fix. `fn_ctx.current_fn_param_names` is seeded from `func.params` only, so `self` is not a member and the caller-retains fact the prologue records is never consulted at the `let`. Not B-2026-09-06-45: the body count is correct here and the interpreter is right | — |
+| B-2026-09-06-63 | 2026-09-06 | interp+codegen | low | A CALLEE THAT WRAPS A `Drop`-BEARING ARGUMENT IN ANOTHER `Drop`-BEARING TYPE LOSES THE WRAPPER'S OWN BODY -- `fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }` called as `let h = wrap_bodied(r)` prints the `R`'s body once and the `H`'s never, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; the view mark that keeps the `R` correct is what suppresses the `H` | — |
 
 ### Relocated
 
@@ -2330,6 +2330,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-52 | codegen | high | A TOP-LEVEL WHOLE REBIND OF A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `shared` FIELD DOUBLE-FREES ON EVERY COMPILED SURFACE -- `fn topreb(r: R) -> i… | 0083494 |
 | B-2026-09-06-53 | interp+codegen | medium | A `Drop`-BEARING LOCAL BUILT FROM THE ENCLOSING FUNCTION'S PARAMETER RUNS NO `Drop` BODY AT ALL, ON EVERY SURFACE -- `fn a(i: i64) { let x = mkUses(i… | 35aff00 |
 | B-2026-09-06-57 | codegen | high | `main` IS RED: B-2026-09-06-45's OWN TWO REGRESSION TESTS FAIL ON A CLEAN CHECKOUT OF 6138e02 -- `asan_nested_self_rebind_keeps_one_owner` double-fre… | d3b39b8 |
+| B-2026-09-06-58 | interp+codegen | medium | THE `String`-PARAMETER SIBLING OF B-2026-09-06-53 STILL LOSES THE RETURNED VALUE'S `Drop` BODY -- `fn mk2(i: i64, s: String) -> R { return R { id: i,… | c88eb3f |
 
 </details>
 
