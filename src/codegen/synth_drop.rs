@@ -4192,7 +4192,32 @@ impl<'ctx> super::Codegen<'ctx> {
                     }
                 }
             }
-            if let Some(body_fn) = self.module.get_function(&format!("{field_type}.drop")) {
+            // B-2026-09-05-15 — resolve the field's OWN Drop body per-monomorph.
+            // A generic-instantiation field (`inner: Go[R]`, `Go[T]` with its own
+            // `impl[T] Drop`) has no name-keyed `Go.drop` symbol: a generic impl
+            // method is parked until instantiated and `drop` is the one method a
+            // program never calls directly, so `get_function("{field_type}.drop")`
+            // missed it and the field's own body was lost -- while the recursion
+            // below still reached THROUGH the field (the grandchild fired), a
+            // run-vs-build divergence. Resolve through the mono path with the
+            // field's nested subst (the same subst the recursion one level down
+            // uses). A non-generic field yields an empty subst and
+            // `user_drop_body_fn_mono` falls back to the bare `.drop`, byte-for-
+            // byte unchanged. `user_drop_body_fn_mono` may instantiate the method
+            // (its own builder save/restore), so re-anchor the insert block
+            // before the call.
+            let nsub = self.nested_struct_field_subst(
+                struct_name,
+                field_idx,
+                effective_subst,
+                &field_type,
+            );
+            let saved_own_bb = self.builder.get_insert_block();
+            let own_body_fn = self.user_drop_body_fn_mono(&field_type, &nsub);
+            if let Some(bb) = saved_own_bb {
+                self.builder.position_at_end(bb);
+            }
+            if let Some(body_fn) = own_body_fn {
                 self.builder
                     .build_call(body_fn, &[field_ptr.into()], "")
                     .unwrap();
@@ -4227,12 +4252,8 @@ impl<'ctx> super::Codegen<'ctx> {
             // Then the field's OWN Drop-bearing fields, one level deeper. The
             // recursion terminates because `user_drop_field_indices` is empty at
             // the leaves, and a struct cannot transitively contain itself.
-            let nsub = self.nested_struct_field_subst(
-                struct_name,
-                field_idx,
-                effective_subst,
-                &field_type,
-            );
+            // `nsub` is the field's nested subst, computed above beside the
+            // own-body resolution and reused here.
             // The recursive call saves and restores the builder's insert block,
             // so emission resumes in THIS fn's entry block.
             // B-2026-08-28-23 — the sub-mask for THIS field, if the callee

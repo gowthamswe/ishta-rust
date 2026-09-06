@@ -4208,6 +4208,84 @@ done
         );
     }
 
+    /// B-2026-09-05-15 — a nested generic-instantiation field WITH ITS OWN
+    /// `impl[T] Drop`, under a parent that also declares a `Drop`, runs that
+    /// field's own body on the compiled backends.
+    ///
+    /// The sibling above (B-2026-09-05-5) had NO-`Drop` intermediate structs, so
+    /// the only body at stake was the grandchild `R`'s, reached through the
+    /// field-bodies walk. Here the intermediate `Go[T]` declares its own
+    /// `impl[T] Drop`, and its body was resolved by the name-keyed
+    /// `get_function("Go.drop")` in `emit_user_drop_field_bodies_fn` — a symbol a
+    /// generic impl never has (parked until instantiated, and `drop` is never
+    /// called directly), so `dGo` was lost while the walk still reached THROUGH
+    /// the field to the grandchild `dR`. The fix resolves the field's own body
+    /// through `user_drop_body_fn_mono` with the field's nested subst.
+    ///
+    /// Four cells: a generic parent (`Gouter[T]`), a NON-generic parent holding
+    /// the same generic-instantiation field (`Nouter`, the sibling the row names
+    /// as sharing the defect), the fully non-generic control (`Pouter`/`Pn`,
+    /// correct before and after — it must not double-fire), and the bound-local
+    /// spelling. Order per cell is parent body, then field body, then grandchild.
+    #[test]
+    fn e2e_nested_generic_field_with_own_drop_runs_its_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+struct Go[T] { r: T, z: i64 }
+impl[T] Drop for Go[T] { fn drop(mut ref self) { println(f"dGo{self.z}") } }
+struct Gouter[T] { inner: Go[T], z: i64 }
+impl[T] Drop for Gouter[T] { fn drop(mut ref self) { println(f"dOut{self.z}") } }
+struct Nouter { inner: Go[R], z: i64 }
+impl Drop for Nouter { fn drop(mut ref self) { println(f"dN{self.z}") } }
+struct Pn { r: R, z: i64 }
+impl Drop for Pn { fn drop(mut ref self) { println(f"dPn{self.z}") } }
+struct Pouter { inner: Pn, z: i64 }
+impl Drop for Pouter { fn drop(mut ref self) { println(f"dPo{self.z}") } }
+fn oOwn[T](h: Gouter[T]) -> i64 { println("  in"); return h.z; }
+fn main() {
+    println("gen_parent");  let _ = oOwn(Gouter[R] { inner: Go[R] { r: mk(1), z: 51 }, z: 52 });
+    println("plain_parent"); let nb = Nouter { inner: Go[R] { r: mk(2), z: 55 }, z: 56 }; println(f"  b{nb.z}");
+    println("control");     let pc = Pouter { inner: Pn { r: mk(3), z: 61 }, z: 62 }; println(f"  c{pc.z}");
+    println("bound");       let gd = Gouter[R] { inner: Go[R] { r: mk(4), z: 71 }, z: 72 }; println(f"  d{gd.z}");
+    println("done");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"gen_parent
+  in
+dOut52
+dGo51
+dR1
+plain_parent
+  b56
+dN56
+dGo55
+dR2
+control
+  c62
+dPo62
+dPn61
+dR3
+bound
+  d72
+dOut72
+dGo71
+dR4
+done
+"#,
+            "a nested generic-instantiation field's OWN Drop body was lost under an \
+             own-Drop parent — B-2026-09-05-15. A cell missing its `dGo`/`dN`-level \
+             body is the pre-fix signature; a cell printing one TWICE means the \
+             mono own-body resolution now double-fires against the memory walk."
+        );
+    }
+
     /// B-2026-09-05-4 — a GENERIC struct with its OWN `impl[T] Drop` registered
     /// NOTHING as a temp-literal argument: not its body, not its Drop-bearing
     /// field's, and not the memory either.
