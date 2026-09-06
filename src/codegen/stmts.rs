@@ -15288,6 +15288,20 @@ impl<'ctx> super::Codegen<'ctx> {
                                         bodies,
                                         UserDropKind::ContainerElemBodies,
                                     );
+                                    // B-2026-09-06-7 — RECORD the element whose
+                                    // bodies this leaf took, exactly as the
+                                    // struct-typed leaf arm below does, so the
+                                    // caller's B-2026-09-02-43 disarm masks it out
+                                    // of the SOURCE's own walk. This arm never
+                                    // recorded it, so a struct source's
+                                    // `NestedTuple` walk still descended into the
+                                    // nested element and ran the inner struct's
+                                    // body at the struct's NLL death -- one
+                                    // statement after `let (inner, y) = h.pe;`,
+                                    // before any read of `inner`. A tuple LOCAL
+                                    // source never showed it because its walk does
+                                    // not descend into a nested tuple element.
+                                    took_bodies.insert(idx as u32);
                                 }
                                 self.zero_tuple_elem_cap_at(base_ptr, tuple_ty, idx as u32, &te);
                             }

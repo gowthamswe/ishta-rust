@@ -2055,6 +2055,92 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-7 — the MEMORY half of
+    /// `tests/codegen.rs`'s `e2e_two_step_nested_tuple_field_destructure_runs_one_body`:
+    /// the same program under ASAN + LSan, so a leaf that stops being a second
+    /// owner of the struct's walk cannot leave the element's `String` / `Vec`
+    /// buffers to nobody (valgrind was clean BEFORE the fix — the doubled body
+    /// read a live value both times — so this pins that the mask did not
+    /// convert a doubled body into a leaked element).
+    #[test]
+    fn asan_two_step_nested_tuple_field_destructure_leaf_is_sole_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] } }\n\
+             fn consume(x: R) -> i64 { return x.id }\n\
+             struct H1 { pe: (R, i64) }\n\
+             struct H2 { pe: ((R, i64), i64) }\n\
+             struct H3 { pe: (((R, i64), i64), i64) }\n\
+             fn mkpair() -> (R, i64) { return (mk(11), 1) }\n\
+             \n\
+             fn local3() { let h: H2 = H2 { pe: ((mk(9), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f\"  l3 {m.id}\") }\n\
+             fn norebind() { let h: H2 = H2 { pe: ((mk(7), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; println(f\"  nr {r.id}\") }\n\
+             fn viacall() { let h: H2 = H2 { pe: ((mk(4), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; let d = consume(r); println(f\"  vc {d}\") }\n\
+             fn three() { let h: H3 = H3 { pe: (((mk(3), 1), 2), 3) }; let (mid, z) = h.pe; let (inner, y) = mid; let (r, x) = inner; let m: R = r; println(f\"  t3 {m.id}\") }\n\
+             fn leftin() { let h: H2 = H2 { pe: ((mk(2), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; println(f\"  li {x}\") }\n\
+             fn nestedblock() { let h: H2 = H2 { pe: ((mk(13), 1), 2) }; let (inner, y) = h.pe; { let (r, x) = inner; let m: R = r; println(f\"  nb {m.id}\") } println(\"  after\") }\n\
+             fn flat() { let h: H1 = H1 { pe: (mk(8), 1) }; let (r, k) = h.pe; let m: R = r; println(f\"  fl {m.id}\") }\n\
+             fn plainlocal() { let t: ((R, i64), i64) = ((mk(6), 1), 2); let (inner, y) = t; let (r, x) = inner; let m: R = r; println(f\"  pl {m.id}\") }\n\
+             fn fromcall() { let inner = mkpair(); let (r, x) = inner; let m: R = r; println(f\"  fc {m.id}\") }\n\
+             fn wholecopy() { let h: H2 = H2 { pe: ((mk(12), 1), 2) }; let t = h.pe; let (inner, y) = t; let (r, x) = inner; let m: R = r; println(f\"  wc {m.id}\") }\n\
+             fn param3(h: H2) { let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f\"  p3 {m.id}\") }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"local3\"); local3();\n\
+             \x20   println(\"norebind\"); norebind();\n\
+             \x20   println(\"viacall\"); viacall();\n\
+             \x20   println(\"three\"); three();\n\
+             \x20   println(\"leftin\"); leftin();\n\
+             \x20   println(\"nestedblock\"); nestedblock();\n\
+             \x20   println(\"flat\"); flat();\n\
+             \x20   println(\"plainlocal\"); plainlocal();\n\
+             \x20   println(\"fromcall\"); fromcall();\n\
+             \x20   println(\"wholecopy\"); wholecopy();\n\
+             \x20   println(\"param3\"); param3(H2 { pe: ((mk(5), 1), 2) });\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "local3",
+                "  l3 9",
+                "  dR9",
+                "norebind",
+                "  nr 7",
+                "  dR7",
+                "viacall",
+                "  dR4",
+                "  vc 4",
+                "three",
+                "  t3 3",
+                "  dR3",
+                "leftin",
+                "  dR2",
+                "  li 1",
+                "nestedblock",
+                "  nb 13",
+                "  dR13",
+                "  after",
+                "flat",
+                "  fl 8",
+                "  dR8",
+                "plainlocal",
+                "  pl 6",
+                "  dR6",
+                "fromcall",
+                "  fc 11",
+                "  dR11",
+                "wholecopy",
+                "  wc 12",
+                "  dR12",
+                "param3",
+                "  p3 5",
+                "  dR5",
+                "end",
+            ],
+            "b7-two-step-nested-tuple-field-destructure",
+        );
+    }
+
     /// B-2026-09-02-27 — MOVING A HEAP FIELD OUT OF A BARE-TUPLE ELEMENT
     /// BINDING MUST DISARM THAT FIELD IN THE TUPLE, NOT IN THE COPY.
     ///

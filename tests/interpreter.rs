@@ -58346,6 +58346,104 @@ fn nll_drop_point_at_a_call_that_last_uses_the_binding() {
     );
 }
 
+/// B-2026-09-06-7 — the two-step destructure of a nested tuple field off a
+/// LOCAL: `let h = H2 { pe: ((mk(9), 1), 2) }; let (inner, y) = h.pe; let (r, x) =
+/// inner; let m: R = r;` ran `dR9` TWICE on every compiled backend, one of them
+/// BEFORE the live read (`dR9 l3 9 dR9` against the interpreter's `l3 9 dR9`).
+/// The early body was the struct's OWN walk, not the leaf's: the tuple-typed leaf
+/// arm of `place_source_tuple_leaf_cleanups` handed `inner` the element bodies but
+/// never recorded the element in `took_bodies`, so the B-2026-09-02-43 disarm
+/// left `h`'s `NestedTuple` walk descending into `pe.0` and running the inner
+/// struct's body at `h`'s NLL death, one statement later. The FIRST destructure
+/// alone already doubled (`let (inner, y) = h.pe; println(inner.0.id)`); the
+/// second step over the leaf (`let (r, x) = inner`) needs nothing of its own —
+/// it moves `inner` whole, and the move-out suppression retires its walk before
+/// the leaves take over (a disarm added there was measured inert by ablation).
+///
+/// THE CONTROLS: `flat` (the struct-typed leaf arm, which did record its index),
+/// `plainlocal` / `fromcall` / `wholecopy` (a tuple LOCAL source, whose walk does
+/// not descend into a nested element) and `param3` (the owned-param source,
+/// B-2026-09-02-41) were one body each before and must stay so.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_two_step_nested_tuple_field_destructure_runs_one_body`, pinned to the same string.
+#[test]
+fn test_two_step_nested_tuple_field_destructure_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+struct H1 { pe: (R, i64) }
+struct H2 { pe: ((R, i64), i64) }
+struct H3 { pe: (((R, i64), i64), i64) }
+fn mkpair() -> (R, i64) { return (mk(11), 1) }
+
+fn local3() { let h: H2 = H2 { pe: ((mk(9), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f"  l3 {m.id}") }
+fn norebind() { let h: H2 = H2 { pe: ((mk(7), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; println(f"  nr {r.id}") }
+fn viacall() { let h: H2 = H2 { pe: ((mk(4), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; let d = consume(r); println(f"  vc {d}") }
+fn three() { let h: H3 = H3 { pe: (((mk(3), 1), 2), 3) }; let (mid, z) = h.pe; let (inner, y) = mid; let (r, x) = inner; let m: R = r; println(f"  t3 {m.id}") }
+fn leftin() { let h: H2 = H2 { pe: ((mk(2), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; println(f"  li {x}") }
+fn nestedblock() { let h: H2 = H2 { pe: ((mk(13), 1), 2) }; let (inner, y) = h.pe; { let (r, x) = inner; let m: R = r; println(f"  nb {m.id}") } println("  after") }
+fn flat() { let h: H1 = H1 { pe: (mk(8), 1) }; let (r, k) = h.pe; let m: R = r; println(f"  fl {m.id}") }
+fn plainlocal() { let t: ((R, i64), i64) = ((mk(6), 1), 2); let (inner, y) = t; let (r, x) = inner; let m: R = r; println(f"  pl {m.id}") }
+fn fromcall() { let inner = mkpair(); let (r, x) = inner; let m: R = r; println(f"  fc {m.id}") }
+fn wholecopy() { let h: H2 = H2 { pe: ((mk(12), 1), 2) }; let t = h.pe; let (inner, y) = t; let (r, x) = inner; let m: R = r; println(f"  wc {m.id}") }
+fn param3(h: H2) { let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f"  p3 {m.id}") }
+
+fn main() {
+    println("local3"); local3();
+    println("norebind"); norebind();
+    println("viacall"); viacall();
+    println("three"); three();
+    println("leftin"); leftin();
+    println("nestedblock"); nestedblock();
+    println("flat"); flat();
+    println("plainlocal"); plainlocal();
+    println("fromcall"); fromcall();
+    println("wholecopy"); wholecopy();
+    println("param3"); param3(H2 { pe: ((mk(5), 1), 2) });
+    println("end");
+}
+"#),
+        r#"local3
+  l3 9
+  dR9
+norebind
+  nr 7
+  dR7
+viacall
+  dR4
+  vc 4
+three
+  t3 3
+  dR3
+leftin
+  dR2
+  li 1
+nestedblock
+  nb 13
+  dR13
+  after
+flat
+  fl 8
+  dR8
+plainlocal
+  pl 6
+  dR6
+fromcall
+  fc 11
+  dR11
+wholecopy
+  wc 12
+  dR12
+param3
+  p3 5
+  dR5
+end
+"#
+    );
+}
+
 /// B-2026-09-05-34 — AN `if let (r, k) = t` OVER AN OWNED TUPLE PARAM RAN THE
 /// ELEMENT'S `Drop` BODY ON THE WRONG OWNER (AND FREED ITS HEAP TWICE).
 ///
