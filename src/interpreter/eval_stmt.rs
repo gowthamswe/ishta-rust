@@ -218,6 +218,8 @@ impl<'a> super::Interpreter<'a> {
             if let StmtKind::Expr(e) = &stmt.kind {
                 if let ExprKind::Return(Some(inner)) = &e.kind {
                     self.record_conditional_move_tail(inner, &cleanup);
+                    // B-2026-09-06-19 — see `record_returned_projection_moves`.
+                    self.record_returned_projection_moves(inner);
                 }
             }
             self.suppress_return_stmt_user_drop(stmt, &mut cleanup);
@@ -441,8 +443,13 @@ impl<'a> super::Interpreter<'a> {
             if let ExprKind::Return(Some(inner)) = &expr.kind {
                 self.note_escaping_site(inner);
                 self.record_conditional_move_tail(inner, &cleanup);
+                // B-2026-09-06-19 — see `record_returned_projection_moves`.
+                self.record_returned_projection_moves(inner);
             }
             self.record_conditional_move_tail(expr, &cleanup);
+            if is_fn_body {
+                self.record_returned_projection_moves(expr);
+            }
             // B-2026-08-29-57 — the two move-records below must see THROUGH a
             // tail `return`, exactly as the statement loop's
             // `suppress_return_stmt_user_drop` and its container twin already
@@ -2821,6 +2828,69 @@ impl<'a> super::Interpreter<'a> {
     /// root that is not a plain identifier, so an element or a call result --
     /// neither of which has an owner this could hand back to -- keeps today's
     /// behaviour.
+    /// B-2026-09-06-19 (local-projection leg) — the interpreter twin of
+    /// codegen's `disarm_returned_projection_field_bodies`: a Drop field
+    /// projected out of a local into the returned value (bare `return p.r`,
+    /// or `p.r` inside a returned struct / tuple / `Option` / `Result`
+    /// literal, or the same as the tail) is a move out of that local, masked
+    /// exactly as `let q = p.r` masks it — one hop in
+    /// `moved_out_struct_field_bodies`, deeper in `moved_out_nested_field_bodies`.
+    pub(crate) fn record_returned_projection_moves(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::FieldAccess { .. } => {
+                let Some((root, path)) = Self::field_chain_name_path(e) else {
+                    return;
+                };
+                // A LOCAL's field only: a param view's projection belongs to
+                // the caller (`owned_param_names_stack`), and only a leaf that
+                // runs a user `Drop` has a body to retract — masking a scalar
+                // leaf (`return h.f.id`) removed it from the walk's copy and
+                // the body then read a missing field.
+                if self
+                    .owned_param_names_stack
+                    .last()
+                    .is_some_and(|p| p.contains(root.as_str()))
+                    || self
+                        .whole_param_alias_stack
+                        .last()
+                        .is_some_and(|a| a.contains(root.as_str()))
+                {
+                    return;
+                }
+                let Some(rv) = self.env.get(&root) else {
+                    return;
+                };
+                let Some(leaf) = Self::value_at_name_path(&rv, &path) else {
+                    return;
+                };
+                if !self.value_runs_user_drop(leaf) {
+                    return;
+                }
+                if path.len() == 1 {
+                    self.moved_out_struct_field_bodies
+                        .insert((root, path[0].clone()));
+                } else {
+                    self.moved_out_nested_field_bodies.insert((root, path));
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } => {
+                for f in fields {
+                    self.record_returned_projection_moves(&f.value);
+                }
+            }
+            ExprKind::Tuple(elems) => {
+                for el in elems {
+                    self.record_returned_projection_moves(el);
+                }
+            }
+            _ => {
+                if let Some(payload) = crate::ast::option_result_ctor_payload(e) {
+                    self.record_returned_projection_moves(payload);
+                }
+            }
+        }
+    }
+
     fn field_chain_name_path(value: &Expr) -> Option<(String, Vec<String>)> {
         let ExprKind::FieldAccess { object, field } = &value.kind else {
             return None;

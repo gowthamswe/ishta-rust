@@ -8503,6 +8503,8 @@ impl<'ctx> super::Codegen<'ctx> {
                     self.suppress_user_drop_for_var(&n);
                 }
             }
+            // B-2026-09-06-19 — see `disarm_returned_projection_field_bodies`.
+            self.disarm_returned_projection_field_bodies(expr);
             // Sub-slice (3) of move-suppression — when the tail
             // expression is an Identifier whose binding has a user
             // `impl Drop`, the source binding's value is moved out as

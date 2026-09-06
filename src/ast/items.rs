@@ -1368,6 +1368,14 @@ pub fn fn_returns_param(f: &Function, arg_index: usize) -> bool {
     let PatternKind::Binding(param_name) = &param.pattern.kind else {
         return false;
     };
+    // B-2026-09-06-19 — the union sees a param handed back THROUGH a wrapping
+    // local (`let p = P2 { r: r, .. }; return Box2 { r: p.r }`) exactly as it
+    // sees the direct `return Box2 { r: r }`: the interpreter's method frame
+    // reads this to decide which by-value params it owns at exit, and a
+    // wrapped-then-returned `r` it owned there ran its body beside the
+    // caller's result binding (`d72 C72 d72` under `--interp` alone).
+    let wraps = param_wrap_aliases(None, f, param_name);
+    let wraps: &[(String, ParamPath)] = &wraps;
     /// A return site "yields" the param when it IS the bare identifier, or
     /// (B-2026-08-02-23 leg 2) when it is an AGGREGATE LITERAL that moves the
     /// param into itself — `Holder { xs: v, tag: 9 }`, `(v, 9)`, or either
@@ -1376,32 +1384,40 @@ pub fn fn_returns_param(f: &Function, arg_index: usize) -> bool {
     /// consumer of the RESULT is the owner either way; recognizing only the
     /// bare form left the caller dropping an arg it had just been handed back
     /// inside a struct, firing the Drop body twice.
-    fn expr_is_ident(e: &Expr, name: &str) -> bool {
+    fn expr_is_ident(e: &Expr, name: &str, wraps: &[(String, ParamPath)]) -> bool {
         match &e.kind {
-            ExprKind::Identifier(n) => n == name,
-            ExprKind::StructLiteral { fields, .. } => {
-                fields.iter().any(|f| expr_is_ident(&f.value, name))
+            ExprKind::Identifier(n) => n == name || place_yields_wrapped_param(e, wraps),
+            // B-2026-09-06-19 — a projection back out of a wrapping local.
+            ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. } => {
+                place_yields_wrapped_param(e, wraps)
             }
-            ExprKind::Tuple(elems) => elems.iter().any(|el| expr_is_ident(el, name)),
+            ExprKind::StructLiteral { fields, .. } => {
+                fields.iter().any(|f| expr_is_ident(&f.value, name, wraps))
+            }
+            ExprKind::Tuple(elems) => elems.iter().any(|el| expr_is_ident(el, name, wraps)),
             _ => false,
         }
     }
-    fn walk_expr(e: &Expr, name: &str) -> bool {
+    fn walk_expr(e: &Expr, name: &str, wraps: &[(String, ParamPath)]) -> bool {
         match &e.kind {
-            ExprKind::Return(Some(inner)) => expr_is_ident(inner, name) || walk_expr(inner, name),
+            ExprKind::Return(Some(inner)) => {
+                expr_is_ident(inner, name, wraps) || walk_expr(inner, name, wraps)
+            }
             ExprKind::Block(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Try(b)
             | ExprKind::Seq(b)
-            | ExprKind::Par(b) => walk_block(b, name),
+            | ExprKind::Par(b) => walk_block(b, name, wraps),
             ExprKind::If {
                 condition,
                 then_block,
                 else_branch,
             } => {
-                walk_expr(condition, name)
-                    || walk_block(then_block, name)
-                    || else_branch.as_deref().is_some_and(|x| walk_expr(x, name))
+                walk_expr(condition, name, wraps)
+                    || walk_block(then_block, name, wraps)
+                    || else_branch
+                        .as_deref()
+                        .is_some_and(|x| walk_expr(x, name, wraps))
             }
             ExprKind::IfLet {
                 value,
@@ -1409,37 +1425,39 @@ pub fn fn_returns_param(f: &Function, arg_index: usize) -> bool {
                 else_branch,
                 ..
             } => {
-                walk_expr(value, name)
-                    || walk_block(then_block, name)
-                    || else_branch.as_deref().is_some_and(|x| walk_expr(x, name))
+                walk_expr(value, name, wraps)
+                    || walk_block(then_block, name, wraps)
+                    || else_branch
+                        .as_deref()
+                        .is_some_and(|x| walk_expr(x, name, wraps))
             }
             ExprKind::Match { scrutinee, arms } => {
-                walk_expr(scrutinee, name)
+                walk_expr(scrutinee, name, wraps)
                     || arms.iter().any(|a| {
                         // An arm TAIL that is the bare param is a return site
                         // when the match is itself a tail — conservative: any
                         // bare-param arm tail counts.
-                        expr_is_ident(&a.body, name) || walk_expr(&a.body, name)
+                        expr_is_ident(&a.body, name, wraps) || walk_expr(&a.body, name, wraps)
                     })
             }
             ExprKind::While { body, .. }
             | ExprKind::WhileLet { body, .. }
             | ExprKind::For { body, .. }
             | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => walk_block(body, name),
+            | ExprKind::LabeledBlock { body, .. } => walk_block(body, name, wraps),
             _ => false,
         }
     }
-    fn walk_block(b: &Block, name: &str) -> bool {
+    fn walk_block(b: &Block, name: &str, wraps: &[(String, ParamPath)]) -> bool {
         b.stmts.iter().any(|st| match &st.kind {
-            StmtKind::Expr(e) => walk_expr(e, name),
+            StmtKind::Expr(e) => walk_expr(e, name, wraps),
             _ => false,
         }) || b
             .final_expr
             .as_deref()
-            .is_some_and(|fe| expr_is_ident(fe, name) || walk_expr(fe, name))
+            .is_some_and(|fe| expr_is_ident(fe, name, wraps) || walk_expr(fe, name, wraps))
     }
-    walk_block(&f.body, param_name)
+    walk_block(&f.body, param_name, wraps)
 }
 
 /// B-2026-09-04-30 — for an OWNED-`self` method: can its RETURN VALUE carry any
@@ -1621,6 +1639,16 @@ type CallRebind = (String, String, Vec<(usize, String)>);
 /// times each name is bound anywhere the walk reaches.
 struct RebindWalk {
     rebinds: Vec<(String, String)>,
+    /// B-2026-09-06-19 — `let x = S { f: y, .. }` / `let x = (y, ..)`: `x` WRAPS
+    /// `y` at `path`. A wrap is not a rebind (the types differ), but it is the
+    /// other way a by-value param travels through a local on its way out:
+    /// `let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }` hands `r` back
+    /// exactly as `let p = r; return p` does.
+    wraps: Vec<(String, String, ParamPath)>,
+    /// `let x = y.f.g` / `let x = y.0`: `x` REBINDS the part of `y` at `path`.
+    /// Read back against a wrap: `let q = p.r` after `let p = P2 { r: r, .. }`
+    /// makes `q` the param itself again (an empty remaining path).
+    proj_rebinds: Vec<(String, String, ParamPath)>,
     /// B-2026-09-06-9 — `(target, callee key, [(arg index, bare-identifier
     /// arg)])` of every `let x = g(..)` candidate; only the program-aware
     /// [`fn_whole_param_aliases`] reads these, the predicates never do.
@@ -1631,6 +1659,36 @@ impl RebindWalk {
     fn bind(&mut self, pat: &Pattern) {
         for n in pat.binding_names() {
             *self.bound.entry(n).or_insert(0) += 1;
+        }
+    }
+    /// Every bare identifier `y` inside the aggregate literal `e`, with the
+    /// field / tuple-index path that reaches it, recorded as `(x, y, path)`.
+    /// Only struct and tuple literals nest; anything else ends the walk.
+    fn collect_wrap_sources(
+        e: &Expr,
+        path: &mut ParamPath,
+        x: &str,
+        out: &mut Vec<(String, String, ParamPath)>,
+    ) {
+        match &e.kind {
+            ExprKind::StructLiteral { fields, .. } => {
+                for f in fields {
+                    path.push(ParamPart::Field(f.name.clone()));
+                    Self::collect_wrap_sources(&f.value, path, x, out);
+                    path.pop();
+                }
+            }
+            ExprKind::Tuple(elems) => {
+                for (i, el) in elems.iter().enumerate() {
+                    path.push(ParamPart::TupleIndex(i));
+                    Self::collect_wrap_sources(el, path, x, out);
+                    path.pop();
+                }
+            }
+            ExprKind::Identifier(y) if !path.is_empty() => {
+                out.push((x.to_string(), y.clone(), path.clone()));
+            }
+            _ => {}
         }
     }
     fn block(&mut self, b: &Block) {
@@ -1647,6 +1705,17 @@ impl RebindWalk {
                         (*is_mut, &pattern.kind, &value.kind)
                     {
                         self.rebinds.push((x.clone(), y.clone()));
+                    }
+                    if let (false, PatternKind::Binding(x)) = (*is_mut, &pattern.kind) {
+                        let mut path: ParamPath = Vec::new();
+                        Self::collect_wrap_sources(value, &mut path, x, &mut self.wraps);
+                    }
+                    if let (false, PatternKind::Binding(x)) = (*is_mut, &pattern.kind) {
+                        if let Some((root, chain)) = place_chain_root_and_path(value) {
+                            if !chain.is_empty() {
+                                self.proj_rebinds.push((x.clone(), root, chain));
+                            }
+                        }
                     }
                     if let (false, PatternKind::Binding(x), ExprKind::Call { callee, args }) =
                         (*is_mut, &pattern.kind, &value.kind)
@@ -1772,6 +1841,8 @@ impl RebindWalk {
 fn rebind_walk(f: &Function) -> RebindWalk {
     let mut w = RebindWalk {
         rebinds: Vec::new(),
+        wraps: Vec::new(),
+        proj_rebinds: Vec::new(),
         call_rebinds: Vec::new(),
         bound: std::collections::HashMap::new(),
     };
@@ -1938,6 +2009,104 @@ pub fn param_whole_aliases(
 
 /// Close `seed` (already alias-closed individually) over the plain rebinds once
 /// more, so a `let v = w;` after a call-rebind of `w` is picked up.
+/// B-2026-09-06-19 — the locals that WRAP `param_name` (or one of its whole
+/// aliases) inside an aggregate literal, each with the path at which the param
+/// sits: `let p = P2 { r: r, n: 1 }` gives `(p, [Field(r)])`, a nested literal
+/// a longer path, and a whole rebind of a wrapper (`let q = p`) or a wrap of a
+/// wrapper (`let w = W { p: p }`) composes. Only once-bound, non-`mut` locals,
+/// exactly as [`param_whole_aliases`] requires. Consumed by the hand-back
+/// predicates so `return p`, `return p.r` and `return Box2 { r: p.r }` count
+/// as yielding the param — the caller-side stand-down and the per-path
+/// clearing at the return then follow the same path.
+pub fn param_wrap_aliases(
+    program: Option<&crate::Program>,
+    f: &Function,
+    param_name: &str,
+) -> Vec<(String, ParamPath)> {
+    let w = rebind_walk(f);
+    let whole = param_whole_aliases(program, f, param_name);
+    let mut out: Vec<(String, ParamPath)> = Vec::new();
+    loop {
+        let before = out.len();
+        for (x, y, path) in &w.wraps {
+            if w.bound.get(x.as_str()) != Some(&1) || out.iter().any(|(a, _)| a == x) {
+                continue;
+            }
+            if whole.iter().any(|a| a == y) {
+                out.push((x.clone(), path.clone()));
+            } else if let Some((_, inner)) = out.iter().find(|(a, _)| a == y) {
+                let mut full = path.clone();
+                full.extend(inner.iter().cloned());
+                out.push((x.clone(), full));
+            }
+        }
+        for (x, y) in &w.rebinds {
+            if w.bound.get(x.as_str()) != Some(&1) || out.iter().any(|(a, _)| a == x) {
+                continue;
+            }
+            if let Some((_, inner)) = out.iter().find(|(a, _)| a == y) {
+                out.push((x.clone(), inner.clone()));
+            }
+        }
+        // `let q = p.r`: a projection rebind that reaches the wrap path (or a
+        // prefix of it) is the param, or a shallower wrapper of it, under a
+        // new name. One that goes PAST the path is a part of the param and is
+        // not followed.
+        for (x, root, chain) in &w.proj_rebinds {
+            if w.bound.get(x.as_str()) != Some(&1) || out.iter().any(|(a, _)| a == x) {
+                continue;
+            }
+            if let Some((_, wpath)) = out.iter().find(|(a, _)| a == root) {
+                if chain.len() <= wpath.len() && wpath.starts_with(chain) {
+                    out.push((x.clone(), wpath[chain.len()..].to_vec()));
+                }
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
+/// `y.f.0.g` → `(y, [Field(f), TupleIndex(0), Field(g)])`; a bare `y` gives
+/// an empty path. `None` for anything that is not a field / tuple-index chain
+/// over an identifier.
+fn place_chain_root_and_path(e: &Expr) -> Option<(String, ParamPath)> {
+    let mut chain: ParamPath = Vec::new();
+    let mut cur = e;
+    loop {
+        match &cur.kind {
+            ExprKind::FieldAccess { object, field } => {
+                chain.push(ParamPart::Field(field.clone()));
+                cur = object;
+            }
+            ExprKind::TupleIndex { object, index } => {
+                chain.push(ParamPart::TupleIndex(*index as usize));
+                cur = object;
+            }
+            ExprKind::Identifier(n) => {
+                chain.reverse();
+                return Some((n.clone(), chain));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Does the place `e` (a bare identifier, or a field / tuple-index chain)
+/// yield a value that CONTAINS the wrapped param — the wrapper itself, or a
+/// projection down to (a prefix of) the wrap path? A projection that goes
+/// PAST the param (`p.r.id`) is a part of the param, not the param, so it
+/// does not.
+fn place_yields_wrapped_param(e: &Expr, wraps: &[(String, ParamPath)]) -> bool {
+    let Some((root, chain)) = place_chain_root_and_path(e) else {
+        return false;
+    };
+    wraps
+        .iter()
+        .any(|(a, path)| *a == root && chain.len() <= path.len() && path.starts_with(&chain))
+}
+
 fn close_many(w: &RebindWalk, seed: &[String]) -> Vec<String> {
     let mut aliases: Vec<String> = seed.to_vec();
     loop {
@@ -2078,7 +2247,9 @@ pub fn fn_always_returns_param(
     // B-2026-09-06-12 — and to a rebind THROUGH an always-returning callee
     // (`let w = keeps(r); return w`), when the caller can supply the program.
     let aliases = param_whole_aliases(program, f, name);
+    let wraps = param_wrap_aliases(program, f, name);
     let name: &[String] = &aliases;
+    let wraps: &[(String, ParamPath)] = &wraps;
 
     /// The same test [`fn_returns_param`] applies at a return site: the bare
     /// identifier, or an aggregate literal that moves the param into itself.
@@ -2092,12 +2263,20 @@ pub fn fn_always_returns_param(
     /// provably owns the value on every path — there is no dies-inside path
     /// left to lose a body on. `option_result_ctor_payload` is the same shape
     /// test the conditional flip and both backends' tail walkers already share.
-    fn yields(e: &Expr, name: &[String]) -> bool {
+    fn yields(e: &Expr, name: &[String], wraps: &[(String, ParamPath)]) -> bool {
         match &e.kind {
-            ExprKind::Identifier(n) => name.iter().any(|a| a == n),
-            ExprKind::StructLiteral { fields, .. } => fields.iter().any(|f| yields(&f.value, name)),
-            ExprKind::Tuple(elems) => elems.iter().any(|el| yields(el, name)),
-            _ => crate::ast::option_result_ctor_payload(e).is_some_and(|p| yields(p, name)),
+            ExprKind::Identifier(n) => {
+                name.iter().any(|a| a == n) || place_yields_wrapped_param(e, wraps)
+            }
+            // B-2026-09-06-19 — a projection back out of a wrapping local.
+            ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. } => {
+                place_yields_wrapped_param(e, wraps)
+            }
+            ExprKind::StructLiteral { fields, .. } => {
+                fields.iter().any(|f| yields(&f.value, name, wraps))
+            }
+            ExprKind::Tuple(elems) => elems.iter().any(|el| yields(el, name, wraps)),
+            _ => crate::ast::option_result_ctor_payload(e).is_some_and(|p| yields(p, name, wraps)),
         }
     }
     fn leaf_tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -2241,7 +2420,9 @@ pub fn fn_always_returns_param(
     return_operands_block(&f.body, &mut returns);
     // Is there a `return` that does NOT hand the param back? A bare `return;`
     // counts: it exits without yielding, so the param dies on that path.
-    let any_bad_return = returns.iter().any(|o| !o.is_some_and(|x| yields(x, name)));
+    let any_bad_return = returns
+        .iter()
+        .any(|o| !o.is_some_and(|x| yields(x, name, wraps)));
 
     let Some(tail) = f.body.final_expr.as_deref() else {
         // NO TAIL EXPRESSION AT ALL — every exit is a `return` (B-2026-08-29-14).
@@ -2266,12 +2447,14 @@ pub fn fn_always_returns_param(
         // A function with no declared return type is excluded outright: it has
         // nothing to hand the param back THROUGH, so its param dies inside and
         // the caller must keep firing.
-        let any_good_return = returns.iter().any(|o| o.is_some_and(|x| yields(x, name)));
+        let any_good_return = returns
+            .iter()
+            .any(|o| o.is_some_and(|x| yields(x, name, wraps)));
         return f.return_type.is_some() && any_good_return && !any_bad_return;
     };
     let mut tails = Vec::new();
     leaf_tails(tail, &mut tails);
-    if tails.is_empty() || !tails.iter().all(|t| yields(t, name)) {
+    if tails.is_empty() || !tails.iter().all(|t| yields(t, name, wraps)) {
         return false;
     }
     !any_bad_return
@@ -2401,7 +2584,14 @@ pub fn fn_conditionally_returns_param_bare(
     // B-2026-09-06-12 — and through an always-returning callee; see
     // `param_whole_aliases`.
     let aliases = param_whole_aliases(program, f, param_name);
-    let name: &[String] = &aliases;
+    let wraps = param_wrap_aliases(program, f, param_name);
+    // B-2026-09-06-19 — a wrapping local MENTIONS the param wherever it
+    // appears (the conservative side of this predicate), and yields it where
+    // `place_yields_wrapped_param` says so.
+    let mut mention_names: Vec<String> = aliases.clone();
+    mention_names.extend(wraps.iter().map(|(a, _)| a.clone()));
+    let name: &[String] = &mention_names;
+    let wraps: &[(String, ParamPath)] = &wraps;
 
     /// May `e` mention `name`? Conservative in the DECLINING direction: any
     /// shape not explicitly recognized answers `true`, which fails condition 3
@@ -2492,25 +2682,32 @@ pub fn fn_conditionally_returns_param_bare(
     /// it left `fn f(r: R, k: bool) -> Box2 { if k { return Box2 { r: mk() };
     /// } return Box2 { r: r }; }` with no owner on the dies-inside path for a
     /// fresh temp and two on the hand-back path for a named one.
-    fn yields_wrapped(e: &Expr, name: &[String], program: Option<&crate::Program>) -> bool {
+    fn yields_wrapped(
+        e: &Expr,
+        name: &[String],
+        wraps: &[(String, ParamPath)],
+        program: Option<&crate::Program>,
+    ) -> bool {
         match &e.kind {
             ExprKind::Identifier(_) => is_bare(e, name),
+            // B-2026-09-06-19 — a projection back out of a wrapping local.
+            ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. } => {
+                place_yields_wrapped_param(e, wraps)
+            }
             ExprKind::StructLiteral { fields, .. } => fields
                 .iter()
-                .any(|f| yields_wrapped(&f.value, name, program)),
-            ExprKind::Tuple(elems) => elems.iter().any(|el| yields_wrapped(el, name, program)),
-            // B-2026-09-06-18 — a USER enum variant constructor
-            // (`Slot.Held(r)`, `Slot.Pair(r, 1)`), told apart from an
-            // associated function of the same spelling by the program's enum
-            // declarations; without a program it stays declined. The
-            // struct-variant spelling (`Slot.Boxed { r: r, n: 1 }`) is a
-            // `StructLiteral` and was already admitted above.
+                .any(|f| yields_wrapped(&f.value, name, wraps, program)),
+            ExprKind::Tuple(elems) => elems
+                .iter()
+                .any(|el| yields_wrapped(el, name, wraps, program)),
             ExprKind::Call { callee, args }
                 if program.is_some_and(|p| is_user_variant_ctor(p, callee)) =>
             {
-                args.iter().any(|a| yields_wrapped(&a.value, name, program))
+                args.iter()
+                    .any(|a| yields_wrapped(&a.value, name, wraps, program))
             }
-            _ => option_result_ctor_payload(e).is_some_and(|p| yields_wrapped(p, name, program)),
+            _ => option_result_ctor_payload(e)
+                .is_some_and(|p| yields_wrapped(p, name, wraps, program)),
         }
     }
     /// The leaf tails of an escaping tail position, following exactly the
@@ -2629,7 +2826,7 @@ pub fn fn_conditionally_returns_param_bare(
         // per-path flag clears it through the same source walk.
         // B-2026-09-02-4 — and the param moved into a returned aggregate
         // literal; see `yields_wrapped`.
-        if yields_wrapped(leaf, name, program) {
+        if yields_wrapped(leaf, name, wraps, program) {
             yields_bare = true;
         } else if may_mention(leaf, name) {
             // Condition 3 — an escape route the flag cannot clear.

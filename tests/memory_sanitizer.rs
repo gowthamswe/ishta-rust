@@ -2751,6 +2751,152 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-19 — the wrap-through-local hand-back and the
+    /// projected-field return, under ASAN + LSan: standing the caller down
+    /// and retracting the local's field walk leaves exactly one owner of the
+    /// `String` / `Vec` buffers on every path, frees nothing twice and leaks
+    /// nothing on the dies-inside paths.
+    #[test]
+    fn asan_param_wrapped_through_local_has_one_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  d{self.id}\") } }\n\
+             fn mr(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] } }\n\
+             struct P2 { r: R, n: i64 }\n\
+             struct Box2 { r: R }\n\
+             struct W { p: P2 }\n\
+             struct K { n: i64 }\n\
+             \n\
+             fn ftwo(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(82) }; } let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }\n\
+             fn fone(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(83) }; } let p = Box2 { r: r }; return p; }\n\
+             fn fproj(r: R, k: bool) -> R { if k { return mr(84); } let p = P2 { r: r, n: 1 }; return p.r; }\n\
+             fn flet(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(85) }; } let p = P2 { r: r, n: 1 }; let q = p.r; return Box2 { r: q }; }\n\
+             fn fnest(r: R, k: bool) -> W { if k { return W { p: P2 { r: mr(86), n: 0 } }; } let p = P2 { r: r, n: 1 }; let w = W { p: p }; return w; }\n\
+             fn ftup(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(87) }; } let t = (r, 1); return Box2 { r: t.0 }; }\n\
+             fn frebind(r: R, k: bool) -> P2 { if k { return P2 { r: mr(88), n: 0 }; } let p = P2 { r: r, n: 1 }; let q = p; return q; }\n\
+             fn fearly(r: R, k: bool) -> Box2 { let p = P2 { r: r, n: 1 }; if k { return Box2 { r: mr(89) }; } return Box2 { r: p.r }; }\n\
+             fn funcond(r: R) -> Box2 { let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }\n\
+             fn fpart(r: R, k: bool) -> i64 { let p = P2 { r: r, n: 1 }; if k { return 0; } return p.r.id; }\n\
+             fn lproj() -> Box2 { let p = P2 { r: mr(19), n: 1 }; return Box2 { r: p.r }; }\n\
+             fn lbare() -> R { let p = P2 { r: mr(20), n: 1 }; return p.r; }\n\
+             fn ltail() -> Box2 { let p = P2 { r: mr(21), n: 1 }; Box2 { r: p.r } }\n\
+             fn lopt() -> Option[R] { let p = P2 { r: mr(22), n: 1 }; return Option.Some(p.r); }\n\
+             fn lnest() -> R { let w = W { p: P2 { r: mr(23), n: 1 } }; return w.p.r; }\n\
+             impl K {\n\
+             \x20   fn mlocal(self) -> Box2 { let p = P2 { r: mr(24), n: self.n }; return Box2 { r: p.r }; }\n\
+             \x20   fn m(self, r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(90) }; } let p = P2 { r: r, n: self.n }; return Box2 { r: p.r }; }\n\
+             \x20   fn mref(ref self, r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(91) }; } let p = P2 { r: r, n: self.n }; return Box2 { r: p.r }; }\n\
+             \x20   fn muncond(self, r: R) -> Box2 { let p = P2 { r: r, n: self.n }; return Box2 { r: p.r }; }\n\
+             }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"ftwo/t\"); let a1 = ftwo(mr(1), true); println(f\"  C{a1.r.id}\");\n\
+             \x20   println(\"ftwo/f\"); let a2 = ftwo(mr(2), false); println(f\"  C{a2.r.id}\");\n\
+             \x20   println(\"fone/f\"); let a3 = fone(mr(3), false); println(f\"  C{a3.r.id}\");\n\
+             \x20   println(\"fproj/f\"); let a4 = fproj(mr(4), false); println(f\"  C{a4.id}\");\n\
+             \x20   println(\"flet/f\"); let a5 = flet(mr(5), false); println(f\"  C{a5.r.id}\");\n\
+             \x20   println(\"fnest/f\"); let a6 = fnest(mr(6), false); println(f\"  C{a6.p.r.id}\");\n\
+             \x20   println(\"ftup/f\"); let a7 = ftup(mr(7), false); println(f\"  C{a7.r.id}\");\n\
+             \x20   println(\"frebind/f\"); let a8 = frebind(mr(8), false); println(f\"  C{a8.r.id}\");\n\
+             \x20   println(\"fearly/t\"); let a9 = fearly(mr(9), true); println(f\"  C{a9.r.id}\");\n\
+             \x20   println(\"fearly/f\"); let a10 = fearly(mr(10), false); println(f\"  C{a10.r.id}\");\n\
+             \x20   println(\"funcond\"); let a11 = funcond(mr(11)); println(f\"  C{a11.r.id}\");\n\
+             \x20   println(\"funcond/named\"); let x12 = mr(12); let a12 = funcond(x12); println(f\"  C{a12.r.id}\");\n\
+             \x20   println(\"fpart/t\"); let a13 = fpart(mr(13), true); println(f\"  C{a13}\");\n\
+             \x20   println(\"fpart/f\"); let a14 = fpart(mr(14), false); println(f\"  C{a14}\");\n\
+             \x20   println(\"m/t\"); let a15 = K { n: 1 }.m(mr(15), true); println(f\"  C{a15.r.id}\");\n\
+             \x20   println(\"m/f\"); let a16 = K { n: 1 }.m(mr(16), false); println(f\"  C{a16.r.id}\");\n\
+             \x20   println(\"mref/f\"); let kk = K { n: 2 }; let a17 = kk.mref(mr(17), false); println(f\"  C{a17.r.id}\");\n\
+             \x20   println(\"muncond\"); let a18 = K { n: 3 }.muncond(mr(18)); println(f\"  C{a18.r.id}\");\n\
+             \x20   println(\"lproj\"); let a19 = lproj(); println(f\"  C{a19.r.id}\");\n\
+             \x20   println(\"lbare\"); let a20 = lbare(); println(f\"  C{a20.id}\");\n\
+             \x20   println(\"ltail\"); let a21 = ltail(); println(f\"  C{a21.r.id}\");\n\
+             \x20   println(\"lopt\"); if let Some(a22) = lopt() { println(f\"  C{a22.id}\"); }\n\
+             \x20   println(\"lnest\"); let a23 = lnest(); println(f\"  C{a23.id}\");\n\
+             \x20   println(\"mlocal\"); let a24 = K { n: 4 }.mlocal(); println(f\"  C{a24.r.id}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "ftwo/t",
+                "  d1",
+                "  C82",
+                "  d82",
+                "ftwo/f",
+                "  C2",
+                "  d2",
+                "fone/f",
+                "  C3",
+                "  d3",
+                "fproj/f",
+                "  C4",
+                "  d4",
+                "flet/f",
+                "  C5",
+                "  d5",
+                "fnest/f",
+                "  C6",
+                "  d6",
+                "ftup/f",
+                "  C7",
+                "  d7",
+                "frebind/f",
+                "  C8",
+                "  d8",
+                "fearly/t",
+                "  C89",
+                "  d89",
+                "fearly/f",
+                "  C10",
+                "  d10",
+                "funcond",
+                "  C11",
+                "  d11",
+                "funcond/named",
+                "  C12",
+                "  d12",
+                "fpart/t",
+                "  d13",
+                "  C0",
+                "fpart/f",
+                "  d14",
+                "  C14",
+                "m/t",
+                "  d15",
+                "  C90",
+                "  d90",
+                "m/f",
+                "  C16",
+                "  d16",
+                "mref/f",
+                "  C17",
+                "  d17",
+                "muncond",
+                "  C18",
+                "  d18",
+                "lproj",
+                "  C19",
+                "  d19",
+                "lbare",
+                "  C20",
+                "  d20",
+                "ltail",
+                "  C21",
+                "  d21",
+                "lopt",
+                "  C22",
+                "  d22",
+                "lnest",
+                "  C23",
+                "  d23",
+                "mlocal",
+                "  C24",
+                "  d24",
+                "end"
+            ],
+            "param_wrapped_through_local",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

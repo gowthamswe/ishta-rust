@@ -1412,6 +1412,9 @@ impl<'ctx> super::Codegen<'ctx> {
                             }
                         }
                     }
+                    // B-2026-09-06-19 — a field projected out of a local into the
+                    // returned value is a move out of that local.
+                    self.disarm_returned_projection_field_bodies(e);
                     // B-2026-08-06-14 — `return b.v;` handing out a direct
                     // `shared` field of a CALLER-RETAINS struct param. The
                     // caller's +1 is still live, so the returned handle is an

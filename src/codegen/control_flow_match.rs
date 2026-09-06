@@ -9594,6 +9594,81 @@ impl<'ctx> super::Codegen<'ctx> {
     /// retraction does not match this action family, which is what made the
     /// first attempt add an action rather than replace one. The struct's own
     /// `impl Drop` body wrapper is a separate action and stays armed.
+    /// B-2026-09-06-19 (local-projection leg) — a Drop field PROJECTED out of a
+    /// local into the returned value: bare `return p.r`, or `p.r` anywhere
+    /// inside a returned struct / tuple / `Option` / `Result` literal (and the
+    /// same as the function's tail). `let q = p.r` already retracts `p`'s
+    /// field walk through [`Self::disarm_struct_field_move_bodies`]; the
+    /// return site never did, so `let p = P2 { r: mk(5), n: 1 }; return
+    /// Box2 { r: p.r }` ran `r`'s body at `p`'s death AND at the result's
+    /// (`d5 C5 d5`) on every compiled backend and the interpreter alike.
+    pub(super) fn disarm_returned_projection_field_bodies(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::FieldAccess { .. } => {
+                // A LOCAL's field only: a parameter's projection is the
+                // caller-retains / param-view machinery's (masking it here
+                // re-registered the param's walk and doubled `fn take(w: W)
+                // -> i64 { w.n }`), a borrowed root is a copy, and only a leaf
+                // that runs a user `Drop` has a body to retract.
+                let Some(root) = Self::place_root_ident(e) else {
+                    return;
+                };
+                if root == "self"
+                    || self.fn_ctx.current_fn_param_names.contains(root)
+                    || self.borrow_vars.ref_params.contains_key(root)
+                {
+                    return;
+                }
+                let mut segs: Vec<&str> = Vec::new();
+                let mut cur = e;
+                loop {
+                    match &cur.kind {
+                        ExprKind::FieldAccess { object, field } => {
+                            segs.push(field.as_str());
+                            cur = object;
+                        }
+                        ExprKind::Identifier(_) => break,
+                        _ => return,
+                    }
+                }
+                segs.reverse();
+                let Some(root_ty) = self.var_types.var_type_names.get(root).cloned() else {
+                    return;
+                };
+                if self.place_chain_leaf_runs_user_drop(&root_ty, &segs) != Some(true) {
+                    return;
+                }
+                if segs.len() == 1 {
+                    self.disarm_struct_field_move_bodies(e);
+                } else if let Some((root, path)) = self.projection_field_index_path(e) {
+                    // Two or more hops (`return w.p.r`): the nested-path mask the
+                    // `let` site writes for the same chain, leaf index only.
+                    if let Some((leaf, prefix)) = path.split_last() {
+                        let mut only: std::collections::HashSet<u32> =
+                            std::collections::HashSet::new();
+                        only.insert(*leaf as u32);
+                        self.disarm_struct_field_tuple_elem_bodies_at(&root, prefix, &only);
+                    }
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } => {
+                for f in fields {
+                    self.disarm_returned_projection_field_bodies(&f.value);
+                }
+            }
+            ExprKind::Tuple(elems) => {
+                for el in elems {
+                    self.disarm_returned_projection_field_bodies(el);
+                }
+            }
+            _ => {
+                if let Some(payload) = crate::ast::option_result_ctor_payload(e) {
+                    self.disarm_returned_projection_field_bodies(payload);
+                }
+            }
+        }
+    }
+
     pub(super) fn disarm_struct_field_bodies_at(&mut self, var_name: &str, field_idx: usize) {
         let Some(struct_name) = self.var_types.var_type_names.get(var_name).cloned() else {
             return;
