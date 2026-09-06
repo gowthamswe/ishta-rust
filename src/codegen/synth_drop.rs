@@ -8911,9 +8911,43 @@ impl<'ctx> super::Codegen<'ctx> {
         // and -55 (`Vec` element) closed one level up, and it is the last
         // position in that family. `Option`/`Result` are excluded because a
         // nested built-in payload rides its own walker, not this arm.
-        let targets: Vec<(u64, String, TypeExpr, usize)> = arms
+        // B-2026-09-05-14 — the TUPLE-payload arm. `Option[(R, i64)]` /
+        // `Result[(R, i64), _]` reached the `TypeKind::Path` gate below, was
+        // dropped as a non-Path, and so emitted NO walker: a discarded such
+        // temp ran the element's `Drop` body on `--interp` and on neither
+        // compiled backend (a run-vs-build divergence; the memory half was
+        // freed by the owned-temp chokepoint, so it was a lost BODY, not a
+        // leak). Admit a tuple payload whose elements run a user drop and
+        // drain it in the case body through `emit_tuple_elem_user_drop_bodies_
+        // fn` — the same body-only walker `Vec[(R, i64)]` already uses one
+        // level up, memory left to the free channel exactly as the struct and
+        // enum arms leave it.
+        //
+        // One Drop-carrying payload arm the tag switch will handle. `sname` is
+        // the payload struct/enum name (empty for a tuple); `tuple_elems` is
+        // `Some` only for a tuple payload, carrying its element `TypeExpr`s.
+        struct PayloadArm {
+            tag: u64,
+            sname: String,
+            tuple_elems: Option<Vec<TypeExpr>>,
+            pte: TypeExpr,
+            thresh: usize,
+        }
+        let targets: Vec<PayloadArm> = arms
             .into_iter()
             .filter_map(|(tag, pte, thresh)| {
+                if let TypeKind::Tuple(elem_tes) = &pte.kind {
+                    if elem_tes.iter().any(|t| self.elem_te_runs_user_drop(t)) {
+                        return Some(PayloadArm {
+                            tag,
+                            sname: String::new(),
+                            tuple_elems: Some(elem_tes.clone()),
+                            pte,
+                            thresh,
+                        });
+                    }
+                    return None;
+                }
                 let TypeKind::Path(pp) = &pte.kind else {
                     return None;
                 };
@@ -8931,7 +8965,13 @@ impl<'ctx> super::Codegen<'ctx> {
                 {
                     return None;
                 }
-                Some((tag, sname, pte, thresh))
+                Some(PayloadArm {
+                    tag,
+                    sname,
+                    tuple_elems: None,
+                    pte,
+                    thresh,
+                })
             })
             .collect();
         if targets.is_empty() {
@@ -8965,21 +9005,31 @@ impl<'ctx> super::Codegen<'ctx> {
             .into_int_value();
 
         let mut switch_cases: Vec<(inkwell::values::IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
-        let case_bbs: Vec<(BasicBlock<'ctx>, String, TypeExpr, usize)> = targets
+        let case_bbs: Vec<(BasicBlock<'ctx>, PayloadArm)> = targets
             .into_iter()
-            .map(|(tag, sname, pte, thresh)| {
+            .map(|arm| {
                 let bb = self
                     .context
-                    .append_basic_block(walker, &format!("or.t{tag}"));
-                switch_cases.push((i64_t.const_int(tag, false), bb));
-                (bb, sname, pte, thresh)
+                    .append_basic_block(walker, &format!("or.t{}", arm.tag));
+                switch_cases.push((i64_t.const_int(arm.tag, false), bb));
+                (bb, arm)
             })
             .collect();
         self.builder
             .build_switch(tag_val, exit, &switch_cases)
             .unwrap();
 
-        for (bb, sname, pte, thresh) in case_bbs {
+        for (
+            bb,
+            PayloadArm {
+                sname,
+                tuple_elems,
+                pte,
+                thresh,
+                ..
+            },
+        ) in case_bbs
+        {
             self.builder.position_at_end(bb);
             let payload_base = self
                 .builder
@@ -9038,7 +9088,18 @@ impl<'ctx> super::Codegen<'ctx> {
                 .is_some_and(|l| !l.is_shared)
                 && sname != "Option"
                 && sname != "Result";
-            let inner = if is_enum {
+            let inner = if let Some(elem_tes) = &tuple_elems {
+                // B-2026-09-05-14 — the tuple payload: run each Drop-carrying
+                // element's body over the tuple aggregate at `target_ptr`
+                // (inline or deboxed above). Body-only, like the struct/enum
+                // arms; the tuple's heap is freed on the value's free channel.
+                match self.llvm_type_for_type_expr(&pte) {
+                    inkwell::types::BasicTypeEnum::StructType(agg_ty) => {
+                        self.emit_tuple_elem_user_drop_bodies_fn(agg_ty, elem_tes)
+                    }
+                    _ => None,
+                }
+            } else if is_enum {
                 self.emit_enum_payload_user_drop_bodies_fn(&sname)
             } else {
                 self.emit_user_drop_field_bodies_fn(&sname, &std::collections::HashMap::new())

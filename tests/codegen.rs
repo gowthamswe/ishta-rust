@@ -31624,6 +31624,49 @@ fn main() {
         );
     }
 
+    /// B-2026-09-05-14 — a discarded `Option`/`Result` temporary whose payload is
+    /// a TUPLE carrying a `Drop` type (`let _ = f();` where `f -> Option[(R, i64)]`)
+    /// runs the nested element's `Drop` body ONCE on the compiled backends.
+    ///
+    /// Before this the compiled discard-drop walker declined a tuple payload
+    /// outright: `emit_optres_payload_user_drop_bodies_fn`'s target filter opened
+    /// with `let TypeKind::Path(pp) = &pte.kind else { return None }`, so a tuple
+    /// payload produced an empty `targets`, emitted no walker, and the discard ran
+    /// no body — while `--interp` ran it, a run-vs-build divergence. Valgrind was
+    /// clean for the INLINE payload here (the tuple fits `Option`'s 3-word area and
+    /// `Result`'s 5-word area, so no box is allocated), which is why only a
+    /// body-count pin catches it; the fix admits a tuple payload whose elements run
+    /// a user drop and drains it through the existing `emit_tuple_elem_user_drop_
+    /// bodies_fn`, body-only like the struct and enum arms beside it. The DIRECT
+    /// (`Option.Some(r)`) and struct-payload spellings already dropped correctly.
+    ///
+    /// A BOXED tuple payload (a heap-carrying element widening the tuple past the
+    /// area) is a SEPARATE, pre-existing memory leak — `try_track_discarded_boxed_
+    /// option` frees a boxed struct payload but declines a boxed tuple one, so the
+    /// box is never freed regardless of this body fix — tracked on its own row.
+    /// This pin stays on the inline shape, which the fix makes correct on every
+    /// surface with no leak.
+    #[test]
+    fn e2e_discarded_optres_tuple_payload_runs_one_body() {
+        assert_eq!(
+            run_program(
+                r#"struct R { id: i64 }
+impl Drop for R { fn drop(mut ref self) { println(f"drop {self.id}") } }
+fn mk(i: i64) -> R { return R { id: i }; }
+fn topagg(r: R) -> Option[(R, i64)] { return Option.Some((r, 9)); }
+fn topres(r: R) -> Result[(R, i64), i64] { return Result.Ok((r, 7)); }
+fn main() {
+    println("o-fn");   let _ = topagg(mk(1));
+    println("r-fn");   let _ = topres(mk(2));
+    println("o-ctor"); let _ = Option.Some((mk(3), 9));
+    println("done")
+}"#
+            ),
+            Some("o-fn\ndrop 1\nr-fn\ndrop 2\no-ctor\ndrop 3\ndone\n".to_string()),
+            "a discarded Option/Result temp with an inline tuple payload runs one body per element"
+        );
+    }
+
     #[test]
     fn e2e_ctor_wrapped_conditional_return_runs_one_body() {
         assert_eq!(
