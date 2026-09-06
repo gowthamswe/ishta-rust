@@ -145466,6 +145466,73 @@ fn main() {
         };
         assert_eq!(out, "in\ngot61\ndR61\none\nin\ngot62\ndR62\ntwo\nin\ngot63\ndR63\nthree\ngot64\ndR64\nfour\nin\ngot65\ndR65\nfive\ngot66\ndR66\nsix\nin\ngot67\ndR67\nseven\ndR69\ngot99\ndR99\nnine\nin\ngot70\ndR70\nten\nin\ndR71\ngot71\neleven\nin\ngot72\ndR72\ntwelve\nin\ngot73\ndR73\nthirteen\nend\n");
     }
+
+    /// B-2026-09-03-4 — a destructured element or field returned WRAPPED in
+    /// an enum constructor (`let (r, k) = t; Option.Some(r)`, `Result.Ok(r)`,
+    /// a user variant) runs its `Drop` body once, at the caller's binding.
+    /// The part channel's return-site walk (`yielded`) descended into a
+    /// struct literal and a tuple literal but not into a constructor CALL, so
+    /// the `let` spellings reported nothing and the caller's element walk
+    /// fired beside the result's owner (`dR2 dR2 got`); the `match` spellings
+    /// were already right through the tuple-arm predicate, whose call rule
+    /// counts a constructor. A call whose callee is a path (not a plain
+    /// identifier) now yields its operands' parts.
+    ///
+    /// The row's expectation that the body fires "at the caller's binding"
+    /// is met at that binding's NLL death: `g` is not read after its `let`,
+    /// so its payload body runs before `got` (one body, the design's
+    /// per-statement liveness), and `sixteen` reads the payload first to show
+    /// the value is alive until then. `one`/`six` the match spellings,
+    /// `two`..`five` the `let` spellings over `Option` / explicit `return` /
+    /// `Result` / a user enum, `seven` the struct-literal wrap (always right),
+    /// `eight`/`fifteen` a struct source, `nine` a LOCAL source, `ten` the
+    /// bare param, `eleven` a two-`Drop` tuple (the unreturned sibling still
+    /// fires), `thirteen`/`fourteen` named-local arguments.
+    #[test]
+    fn e2e_destructured_part_returned_in_a_constructor_has_one_owner() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B(i64) }
+struct W { r: R, n: i64 }
+struct Cd { r: R, z: i64 }
+fn f_m(t: (R, i64)) -> Option[R] { match t { (r, k) => { Option.Some(r) } } }
+fn f_l(t: (R, i64)) -> Option[R] { let (r, k) = t; Option.Some(r) }
+fn f_lr(t: (R, i64)) -> Option[R] { let (r, k) = t; return Option.Some(r); }
+fn f_res(t: (R, i64)) -> Result[R, i64] { let (r, k) = t; Result.Ok(r) }
+fn f_e(t: (R, i64)) -> E { let (r, k) = t; E.A(r) }
+fn f_em(t: (R, i64)) -> E { match t { (r, k) => { E.A(r) } } }
+fn f_w(t: (R, i64)) -> W { let (r, k) = t; W { r: r, n: k } }
+fn f_s(g: Cd) -> Option[R] { let Cd { r, z } = g; Option.Some(r) }
+fn f_sm(g: Cd) -> Option[R] { match g { Cd { r, z } => { Option.Some(r) } } }
+fn f_local() -> Option[R] { let t: (R, i64) = (mk(9), 0); let (r, k) = t; Option.Some(r) }
+fn f_bare(x: R) -> Option[R] { Option.Some(x) }
+fn f_two(t: (R, R)) -> Option[R] { let (a, b) = t; Option.Some(a) }
+fn main() {
+    { let g: Option[R] = f_m((mk(1), 0)); println("got"); println("one") }
+    { let g: Option[R] = f_l((mk(2), 0)); println("got"); println("two") }
+    { let g: Option[R] = f_lr((mk(3), 0)); println("got"); println("three") }
+    { let g: Result[R, i64] = f_res((mk(4), 0)); println("got"); println("four") }
+    { let g: E = f_e((mk(5), 0)); println("got"); println("five") }
+    { let g: E = f_em((mk(6), 0)); println("got"); println("six") }
+    { let g: W = f_w((mk(7), 0)); println(f"got{g.r.id}"); println("seven") }
+    { let g: Option[R] = f_s(Cd { r: mk(8), z: 1 }); println("got"); println("eight") }
+    { let g: Option[R] = f_local(); println("got"); println("nine") }
+    { let g: Option[R] = f_bare(mk(10)); println("got"); println("ten") }
+    { let g: Option[R] = f_two((mk(11), mk(12))); println("got"); println("eleven") }
+    { let t: (R, i64) = (mk(13), 0); let g: Option[R] = f_m(t); println("got"); println("thirteen") }
+    { let t: (R, i64) = (mk(14), 0); let g: Option[R] = f_l(t); println("got"); println("fourteen") }
+    { let g: Option[R] = f_sm(Cd { r: mk(15), z: 1 }); println("got"); println("fifteen") }
+    { let g: Option[R] = f_m((mk(16), 0)); match g { Option.Some(x) => { println(f"x{x.id}") }, Option.None => { println("none") } } println("sixteen") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dR1\ngot\none\ndR2\ngot\ntwo\ndR3\ngot\nthree\ndR4\ngot\nfour\ndR5\ngot\nfive\ndR6\ngot\nsix\ngot7\ndR7\nseven\ndR8\ngot\neight\ndR9\ngot\nnine\ndR10\ngot\nten\ndR12\ndR11\ngot\neleven\ndR13\ngot\nthirteen\ndR14\ngot\nfourteen\ndR15\ngot\nfifteen\nx16\ndR16\nsixteen\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]

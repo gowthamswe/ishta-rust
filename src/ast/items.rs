@@ -2914,6 +2914,23 @@ fn returned_param_part_paths_impl(
                     yielded(el, aliases, out);
                 }
             }
+            // B-2026-09-03-4 — a CONSTRUCTOR wrap (`Option.Some(r)`,
+            // `Result.Ok(r)`, `E.A(r)`): the callee is a path, not a plain
+            // identifier, and the operand crosses the frame boundary inside the
+            // constructed value exactly as it does inside a struct literal.
+            // `let (r, k) = t; Option.Some(r)` ran `r`'s body twice on every
+            // surface — the caller's element walk beside the result's owner —
+            // while the `match` spelling was right through the tuple-arm
+            // predicate, whose `payload_yields` already counts a constructor
+            // call. A call to a plain IDENTIFIER is a free function's business
+            // and stays with the program-aware `taken_over`.
+            ExprKind::Call { callee, args, .. }
+                if !matches!(&callee.kind, ExprKind::Identifier(_)) =>
+            {
+                for a in args {
+                    yielded(&a.value, aliases, out);
+                }
+            }
             _ => {
                 // An EMPTY path is the whole param, which is
                 // `fn_returns_param`'s answer and not this one's.
