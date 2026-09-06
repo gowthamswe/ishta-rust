@@ -3522,7 +3522,9 @@ impl<'a> super::Interpreter<'a> {
                 collect(pats, items, &mut discarded);
             }
             (
-                PatternKind::Struct { fields, .. },
+                PatternKind::Struct {
+                    fields, has_rest, ..
+                },
                 Value::Struct {
                     name: sname,
                     fields: vals,
@@ -3535,11 +3537,28 @@ impl<'a> super::Interpreter<'a> {
                 let order = crate::interpreter::type_order::current()
                     .and_then(|reg| reg.struct_field_order(sname).cloned());
                 let mut picked: Vec<(u32, Value)> = Vec::new();
+                // B-2026-09-06-34 — a discarded field that is a PARAM VIEW
+                // (`S3 { a: mk(9), b: r }` over a by-value `r`, then `{ a, .. }`
+                // or `{ a, b: _ }`) is the caller's body, not a discard: the
+                // source's `param_view_struct_fields` record names it.
+                let src_name = match &value.kind {
+                    ExprKind::Identifier(n) => Some(n.clone()),
+                    _ => None,
+                };
+                let is_view = |this: &Self, f: &str| {
+                    src_name.as_ref().is_some_and(|n| {
+                        this.param_view_struct_fields
+                            .contains(&(n.clone(), f.to_string()))
+                    })
+                };
                 for fp in fields {
                     // `W { r: _, n }` — only the RENAMED form can carry a
                     // wildcard; the shorthand `W { r, n }` is a binding.
                     let Some(inner) = &fp.pattern else { continue };
                     if matches!(inner.kind, PatternKind::Wildcard) {
+                        if is_view(self, &fp.name) {
+                            continue;
+                        }
                         if let Some(v) = vals.get(&fp.name) {
                             let idx = order
                                 .as_ref()
@@ -3547,6 +3566,26 @@ impl<'a> super::Interpreter<'a> {
                                 .unwrap_or(picked.len() as u32);
                             picked.push((idx, v.clone()));
                         }
+                    }
+                }
+                // B-2026-09-06-34 — the fields a `..` rest covers are discarded
+                // leaves on exactly the terms an explicit `_` field is: the
+                // pattern moves the whole struct out of the source (whose own
+                // slot is disarmed as moved-from) and binds only the named
+                // fields, so a rest field was owned by nobody and its `Drop`
+                // body never ran (`dR9 dR8` for `let S3 { a, .. } = s` against
+                // `dR10 dR9 dR8` on every compiled backend). Same slot, same
+                // reverse-declaration order as the compiled side.
+                if *has_rest {
+                    for (fname, v) in vals {
+                        if fields.iter().any(|fp| &fp.name == fname) || is_view(self, fname) {
+                            continue;
+                        }
+                        let idx = order
+                            .as_ref()
+                            .and_then(|o| o.get(fname).copied())
+                            .unwrap_or(picked.len() as u32);
+                        picked.push((idx, v.clone()));
                     }
                 }
                 picked.sort_by(|a, b| b.0.cmp(&a.0));

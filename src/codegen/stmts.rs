@@ -13453,7 +13453,12 @@ impl<'ctx> super::Codegen<'ctx> {
         value: &Expr,
         val: BasicValueEnum<'ctx>,
     ) -> Result<(), String> {
-        let PatternKind::Struct { path, fields, .. } = &pattern.kind else {
+        let PatternKind::Struct {
+            path,
+            fields,
+            has_rest,
+        } = &pattern.kind
+        else {
             return Ok(());
         };
         let struct_name = path.last().cloned().unwrap_or_default();
@@ -13981,16 +13986,24 @@ impl<'ctx> super::Codegen<'ctx> {
             // MEMORY? Only it knows, because the answer depends on whether the
             // field's type has a `Drop` body to hang a walker off at all.
             let mut discard_took_memory = false;
-            if fresh
-                && matches!(
-                    fields
-                        .iter()
-                        .find(|f| &f.name == fname)
-                        .and_then(|f| f.pattern.as_ref())
-                        .map(|p| &p.kind),
-                    Some(PatternKind::Wildcard)
-                )
-            {
+            // B-2026-09-06-34 — a field ABSENT from the pattern under a `..`
+            // rest is discarded on the same terms as an explicit `_` field:
+            // over a fresh struct LITERAL nothing else claims it, so
+            // `let S3 { a, .. } = S3 { a: mk(5), b: mk(6) }` ran `b`'s body
+            // zero times (`mid dR5` on every surface). Bodies only for a fresh
+            // CALL source (`free_memory` is `fresh_struct_literal`): its
+            // memory stays with the unbound-field arm at the bottom of the
+            // loop, whose synthetic slot frees it at scope exit and runs no
+            // body — both freeing it aborted at 12 frees for 11 allocs.
+            let pattern_field = fields.iter().find(|f| &f.name == fname);
+            let explicit_wildcard = matches!(
+                pattern_field
+                    .and_then(|f| f.pattern.as_ref())
+                    .map(|p| &p.kind),
+                Some(PatternKind::Wildcard)
+            );
+            let rest_discard = *has_rest && pattern_field.is_none();
+            if fresh && (explicit_wildcard || rest_discard) {
                 if let Ok(elem) = self
                     .builder
                     .build_extract_value(sv, idx as u32, "sfield.discard")

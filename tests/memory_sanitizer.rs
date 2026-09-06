@@ -3000,6 +3000,103 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-34 — the rest-covered fields of a struct destructure under
+    /// ASAN + LSan: a fresh literal's rest field is freed by the discard
+    /// walker, a fresh call's by the bottom arm's slot (bodies only here), a
+    /// named local's by its own walk — one owner each, nothing freed twice,
+    /// nothing leaked.
+    #[test]
+    fn asan_struct_destructure_rest_fields_have_one_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"n{i}\", xs: [i] }; }\n\
+             struct S3 { a: R, b: R }\n\
+             struct S4 { a: R, b: R, c: R, n: i64 }\n\
+             fn mks(i: i64) -> S3 { return S3 { a: mk(i), b: mk(i + 1) }; }\n\
+             \n\
+             fn local_a(i: i64) -> i64 { let s = S3 { a: mk(i), b: mk(i + 1) }; let S3 { a, .. } = s; println(\"  mid\"); return a.id; }\n\
+             fn local_ab(i: i64) -> i64 { let s = S4 { a: mk(i), b: mk(i + 1), c: mk(i + 2), n: 4 }; let S4 { a, b, .. } = s; println(\"  mid\"); return a.id + b.id; }\n\
+             fn local_all_rest(i: i64) -> i64 { let s = S3 { a: mk(i), b: mk(i + 1) }; let S3 { .. } = s; println(\"  mid\"); return 1; }\n\
+             fn local_wild(i: i64) -> i64 { let s = S3 { a: mk(i), b: mk(i + 1) }; let S3 { a, b: _ } = s; println(\"  mid\"); return a.id; }\n\
+             fn lit_a(i: i64) -> i64 { let S3 { a, .. } = S3 { a: mk(i), b: mk(i + 1) }; println(\"  mid\"); return a.id; }\n\
+             fn lit_wild(i: i64) -> i64 { let S3 { a, b: _ } = S3 { a: mk(i), b: mk(i + 1) }; println(\"  mid\"); return a.id; }\n\
+             fn call_a(i: i64) -> i64 { let S3 { a, .. } = mks(i); println(\"  mid\"); return a.id; }\n\
+             fn param_a(s: S3) -> i64 { let S3 { a, .. } = s; println(\"  mid\"); return 1; }\n\
+             fn view_w(r: R) -> i64 { let s = S3 { a: mk(92), b: r }; let S3 { a, b: _ } = s; println(\"  mid\"); return a.id; }\n\
+             fn view_a(r: R) -> i64 { let s = S3 { a: mk(90), b: r }; let S3 { a, .. } = s; println(\"  mid\"); return a.id; }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"local_a\"); let v1 = local_a(1); println(f\"  v={v1}\");\n\
+             \x20   println(\"local_ab\"); let v2 = local_ab(10); println(f\"  v={v2}\");\n\
+             \x20   println(\"local_all_rest\"); let v3 = local_all_rest(20); println(f\"  v={v3}\");\n\
+             \x20   println(\"local_wild\"); let v4 = local_wild(30); println(f\"  v={v4}\");\n\
+             \x20   println(\"lit_a\"); let v5 = lit_a(40); println(f\"  v={v5}\");\n\
+             \x20   println(\"lit_wild\"); let v6 = lit_wild(50); println(f\"  v={v6}\");\n\
+             \x20   println(\"call_a\"); let v7 = call_a(60); println(f\"  v={v7}\");\n\
+             \x20   println(\"param_a\"); let v8 = param_a(S3 { a: mk(70), b: mk(71) }); println(f\"  v={v8}\");\n\
+             \x20   println(\"view_a\"); let v9 = view_a(mk(80)); println(f\"  v={v9}\");\n\
+             \x20   println(\"view_w\"); let v10 = view_w(mk(82)); println(f\"  v={v10}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "local_a",
+                "  dR2",
+                "  mid",
+                "  dR1",
+                "  v=1",
+                "local_ab",
+                "  dR12",
+                "  mid",
+                "  dR11",
+                "  dR10",
+                "  v=21",
+                "local_all_rest",
+                "  dR21",
+                "  dR20",
+                "  mid",
+                "  v=1",
+                "local_wild",
+                "  dR31",
+                "  mid",
+                "  dR30",
+                "  v=30",
+                "lit_a",
+                "  dR41",
+                "  mid",
+                "  dR40",
+                "  v=40",
+                "lit_wild",
+                "  dR51",
+                "  mid",
+                "  dR50",
+                "  v=50",
+                "call_a",
+                "  dR61",
+                "  mid",
+                "  dR60",
+                "  v=60",
+                "param_a",
+                "  mid",
+                "  dR71",
+                "  dR70",
+                "  v=1",
+                "view_a",
+                "  mid",
+                "  dR90",
+                "  dR80",
+                "  v=90",
+                "view_w",
+                "  mid",
+                "  dR92",
+                "  dR82",
+                "  v=92",
+                "end"
+            ],
+            "struct_destructure_rest_fields",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

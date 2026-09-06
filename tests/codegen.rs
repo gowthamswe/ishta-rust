@@ -33704,6 +33704,113 @@ end
         );
     }
 
+    /// B-2026-09-06-34 — the fields a `..` rest covers in a struct `let`
+    /// destructure are discarded leaves on the terms an explicit `_` field
+    /// already is: dropped at the destructure, in reverse declaration order.
+    /// The interpreter never gave them a slot (`dR9 dR8` for `let S3 { a, .. }
+    /// = s` against `dR10 dR9 dR8` compiled); codegen lost them over a FRESH
+    /// source (`lit_a`, `call_a`: `mid dR5` while `lit_wild` ran the body). A
+    /// param-view field (`view_a`, `view_w`) stays the caller's body. The
+    /// param cell reads nothing off its leaf and the pin names first-declared
+    /// fields only — see B-2026-09-06-33 and the crash row filed with this one.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_struct_destructure_rest_fields_run_their_bodies_once`, pinned to the same string.
+    #[test]
+    fn e2e_struct_destructure_rest_fields_run_their_bodies_once() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, name: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}", xs: [i] }; }
+struct S3 { a: R, b: R }
+struct S4 { a: R, b: R, c: R, n: i64 }
+fn mks(i: i64) -> S3 { return S3 { a: mk(i), b: mk(i + 1) }; }
+
+fn local_a(i: i64) -> i64 { let s = S3 { a: mk(i), b: mk(i + 1) }; let S3 { a, .. } = s; println("  mid"); return a.id; }
+fn local_ab(i: i64) -> i64 { let s = S4 { a: mk(i), b: mk(i + 1), c: mk(i + 2), n: 4 }; let S4 { a, b, .. } = s; println("  mid"); return a.id + b.id; }
+fn local_all_rest(i: i64) -> i64 { let s = S3 { a: mk(i), b: mk(i + 1) }; let S3 { .. } = s; println("  mid"); return 1; }
+fn local_wild(i: i64) -> i64 { let s = S3 { a: mk(i), b: mk(i + 1) }; let S3 { a, b: _ } = s; println("  mid"); return a.id; }
+fn lit_a(i: i64) -> i64 { let S3 { a, .. } = S3 { a: mk(i), b: mk(i + 1) }; println("  mid"); return a.id; }
+fn lit_wild(i: i64) -> i64 { let S3 { a, b: _ } = S3 { a: mk(i), b: mk(i + 1) }; println("  mid"); return a.id; }
+fn call_a(i: i64) -> i64 { let S3 { a, .. } = mks(i); println("  mid"); return a.id; }
+fn param_a(s: S3) -> i64 { let S3 { a, .. } = s; println("  mid"); return 1; }
+fn view_w(r: R) -> i64 { let s = S3 { a: mk(92), b: r }; let S3 { a, b: _ } = s; println("  mid"); return a.id; }
+fn view_a(r: R) -> i64 { let s = S3 { a: mk(90), b: r }; let S3 { a, .. } = s; println("  mid"); return a.id; }
+
+fn main() {
+    println("local_a"); let v1 = local_a(1); println(f"  v={v1}");
+    println("local_ab"); let v2 = local_ab(10); println(f"  v={v2}");
+    println("local_all_rest"); let v3 = local_all_rest(20); println(f"  v={v3}");
+    println("local_wild"); let v4 = local_wild(30); println(f"  v={v4}");
+    println("lit_a"); let v5 = lit_a(40); println(f"  v={v5}");
+    println("lit_wild"); let v6 = lit_wild(50); println(f"  v={v6}");
+    println("call_a"); let v7 = call_a(60); println(f"  v={v7}");
+    println("param_a"); let v8 = param_a(S3 { a: mk(70), b: mk(71) }); println(f"  v={v8}");
+    println("view_a"); let v9 = view_a(mk(80)); println(f"  v={v9}");
+    println("view_w"); let v10 = view_w(mk(82)); println(f"  v={v10}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"local_a
+  dR2
+  mid
+  dR1
+  v=1
+local_ab
+  dR12
+  mid
+  dR11
+  dR10
+  v=21
+local_all_rest
+  dR21
+  dR20
+  mid
+  v=1
+local_wild
+  dR31
+  mid
+  dR30
+  v=30
+lit_a
+  dR41
+  mid
+  dR40
+  v=40
+lit_wild
+  dR51
+  mid
+  dR50
+  v=50
+call_a
+  dR61
+  mid
+  dR60
+  v=60
+param_a
+  mid
+  dR71
+  dR70
+  v=1
+view_a
+  mid
+  dR90
+  dR80
+  v=90
+view_w
+  mid
+  dR92
+  dR82
+  v=92
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value
