@@ -3214,24 +3214,35 @@ impl<'ctx> super::Codegen<'ctx> {
                 // `arm_conditional_store_flag` — whose `hands_over` reads a
                 // bare `self` for exactly this.
                 //
-                // THE BINDING'S OWN WRAPPER (`karac_drop_<T>`), not the
-                // bodies-only walker the conditional-return legs above use, and
-                // the difference is measured. Standing the caller down leaves
-                // it with a memory action over ITS value, so the value arrives
-                // here still owning its heap and the prologue's per-field deep
-                // copy is taken — the callee holds a COPY of the receiver's
-                // buffers, which the rebinding path frees through the local
-                // (`karac_drop_S(%s2)`) and the non-rebinding path freed
-                // nowhere: 22 allocations against 20 frees, the copy's
-                // `String` and `Vec` definitely lost under valgrind on a
-                // program that calls the method once each way. The wrapper runs
-                // the same body the local's death would and frees the same
-                // copy, so both paths end with one owner and one free.
+                // BODIES ONLY, and the memory left to B-2026-09-05-37's
+                // per-path guard, which landed beside this row and settles the
+                // question the two rows share.
                 //
-                // It cannot double-free the CALLER's buffers: what it frees is
-                // the entry copy the prologue just made, and where no copy
-                // happened the value carries no capacity and every free in the
-                // wrapper is a no-op on it.
+                // Standing the caller down leaves it with a memory action over
+                // ITS value, so the value arrives here still owning its heap
+                // and the prologue's per-field deep copy is taken: the callee
+                // holds a COPY of the receiver's buffers. The rebinding path
+                // frees that copy through the local (`karac_drop_S(%s2)`), and
+                // the non-rebinding path is exactly what
+                // `guard_struct_cleanup_for_nested_move` now covers — the
+                // source's `StructDrop`, kept and guarded by the SAME
+                // `cond_move_drop_flags` bit this registration arms, instead of
+                // statically removed. So the memory has one owner per path
+                // already, and registering the binding's own WRAPPER here
+                // (which frees as well as running bodies) freed the copy twice:
+                // `free(): double free detected in tcache 2` on the struct
+                // receiver, aborting before any output. Bodies-only composes
+                // with that guard — one store disarms both halves on the
+                // rebinding path, and on the other path their free runs beside
+                // this walk.
+                //
+                // An ENUM receiver takes its SHELL body alone (`<E>.drop`), not
+                // the bodies-only walker the struct case uses: the caller
+                // suppresses an owned-`self` enum receiver's payload walk
+                // unconditionally (B-2026-08-01-7 — the arm channel inside the
+                // method owns the payload), so the shell body is the only thing
+                // this stand-down takes away, and running the payload walker
+                // here as well would double the payload body against that arm.
                 if i == 0
                     && param_name == "self"
                     && func.generic_params.is_none()
@@ -3251,18 +3262,19 @@ impl<'ctx> super::Codegen<'ctx> {
                                     .shared_types
                                     .contains_key(type_name.as_str())
                             {
-                                let wrapper = self
-                                    .drop_rc
-                                    .user_drop_wrapper_fns
-                                    .get(type_name.as_str())
-                                    .copied();
-                                if let Some(wrapper) = wrapper {
+                                let is_enum = self.type_decls.enum_layouts.contains_key(&type_name);
+                                let bodies = if is_enum {
+                                    self.module.get_function(&format!("{type_name}.drop"))
+                                } else {
+                                    self.emit_struct_user_drop_bodies_only_fn(&type_name)
+                                };
+                                if let Some(bodies) = bodies {
                                     self.track_user_drop_var_with_fn(
-                                        &type_name,
+                                        "",
                                         &param_name,
                                         alloca,
-                                        wrapper,
-                                        crate::codegen::state::UserDropKind::OwnWrapper,
+                                        bodies,
+                                        crate::codegen::state::UserDropKind::StructFieldBodies,
                                     );
                                     // Arm the per-path flag eagerly: the rebind
                                     // that clears it may be the only site that
