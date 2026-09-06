@@ -32361,6 +32361,82 @@ fn main() {
         );
     }
 
+    /// B-2026-09-01-39 — a LIVE local handed out of a discarded branch, or
+    /// discarded directly (`let _ = e;`), runs its payload's `Drop` body
+    /// exactly once on every surface, reading the bound-local oracle
+    /// (`dE dR1`). Two halves: the interpreter's discard site now OWNS a taken
+    /// tail that names a live local (the `if` arm is a block whose tail record
+    /// had already masked the local's payload walk; the `match` arm is not, so
+    /// the two disagreed) and silences the local whole; codegen's general
+    /// `let` path no longer retracts the source's element-bodies walker for a
+    /// wildcard target, which has no destination to register it anew. Cells:
+    /// `if` and `match`, `let _` and bare-statement, both branch directions,
+    /// direct `let _ = e` and `e;`, an own-`Drop` enum, an enum without one, a
+    /// `Drop`-bearing struct, a plain struct, a bare `R`, a unit variant, and
+    /// a branch nested two deep. Interpreter twin:
+    /// `test_live_local_handed_out_of_a_discarded_branch_runs_payload_body_once`.
+    #[test]
+    fn e2e_live_local_handed_out_of_a_discarded_branch_runs_payload_body_once() {
+        assert_eq!(
+            run_program(
+                r#"struct R { id: i64 }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("dE") } }
+struct W { r: R, n: i64 }
+impl Drop for W { fn drop(mut ref self) { println("dW") } }
+struct P { r: R, n: i64 }
+enum E2 { A(R), B }
+fn mk(n: i64) -> R { return R { id: n }; }
+fn if_let_e2(c: bool) { let e = E2.A(mk(21)); let _ = if c { E2.A(mk(8)) } else { e }; println("mid") }
+fn direct_let_e2() { let e = E2.A(mk(22)); let _ = e; println("mid") }
+fn direct_bare_e2() { let e = E2.A(mk(23)); e; println("mid") }
+fn direct_let_read(c: bool) { let e = E.A(mk(24)); let _ = e; println("mid") }
+fn direct_let_e_unit() { let e = E.B; let _ = e; println("mid") }
+fn if_let(c: bool) { let e = E.A(mk(1)); let _ = if c { E.A(mk(8)) } else { e }; println("mid") }
+fn if_bare(c: bool) { let e = E.A(mk(2)); if c { E.A(mk(8)) } else { e }; println("mid") }
+fn match_let(c: bool) { let e = E.A(mk(3)); let _ = match c { true => E.A(mk(8)), _ => e }; println("mid") }
+fn match_bare(c: bool) { let e = E.A(mk(4)); match c { true => E.A(mk(8)), _ => e }; println("mid") }
+fn direct_let() { let e = E.A(mk(5)); let _ = e; println("mid") }
+fn direct_bare() { let e = E.A(mk(6)); e; println("mid") }
+fn if_let_w(c: bool) { let w = W { r: mk(11), n: 1 }; let _ = if c { W { r: mk(8), n: 2 } } else { w }; println("mid") }
+fn direct_let_w() { let w = W { r: mk(12), n: 1 }; let _ = w; println("mid") }
+fn if_let_p(c: bool) { let p = P { r: mk(13), n: 1 }; let _ = if c { P { r: mk(8), n: 2 } } else { p }; println("mid") }
+fn direct_let_p() { let p = P { r: mk(14), n: 1 }; let _ = p; println("mid") }
+fn if_let_r(c: bool) { let r = mk(15); let _ = if c { mk(8) } else { r }; println("mid") }
+fn direct_let_r() { let r = mk(16); let _ = r; println("mid") }
+fn if_let_nested(c: bool) { let e = E.A(mk(17)); let _ = if c { E.A(mk(8)) } else { if c { E.B } else { e } }; println("mid") }
+fn main() {
+    println("if_let-f"); if_let(false);
+    println("if_let-t"); if_let(true);
+    println("if_bare-f"); if_bare(false);
+    println("if_bare-t"); if_bare(true);
+    println("match_let-f"); match_let(false);
+    println("match_let-t"); match_let(true);
+    println("match_bare-f"); match_bare(false);
+    println("direct_let"); direct_let();
+    println("direct_bare"); direct_bare();
+    println("if_let_w-f"); if_let_w(false);
+    println("if_let_w-t"); if_let_w(true);
+    println("direct_let_w"); direct_let_w();
+    println("if_let_p-f"); if_let_p(false);
+    println("if_let_p-t"); if_let_p(true);
+    println("direct_let_p"); direct_let_p();
+    println("if_let_r-f"); if_let_r(false);
+    println("direct_let_r"); direct_let_r();
+    println("if_let_nested-f"); if_let_nested(false);
+    println("if_let_e2-f"); if_let_e2(false);
+    println("direct_let_e2"); direct_let_e2();
+    println("direct_bare_e2"); direct_bare_e2();
+    println("direct_let_e_unit"); direct_let_e_unit();
+    println("end");
+}"#
+            ),
+            Some("if_let-f\ndE\ndR1\nmid\nif_let-t\ndE\ndR8\ndE\ndR1\nmid\nif_bare-f\ndE\ndR2\nmid\nif_bare-t\ndE\ndR8\ndE\ndR2\nmid\nmatch_let-f\ndE\ndR3\nmid\nmatch_let-t\ndE\ndR8\ndE\ndR3\nmid\nmatch_bare-f\ndE\ndR4\nmid\ndirect_let\ndE\ndR5\nmid\ndirect_bare\ndE\ndR6\nmid\nif_let_w-f\ndW\ndR11\nmid\nif_let_w-t\ndW\ndR8\ndW\ndR11\nmid\ndirect_let_w\ndW\ndR12\nmid\nif_let_p-f\ndR13\nmid\nif_let_p-t\ndR8\ndR13\nmid\ndirect_let_p\ndR14\nmid\nif_let_r-f\ndR15\nmid\ndirect_let_r\ndR16\nmid\nif_let_nested-f\ndE\ndR17\nmid\nif_let_e2-f\ndR21\nmid\ndirect_let_e2\ndR22\nmid\ndirect_bare_e2\ndR23\nmid\ndirect_let_e_unit\ndE\nmid\nend\n".to_string()),
+            "a live local handed out of a discarded branch runs its payload body once"
+        );
+    }
+
     /// B-2026-08-29-31 — the `let _ =` spelling of a discarded branch now owns
     /// whatever its arm hands out, on all three backends.
     ///
@@ -137185,12 +137261,12 @@ fn main() {
     /// records no arm tail when the condition is false, and the all-ctor
     /// branch must keep the count it already had. Nothing here may double.
     ///
-    /// STILL DIVERGING, and deliberately not in this test: the run where the
-    /// TAKEN arm is itself the live local and that local carries a payload.
-    /// Compiled runs the payload's body there and the interpreter does not,
-    /// and the `if` and `match` spellings disagree with each other on BOTH
-    /// backends in opposite directions. That is a separate defect, measured
-    /// and filed on its own row rather than folded into this one.
+    /// The run where the TAKEN arm is itself the live local and that local
+    /// carries a payload was left out when this landed (compiled ran the
+    /// payload's body, the interpreter did not, and the `if` and `match`
+    /// spellings disagreed in opposite directions); B-2026-09-01-39 settled it
+    /// and pins it in
+    /// `e2e_live_local_handed_out_of_a_discarded_branch_runs_payload_body_once`.
     #[test]
     fn e2e_a_discarded_branch_whose_sibling_arm_names_a_live_local() {
         const PRELUDE: &str = "struct R { id: i64 }\n\
@@ -137276,10 +137352,13 @@ fn main() {
                 "dE\ndR5\ndE\ndR8\nmid\nv=7\n",
             ),
             (
+                // B-2026-09-01-39 — this cell pinned the AGREED-WRONG `dE`
+                // (the payload body lost on all four surfaces) while that row
+                // was open; it now reads the bound-local oracle.
                 "guard: the local discarded DIRECTLY, no branch",
                 "let e = E.A(mk(5));\n\
                  let _ = e;",
-                "dE\nmid\nv=7\n",
+                "dE\ndR5\nmid\nv=7\n",
             ),
             (
                 // The boundary the taken-tail question is NARROWED at: a CALL

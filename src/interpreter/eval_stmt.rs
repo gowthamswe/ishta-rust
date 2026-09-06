@@ -4875,16 +4875,36 @@ impl<'a> super::Interpreter<'a> {
                 .final_expr
                 .as_deref()
                 .and_then(|e| self.taken_discarded_tail(e)),
-            ExprKind::Match { arms, .. } => self.taken_arm_tail_of(arms.iter().map(|a| &a.body)),
+            // B-2026-09-01-39 — a NESTED branch (`if c { .. } else { if d { .. }
+            // else { e } }`): the recorded tail is the innermost arm's, which
+            // matches no arm of the OUTER construct. Recurse into the arm that
+            // is itself a branch, so the site that owns the value knows which
+            // local it took; answering `None` here sent it to the all-arms
+            // fallback, which owned the value without disarming `e`, and the
+            // enum's own body ran twice (`dE dE`).
+            ExprKind::Match { arms, .. } => {
+                let bodies: Vec<&Expr> = arms.iter().map(|a| &a.body).collect();
+                self.taken_arm_tail_of(bodies.iter().copied()).or_else(|| {
+                    bodies
+                        .iter()
+                        .find_map(|b| self.taken_discarded_tail(Self::arm_tail_expr(b)))
+                })
+            }
             ExprKind::If {
                 then_block,
                 else_branch,
                 ..
-            } => self.taken_arm_tail_of(
-                [then_block.final_expr.as_deref(), else_branch.as_deref()]
+            } => {
+                let cands: Vec<&Expr> = [then_block.final_expr.as_deref(), else_branch.as_deref()]
                     .into_iter()
-                    .flatten(),
-            ),
+                    .flatten()
+                    .collect();
+                self.taken_arm_tail_of(cands.iter().copied()).or_else(|| {
+                    cands
+                        .iter()
+                        .find_map(|c| self.taken_discarded_tail(Self::arm_tail_expr(c)))
+                })
+            }
             _ => None,
         }
     }
@@ -4910,6 +4930,18 @@ impl<'a> super::Interpreter<'a> {
         let Some(tail) = self.taken_discarded_tail(rhs).cloned() else {
             return;
         };
+        // B-2026-09-01-39 — a BARE identifier tail hands the local over WHOLE,
+        // and this site now owns it whether or not the type declares its own
+        // `Drop` (`discard_arm_tail_is_ownable`): the value walk it just ran
+        // covered the payload, so the local's slot must run nothing — without
+        // this a no-own-`Drop` enum handed out of a `match` arm ran its
+        // payload body here and again at the local's death.
+        if let ExprKind::Identifier(n) = &tail.kind {
+            if self.env.get(n).is_some() {
+                self.moved_out_user_drop_bindings.insert(n.clone());
+                return;
+            }
+        }
         let mut names: Vec<String> = Vec::new();
         Self::collect_aggregate_literal_sources(&tail, &mut names);
         for name in names {
@@ -4958,11 +4990,21 @@ impl<'a> super::Interpreter<'a> {
     /// BARE-STATEMENT `If` arm has always used — which is why the two
     /// statement forms now answer alike instead of one excluding a population
     /// the other admits.
-    fn discard_arm_tail_is_ownable(&self, tail: &Expr) -> bool {
-        match &tail.kind {
-            ExprKind::Identifier(n) => self.env.get(n).is_none(),
-            _ => true,
-        }
+    ///
+    /// B-2026-09-01-39 — a LIVE local is admitted too, now. The exclusion
+    /// rested on "the local keeps its own scope-exit body", and for the `if`
+    /// spelling that was already false: an `else { e }` arm is a BLOCK, and
+    /// the block-tail move record (`record_container_bodies_move_sources`)
+    /// masks the local's payload walk on the reading that the block's result
+    /// has a receiver — so when this site then declined to be that receiver,
+    /// `e`'s slot ran the enum's own body and NOT its payload's (`dE` against
+    /// the bound-local oracle `dE dR1` and every compiled surface). The
+    /// `match` spelling's arm is not a block, which is why the two disagreed.
+    /// Owning the taken tail here is what the compiled backends do in the
+    /// arm's own basic block; `disarm_discarded_tail_sources` then silences
+    /// the local whole, so nothing doubles on either spelling.
+    fn discard_arm_tail_is_ownable(&self, _tail: &Expr) -> bool {
+        true
     }
 
     /// B-2026-08-31-22 — does the DISCARD PRODUCER behind `expr` construct the
@@ -5112,6 +5154,14 @@ impl<'a> super::Interpreter<'a> {
         if self.discard_producer_runs_payload_walk(expr) {
             return true;
         }
+        // B-2026-09-01-39 — the RHS IS a live local (`let _ = e;`): this site
+        // owns the whole value (the let-rebind hook retracts the source's
+        // slot), so an own-`Drop` enum's payload has no other walker. Was
+        // `dE` alone on all four surfaces against the bound-local oracle's
+        // `dE dR5`.
+        if let ExprKind::Identifier(n) = &expr.kind {
+            return self.env.get(n).is_some();
+        }
         // …and ONLY where the all-arms question declined on a LIVE LOCAL. That
         // restriction is not caution, it is the difference between the two
         // reasons an arm can fail `discard_arm_yields_fresh_enum`, and only one
@@ -5138,8 +5188,14 @@ impl<'a> super::Interpreter<'a> {
         if !self.branch_arms_are_fresh_or_live_locals(expr) {
             return false;
         }
-        self.taken_discarded_tail(expr)
-            .is_some_and(|tail| self.discard_arm_yields_fresh_enum(tail))
+        // B-2026-09-01-39 — and a taken tail that is a LIVE local is owned
+        // by this site as well (see `discard_arm_tail_is_ownable`), so its
+        // payload walk runs here; the local is silenced whole by
+        // `disarm_discarded_tail_sources`.
+        self.taken_discarded_tail(expr).is_some_and(|tail| {
+            self.discard_arm_yields_fresh_enum(tail)
+                || matches!(&tail.kind, ExprKind::Identifier(n) if self.env.get(n).is_some())
+        })
     }
 
     /// Is every arm of this branch either a fresh producer or a name that is

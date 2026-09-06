@@ -4216,7 +4216,22 @@ impl<'ctx> super::Codegen<'ctx> {
                 // the second time over the cap-zeroed moved-from slot
                 // (`self.id` reads 0). Interp twin:
                 // `record_container_bodies_move_sources`.
-                self.disarm_container_bodies_move_sources(value);
+                //
+                // B-2026-09-01-39 — NOT for `let _ = e;` over a bare local.
+                // A wildcard has no destination to register the walker anew,
+                // so retracting the source's left an enum local's payload
+                // bodies with no owner at all: `dE` alone for an own-`Drop`
+                // enum and NOTHING for one without, against the bound-local
+                // oracle `dE dR5` (memory was still freed once, by the
+                // source's own drop, which is why no sanitizer saw it). The
+                // source keeps its walker and fires it at its live-range end
+                // — this very statement — exactly as a struct local already
+                // did through its wrapper.
+                let wildcard_of_local = matches!(&pattern.kind, PatternKind::Wildcard)
+                    && matches!(&value.kind, ExprKind::Identifier(_));
+                if !wildcard_of_local {
+                    self.disarm_container_bodies_move_sources(value);
+                }
                 // B-2026-08-04-2 — a boxed `Option`/`Result` payload binding
                 // whole-moved by a plain `let x = r;` hands the box's interior
                 // to `x`, which registers its own drop. Neutralize the box's

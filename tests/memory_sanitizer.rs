@@ -69845,6 +69845,39 @@ fn main() {
         );
     }
 
+    /// B-2026-09-01-39 — the MEMORY half: a live enum local handed out of a
+    /// discarded branch, or discarded directly, now runs its payload body from
+    /// the discard site (interpreter) or its own walker (codegen) instead of
+    /// losing it; every payload here carries a `String` so that a second owner
+    /// would be a double free and a lost one a leak, not just a miscount.
+    #[test]
+    fn asan_discarded_live_enum_local_payload_is_memory_balanced() {
+        assert_clean_asan_run(
+            r#"struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+enum E3 { A(S), B }
+impl Drop for E3 { fn drop(mut ref self) { println("dE3") } }
+enum E4 { A(S), B }
+fn mk(n: i64) -> S { return S { id: n, name: f"nm-{n}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }; }
+fn if_let(c: bool) { let e = E3.A(mk(1)); let _ = if c { E3.A(mk(8)) } else { e }; println("mid") }
+fn if_let4(c: bool) { let e = E4.A(mk(2)); let _ = if c { E4.A(mk(8)) } else { e }; println("mid") }
+fn match_let(c: bool) { let e = E3.A(mk(3)); let _ = match c { true => E3.A(mk(8)), _ => e }; println("mid") }
+fn direct_let() { let e = E3.A(mk(4)); let _ = e; println("mid") }
+fn direct_let4() { let e = E4.A(mk(5)); let _ = e; println("mid") }
+fn if_bare(c: bool) { let e = E3.A(mk(6)); if c { E3.A(mk(8)) } else { e }; println("mid") }
+fn main() {
+    let base: i64 = env.args().len();
+    if_let(base == 0); if_let(base == 1); if_let4(base == 0); match_let(base == 0); direct_let(); direct_let4(); if_bare(base == 0);
+    println("end");
+}"#,
+            &[
+                "dE3", "dS1", "mid", "dE3", "dS8", "dE3", "dS1", "mid", "dS2", "mid", "dE3", "dS3",
+                "mid", "dE3", "dS4", "mid", "dS5", "mid", "dE3", "dS6", "mid", "end",
+            ],
+            "discarded-live-enum-local-payload",
+        );
+    }
+
     /// B-2026-08-28-71 — the MEMORY half of the GENERIC leg of the same fix.
     ///
     /// The monomorph is compiled through `compile_mono_function`, which has its
