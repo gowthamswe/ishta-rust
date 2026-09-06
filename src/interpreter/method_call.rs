@@ -526,9 +526,19 @@ impl<'a> super::Interpreter<'a> {
                                 // field walk; the enum payload walk is already
                                 // masked above). Codegen's twin stands down at
                                 // the same call site.
+                                // B-2026-09-06-45 — and the NESTED spelling
+                                // (`if c { let e = self; .. }`) now stands the
+                                // caller down too: the callee frame adopts the
+                                // receiver's body below and runs it on the paths
+                                // that do NOT rebind, so the stand-down no
+                                // longer loses a body there. Codegen's twin
+                                // widens the same call-site condition.
                                 if self
                                     .find_impl_method_ast(&type_name, method)
-                                    .is_some_and(crate::ast::fn_rebinds_self_whole)
+                                    .is_some_and(|f| {
+                                        crate::ast::fn_rebinds_self_whole(f)
+                                            || crate::ast::fn_conditionally_rebinds_self(f)
+                                    })
                                 {
                                     self.moved_out_user_drop_bindings.insert(recv_name.clone());
                                     self.record_container_move_source_name(recv_name);
@@ -603,7 +613,26 @@ impl<'a> super::Interpreter<'a> {
                 // `record_conditional_move_tail`. Same channel as the free-fn
                 // seeding in `eval_call`, wider admission — see
                 // `method_param_drop_names`.
-                let param_drop_names = self.method_param_drop_names(&type_name, method, args);
+                let mut param_drop_names = self.method_param_drop_names(&type_name, method, args);
+                // B-2026-09-06-45 — the RECEIVER joins that set when the callee
+                // rebinds `self` whole on SOME paths only. The caller has stood
+                // down for the whole call (above), so this frame owes the
+                // receiver's body on every path where the rebind did not
+                // happen; the rebind statement itself disarms it through
+                // `disarm_cond_store_param_on_handover`, whose `hands_over`
+                // reads a bare `self`. Codegen reaches the same split through
+                // `compile_function`'s guarded registration and the per-path
+                // flag — the dynamic form here needs no flag, because only one
+                // path ever runs.
+                let adopts_self_body = matches!(
+                    self.method_self_param(&type_name, method),
+                    Some(crate::ast::SelfParam::Owned)
+                ) && self
+                    .find_impl_method_ast(&type_name, method)
+                    .is_some_and(crate::ast::fn_conditionally_rebinds_self);
+                if adopts_self_body {
+                    param_drop_names.push("self".to_string());
+                }
                 // B-2026-08-29-11, PARAM LEG — `moved_out_user_drop_bindings` is
                 // keyed by bare NAME with no frame qualifier, and the method
                 // path deliberately does not isolate it (see the note below).
@@ -711,6 +740,20 @@ impl<'a> super::Interpreter<'a> {
                 // rather than a line. Tracked as its own row; the leak is
                 // restored here because a double `Drop` body is a worse defect
                 // than the missed one it hides.
+                // B-2026-09-06-45 — the adopted receiver runs its SHELL body
+                // alone for an ENUM: mark its payload walk moved-out inside
+                // this frame, exactly as the caller marks it for a named
+                // receiver (B-2026-08-01-7 — the arm channel inside the method
+                // owns the payload). Without this the frame's drop ran the
+                // payload body a second time beside that arm (`dR12 dE dR12`
+                // against the compiled `dR12 dE`), and on a body that binds
+                // nothing out it ran a payload body the compiled backends do
+                // not run at all. Placed AFTER the isolation above so the mark
+                // belongs to this frame and is restored with it.
+                if adopts_self_body && matches!(obj, Value::EnumVariant { .. }) {
+                    self.moved_out_container_bodies_bindings
+                        .insert("self".to_string());
+                }
                 let result = if contract_fault.is_some() {
                     Ok(Value::Unit)
                 } else {

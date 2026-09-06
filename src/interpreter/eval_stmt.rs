@@ -4553,6 +4553,12 @@ impl<'a> super::Interpreter<'a> {
         fn hands_over(e: &Expr, name: &str) -> bool {
             match &e.kind {
                 ExprKind::Identifier(n) => n == name,
+                // B-2026-09-06-45 — a bare `self` hands the RECEIVER over
+                // (`let e = self;` nested in a branch of an owned-`self`
+                // method), and the receiver is adopted under the name its
+                // frame binds it to. Codegen's `hands_over` carries the same
+                // arm, so the two backends disarm on the same statement.
+                ExprKind::SelfValue => name == "self",
                 ExprKind::Call { args, .. } | ExprKind::MethodCall { args, .. } => {
                     args.iter().any(|a| hands_over(&a.value, name))
                 }

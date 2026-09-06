@@ -1664,6 +1664,106 @@ pub fn fn_rebinds_self_whole(f: &Function) -> bool {
     })
 }
 
+/// B-2026-09-06-45 — does `f` rebind its owned `self` WHOLE on SOME paths
+/// only: a `let <name> = self;` nested inside a branch, arm or loop, with no
+/// top-level one?
+///
+/// The complement of [`fn_rebinds_self_whole`], and the two are mutually
+/// exclusive by construction: a body with a top-level rebind answers `false`
+/// here and `true` there. Together they cover every whole-`self` transfer.
+///
+/// The nested spelling is the one that needs a per-path answer. On the path
+/// that rebinds, the local owns the receiver and runs its bodies; on the path
+/// that does not, nobody inside the callee does, and an owned `self` registers
+/// nothing at entry (caller-retains). So the caller standing down
+/// unconditionally — which is all [`fn_rebinds_self_whole`] asks for — would
+/// LOSE the body on the non-rebinding path, the B-2026-08-28-22 class. Both
+/// backends therefore pair this predicate with a callee-frame registration
+/// guarded per path: the flag is armed at entry and cleared by the rebind
+/// itself (codegen's `arm_conditional_store_flag`, whose `hands_over` reads a
+/// bare `self`; the interpreter's `record_container_bodies_move_sources`).
+/// Measured before that: `dE dR11 dE` for an own-`Drop` enum receiver on the
+/// rebinding path and `dS1 dR31 dS1 dR31` for an own-`Drop` struct, each body
+/// twice, while the non-rebinding path was already right.
+///
+/// A rebind inside a LOOP body counts as nested: the loop may run zero times,
+/// so the transfer is per path exactly as a branch's is.
+pub fn fn_conditionally_rebinds_self(f: &Function) -> bool {
+    if fn_rebinds_self_whole(f) {
+        return false;
+    }
+    fn is_self_rebind(st: &crate::ast::Stmt) -> bool {
+        matches!(&st.kind, StmtKind::Let { pattern, value, .. }
+            if matches!(pattern.kind, PatternKind::Binding(_))
+                && matches!(value.kind, ExprKind::SelfValue))
+    }
+    fn walk_block(b: &Block) -> bool {
+        b.stmts.iter().any(|st| {
+            is_self_rebind(st)
+                || match &st.kind {
+                    StmtKind::Let { value, .. } | StmtKind::Assign { value, .. } => {
+                        walk_expr(value)
+                    }
+                    StmtKind::LetElse {
+                        value, else_block, ..
+                    } => walk_expr(value) || walk_block(else_block),
+                    StmtKind::Defer { body } | StmtKind::ErrDefer { body, .. } => walk_block(body),
+                    StmtKind::Expr(e) => walk_expr(e),
+                    _ => false,
+                }
+        }) || b.final_expr.as_deref().is_some_and(walk_expr)
+    }
+    fn walk_expr(e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::If {
+                condition,
+                then_block,
+                else_branch,
+            } => {
+                walk_expr(condition)
+                    || walk_block(then_block)
+                    || else_branch.as_deref().is_some_and(walk_expr)
+            }
+            ExprKind::IfLet {
+                value,
+                then_block,
+                else_branch,
+                ..
+            } => {
+                walk_expr(value)
+                    || walk_block(then_block)
+                    || else_branch.as_deref().is_some_and(walk_expr)
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                walk_expr(scrutinee) || arms.iter().any(|a| walk_expr(&a.body))
+            }
+            ExprKind::WhileLet { value, body, .. } => walk_expr(value) || walk_block(body),
+            ExprKind::While { body, .. }
+            | ExprKind::For { body, .. }
+            | ExprKind::Loop { body, .. }
+            | ExprKind::LabeledBlock { body, .. } => walk_block(body),
+            ExprKind::Block(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Try(b)
+            | ExprKind::Seq(b)
+            | ExprKind::Par(b) => walk_block(b),
+            ExprKind::Return(inner) => inner.as_deref().is_some_and(walk_expr),
+            _ => false,
+        }
+    }
+    // TOP-LEVEL statements are `fn_rebinds_self_whole`'s half and are already
+    // ruled out above; only what they CONTAIN is this predicate's.
+    f.body.stmts.iter().any(|st| match &st.kind {
+        StmtKind::Let { value, .. } | StmtKind::Assign { value, .. } => walk_expr(value),
+        StmtKind::LetElse {
+            value, else_block, ..
+        } => walk_expr(value) || walk_block(else_block),
+        StmtKind::Defer { body } | StmtKind::ErrDefer { body, .. } => walk_block(body),
+        StmtKind::Expr(e) => walk_expr(e),
+        _ => false,
+    }) || f.body.final_expr.as_deref().is_some_and(walk_expr)
+}
+
 /// B-2026-09-04-30 — does `f`'s body BIND A PART OF `self` OUT: a `let` (or
 /// `let…else`) initialized from `self` or a `self`-rooted place, or a
 /// `match` / `if let` / `while let` whose scrutinee is one?

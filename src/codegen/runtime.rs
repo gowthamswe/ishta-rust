@@ -10626,6 +10626,12 @@ impl<'ctx> super::Codegen<'ctx> {
         fn hands_over(e: &Expr, name: &str) -> bool {
             match &e.kind {
                 ExprKind::Identifier(n) => n == name,
+                // B-2026-09-06-45 — a bare `self` hands the RECEIVER over
+                // (`let e = self;`), and the receiver's flag is keyed under the
+                // name its slot carries. Without this arm the flag stayed armed
+                // on the rebinding path and the callee ran a body the local was
+                // already running.
+                ExprKind::SelfValue => name == "self",
                 ExprKind::Call { args, .. } | ExprKind::MethodCall { args, .. } => {
                     args.iter().any(|a| hands_over(&a.value, name))
                 }

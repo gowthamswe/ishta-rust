@@ -1948,7 +1948,6 @@ fn main() {
                 "cond-true/local",
                 "  dE",
                 "  dR11",
-                "  dE",
                 "  x11",
                 "cond-false/local",
                 "  dR12",
@@ -3505,6 +3504,137 @@ fn main() {
                 "end"
             ],
             "projection_off_param_sibling_once",
+        );
+    }
+
+    /// B-2026-09-06-45 — the MEMORY half of `tests/codegen.rs`'s
+    /// `e2e_nested_self_rebind_runs_each_body_once` under ASAN + LSan. The
+    /// callee-side registration is the binding's OWN wrapper rather than a
+    /// bodies-only walk, because standing the caller down leaves the receiver
+    /// owning its heap at the call and the prologue's per-field deep copy is
+    /// then taken: a bodies-only registration ran the right bodies and freed
+    /// that copy nowhere (22 allocations against 20 frees under valgrind, the
+    /// copy's `String` and `Vec` definitely lost, on a program calling the
+    /// method once each way). This pins one owner and one free per object on
+    /// every spelling.
+    #[test]
+    fn asan_nested_self_rebind_keeps_one_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] }; }\n\
+             struct S { r: R, n: i64 }\n\
+             impl Drop for S { fn drop(mut ref self) { println(f\"  dS{self.n}\") } }\n\
+             enum E { A(R), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"  dE\") } }\n\
+             \n\
+             impl E {\n\
+             \x20   fn cond_match(self, c: bool) -> i64 {\n\
+             \x20       if c { let e = self; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             \x20       else { match self { E.A(r) => { return r.id + 100; } E.B => { return 100; } } }\n\
+             \x20   }\n\
+             \x20   fn cond_bare(self, c: bool) -> i64 { if c { let e = self; return 7; } return 0; }\n\
+             \x20   fn cond_mut(self, c: bool) -> i64 { if c { let mut e = self; match e { E.A(r) => { return r.id; } E.B => { return 0; } } } else { return 5; } }\n\
+             \x20   fn cond_loop(self, n: i64) -> i64 { let mut i = 0; while i < n { let e = self; return 9; } return 0; }\n\
+             \x20   fn cond_arm(self, k: i64) -> i64 { match k { 1 => { let e = self; return 1; } _ => { return 2; } } }\n\
+             \x20   fn top_let(self) -> i64 { let e = self; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             \x20   fn plain(self, c: bool) -> i64 { if c { return 1; } return 2; }\n\
+             \x20   fn borrowed(ref self, c: bool) -> i64 { if c { return 1; } return 2; }\n\
+             }\n\
+             \n\
+             impl S {\n\
+             \x20   fn cond_struct(self, c: bool) -> i64 { if c { let s2 = self; return s2.n; } return self.n + 100; }\n\
+             \x20   fn both_arms(self, c: bool) -> i64 { if c { let s1 = self; return s1.n; } else { let s2 = self; return s2.n + 50; } }\n\
+             }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"enum_true\"); let a = E.A(mk(1)); let v1 = a.cond_match(true); println(f\"  v={v1}\");\n\
+             \x20   println(\"enum_false\"); let b = E.A(mk(2)); let v2 = b.cond_match(false); println(f\"  v={v2}\");\n\
+             \x20   println(\"bare_true\"); let c = E.A(mk(3)); let v3 = c.cond_bare(true); println(f\"  v={v3}\");\n\
+             \x20   println(\"bare_false\"); let d = E.A(mk(4)); let v4 = d.cond_bare(false); println(f\"  v={v4}\");\n\
+             \x20   println(\"mut_true\"); let e = E.A(mk(5)); let v5 = e.cond_mut(true); println(f\"  v={v5}\");\n\
+             \x20   println(\"loop_once\"); let f = E.A(mk(6)); let v6 = f.cond_loop(1); println(f\"  v={v6}\");\n\
+             \x20   println(\"loop_zero\"); let g = E.A(mk(7)); let v7 = g.cond_loop(0); println(f\"  v={v7}\");\n\
+             \x20   println(\"arm_taken\"); let h = E.A(mk(8)); let v8 = h.cond_arm(1); println(f\"  v={v8}\");\n\
+             \x20   println(\"arm_other\"); let i = E.A(mk(9)); let v9 = i.cond_arm(3); println(f\"  v={v9}\");\n\
+             \x20   println(\"temp_true\"); let v10 = E.A(mk(10)).cond_match(true); println(f\"  v={v10}\");\n\
+             \x20   println(\"temp_false\"); let v11 = E.A(mk(11)).cond_match(false); println(f\"  v={v11}\");\n\
+             \x20   println(\"struct_true\"); let j = S { r: mk(12), n: 1 }; let v12 = j.cond_struct(true); println(f\"  v={v12}\");\n\
+             \x20   println(\"struct_false\"); let k = S { r: mk(13), n: 2 }; let v13 = k.cond_struct(false); println(f\"  v={v13}\");\n\
+             \x20   println(\"both_arms\"); let l = S { r: mk(14), n: 3 }; let v14 = l.both_arms(false); println(f\"  v={v14}\");\n\
+             \x20   println(\"top_let\"); let m = E.A(mk(15)); let v15 = m.top_let(); println(f\"  v={v15}\");\n\
+             \x20   println(\"plain\"); let n = E.A(mk(16)); let v16 = n.plain(true); println(f\"  v={v16}\");\n\
+             \x20   println(\"borrowed\"); let o = E.A(mk(17)); let v17 = o.borrowed(true); println(f\"  v={v17}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "enum_true",
+                "  dE",
+                "  dR1",
+                "  v=1",
+                "enum_false",
+                "  dR2",
+                "  dE",
+                "  v=102",
+                "bare_true",
+                "  dE",
+                "  dR3",
+                "  v=7",
+                "bare_false",
+                "  dE",
+                "  v=0",
+                "mut_true",
+                "  dE",
+                "  dR5",
+                "  v=5",
+                "loop_once",
+                "  dE",
+                "  dR6",
+                "  v=9",
+                "loop_zero",
+                "  dE",
+                "  v=0",
+                "arm_taken",
+                "  dE",
+                "  dR8",
+                "  v=1",
+                "arm_other",
+                "  dE",
+                "  v=2",
+                "temp_true",
+                "  dE",
+                "  dR10",
+                "  v=10",
+                "temp_false",
+                "  dR11",
+                "  dE",
+                "  v=111",
+                "struct_true",
+                "  dS1",
+                "  dR12",
+                "  v=1",
+                "struct_false",
+                "  dS2",
+                "  dR13",
+                "  v=102",
+                "both_arms",
+                "  dS3",
+                "  dR14",
+                "  v=53",
+                "top_let",
+                "  dE",
+                "  dR15",
+                "  v=15",
+                "plain",
+                "  dE",
+                "  v=1",
+                "borrowed",
+                "  dE",
+                "  dR17",
+                "  v=1",
+                "end"
+            ],
+            "nested_self_rebind_one_owner",
         );
     }
 

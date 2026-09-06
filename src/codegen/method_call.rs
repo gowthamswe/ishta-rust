@@ -7594,7 +7594,19 @@ impl<'ctx> super::Codegen<'ctx> {
                         Some((crate::ast::SelfParam::Owned, _))
                     ) && self
                         .find_impl_method_ast(&receiver_type, method)
-                        .is_some_and(crate::ast::fn_rebinds_self_whole)
+                        .is_some_and(|f| {
+                            crate::ast::fn_rebinds_self_whole(f)
+                                // B-2026-09-06-45 — the NESTED spelling stands
+                                // the caller down too, now that the callee
+                                // frame carries the body on the paths that do
+                                // not rebind (`compile_function`'s receiver
+                                // registration, cleared by the rebind's own
+                                // block). Before that pairing this arm would
+                                // have lost the body on the non-rebinding path,
+                                // which is why the top-level predicate declined
+                                // it.
+                                || crate::ast::fn_conditionally_rebinds_self(f)
+                        })
                     {
                         let recv_name = recv_name.clone();
                         self.suppress_user_drop_body_keeping_memory(&recv_name);

@@ -3168,6 +3168,104 @@ impl<'ctx> super::Codegen<'ctx> {
                         }
                     }
                 }
+                // B-2026-09-06-45 — CONDITIONALLY-REBOUND owned `self`: take
+                // the receiver's BODY into the callee frame, guarded per path.
+                //
+                // The receiver leg of the conditional-return registration
+                // above, and the same defect one binding over. An owned `self`
+                // is caller-retains — the callee registers nothing at entry —
+                // and B-2026-09-06-42 has the caller stand down whenever the
+                // callee rebinds `self` whole. That predicate is top-level
+                // only, deliberately: a rebind NESTED in a branch moves the
+                // receiver on some paths and leaves it with the caller on the
+                // rest, so an unconditional stand-down would lose the body on
+                // the non-rebinding path. Leaving the caller armed instead is
+                // what this row measured: the local's own death plus the
+                // caller's walk ran `dE dR11 dE` for an enum receiver and
+                // `dS1 dR31 dS1 dR31` for a struct, each body twice.
+                //
+                // So the caller stands down for the whole call (the same three
+                // retractions the top-level case makes, in `method_call`) and
+                // the body comes back here, cleared on the path that rebinds by
+                // `arm_conditional_store_flag` — whose `hands_over` reads a
+                // bare `self` for exactly this.
+                //
+                // THE BINDING'S OWN WRAPPER (`karac_drop_<T>`), not the
+                // bodies-only walker the conditional-return legs above use, and
+                // the difference is measured. Standing the caller down leaves
+                // it with a memory action over ITS value, so the value arrives
+                // here still owning its heap and the prologue's per-field deep
+                // copy is taken — the callee holds a COPY of the receiver's
+                // buffers, which the rebinding path frees through the local
+                // (`karac_drop_S(%s2)`) and the non-rebinding path freed
+                // nowhere: 22 allocations against 20 frees, the copy's
+                // `String` and `Vec` definitely lost under valgrind on a
+                // program that calls the method once each way. The wrapper runs
+                // the same body the local's death would and frees the same
+                // copy, so both paths end with one owner and one free.
+                //
+                // It cannot double-free the CALLER's buffers: what it frees is
+                // the entry copy the prologue just made, and where no copy
+                // happened the value carries no capacity and every free in the
+                // wrapper is a no-op on it.
+                if i == 0
+                    && param_name == "self"
+                    && func.generic_params.is_none()
+                    && !self.is_coroutine_compiled(&func.name)
+                    && crate::ast::fn_conditionally_rebinds_self(func)
+                {
+                    if let TypeKind::Path(path) = &param.ty.kind {
+                        if let Some(type_name) = path.segments.first().cloned() {
+                            let has_user_drop = self
+                                .program_snapshot
+                                .as_deref()
+                                .map(|p| p.drop_method_keys.contains_key(&type_name))
+                                .unwrap_or(false);
+                            if has_user_drop
+                                && !self
+                                    .type_decls
+                                    .shared_types
+                                    .contains_key(type_name.as_str())
+                            {
+                                let wrapper = self
+                                    .drop_rc
+                                    .user_drop_wrapper_fns
+                                    .get(type_name.as_str())
+                                    .copied();
+                                if let Some(wrapper) = wrapper {
+                                    self.track_user_drop_var_with_fn(
+                                        &type_name,
+                                        &param_name,
+                                        alloca,
+                                        wrapper,
+                                        crate::codegen::state::UserDropKind::OwnWrapper,
+                                    );
+                                    // Arm the per-path flag eagerly: the rebind
+                                    // that clears it may be the only site that
+                                    // ever mentions this binding, and
+                                    // `arm_conditional_store_flag` clears a flag
+                                    // it finds rather than creating one.
+                                    let _ = self.cond_move_drop_flag_for(&param_name);
+                                    // And join the per-path set, for the reason
+                                    // the conditional-store leg joins it: the
+                                    // rebind reaches `suppress_user_drop_for_var`
+                                    // (through the whole-value move machinery,
+                                    // which resolves a bare `self` to this
+                                    // slot), whose retraction is ALL PATHS and
+                                    // would delete the very action the flag
+                                    // schedules. Measured without it: the
+                                    // rebinding path came out right and the
+                                    // non-rebinding path lost the body outright
+                                    // — `dR12` with no `dE`, and `x102` with
+                                    // neither `dS2` nor `dR32`.
+                                    self.drop_rc
+                                        .cond_store_flag_params
+                                        .insert(param_name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 self.variables.insert(
                     param_name,
                     VarSlot {
