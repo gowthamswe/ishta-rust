@@ -517,6 +517,22 @@ impl<'a> super::Interpreter<'a> {
                                     self.moved_out_container_bodies_bindings
                                         .insert(recv_name.clone());
                                 }
+                                // B-2026-09-06-42 — the callee REBINDS `self`
+                                // whole (`let e = self;`): the local owns the
+                                // receiver and runs its body and its field /
+                                // payload bodies at its death, so the named
+                                // receiver's retained walk stands down on
+                                // bodies (its own body and, for a struct, its
+                                // field walk; the enum payload walk is already
+                                // masked above). Codegen's twin stands down at
+                                // the same call site.
+                                if self
+                                    .find_impl_method_ast(&type_name, method)
+                                    .is_some_and(crate::ast::fn_rebinds_self_whole)
+                                {
+                                    self.moved_out_user_drop_bindings.insert(recv_name.clone());
+                                    self.record_container_move_source_name(recv_name);
+                                }
                             }
                         }
                         self.self_param_stack.push(sp);

@@ -8312,7 +8312,15 @@ impl<'ctx> super::Codegen<'ctx> {
                             .enum_layouts
                             .get(name.as_str())
                             .is_some_and(|l| l.is_shared);
-                        if matches!(&value.kind, ExprKind::Identifier(_)) && !dest_is_shared_enum {
+                        // B-2026-09-06-42 — a bare owned `self` is the same
+                        // whole-value move (`let e = self;` inside an owned-`self`
+                        // method on a value enum): `self`'s entry-copied payload
+                        // is now `e`'s, and `self`'s own `EnumDrop` must no-op or
+                        // both free it (measured as a double free at -O0 / JIT).
+                        // The suppressor resolves `SelfValue` to the `self` slot.
+                        if matches!(&value.kind, ExprKind::Identifier(_) | ExprKind::SelfValue)
+                            && !dest_is_shared_enum
+                        {
                             self.suppress_source_vec_cleanup_for_arg(value);
                         }
                         // #19: an ENUM field moved OUT of an owned (entry-copied

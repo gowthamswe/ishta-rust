@@ -1640,6 +1640,30 @@ fn type_name_can_contain(
     true
 }
 
+/// B-2026-09-06-42 — does `f` REBIND its owned `self` WHOLE, unconditionally:
+/// a top-level `let <name> = self;` statement of the body?
+///
+/// The rebind transfers the receiver to the local: the local's own drop runs
+/// the shell / struct body AND the field / payload bodies at its death, so the
+/// caller's retained walk over a NAMED receiver (`let a = E.A(mk(1)); a.m_let()`)
+/// must stand down on bodies (keeping its memory action, which frees the
+/// caller's own copy). Measured before this on all four surfaces: `dE dR1 dE`
+/// for an own-`Drop` enum, `dS dR2 dS dR2` for an own-`Drop` struct, `dR1 dR1`
+/// for a struct with only Drop-bearing fields — each body twice.
+///
+/// Deliberately TOP-LEVEL ONLY. A rebind nested in a branch or loop moves the
+/// receiver on some paths and leaves it with the caller on the rest, and the
+/// callee frame registers nothing for an owned `self` (caller-retains), so an
+/// unconditional stand-down would lose the body on the non-rebinding path —
+/// the B-2026-08-28-22 class. Those spellings keep today's behaviour.
+pub fn fn_rebinds_self_whole(f: &Function) -> bool {
+    f.body.stmts.iter().any(|st| {
+        matches!(&st.kind, StmtKind::Let { pattern, value, .. }
+            if matches!(pattern.kind, PatternKind::Binding(_))
+                && matches!(value.kind, ExprKind::SelfValue))
+    })
+}
+
 /// B-2026-09-04-30 — does `f`'s body BIND A PART OF `self` OUT: a `let` (or
 /// `let…else`) initialized from `self` or a `self`-rooted place, or a
 /// `match` / `if let` / `while let` whose scrutinee is one?

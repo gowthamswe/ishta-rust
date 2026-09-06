@@ -7579,6 +7579,29 @@ impl<'ctx> super::Codegen<'ctx> {
                         self.suppress_container_elem_bodies_for_var(&recv_name);
                     }
                 }
+                // B-2026-09-06-42 — the callee REBINDS `self` whole
+                // (`let e = self;`): the local owns the receiver outright and
+                // runs its body and its field / payload bodies at its death, so
+                // the caller's retained walk over a NAMED receiver stands down
+                // on bodies and keeps only its memory action (the caller's copy
+                // is still the caller's to free). Before this every body ran
+                // twice on every surface (`dE dR1 dE`, `dS dR2 dS dR2`,
+                // `dR1 dR1`). A fresh TEMP receiver was already right: the
+                // receiver-temp registrar declines via `fn_binds_self_part_out`.
+                if let ExprKind::Identifier(recv_name) = &object.kind {
+                    if matches!(
+                        self.impl_method_self_and_borrow_return(&receiver_type, method),
+                        Some((crate::ast::SelfParam::Owned, _))
+                    ) && self
+                        .find_impl_method_ast(&receiver_type, method)
+                        .is_some_and(crate::ast::fn_rebinds_self_whole)
+                    {
+                        let recv_name = recv_name.clone();
+                        self.suppress_user_drop_body_keeping_memory(&recv_name);
+                        self.suppress_struct_field_bodies_for_var(&recv_name);
+                        self.suppress_container_elem_bodies_for_var(&recv_name);
+                    }
+                }
                 // Inspect the resolved fn's first param to decide the receiver
                 // calling convention: pointer-typed (ref self / mut ref self)
                 // means pass the address of the receiver's storage; struct-

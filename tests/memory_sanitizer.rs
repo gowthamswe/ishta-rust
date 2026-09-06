@@ -1861,6 +1861,110 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-42 — `let e = self;` inside an owned-`self` method on a value
+    /// enum with its own `Drop` double-freed the entry-copied payload at -O0 and
+    /// under the JIT (`free(): double free detected in tcache 2`; valgrind: two
+    /// frees of one block from `main`), the let-lowering's whole-rebind source
+    /// cap-zero having admitted an `Identifier` source only. This pins the fixture
+    /// of `e2e_whole_self_rebind_in_owned_method_runs_each_body_once` under ASAN /
+    /// LSan: no double free, and no leak from the caller's retained memory action
+    /// once its bodies stand down. valgrind measured 0 errors (leak check on) at
+    /// -O0 and -O2 before this landed as a test.
+    #[test]
+    fn asan_whole_self_rebind_in_owned_method_is_balanced() {
+        assert_clean_asan_run(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+enum F { A(R), B }
+struct S { r: R }
+struct Sd { r: R }
+impl Drop for Sd { fn drop(mut ref self) { println("  dS") } }
+impl E {
+    fn m_let(self) -> i64 { let e = self; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_cond(self, c: bool) -> i64 { if c { let e = self; match e { E.A(r) => { return r.id; } E.B => { return 0; } } } else { match self { E.A(r) => { return r.id + 100; } E.B => { return 100; } } } }
+    fn m_mut(self) -> i64 { let mut e = self; e = E.B; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+}
+impl F { fn m_let(self) -> i64 { let e = self; match e { F.A(r) => { return r.id; } F.B => { return 0; } } } }
+impl S { fn m_let(self) -> i64 { let e = self; return e.r.id; } }
+impl Sd { fn m_let(self) -> i64 { let e = self; return e.r.id; } }
+fn f_let(x: E) -> i64 { let e = x; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+fn main() {
+    println("enum/local"); let a = E.A(mk(1)); let x1 = a.m_let(); println(f"  x{x1}");
+    println("enum/temp"); let x2 = E.A(mk(2)).m_let(); println(f"  x{x2}");
+    println("noshell/local"); let b = F.A(mk(3)); let x3 = b.m_let(); println(f"  x{x3}");
+    println("noshell/temp"); let x4 = F.A(mk(4)).m_let(); println(f"  x{x4}");
+    println("struct/local"); let c = S { r: mk(5) }; let x5 = c.m_let(); println(f"  x{x5}");
+    println("struct/temp"); let x6 = S { r: mk(6) }.m_let(); println(f"  x{x6}");
+    println("structdrop/local"); let d = Sd { r: mk(7) }; let x7 = d.m_let(); println(f"  x{x7}");
+    println("structdrop/temp"); let x8 = Sd { r: mk(8) }.m_let(); println(f"  x{x8}");
+    println("free/local"); let g = E.A(mk(9)); let x9 = f_let(g); println(f"  x{x9}");
+    println("free/temp"); let x10 = f_let(E.A(mk(10))); println(f"  x{x10}");
+    println("cond-true/local"); let h = E.A(mk(11)); let x11 = h.m_cond(true); println(f"  x{x11}");
+    println("cond-false/local"); let i = E.A(mk(12)); let x12 = i.m_cond(false); println(f"  x{x12}");
+    println("mut/local"); let j = E.A(mk(13)); let x13 = j.m_mut(); println(f"  x{x13}");
+    println("end");
+}
+"#,
+            &[
+                "enum/local",
+                "  dE",
+                "  dR1",
+                "  x1",
+                "enum/temp",
+                "  dE",
+                "  dR2",
+                "  x2",
+                "noshell/local",
+                "  dR3",
+                "  x3",
+                "noshell/temp",
+                "  dR4",
+                "  x4",
+                "struct/local",
+                "  dR5",
+                "  x5",
+                "struct/temp",
+                "  dR6",
+                "  x6",
+                "structdrop/local",
+                "  dS",
+                "  dR7",
+                "  x7",
+                "structdrop/temp",
+                "  dS",
+                "  dR8",
+                "  x8",
+                "free/local",
+                "  dE",
+                "  dR9",
+                "  x9",
+                "free/temp",
+                "  dE",
+                "  dR10",
+                "  x10",
+                "cond-true/local",
+                "  dE",
+                "  dR11",
+                "  dE",
+                "  x11",
+                "cond-false/local",
+                "  dR12",
+                "  dE",
+                "  x112",
+                "mut/local",
+                "  dE",
+                "  dR13",
+                "  dE",
+                "  x0",
+                "end",
+            ],
+            "asan_whole_self_rebind_in_owned_method_is_balanced",
+        );
+    }
+
     /// B-2026-09-06-28 — an enum leaf bound out of an owned-struct-pattern
     /// match arm and NEVER consumed frees its payload. These are the `shell`
     /// cells the parent test (B-2026-09-06-15) deliberately omitted: a
