@@ -54934,6 +54934,60 @@ fn main() {
     );
 }
 
+/// B-2026-09-05-11 — the INTERPRETER twin of
+/// `e2e_nested_optres_ctor_let_over_param_runs_one_body`, same program and
+/// the same expected string. The interpreter's half of the row was the METHOD
+/// spelling only: `method_frame_caller_retains_args` asks every by-value
+/// param by argument SHAPE, so a literal `true` (or an `i64` the method
+/// returns) answered for the whole frame, the frame stopped retracting, and
+/// `let o = Option.Some(r)` minted a slot beside the caller's fire. A scalar
+/// carries no `Drop` work and is now neutral there; the free-fn spelling never
+/// consulted the predicate and was right all along.
+#[test]
+fn test_nested_optres_ctor_let_over_param_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"drop {self.id} {self.name}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}" }; }
+fn fl(r: R, keep: bool) -> i64 { if keep { let o = Option.Some(r); println("held"); } return 7; }
+fn flb(r: R, keep: bool) -> i64 { if keep { let o = Some(r); println("held"); } return 7; }
+fn flt(r: R) -> i64 { let o = Option.Some(r); println("held"); return 7; }
+fn flr(r: R, keep: bool) -> i64 { if keep { let o: Result[R, i64] = Result.Ok(r); println("held"); } return 7; }
+fn flu(r: R, keep: bool) -> i64 { if keep { let o = Option.Some(r); println("held"); let p = o; println("used"); } return 7; }
+fn fln(r: R, n: i64) -> i64 { let o = Option.Some(r); println("held"); return n; }
+struct K { z: i64 }
+impl K {
+    fn l(ref self, r: R, keep: bool) -> i64 { if keep { let o = Option.Some(r); println("held"); } return 7; }
+    fn lb(ref self, r: R, keep: bool) -> i64 { if keep { let o = Some(r); println("held"); } return 7; }
+    fn lt(ref self, r: R) -> i64 { let o = Option.Some(r); println("held"); return 7; }
+    fn lr(ref self, r: R, keep: bool) -> i64 { if keep { let o: Result[R, i64] = Result.Ok(r); println("held"); } return 7; }
+    fn ln(ref self, r: R, n: i64) -> i64 { let o = Option.Some(r); println("held"); return n; }
+}
+fn main() {
+    let k = K { z: 0 };
+    println("fl-f"); let _ = fl(mk(1), false);
+    println("fl-t"); let _ = fl(mk(2), true);
+    println("flb-t"); let _ = flb(mk(3), true);
+    println("flt"); let _ = flt(mk(4));
+    println("flr-t"); let _ = flr(mk(5), true);
+    println("flu-t"); let _ = flu(mk(6), true);
+    println("fln"); let _ = fln(mk(7), 9);
+    println("fl-n"); let a = mk(8); let _ = fl(a, true);
+    println("ml-f"); let _ = k.l(mk(11), false);
+    println("ml-t"); let _ = k.l(mk(12), true);
+    println("mlb-t"); let _ = k.lb(mk(13), true);
+    println("mlt"); let _ = k.lt(mk(14));
+    println("mlr-t"); let _ = k.lr(mk(15), true);
+    println("mln"); let _ = k.ln(mk(16), 9);
+    println("ml-n"); let b = mk(17); let _ = k.l(b, true);
+    println("ml-var"); let t = true; let _ = k.l(mk(18), t);
+    println("end");
+}"#),
+        "fl-f\ndrop 1 h1\nfl-t\nheld\ndrop 2 h2\nflb-t\nheld\ndrop 3 h3\nflt\nheld\ndrop 4 h4\nflr-t\nheld\ndrop 5 h5\nflu-t\nheld\nused\ndrop 6 h6\nfln\nheld\ndrop 7 h7\nfl-n\nheld\ndrop 8 h8\nml-f\ndrop 11 h11\nml-t\nheld\ndrop 12 h12\nmlb-t\nheld\ndrop 13 h13\nmlt\nheld\ndrop 14 h14\nmlr-t\nheld\ndrop 15 h15\nmln\nheld\ndrop 16 h16\nml-n\nheld\ndrop 17 h17\nml-var\nheld\ndrop 18 h18\nend\n",
+        "a nested Option/Result ctor let over a by-value param runs one body"
+    );
+}
+
 /// B-2026-08-29-31 — the INTERPRETER twin of
 /// `e2e_wildcard_let_discard_owns_what_its_arm_hands_out`, landed in the same
 /// commit with the SAME shapes in the same order, so the two backends cannot

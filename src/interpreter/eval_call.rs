@@ -2809,6 +2809,33 @@ impl<'a> super::Interpreter<'a> {
             ) {
                 return true;
             }
+            // B-2026-09-05-11 — a SCALAR is neutral: it carries no `Drop` work,
+            // so there is no body for either side to own and nothing for the
+            // frame to hand over. Asked as a per-argument shape test, a `bool`
+            // or `i64` param answered for the whole frame: `k.l(mk(2), true)`
+            // failed on the literal (neither an identifier nor a fresh temp),
+            // and `k.l2(mk(5), n)` failed because `n` is returned on every
+            // path — so the frame stopped retracting, `let o = Option.Some(r)`
+            // minted a slot beside the caller's fire, and the body ran twice
+            // (`drop 2 / held / drop 2`) while passing the SAME bool through a
+            // named variable ran it once. The `--interp`-only half of the row,
+            // and the reason its free-fn twin never showed it: that path never
+            // consults this predicate.
+            if p.name().is_some_and(|n| {
+                matches!(
+                    self.env.get(n),
+                    Some(
+                        Value::Int(_)
+                            | Value::Float(_)
+                            | Value::Bool(_)
+                            | Value::Char(_)
+                            | Value::String(_)
+                            | Value::Unit
+                    )
+                )
+            }) {
+                return true;
+            }
             // B-2026-09-03-7 — a FRESH TEMP now reaches a caller-side fire too
             // (`run_fresh_temp_arg_drops` runs on this path), so it joins the
             // identifier case rather than forcing the frame to claim the

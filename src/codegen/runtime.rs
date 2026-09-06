@@ -7210,15 +7210,18 @@ impl<'ctx> super::Codegen<'ctx> {
     /// an arm here would have fixed the half whose source happens to be a param
     /// and left the identical local-source double in place.
     pub(super) fn optres_ctor_payloads_are_all_param_views(&self, value: &Expr) -> bool {
-        let ExprKind::Call { callee, args } = &value.kind else {
-            return false;
-        };
-        let ExprKind::Identifier(n) = &callee.kind else {
-            return false;
-        };
-        matches!(n.as_str(), "Some" | "Ok" | "Err")
-            && !args.is_empty()
-            && args.iter().all(|a| self.expr_is_param_view(&a.value))
+        // B-2026-09-05-11 — through the shared constructor shape test, so the
+        // QUALIFIED spelling counts. This matched a bare `Some`/`Ok`/`Err`
+        // callee only, and `let o = Option.Some(r)` is a `Path` callee: the
+        // let-site then armed a payload walker for `o` over a value the caller
+        // still fires, and the body ran twice on every compiled surface
+        // (`drop 4 / held / drop 4`) while `let o = Some(r)` beside it ran
+        // once. The interpreter's twin (`let_ctor_payloads_are_param_views`)
+        // accepted both spellings all along, which is what made this the
+        // row's run-vs-build half. `option_result_ctor_payload` is the shape
+        // test the admission predicate and both tail-source walkers already
+        // share, so the four now agree on what a constructor is.
+        crate::ast::option_result_ctor_payload(value).is_some_and(|p| self.expr_is_param_view(p))
     }
 
     /// B-2026-08-29-24 — the element indices of a TUPLE LITERAL that were
