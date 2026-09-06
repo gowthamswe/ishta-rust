@@ -8596,7 +8596,37 @@ impl<'ctx> super::Codegen<'ctx> {
                                             .or_default()
                                             .extend(view_elems.iter().copied());
                                     }
-                                    if let Some(bodies) = self
+                                    // B-2026-09-06-6 — a WHOLE rebind of a
+                                    // tuple-typed param VIEW (`let z = t;` over
+                                    // a bare `t: (R, i64)` param, or over a
+                                    // leaf `inner` that `let (inner, y) = h.pe`
+                                    // marked a view) is itself a view. Its
+                                    // element bodies belong to the CALLER,
+                                    // which runs them on its own fresh-temp /
+                                    // named-arg walk (caller-retains), so this
+                                    // binding registers NO walker of its own —
+                                    // the memory registration above is what it
+                                    // keeps, exactly as the struct spelling
+                                    // (`let h2 = h;`, B-2026-08-01-15) does.
+                                    // Before this the rebind path re-armed a
+                                    // full walk from the inherited element
+                                    // types and the body fired twice on every
+                                    // compiled backend (`v3m 1 dR1 dR1` against
+                                    // the interpreter's `v3m 1 dR1`), and a
+                                    // rebind of the rebind fired it a third
+                                    // time. View-ness PROPAGATES so a later
+                                    // `let x = z.0;` / `let (r, x) = z;` hits
+                                    // the same param gates a direct param
+                                    // projection does.
+                                    let rhs_is_param_view = self.expr_is_param_view(value);
+                                    if rhs_is_param_view {
+                                        self.payload_vars
+                                            .param_view_locals
+                                            .insert(var_name.clone());
+                                    }
+                                    if rhs_is_param_view {
+                                        // Bodies are the caller's; memory only.
+                                    } else if let Some(bodies) = self
                                         .emit_tuple_elem_user_drop_bodies_fn_skipping(
                                             agg_ty,
                                             &elem_tes,

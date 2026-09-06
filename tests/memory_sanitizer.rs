@@ -74157,4 +74157,78 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-6 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_whole_rebind_of_a_tuple_param_view_runs_one_body`: the rebound
+    /// tuple view's element is freed once and its body runs once. Heap `R`
+    /// (`String` + `Vec`), so a second owner would be a double free here and
+    /// not only a body miscount.
+    #[test]
+    fn asan_whole_rebind_of_a_tuple_param_view_clean() {
+        let label = "whole_rebind_of_a_tuple_param_view";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct H2 { pe: ((R, i64), i64) }
+struct H1 { pe: (R, i64) }
+fn take(t: (R, i64)) { println(f"take {t.0.id}") }
+fn v3m(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; println(f"v3m {z.0.id}") }
+fn v3m_unread(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; println("v3mu") }
+fn v3m_destr(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; let (r, x) = z; println(f"v3md {r.id}") }
+fn v3m_twice(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; let w: (R, i64) = z; println(f"v3mt {w.0.id}") }
+fn v3m_ret(h: H2) -> (R, i64) { let (inner, y) = h.pe; let z: (R, i64) = inner; return z; }
+fn v3m_untyped(h: H2) { let (inner, y) = h.pe; let z = inner; println(f"vu {z.0.id}") }
+fn v3m_take(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; take(z); println("vt") }
+fn flat_m(h: H1) { let p: (R, i64) = h.pe; println(f"fm {p.0.id}") }
+fn t_m(t: (R, i64)) { let z: (R, i64) = t; println(f"tm {z.0.id}") }
+fn t_destr(t: (R, i64)) { let z: (R, i64) = t; let (r, n) = z; println(f"td {r.id} {n}") }
+fn t_take(t: (R, i64)) { let z: (R, i64) = t; take(z); println("tt") }
+fn t_ret(t: (R, i64)) -> (R, i64) { let z: (R, i64) = t; return z; }
+fn t_untyped(t: (R, i64)) { let z = t; println(f"tu {z.0.id}") }
+fn main() {
+    { v3m(H2 { pe: ((mk(1), 1), 2) }); println("one") }
+    { v3m_unread(H2 { pe: ((mk(2), 1), 2) }); println("two") }
+    { v3m_destr(H2 { pe: ((mk(3), 1), 2) }); println("three") }
+    { v3m_twice(H2 { pe: ((mk(4), 1), 2) }); println("four") }
+    { let a: (R, i64) = v3m_ret(H2 { pe: ((mk(5), 1), 2) }); println(f"got{a.0.id}"); println("five") }
+    { flat_m(H1 { pe: (mk(6), 1) }); println("six") }
+    { t_m((mk(7), 1)); println("seven") }
+    { let h: H2 = H2 { pe: ((mk(8), 1), 2) }; v3m(h); println("eight") }
+    { v3m_untyped(H2 { pe: ((mk(9), 1), 2) }); println("nine") }
+    { v3m_take(H2 { pe: ((mk(10), 1), 2) }); println("ten") }
+    { t_destr((mk(11), 11)); println("eleven") }
+    { t_take((mk(12), 12)); println("twelve") }
+    { let a: (R, i64) = t_ret((mk(13), 13)); println(f"got{a.0.id}"); println("thirteen") }
+    { t_untyped((mk(14), 14)); println("fourteen") }
+    { let t: (R, i64) = (mk(15), 15); t_m(t); println("fifteen") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "v3m 1", "dR1", "one", "v3mu", "dR2", "two", "v3md 3", "dR3", "three", "v3mt 4",
+                "dR4", "four", "got5", "dR5", "five", "fm 6", "dR6", "six", "tm 7", "dR7", "seven",
+                "v3m 8", "dR8", "eight", "vu 9", "dR9", "nine", "take 10", "vt", "dR10", "ten",
+                "td 11 11", "dR11", "eleven", "take 12", "tt", "dR12", "twelve", "got13", "dR13",
+                "thirteen", "tu 14", "dR14", "fourteen", "tm 15", "dR15", "fifteen", "end"
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

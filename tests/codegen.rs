@@ -145590,6 +145590,74 @@ fn main() {
         };
         assert_eq!(out, "v3 1\ndR1\none\nv3r 2\ndR2\ntwo\nv3u\ndR3\nthree\nv3o\ndR5\nfive\nflat 7\ndR7\nseven\nflatr 8\ndR8\neight\ndeep 10\ndR10\nten\nv3 11\ndR11\neleven\nend\n");
     }
+
+    /// B-2026-09-06-6 — a WHOLE rebind of a tuple-typed param VIEW
+    /// (`let z: (R, i64) = inner` after `let (inner, y) = h.pe`, or
+    /// `let z = t` over a bare `t: (R, i64)` param) runs the element's user
+    /// `Drop` body ONCE. The struct spelling (`let h2 = h`) had inherited
+    /// view-ness at the `let` site since B-2026-08-01-15; the tuple spelling
+    /// re-armed a full element-bodies walker from the inherited element
+    /// types, so the body fired at `z`'s death AND in the caller's walk —
+    /// `v3m 1 dR1 dR1` on jit / aot / AUTO_PAR=0 against the interpreter's
+    /// `v3m 1 dR1`, and a rebind of the rebind fired it a third time. The
+    /// rebind is now a view too: memory registered, no bodies, and the mark
+    /// propagates so a later projection / destructure / handoff of `z`
+    /// takes the param gates a direct `t` does.
+    ///
+    /// `one`..`five` the row's shape by read / unread / destructure-of-the-
+    /// rebind / rebind-of-the-rebind / returned; `six` the flat projection
+    /// (always right); `seven` and `eleven`..`fourteen` the bare tuple
+    /// param; `eight` and `fifteen` the named-local argument; `nine` the
+    /// un-annotated rebind; `ten` / `twelve` the rebind handed to a callee.
+    /// Not here, filed separately: `let x: R = z.0` leaks `x`'s interior at
+    /// -O0 in the DIRECT spelling too, and `let w = keep(z)` over a callee
+    /// that returns its param runs the body twice on all four surfaces.
+    #[test]
+    fn e2e_whole_rebind_of_a_tuple_param_view_runs_one_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct H2 { pe: ((R, i64), i64) }
+struct H1 { pe: (R, i64) }
+fn take(t: (R, i64)) { println(f"take {t.0.id}") }
+fn v3m(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; println(f"v3m {z.0.id}") }
+fn v3m_unread(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; println("v3mu") }
+fn v3m_destr(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; let (r, x) = z; println(f"v3md {r.id}") }
+fn v3m_twice(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; let w: (R, i64) = z; println(f"v3mt {w.0.id}") }
+fn v3m_ret(h: H2) -> (R, i64) { let (inner, y) = h.pe; let z: (R, i64) = inner; return z; }
+fn v3m_untyped(h: H2) { let (inner, y) = h.pe; let z = inner; println(f"vu {z.0.id}") }
+fn v3m_take(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; take(z); println("vt") }
+fn flat_m(h: H1) { let p: (R, i64) = h.pe; println(f"fm {p.0.id}") }
+fn t_m(t: (R, i64)) { let z: (R, i64) = t; println(f"tm {z.0.id}") }
+fn t_destr(t: (R, i64)) { let z: (R, i64) = t; let (r, n) = z; println(f"td {r.id} {n}") }
+fn t_take(t: (R, i64)) { let z: (R, i64) = t; take(z); println("tt") }
+fn t_ret(t: (R, i64)) -> (R, i64) { let z: (R, i64) = t; return z; }
+fn t_untyped(t: (R, i64)) { let z = t; println(f"tu {z.0.id}") }
+fn main() {
+    { v3m(H2 { pe: ((mk(1), 1), 2) }); println("one") }
+    { v3m_unread(H2 { pe: ((mk(2), 1), 2) }); println("two") }
+    { v3m_destr(H2 { pe: ((mk(3), 1), 2) }); println("three") }
+    { v3m_twice(H2 { pe: ((mk(4), 1), 2) }); println("four") }
+    { let a: (R, i64) = v3m_ret(H2 { pe: ((mk(5), 1), 2) }); println(f"got{a.0.id}"); println("five") }
+    { flat_m(H1 { pe: (mk(6), 1) }); println("six") }
+    { t_m((mk(7), 1)); println("seven") }
+    { let h: H2 = H2 { pe: ((mk(8), 1), 2) }; v3m(h); println("eight") }
+    { v3m_untyped(H2 { pe: ((mk(9), 1), 2) }); println("nine") }
+    { v3m_take(H2 { pe: ((mk(10), 1), 2) }); println("ten") }
+    { t_destr((mk(11), 11)); println("eleven") }
+    { t_take((mk(12), 12)); println("twelve") }
+    { let a: (R, i64) = t_ret((mk(13), 13)); println(f"got{a.0.id}"); println("thirteen") }
+    { t_untyped((mk(14), 14)); println("fourteen") }
+    { let t: (R, i64) = (mk(15), 15); t_m(t); println("fifteen") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "v3m 1\ndR1\none\nv3mu\ndR2\ntwo\nv3md 3\ndR3\nthree\nv3mt 4\ndR4\nfour\ngot5\ndR5\nfive\nfm 6\ndR6\nsix\ntm 7\ndR7\nseven\nv3m 8\ndR8\neight\nvu 9\ndR9\nnine\ntake 10\nvt\ndR10\nten\ntd 11 11\ndR11\neleven\ntake 12\ntt\ndR12\ntwelve\ngot13\ndR13\nthirteen\ntu 14\ndR14\nfourteen\ntm 15\ndR15\nfifteen\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]
