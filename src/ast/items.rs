@@ -3446,7 +3446,7 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
 /// `arg_index` have a payload that `f` hands out of its frame?
 ///
 /// ```text
-/// fn e_call(b: E) -> i64   { match b { E.A(r) => consume(r), E.B(k) => k } }   // ["B"]
+/// fn e_call(b: E) -> i64   { match b { E.A(r) => consume(r), E.B(k) => k } }   // [] — `k: i64` carries no body (B-2026-09-06-26; was ["B"])
 /// fn e_ret(b: E) -> R      { match b { E.A(r) => r,          E.B(k) => mk(k) } } // ["A"]
 /// fn e_fwd(b: E) -> R      { match b { E.A(r) => wrap(r),    E.B(k) => mk(k) } } // ["A"]
 /// fn any(b: E) -> E        { match b { x => x } }                                 // ["*"]
@@ -3989,7 +3989,11 @@ fn escaping_param_payload_variants_impl(
                         walk(&a.body, param, fn_body, rule, stored, stored_block, out);
                         continue;
                     }
-                    let names: Vec<String> = a.pattern.binding_names();
+                    let names = payload_names_that_can_carry_a_body(
+                        &a.pattern,
+                        a.pattern.binding_names(),
+                        rule,
+                    );
                     if !names.is_empty()
                         && (names.iter().any(|n| payload_yields(&a.body, n, rule))
                             || payload_returns_any(&a.body, &names, rule)
@@ -4006,7 +4010,8 @@ fn escaping_param_payload_variants_impl(
                 then_block,
                 ..
             } if scrutinee_is_param(value) && !matches!(pattern.kind, PatternKind::Tuple(_)) => {
-                let names: Vec<String> = pattern.binding_names();
+                let names =
+                    payload_names_that_can_carry_a_body(pattern, pattern.binding_names(), rule);
                 if !names.is_empty()
                     && (payload_returns_any_block(then_block, &names, rule)
                         || payload_escapes_by_assignment_block(then_block, &names, fn_body, rule)
@@ -4021,7 +4026,8 @@ fn escaping_param_payload_variants_impl(
                 body,
                 ..
             } if scrutinee_is_param(value) && !matches!(pattern.kind, PatternKind::Tuple(_)) => {
-                let names: Vec<String> = pattern.binding_names();
+                let names =
+                    payload_names_that_can_carry_a_body(pattern, pattern.binding_names(), rule);
                 if !names.is_empty()
                     && (payload_returns_any_block(body, &names, rule)
                         || payload_escapes_by_assignment_block(body, &names, fn_body, rule)
@@ -4710,6 +4716,125 @@ enum CallYieldRule<'p> {
 /// returned aggregate literal, or handed to a call per `rule`? A FIELD
 /// projection (`r.id`) deliberately does not count: the payload stays behind,
 /// only a copy of one field leaves.
+/// B-2026-09-06-26 — of the names an arm's pattern binds, the ones whose value
+/// could carry a user `Drop` body at all.
+///
+/// The escape predicates above answer a BODIES question: does the caller's
+/// retained walk over the argument have to stand down because the value it
+/// would fire for has left the frame? A leaf whose DECLARED type is a scalar
+/// primitive or a `String` (`H2 { e, n }` with `n: i64`) cannot carry a body wherever it
+/// goes, so its leaving proves nothing about the argument — yet the scanner
+/// counted it, and for a plain-STRUCT pattern there is one "variant" (the
+/// struct itself), so `return n` stood the whole argument down and the
+/// enum field's `dE dR` ran nowhere under `--interp` (the compiled backends
+/// never ask this predicate of a struct argument, which is why they were
+/// right on the same cells). Program-aware only: the `Any` rule has no
+/// declarations to read and keeps every name, its callee-side consumers'
+/// measured behaviour. For an enum this narrows the -35 per-variant answer
+/// the same way: `E.B(k) => k` with `k: i64` no longer reports `B`, whose
+/// payload has no body to mask.
+fn payload_names_that_can_carry_a_body(
+    pattern: &Pattern,
+    names: Vec<String>,
+    rule: CallYieldRule<'_>,
+) -> Vec<String> {
+    let CallYieldRule::ReturnsIt(program) = rule else {
+        return names;
+    };
+    names
+        .into_iter()
+        .filter(|n| pattern_leaf_may_carry_body(program, pattern, n))
+        .collect()
+}
+
+/// The DECLARED type of the field / payload position `name` binds under
+/// `pattern`, looked up in the program's struct and enum declarations; `true`
+/// (may carry) whenever the shape or the declaration cannot be resolved —
+/// the conservative direction this family runs on.
+fn pattern_leaf_may_carry_body(program: &crate::Program, pattern: &Pattern, name: &str) -> bool {
+    let declared: Option<&TypeExpr> = match &pattern.kind {
+        PatternKind::Struct { path, fields, .. } => {
+            let Some(last) = path.last() else {
+                return true;
+            };
+            let Some(field) = fields.iter().find_map(|f| match &f.pattern {
+                None if f.name == name => Some(f.name.as_str()),
+                Some(sub) if matches!(&sub.kind, PatternKind::Binding(b) if b == name) => {
+                    Some(f.name.as_str())
+                }
+                _ => None,
+            }) else {
+                return true;
+            };
+            let plain = program.items.iter().find_map(|it| match it {
+                Item::StructDef(s) if &s.name == last => {
+                    s.fields.iter().find(|f| f.name == field).map(|f| &f.ty)
+                }
+                _ => None,
+            });
+            plain.or_else(|| {
+                program.items.iter().find_map(|it| match it {
+                    Item::EnumDef(e) => {
+                        e.variants
+                            .iter()
+                            .find(|v| &v.name == last)
+                            .and_then(|v| match &v.kind {
+                                VariantKind::Struct(fs) => {
+                                    fs.iter().find(|f| f.name == field).map(|f| &f.ty)
+                                }
+                                _ => None,
+                            })
+                    }
+                    _ => None,
+                })
+            })
+        }
+        PatternKind::TupleVariant { path, patterns } => {
+            let Some(last) = path.last() else {
+                return true;
+            };
+            let Some(pos) = patterns
+                .iter()
+                .position(|p| matches!(&p.kind, PatternKind::Binding(b) if b == name))
+            else {
+                return true;
+            };
+            program.items.iter().find_map(|it| match it {
+                Item::EnumDef(e) => {
+                    e.variants
+                        .iter()
+                        .find(|v| &v.name == last)
+                        .and_then(|v| match &v.kind {
+                            VariantKind::Tuple(ts) => ts.get(pos),
+                            _ => None,
+                        })
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    };
+    !declared.is_some_and(type_expr_cannot_carry_drop_body)
+}
+
+/// A type that can own nothing a user `Drop` body observes: a bare scalar
+/// primitive, unit, or `String` (heap, but no user `Drop` and nothing inside
+/// that could declare one). Every other shape — a user type, a generic
+/// container, a tuple — may carry one and keeps the conservative answer.
+fn type_expr_cannot_carry_drop_body(te: &TypeExpr) -> bool {
+    match &te.kind {
+        crate::ast::TypeKind::Unit => true,
+        crate::ast::TypeKind::Path(p) if p.generic_args.is_none() => {
+            matches!(p.segments.as_slice(), [n] if matches!(
+                n.as_str(),
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
+                    | "u64" | "u128" | "usize" | "f32" | "f64" | "bool" | "char" | "String"
+            ))
+        }
+        _ => false,
+    }
+}
+
 fn payload_yields(e: &Expr, name: &str, rule: CallYieldRule<'_>) -> bool {
     match &e.kind {
         ExprKind::Identifier(n) => n == name,
@@ -4719,6 +4844,15 @@ fn payload_yields(e: &Expr, name: &str, rule: CallYieldRule<'_>) -> bool {
         ExprKind::Tuple(elems) => elems.iter().any(|el| payload_yields(el, name, rule)),
         ExprKind::Call { callee, args, .. } => args.iter().enumerate().any(|(j, a)| {
             if !payload_yields(&a.value, name, rule) {
+                return false;
+            }
+            // B-2026-09-06-26 — a LOWERED PRIMITIVE OPERATOR. By the time the
+            // interpreter runs, `lower_program` has rewritten `r.id + n` into
+            // `i64.add(r.id, n)`: a `Call` whose callee is a `Path`, which the
+            // resolution below cannot name and so counted as "unknown callee,
+            // keeps the escape". An intrinsic returns a fresh scalar and takes
+            // nothing over, under either rule.
+            if crate::consume_class::is_lowered_primitive_operator(callee) {
                 return false;
             }
             let CallYieldRule::ReturnsIt(program) = rule else {

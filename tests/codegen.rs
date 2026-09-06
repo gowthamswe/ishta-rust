@@ -33966,6 +33966,168 @@ end
         );
     }
 
+    /// B-2026-09-06-26 — a free function whose arm RETURNS A SCALAR LEAF of an
+    /// owned-param struct destructure ran NO `Drop` body at all under `--interp`:
+    /// `fn p_bare(h: H2) -> i64 { match h { H2 { e, n } => { return n; } } }` printed
+    /// `x100` alone against `dE dR3 x100` on jit / -O0 / -O2, and so did every
+    /// spelling that mentioned the `i64` leaf on the way out (`r.id + n`, a rebind
+    /// `let z = n * 2`, a renamed field `n: k`, `if let`, a `bool`/`f64` leaf, a
+    /// returned `String` leaf). The caller's stand-down is `record_passthrough_arg_moves`
+    /// → `fn_returns_param_payload_of`, whose scanner counted every name the arm binds
+    /// and asked only whether it LEAVES the frame — an `i64` leaving proves nothing
+    /// about the argument's bodies, and for a plain-struct pattern there is one
+    /// "variant" (the struct itself), so the whole walk over the argument stood down.
+    /// The arithmetic spellings left because, by the time the interpreter runs,
+    /// `lower_program` has rewritten `r.id + n` into `i64.add(r.id, n)`: a `Call` with
+    /// a `Path` callee, which the scanner's "unknown callee keeps the escape" fallback
+    /// counted as taking `n` over.
+    ///
+    /// Fixed in the scanner (`escaping_param_payload_variants_impl`): a lowered
+    /// primitive operator (`consume_class::is_lowered_primitive_operator`) never takes
+    /// an argument over, and — program-aware — a leaf whose DECLARED type cannot carry
+    /// a user `Drop` body (`payload_names_that_can_carry_a_body`: scalar primitives,
+    /// unit, `String`) is dropped from the arm's names before the escape question is
+    /// asked. The compiled backends never asked this predicate of a struct argument,
+    /// which is why they were right on every struct cell; the ENUM cells are where
+    /// both backends consult it, and `sk/S` (`E3.S { k, r } => k`, `k: i64`) is the
+    /// one that moved on every surface: reporting `S` masked `r`'s body out of the
+    /// walk for a value that never left (`dE3 x32`, no `dR132`, agreed-and-wrong), and
+    /// now runs it. `ecall/B` / `earith/B` pin that a scalar-payload variant still
+    /// hands nothing back. `read` / `slen` are the controls that were right throughout.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_scalar_leaf_return_keeps_the_arg_walk`, pinned to the same string.
+    #[test]
+    fn e2e_scalar_leaf_return_keeps_the_arg_walk() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct H2 { e: E, n: i64 }
+struct Hs { e: E, s: String }
+struct Hb { e: E, b: bool, f: f64 }
+enum E2 { A(R), B(i64) }
+impl Drop for E2 { fn drop(mut ref self) { println("  dE2") } }
+enum E3 { A(R), S { k: i64, r: R } }
+impl Drop for E3 { fn drop(mut ref self) { println("  dE3") } }
+fn consume(x: R) -> i64 { return x.id }
+
+fn p_sum(h: H2) -> i64 { match h { H2 { e, n } => { match e { E.A(r) => { return r.id + n; } E.B => { return n; } } } } }
+fn p_bare(h: H2) -> i64 { match h { H2 { e, n } => { return n; } } }
+fn p_ren(h: H2) -> i64 { match h { H2 { e, n: k } => { return k; } } }
+fn p_iflet(h: H2) -> i64 { if let H2 { e, n } = h { return n; } else { return 0; } }
+fn p_alias(h: H2) -> i64 { match h { H2 { e, n } => { let z = n * 2; match e { E.A(r) => { return r.id + z; } E.B => { return 0; } } } } }
+fn p_bf(h: Hb) -> f64 { match h { Hb { e, b, f } => { if b { return f; } return 0.0; } } }
+fn p_s(h: Hs) -> String { match h { Hs { e, s } => { return s; } } }
+fn p_slen(h: Hs) -> i64 { match h { Hs { e, s } => { return s.len(); } } }
+fn p_read(h: H2) -> i64 { match h { H2 { e, n } => { match e { E.A(r) => { return r.id; } E.B => { return 0; } } } } }
+fn e_call(b: E2) -> i64 { match b { E2.A(r) => { return consume(r); } E2.B(k) => { return k; } } }
+fn e_arith(b: E2) -> i64 { match b { E2.A(r) => { return r.id * 2; } E2.B(k) => { return k + 1; } } }
+fn s_k(b: E3) -> i64 { match b { E3.A(r) => { return r.id; } E3.S { k, r } => { return k; } } }
+
+fn main() {
+    println("sum/local"); let a1 = H2 { e: E.A(mk(1)), n: 100 }; let x1 = p_sum(a1); println(f"  x{x1}");
+    println("sum/temp"); let x2 = p_sum(H2 { e: E.A(mk(2)), n: 100 }); println(f"  x{x2}");
+    println("bare/local"); let a3 = H2 { e: E.A(mk(3)), n: 100 }; let x3 = p_bare(a3); println(f"  x{x3}");
+    println("bare/temp"); let x4 = p_bare(H2 { e: E.A(mk(4)), n: 100 }); println(f"  x{x4}");
+    println("ren/local"); let a5 = H2 { e: E.A(mk(5)), n: 100 }; let x5 = p_ren(a5); println(f"  x{x5}");
+    println("iflet/local"); let a6 = H2 { e: E.A(mk(6)), n: 100 }; let x6 = p_iflet(a6); println(f"  x{x6}");
+    println("alias/local"); let a7 = H2 { e: E.A(mk(7)), n: 100 }; let x7 = p_alias(a7); println(f"  x{x7}");
+    println("bf/local"); let a8 = Hb { e: E.A(mk(8)), b: true, f: 2.5 }; let x8 = p_bf(a8); println(f"  x{x8}");
+    println("s/local"); let a9 = Hs { e: E.A(mk(9)), s: "abc".to_string() }; let x9 = p_s(a9); println(f"  x{x9}");
+    println("slen/local"); let a10 = Hs { e: E.A(mk(10)), s: "abcd".to_string() }; let x10 = p_slen(a10); println(f"  x{x10}");
+    println("read/local"); let a11 = H2 { e: E.A(mk(11)), n: 100 }; let x11 = p_read(a11); println(f"  x{x11}");
+    println("ecall/A"); let b1 = E2.A(mk(21)); let y1 = e_call(b1); println(f"  x{y1}");
+    println("ecall/B"); let b2 = E2.B(22); let y2 = e_call(b2); println(f"  x{y2}");
+    println("earith/A"); let b3 = E2.A(mk(23)); let y3 = e_arith(b3); println(f"  x{y3}");
+    println("earith/B"); let b4 = E2.B(24); let y4 = e_arith(b4); println(f"  x{y4}");
+    println("sk/A"); let c1 = E3.A(mk(31)); let z1 = s_k(c1); println(f"  x{z1}");
+    println("sk/S"); let c2 = E3.S { k: 32, r: mk(132) }; let z2 = s_k(c2); println(f"  x{z2}");
+    println("sk/S-temp"); let z3 = s_k(E3.S { k: 33, r: mk(133) }); println(f"  x{z3}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"sum/local
+  dE
+  dR1
+  x101
+sum/temp
+  dE
+  dR2
+  x102
+bare/local
+  dE
+  dR3
+  x100
+bare/temp
+  dE
+  dR4
+  x100
+ren/local
+  dE
+  dR5
+  x100
+iflet/local
+  dE
+  dR6
+  x100
+alias/local
+  dE
+  dR7
+  x207
+bf/local
+  dE
+  dR8
+  x2.5
+s/local
+  dE
+  dR9
+  xabc
+slen/local
+  dE
+  dR10
+  x4
+read/local
+  dE
+  dR11
+  x11
+ecall/A
+  dE2
+  dR21
+  x21
+ecall/B
+  dE2
+  x22
+earith/A
+  dE2
+  dR23
+  x46
+earith/B
+  dE2
+  x25
+sk/A
+  dE3
+  dR31
+  x31
+sk/S
+  dE3
+  dR132
+  x32
+sk/S-temp
+  dE3
+  dR133
+  x33
+end
+"#
+        );
+    }
+
     #[test]
     fn e2e_deep_projection_scrutinee_runs_one_payload_body() {
         let hdr = "struct R { id: i64 }\n\
