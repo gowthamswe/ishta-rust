@@ -75725,4 +75725,65 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-30 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_let_destructure_of_a_mixed_struct_literal_runs_one_body`: a
+    /// destructure leaf bound out of a view field / element goes memory-only,
+    /// so its buffer is still freed exactly once (heap `R`, `String` field)
+    /// while its body is the caller's.
+    #[test]
+    fn asan_let_destructure_of_a_mixed_struct_literal_clean() {
+        let label = "let_destructure_of_a_mixed_struct_literal";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct S3 { a: R, b: R }
+fn d_b(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(2) }; let S3 { a, b } = s; return b.id; }
+fn d_a(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(4) }; let S3 { a, b } = s; return a.id; }
+fn d_unread(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(6) }; let S3 { a, b } = s; return 1; }
+fn d_rebind(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(8) }; let s2: S3 = s; let S3 { a, b } = s2; return b.id; }
+fn d_rebind_leaf(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(10) }; let S3 { a, b } = s; let m: R = a; return m.id; }
+fn d_swap(r: R) -> i64 { let s: S3 = S3 { a: mk(12), b: r }; let S3 { a, b } = s; return a.id; }
+fn d_fresh(r: R) -> i64 { let s: S3 = S3 { a: mk(14), b: mk(15) }; let S3 { a, b } = s; return a.id; }
+fn t_b(r: R) -> i64 { let t: (R, R) = (r, mk(19)); let (a, b) = t; return b.id; }
+fn t_rebind_leaf(r: R) -> i64 { let t: (R, R) = (r, mk(21)); let (a, b) = t; let m: R = a; return m.id; }
+fn main() {
+    { let v: i64 = d_b(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = d_a(mk(3)); println(f"v={v}"); println("two") }
+    { let v: i64 = d_unread(mk(5)); println(f"v={v}"); println("three") }
+    { let v: i64 = d_rebind(mk(7)); println(f"v={v}"); println("four") }
+    { let v: i64 = d_rebind_leaf(mk(9)); println(f"v={v}"); println("five") }
+    { let v: i64 = d_swap(mk(11)); println(f"v={v}"); println("six") }
+    { let v: i64 = d_fresh(mk(13)); println(f"v={v}"); println("seven") }
+    { let v: i64 = t_b(mk(18)); println(f"v={v}"); println("eight") }
+    { let v: i64 = t_rebind_leaf(mk(20)); println(f"v={v}"); println("nine") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "dR2", "dR1", "v=2", "one", "dR4", "dR3", "v=3", "two", "dR6", "dR5", "v=1",
+                "three", "dR8", "dR7", "v=8", "four", "dR10", "dR9", "v=9", "five", "dR12", "dR11",
+                "v=12", "six", "dR15", "dR14", "dR13", "v=14", "seven", "dR19", "dR18", "v=19",
+                "eight", "dR21", "dR20", "v=20", "nine", "end"
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

@@ -63538,3 +63538,52 @@ fn main() {
         "dR2\ndR1\nv=2\none\ndR4\ndR3\nv=3\ntwo\ndR6\ndR5\nv=1\nthree\ndR8\ndR7\nv=8\nfour\ndR10\ndR9\nv=10\nfive\ndR12\ndR11\nv=11\nsix\ndR14\ndR13\nv=14\nseven\ndR17\ndR16\ndR15\nv=16\neight\ndR21\ndR20\nv=21\nten\nend\n"
     );
 }
+
+/// B-2026-09-06-30 — a `let` DESTRUCTURE of a mixed struct literal
+/// (`let s = S3 { a: r, b: mk(2) }; let S3 { a, b } = s;`, `r` a by-value
+/// param) ran the view field's `Drop` body twice on ALL FOUR surfaces: the
+/// literal's `param_view_struct_fields` record guarded `s`'s own walk, but
+/// the destructure leaf `a` got a slot of its own beside the caller's walk.
+/// `let_destructure_view_leaves` now hands those leaves to
+/// `push_drops_for_stmt_except` and marks them views in
+/// `owned_param_names_stack`, mirroring B-2026-09-06-22's match arm. Twin of
+/// `tests/codegen.rs`'s
+/// `e2e_let_destructure_of_a_mixed_struct_literal_runs_one_body`, same
+/// program and string.
+///
+/// `one`..`three` direct / `a` read / unread, `four` rebound source, `five`
+/// `let m = a` after the destructure, `six` the view in the other field,
+/// `seven` a fresh literal (no view), `eight`/`nine` the tuple spelling
+/// (`param_view_tuple_elems`) direct and re-bound.
+#[test]
+fn test_let_destructure_of_a_mixed_struct_literal_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct S3 { a: R, b: R }
+fn d_b(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(2) }; let S3 { a, b } = s; return b.id; }
+fn d_a(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(4) }; let S3 { a, b } = s; return a.id; }
+fn d_unread(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(6) }; let S3 { a, b } = s; return 1; }
+fn d_rebind(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(8) }; let s2: S3 = s; let S3 { a, b } = s2; return b.id; }
+fn d_rebind_leaf(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(10) }; let S3 { a, b } = s; let m: R = a; return m.id; }
+fn d_swap(r: R) -> i64 { let s: S3 = S3 { a: mk(12), b: r }; let S3 { a, b } = s; return a.id; }
+fn d_fresh(r: R) -> i64 { let s: S3 = S3 { a: mk(14), b: mk(15) }; let S3 { a, b } = s; return a.id; }
+fn t_b(r: R) -> i64 { let t: (R, R) = (r, mk(19)); let (a, b) = t; return b.id; }
+fn t_rebind_leaf(r: R) -> i64 { let t: (R, R) = (r, mk(21)); let (a, b) = t; let m: R = a; return m.id; }
+fn main() {
+    { let v: i64 = d_b(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = d_a(mk(3)); println(f"v={v}"); println("two") }
+    { let v: i64 = d_unread(mk(5)); println(f"v={v}"); println("three") }
+    { let v: i64 = d_rebind(mk(7)); println(f"v={v}"); println("four") }
+    { let v: i64 = d_rebind_leaf(mk(9)); println(f"v={v}"); println("five") }
+    { let v: i64 = d_swap(mk(11)); println(f"v={v}"); println("six") }
+    { let v: i64 = d_fresh(mk(13)); println(f"v={v}"); println("seven") }
+    { let v: i64 = t_b(mk(18)); println(f"v={v}"); println("eight") }
+    { let v: i64 = t_rebind_leaf(mk(20)); println(f"v={v}"); println("nine") }
+    println("end")
+}
+"#),
+        "dR2\ndR1\nv=2\none\ndR4\ndR3\nv=3\ntwo\ndR6\ndR5\nv=1\nthree\ndR8\ndR7\nv=8\nfour\ndR10\ndR9\nv=9\nfive\ndR12\ndR11\nv=12\nsix\ndR15\ndR14\ndR13\nv=14\nseven\ndR19\ndR18\nv=19\neight\ndR21\ndR20\nv=20\nnine\nend\n"
+    );
+}

@@ -13885,6 +13885,22 @@ impl<'ctx> super::Codegen<'ctx> {
             && matches!(&value.kind, ExprKind::Identifier(root)
                 if self.payload_vars.shared_enum_payload_view_vars.contains_key(root.as_str())
                     || self.borrow_vars.for_loop_owned_agg_vars.contains(root.as_str()));
+        // B-2026-09-06-30 — the fields of a LOCAL source that a mixed literal
+        // recorded as the caller's (`param_view_struct_fields`, B-2026-08-29-47).
+        // A leaf bound out of one is a view exactly as a leaf of a param
+        // source is: memory only, and marked, so `let m = a;` inherits it.
+        // The source's masked walk already skips the field; without this the
+        // leaf minted a second owner and the body ran at the leaf's death AND
+        // in the caller's walk, on all four surfaces.
+        let view_fields: std::collections::HashSet<String> = match &value.kind {
+            ExprKind::Identifier(src) if !owner_runs_bodies => self
+                .payload_vars
+                .param_view_struct_fields
+                .get(src.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            _ => std::collections::HashSet::new(),
+        };
 
         for (idx, fname) in field_names.iter().enumerate() {
             let Some(field_te) = field_tes.get(idx).cloned() else {
@@ -13992,7 +14008,10 @@ impl<'ctx> super::Codegen<'ctx> {
                 // chain because it is a statement about who runs the BODY, not
                 // about which arm ends up owning the MEMORY: the arms below
                 // still transfer buffers to this leaf exactly as they did.
-                if mark_views {
+                // B-2026-09-06-30 — per field: a param source marks every
+                // leaf, a local source marks the leaves of its view fields.
+                let leaf_is_view_field = view_fields.contains(fname);
+                if mark_views || leaf_is_view_field {
                     self.payload_vars.param_view_locals.insert(name.clone());
                 }
                 // B-2026-08-05-7: tracks whether the chain below already gave
@@ -14084,7 +14103,24 @@ impl<'ctx> super::Codegen<'ctx> {
                     } else {
                         None
                     });
-                if let (Some(src), Some(tn)) = (&place_body_src, &leaf_struct_name) {
+                if let (Some(src), Some(tn), true) =
+                    (&place_body_src, &leaf_struct_name, leaf_is_view_field)
+                {
+                    // B-2026-09-06-30 — a leaf out of a VIEW field takes the
+                    // memory half of the transfer (the leaf frees the copy,
+                    // the source's field is cap-zeroed) and none of the body
+                    // half: the source's walk is already masked there and the
+                    // caller runs the body. `track_struct_var` is the
+                    // memory-only registration the owned-param payload arm of
+                    // `bind_pattern_values` uses for the same reason.
+                    let (src, tn) = (src.clone(), tn.clone());
+                    if let Some(slot) = self.variables.get(&name).copied() {
+                        self.track_struct_var(&tn, slot.ptr);
+                        self.suppress_struct_field_move_by_name(&src, fname);
+                        place_leaf_took_memory = true;
+                        leaf_cleanup_registered = true;
+                    }
+                } else if let (Some(src), Some(tn)) = (&place_body_src, &leaf_struct_name) {
                     let (src, tn) = (src.clone(), tn.clone());
                     let src_ptr = self.variables.get(src.as_str()).map(|v| v.ptr);
                     if let (Some(slot), Some(_)) = (self.variables.get(&name).copied(), src_ptr) {
@@ -15066,6 +15102,19 @@ impl<'ctx> super::Codegen<'ctx> {
             return;
         };
         let mut took_bodies: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // B-2026-09-06-30 — the elements of a LOCAL tuple source that a mixed
+        // literal recorded as the caller's (`param_view_tuple_elems`); their
+        // leaves are views, per element. Empty for a param source (every leaf
+        // is a view there already) and for any other source shape.
+        let view_elems: std::collections::HashSet<u32> = match &value.kind {
+            ExprKind::Identifier(src) if !owner_runs_bodies => self
+                .payload_vars
+                .param_view_tuple_elems
+                .get(src.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            _ => std::collections::HashSet::new(),
+        };
         self.place_source_tuple_leaf_cleanups(
             pats,
             &elems,
@@ -15073,6 +15122,7 @@ impl<'ctx> super::Codegen<'ctx> {
             tuple_ty,
             owner_runs_bodies,
             mark_views,
+            &view_elems,
             &mut took_bodies,
         );
         // B-2026-09-02-43 — when the LEAVES took the bodies, the source must
@@ -15119,12 +15169,22 @@ impl<'ctx> super::Codegen<'ctx> {
         // the TOP-level call's set is used; the nested-tuple recursion below
         // passes a throwaway, because an inner element's index is meaningless
         // against the outer field.
+        // B-2026-09-06-30 — element indices whose body already belongs to the
+        // CALLER (the source is a by-value tuple param whose element was
+        // handed back, `param_view_tuple_elems`). A leaf over such an element
+        // is a view of the caller's body exactly as a `mark_views` leaf is —
+        // memory only, and the source does not run the body either — so the
+        // two flags are folded per element below. Only the top-level call
+        // consults it; the nested recursion passes an empty set.
+        view_elems: &std::collections::HashSet<u32>,
         took_bodies: &mut std::collections::HashSet<u32>,
     ) {
         for (idx, pat) in pats.iter().enumerate() {
             let Some(te) = elems.get(idx).cloned() else {
                 continue;
             };
+            let leaf_is_view = mark_views || view_elems.contains(&(idx as u32));
+            let owner_runs_bodies = owner_runs_bodies || view_elems.contains(&(idx as u32));
             // B-2026-08-28-12 — a WILDCARD leaf over a PLACE source
             // (`let p = (R { .. }, 1); let (_, n) = p;`), the row's own repro.
             // The loop below binds names; a wildcard binds none, so it fell
@@ -15223,6 +15283,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     inner_ty,
                     owner_runs_bodies,
                     mark_views,
+                    &std::collections::HashSet::new(),
                     &mut inner_took,
                 );
                 // B-2026-09-03-14 — the recursion cap-zeroes the inner leaves it
@@ -15299,7 +15360,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 // view recorded, the second destructure takes the
                 // owner-runs-bodies path through `param_view_locals`, and
                 // its element types are already in the registry above.
-                if mark_views {
+                if leaf_is_view {
                     self.payload_vars.param_view_locals.insert(name.clone());
                 }
                 // B-2026-09-02-41 — MEMORY and the source zeroing on BOTH legs,
@@ -15589,7 +15650,7 @@ impl<'ctx> super::Codegen<'ctx> {
             // site: the `zero_tuple_elem_cap_at` below still hands this
             // element's buffer to the leaf. This records only who runs the
             // body, which under `owner_runs_bodies` is the source.
-            if mark_views {
+            if leaf_is_view {
                 self.payload_vars.param_view_locals.insert(name.clone());
             }
             self.zero_tuple_elem_cap_at(base_ptr, tuple_ty, idx as u32, &te);

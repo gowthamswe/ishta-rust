@@ -18,7 +18,7 @@ use crate::ast::*;
 use crate::token::Span;
 
 use super::exec::{
-    compute_block_last_use, push_drops_for_stmt, CleanupAction, ControlFlow, ErrDeferEntry,
+    compute_block_last_use, push_drops_for_stmt_except, CleanupAction, ControlFlow, ErrDeferEntry,
     EvalResult, ExitPath, PendingRelease,
 };
 use super::value::{EnumData, Value};
@@ -357,10 +357,23 @@ impl<'a> super::Interpreter<'a> {
             // the container still owns registers no slot either, for the same
             // caller-retains reason: `v[i]` is a `ref T`, so the container's
             // own walk runs the body.
+            // B-2026-09-06-30 — the leaves a destructure binds out of a LOCAL
+            // source's VIEW fields / elements (a mixed literal moved a param
+            // view in; `param_view_struct_fields` / `param_view_tuple_elems`
+            // record which). They are views on the same terms as the leaves
+            // of a param source: into the view set, and no slot of their own —
+            // the source's masked walk already skips them and the caller runs
+            // the body. Per leaf, so the fresh field's leaf keeps its slot.
+            let view_leaves = self.let_destructure_view_leaves(stmt);
+            for n in &view_leaves {
+                if let Some(top) = self.owned_param_names_stack.last_mut() {
+                    top.insert(n.clone());
+                }
+            }
             if !self.let_destructures_owned_param(stmt)
                 && !Self::let_binds_borrowed_container_elem(stmt)
             {
-                push_drops_for_stmt(stmt, &mut cleanup);
+                push_drops_for_stmt_except(stmt, &mut cleanup, &view_leaves);
             }
             // NLL placement: fire any Drop slot whose binding's last
             // use was this statement, then remove it from `cleanup`
@@ -2883,6 +2896,41 @@ impl<'a> super::Interpreter<'a> {
         match &value.kind {
             ExprKind::Index { object, .. } => Self::place_walk_is_retractable(object),
             _ => false,
+        }
+    }
+
+    /// B-2026-09-06-30 — the binding names a `let` destructure takes out of
+    /// a bare-identifier source's VIEW fields (`param_view_struct_fields`) or
+    /// VIEW elements (`param_view_tuple_elems`). Empty for any other shape.
+    fn let_destructure_view_leaves(&self, stmt: &Stmt) -> Vec<String> {
+        let (pattern, value) = match &stmt.kind {
+            StmtKind::Let { pattern, value, .. } | StmtKind::LetElse { pattern, value, .. } => {
+                (pattern, value)
+            }
+            _ => return Vec::new(),
+        };
+        let ExprKind::Identifier(src) = &value.kind else {
+            return Vec::new();
+        };
+        match &pattern.kind {
+            PatternKind::Struct { fields, .. } => fields
+                .iter()
+                .filter(|f| {
+                    self.param_view_struct_fields
+                        .contains(&(src.clone(), f.name.clone()))
+                })
+                .flat_map(|f| match &f.pattern {
+                    Some(sub) => sub.binding_names(),
+                    None => vec![f.name.clone()],
+                })
+                .collect(),
+            PatternKind::Tuple(pats) => pats
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.param_view_tuple_elems.contains(&(src.clone(), *i)))
+                .flat_map(|(_, p)| p.binding_names())
+                .collect(),
+            _ => Vec::new(),
         }
     }
 

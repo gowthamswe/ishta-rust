@@ -5,7 +5,7 @@
 //! block-exit classifier (`ExitPath`), value-deep-clone
 //! (`deep_clone_value`), slice-pattern view (`slice_pattern_view`),
 //! `option_value_from` / `cancelled_sentinel`, last-use analysis
-//! (`compute_block_last_use`, `push_drops_for_stmt`), the scope-chain
+//! (`compute_block_last_use`, `push_drops_for_stmt_except`), the scope-chain
 //! `Env` struct with its impl, and the free-identifier scanning
 //! helpers (`add_pattern_bindings`, `collect_free_idents_block`,
 //! `collect_free_idents_expr`).
@@ -825,10 +825,21 @@ pub(crate) enum PendingRelease {
     Captured(String, Value),
 }
 
-pub(crate) fn push_drops_for_stmt(stmt: &Stmt, cleanup: &mut Vec<CleanupAction>) {
+/// Registers a `Drop` cleanup slot per name a `let` / `let-else` pattern binds.
+/// `skip` (B-2026-09-06-30) names the leaves that get NO slot: the ones a
+/// destructure binds out of a local source's VIEW fields / elements, whose
+/// bodies belong to the caller and are run by the caller's walk.
+pub(crate) fn push_drops_for_stmt_except(
+    stmt: &Stmt,
+    cleanup: &mut Vec<CleanupAction>,
+    skip: &[String],
+) {
     match &stmt.kind {
         StmtKind::Let { pattern, .. } | StmtKind::LetElse { pattern, .. } => {
             for name in pattern.binding_names() {
+                if skip.contains(&name) {
+                    continue;
+                }
                 cleanup.push(CleanupAction::Drop { name });
             }
         }
