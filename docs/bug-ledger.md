@@ -158,7 +158,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-29 | 2026-09-06 | interp+codegen | medium | A PAYLOAD HANDED BACK OUT OF A TWO-LEVEL OWNED-PARAM DESTRUCTURE RUNS ITS `Drop` BODY TWICE ON EVERY SURFACE -- `fn p_h(h: H1) -> R { match h { H1 { e } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } }` prints `dE dR5 r5 dR5` for `let g = ..; let r5 = p_h(g); println(f"r{r5.id}")` on --interp / jit / -O0 / -O2, where the one-level `fn p_r(e: E) -> R { match e { E.A(r) => { return r; } .. } }` prints `dE r1 dR1`; the owned-`self` receiver spelling (`fn hand(self) -> R`) is identical | — |
 | B-2026-09-06-30 | 2026-09-06 | interp+codegen | medium | A `let` DESTRUCTURE OF A MIXED STRUCT LITERAL RUNS THE VIEW FIELD'S `Drop` BODY TWICE ON ALL FOUR SURFACES -- `let s = S3 { a: r, b: mk(19) }; let S3 { a, b } = s; return b.id;` prints `dR18 dR19 dR18` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike where `dR19 dR18` is due; the `match` spelling of the same destructure is one body on every surface since B-2026-09-06-22 | — |
 | B-2026-09-06-31 | 2026-09-06 | typecheck | low | W0299 `borrow_projection_copy` IS SILENT FOR EVERY VALUE POSITION OF A BORROW PROJECTION EXCEPT `let` / ASSIGNMENT / A PATTERN SCRUTINEE -- `return w.r`, `consume(w.r)`, `W { r: w.r }`, `v.push(w.r)` and a tail-expression `w.r` through `w: ref W` each copy a non-`Copy` field out of the borrow on every backend (two `Drop` bodies, measured) and `karac check --output=json` returns 0 diagnostics for all five | — |
-| B-2026-09-06-32 | 2026-09-06 | codegen | high | A `Drop`-CARRYING ENUM LEAF HANDED BACK OUT OF A `let` DESTRUCTURE OF A BY-VALUE PARAM, OR OUT OF A BARE-TUPLE `match` ARM, DOUBLE-FREES ON jit AND -O0 -- `fn p(h: H2) -> E { let H2 { e, n } = h; return e; }` and `fn p(t: (E, i64)) -> E { match t { (e, n) => { return e; } } }` abort with glibc's `free(): double free detected in tcache 2` under `karac run` and `KARAC_OPT_LEVEL=0 karac build`, clean at -O2 and under `--interp`; the `match h { H2 { e, n } => return e }` and `return h.e` spellings, and every `R`-leaf twin, are correct | — |
 
 ### Relocated
 
@@ -2300,6 +2299,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-24 | codegen | medium | A READ-ONLY `if let` / `while let` OVER A BORROW-PROJECTION SCRUTINEE COPIES THE PAYLOAD OUT UNDER CODEGEN AND BINDS A VIEW IN THE INTERPRETER -- `if… | d20a701 |
 | B-2026-09-06-25 | interp | medium | THE INTERPRETER TAKES NO COPY WHEN A VIEW BOUND OFF A BORROW-PROJECTION SCRUTINEE IS MATERIALIZED BY AN ARM VALUE OR A BY-VALUE CALL ARGUMENT -- `let… | b3aa3e3 |
 | B-2026-09-06-26 | interp | medium | A FREE FUNCTION WHOSE ARM RETURNS A SCALAR LEAF OF AN OWNED-PARAM STRUCT DESTRUCTURE RUNS NO `Drop` BODY AT ALL UNDER `--interp` -- `fn p_two(h: H2)… | d9b567c |
+| B-2026-09-06-32 | codegen | high | A `Drop`-CARRYING ENUM LEAF HANDED BACK OUT OF A `let` DESTRUCTURE OF A BY-VALUE PARAM, OR OUT OF A BARE-TUPLE `match` ARM, DOUBLE-FREES ON jit AND -… | 1de1486 |
 
 </details>
 
