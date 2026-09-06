@@ -103,7 +103,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | soundness | 95 |
 | perf | 94 |
 | other | 78 |
-| crash | 73 |
+| crash | 74 |
 | use-after-free | 31 |
 
 ### By surface
@@ -111,7 +111,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | surface | total |
 |---|---|
 | codegen | 1516 |
-| interp | 386 |
+| interp | 387 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -153,12 +153,12 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-21 | 2026-09-06 | interp+codegen | low | TWO FRESH PAYLOADS BOUND OUT OF A `match` ARM DIE IN OPPOSITE ORDERS ON THE TWO BACKENDS -- `let w = W2.Two(mk(16), mk(17)); match w { W2.Two(a, b) => { return a.id; } .. }` prints `dR16 dR17` on jit / aot / `KARAC_AUTO_PAR=0` (declaration order) and `dR17 dR16` under `--interp` (reverse); the body COUNT is right on both, only the arm-end sequence differs | — |
 | B-2026-09-06-23 | 2026-09-06 | interp+codegen | low | THE COPY A MATERIALIZING `match` ARM TAKES OFF A BORROW-PROJECTION SCRUTINEE NEVER RUNS THE ENUM SHELL'S OWN `Drop` BODY, ON EVERY BACKEND -- `match h.e { E.A(r) => { let m = r; return m.id; } .. }` through `mut ref h` prints `dR1 dE dR1` (the copy's payload body, then the original's shell and payload) where the `let e = h.e; match e { .. }` spelling of the same copy prints `dE dR1 dE dR1`; a fresh-temp or local scrutinee (`match mk(7) { .. }`, `let e = mk(8); match e { .. }`) does run its shell's `dE` after the payload moves out | — |
 | B-2026-09-06-31 | 2026-09-06 | typecheck | low | W0299 `borrow_projection_copy` IS SILENT FOR EVERY VALUE POSITION OF A BORROW PROJECTION EXCEPT `let` / ASSIGNMENT / A PATTERN SCRUTINEE -- `return w.r`, `consume(w.r)`, `W { r: w.r }`, `v.push(w.r)` and a tail-expression `w.r` through `w: ref W` each copy a non-`Copy` field out of the borrow on every backend (two `Drop` bodies, measured) and `karac check --output=json` returns 0 diagnostics for all five | — |
-| B-2026-09-06-34 | 2026-09-06 | interp | medium | THE INTERPRETER NEVER RUNS THE `..` REST FIELDS' `Drop` BODIES IN A PARTIAL STRUCT `let` DESTRUCTURE -- `let s = S3 { a: mk(9), b: mk(10) }; let S3 { a, .. } = s; return a.id;` prints `dR9 dR8` under `--interp` against `dR10 dR9 dR8` on jit / aot / `KARAC_AUTO_PAR=0`; field `b` is moved out of `s` by the pattern and then owned by nobody | — |
 | B-2026-09-06-35 | 2026-09-06 | interp+codegen | low | A PARTIAL STRUCT `match` PATTERN DROPS THE `..` REST FIELD BEFORE THE BOUND FIELD ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(2), b: mk(3) }; match s { S3 { a, .. } => { return a.id; } }` prints `dR3 dR2` under `--interp` and `dR2 dR3` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs exactly once on every surface, the sequence alone diverges | — |
 | B-2026-09-06-36 | 2026-09-06 | codegen | low | A MATCH OVER A LOCAL STRUCT SCRUTINEE WITH AN UNCONSUMED ENUM LEAF LOSES THE LEAF'S `Drop` BODY ON THE COMPILED BACKENDS -- `let c = H1 { e: E.A(mk(34)) }; match c { H1 { e } => .. }` with `e` never touched prints `dE dR34` under `--interp` and NOTHING on run/build/AUTO_PAR=0 (memory balanced -- a lost BODY, not a leak). The by-value PARAM spelling is correct (the caller runs the body); only a LOCAL scrutinee has no such owner | — |
 | B-2026-09-06-38 | 2026-09-06 | interp+codegen | low | A FRESH-TEMP OWNED ENUM RECEIVER LOSES THE ENUM SHELL'S OWN `Drop` BODY ON EVERY SURFACE -- `E.A(mk(2)).m_read()` prints `dR2 x2` and never `dE` on --interp / jit / -O0 / -O2, where the named-local receiver `let a = E.A(mk(1)); a.m_read()` prints `dR1 dE x1`; B-2026-09-04-30's receiver-temp registrar declines an enum receiver's bodies by design, and the arm channel runs only the payload it bound | — |
 | B-2026-09-06-39 | 2026-09-06 | interp+codegen | low | A READ-ONLY ARM OVER AN OWNED ENUM RECEIVER RUNS THE PAYLOAD'S `Drop` BODY BEFORE THE SHELL'S ON EVERY SURFACE -- `a.m_read()` prints `dR1 dE`, the reverse of the local-scrutinee order B-2026-08-28-67 established (`dE dR`, shell then fields per design.md § Part 8), so the same read-only arm orders its two bodies differently depending on whether the scrutinee is `self` or a local | — |
 | B-2026-09-06-40 | 2026-09-06 | interp+codegen | low | A REORDERED STRUCT `let` PATTERN DROPS ITS LEAVES IN REVERSE PATTERN ORDER ON THE INTERPRETER AND REVERSE DECLARATION ORDER ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(7), b: mk(8) }; let S3 { b, a } = s; return b.id * 100 + a.id;` prints `dR7 dR8 dR6 v=807` under `--interp` and `dR8 dR7 dR6 v=807` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs once, the sequence alone diverges | — |
+| B-2026-09-06-41 | 2026-09-06 | interp | high | THE INTERPRETER PANICS WHEN A SCALAR FIELD IS READ OFF A LEAF DESTRUCTURED OUT OF A BY-VALUE PARAM WHOSE TYPE HAS ITS OWN `Drop` -- `fn g(s: S3) -> i64 { let S3 { a, b } = s; return a.id; }` (and `let x = a.id;`, and the `{ a, .. }` / `{ a, b: _ }` spellings) dies at the leaf's death with `internal error: entered unreachable code: field 'id' not found on struct 'R'` from inside `R`'s own `drop` body, after `mid dR6`; jit / aot print `mid dR6 dR5 v=5`; reading nothing off the leaf (`return 1`) runs clean | — |
 
 ### Relocated
 
@@ -2307,6 +2307,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-30 | interp+codegen | medium | A `let` DESTRUCTURE OF A MIXED STRUCT LITERAL RUNS THE VIEW FIELD'S `Drop` BODY TWICE ON ALL FOUR SURFACES -- `let s = S3 { a: r, b: mk(19) }; let S3… | 676a369 |
 | B-2026-09-06-32 | codegen | high | A `Drop`-CARRYING ENUM LEAF HANDED BACK OUT OF A `let` DESTRUCTURE OF A BY-VALUE PARAM, OR OUT OF A BARE-TUPLE `match` ARM, DOUBLE-FREES ON jit AND -… | 1de1486 |
 | B-2026-09-06-33 | codegen | high | A PARTIAL STRUCT `let` PATTERN BINDS THE FIRST DECLARED FIELD REGARDLESS OF WHICH FIELD IS NAMED, and double-frees on the JIT -- `let s = S3 { a: mk(… | e322cbd |
+| B-2026-09-06-34 | interp | medium | THE INTERPRETER NEVER RUNS THE `..` REST FIELDS' `Drop` BODIES IN A PARTIAL STRUCT `let` DESTRUCTURE -- `let s = S3 { a: mk(9), b: mk(10) }; let S3 {… | dd7c8ae |
 | B-2026-09-06-37 | interp+codegen | medium | A WILDCARD ARM OVER AN OWNED ENUM RECEIVER RUNS THE PAYLOAD'S `Drop` BODY ON NO SURFACE -- `impl E { fn m_none(self) -> i64 { match self { E.A(_) =>… | 3df184c |
 
 </details>
