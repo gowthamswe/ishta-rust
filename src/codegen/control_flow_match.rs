@@ -9728,8 +9728,18 @@ impl<'ctx> super::Codegen<'ctx> {
         // reads one of its fields (`let q = inner.z`) ran `r`'s body from
         // here and again from the caller. Only a binding that already holds
         // a walk gets it re-registered under the wider mask.
+        // B-2026-09-06-44 — a root with NO walk of its own gets none minted
+        // here. That was always the rule for a param-view local; a by-value
+        // PARAM the callee does not own (caller-retains, so no
+        // `StructFieldBodies` action was registered at entry) is the same
+        // case, and minting a `$keep` walk for it ran the sibling field's body
+        // in the callee beside the caller's own walk: `let a = s.a` in
+        // `fn g(s: S3)` printed `mid dR6 dR6 dR5` on every compiled backend
+        // against `mid dR6 dR5` under `--interp` (the destructure spelling,
+        // which never reaches this disarm, was already at one body).
         if !self.var_owns_struct_field_bodies(var_name)
-            && self.payload_vars.param_view_locals.contains(var_name)
+            && (self.payload_vars.param_view_locals.contains(var_name)
+                || self.fn_ctx.current_fn_param_names.contains(var_name))
         {
             return;
         }

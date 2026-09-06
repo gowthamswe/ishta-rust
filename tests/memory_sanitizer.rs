@@ -3413,6 +3413,101 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-44 — the MEMORY half of `tests/codegen.rs`'s
+    /// `e2e_projection_off_a_param_runs_the_sibling_body_once` under ASAN +
+    /// LSan: with the `$keep` walk no longer minted for a caller-retained
+    /// param root, the sibling field's `String` / `Vec` buffers have exactly
+    /// one owner on every projection spelling, nothing freed twice, nothing
+    /// leaked.
+    #[test]
+    fn asan_projection_off_a_param_keeps_one_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"n{i}\", xs: [i] }; }\n\
+             struct S3 { a: R, b: R }\n\
+             struct T { r: R, v: Vec[i64] }\n\
+             \n\
+             fn proj_none(s: S3) -> i64 { let a = s.a; println(\"  mid\"); return 1; }\n\
+             fn proj_ret(s: S3) -> i64 { let a = s.a; println(\"  mid\"); return a.id; }\n\
+             fn proj_b(s: S3) -> i64 { let b = s.b; println(\"  mid\"); return b.id; }\n\
+             fn proj_both(s: S3) -> i64 { let a = s.a; let b = s.b; println(\"  mid\"); return a.id + b.id; }\n\
+             fn proj_reads(s: S3) -> i64 { let a = s.a; println(f\"  m{a.id}\"); let b = s.b; println(f\"  m{b.id}\"); return 1; }\n\
+             fn proj_whole(s: S3) -> R { let a = s.a; println(\"  mid\"); return a; }\n\
+             fn proj_heap(t: T) -> i64 { let r = t.r; println(\"  mid\"); return r.id + t.v.len(); }\n\
+             fn destr(s: S3) -> i64 { let S3 { a, b } = s; println(\"  mid\"); return a.id; }\n\
+             impl S3 { fn m(self) -> i64 { let a = self.a; println(\"  mid\"); return a.id; } }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"proj_none\"); let v1 = proj_none(S3 { a: mk(1), b: mk(2) }); println(f\"  v={v1}\");\n\
+             \x20   println(\"proj_ret\"); let v2 = proj_ret(S3 { a: mk(3), b: mk(4) }); println(f\"  v={v2}\");\n\
+             \x20   println(\"proj_b\"); let v3 = proj_b(S3 { a: mk(5), b: mk(6) }); println(f\"  v={v3}\");\n\
+             \x20   println(\"proj_both\"); let v4 = proj_both(S3 { a: mk(7), b: mk(8) }); println(f\"  v={v4}\");\n\
+             \x20   println(\"proj_reads\"); let v5 = proj_reads(S3 { a: mk(9), b: mk(10) }); println(f\"  v={v5}\");\n\
+             \x20   println(\"proj_whole\"); let r6 = proj_whole(S3 { a: mk(11), b: mk(12) }); println(f\"  v={r6.id}\");\n\
+             \x20   println(\"proj_heap\"); let v7 = proj_heap(T { r: mk(13), v: [1, 2] }); println(f\"  v={v7}\");\n\
+             \x20   println(\"self_root\"); let v8 = S3 { a: mk(14), b: mk(15) }.m(); println(f\"  v={v8}\");\n\
+             \x20   println(\"named\"); let s9 = S3 { a: mk(16), b: mk(17) }; let v9 = proj_none(s9); println(f\"  v={v9}\");\n\
+             \x20   println(\"destr\"); let v10 = destr(S3 { a: mk(18), b: mk(19) }); println(f\"  v={v10}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "proj_none",
+                "  mid",
+                "  dR2",
+                "  dR1",
+                "  v=1",
+                "proj_ret",
+                "  mid",
+                "  dR4",
+                "  dR3",
+                "  v=3",
+                "proj_b",
+                "  mid",
+                "  dR6",
+                "  dR5",
+                "  v=6",
+                "proj_both",
+                "  mid",
+                "  dR8",
+                "  dR7",
+                "  v=15",
+                "proj_reads",
+                "  m9",
+                "  m10",
+                "  dR10",
+                "  dR9",
+                "  v=1",
+                "proj_whole",
+                "  mid",
+                "  dR12",
+                "  v=11",
+                "  dR11",
+                "proj_heap",
+                "  mid",
+                "  dR13",
+                "  v=15",
+                "self_root",
+                "  mid",
+                "  dR15",
+                "  dR14",
+                "  v=14",
+                "named",
+                "  mid",
+                "  dR17",
+                "  dR16",
+                "  v=1",
+                "destr",
+                "  mid",
+                "  dR19",
+                "  dR18",
+                "  v=18",
+                "end"
+            ],
+            "projection_off_param_sibling_once",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

@@ -33904,6 +33904,114 @@ end
         );
     }
 
+    /// B-2026-09-06-44 — the codegen sibling of B-2026-09-06-41: on the
+    /// PROJECTION spelling (`let a = s.a` inside `fn g(s: S3)`, `s` a by-value
+    /// param the callee never came to own) every compiled backend ran the
+    /// sibling field's body twice (`mid dR2 dR2 dR1`) against `--interp`'s one,
+    /// while the destructure spelling of the same callee was already agreed.
+    /// The returned-projection disarm minted a `$keep` walk for the param
+    /// root itself, and that walk ran `b`'s body in the callee beside the
+    /// caller's own after-call walk. A root with no walk of its own — a
+    /// param-view local before, a caller-retained by-value param now — gets
+    /// none minted there. Pins the no-read, scalar-read, sibling, both-fields,
+    /// interleaved-reads, whole-field-return, heap-field, `self`-root,
+    /// named-argument and destructure-control spellings against the
+    /// interpreter twin.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_projection_off_a_param_runs_the_sibling_body_once`, pinned to the same string.
+    #[test]
+    fn e2e_projection_off_a_param_runs_the_sibling_body_once() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, name: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}", xs: [i] }; }
+struct S3 { a: R, b: R }
+struct T { r: R, v: Vec[i64] }
+
+fn proj_none(s: S3) -> i64 { let a = s.a; println("  mid"); return 1; }
+fn proj_ret(s: S3) -> i64 { let a = s.a; println("  mid"); return a.id; }
+fn proj_b(s: S3) -> i64 { let b = s.b; println("  mid"); return b.id; }
+fn proj_both(s: S3) -> i64 { let a = s.a; let b = s.b; println("  mid"); return a.id + b.id; }
+fn proj_reads(s: S3) -> i64 { let a = s.a; println(f"  m{a.id}"); let b = s.b; println(f"  m{b.id}"); return 1; }
+fn proj_whole(s: S3) -> R { let a = s.a; println("  mid"); return a; }
+fn proj_heap(t: T) -> i64 { let r = t.r; println("  mid"); return r.id + t.v.len(); }
+fn destr(s: S3) -> i64 { let S3 { a, b } = s; println("  mid"); return a.id; }
+impl S3 { fn m(self) -> i64 { let a = self.a; println("  mid"); return a.id; } }
+
+fn main() {
+    println("proj_none"); let v1 = proj_none(S3 { a: mk(1), b: mk(2) }); println(f"  v={v1}");
+    println("proj_ret"); let v2 = proj_ret(S3 { a: mk(3), b: mk(4) }); println(f"  v={v2}");
+    println("proj_b"); let v3 = proj_b(S3 { a: mk(5), b: mk(6) }); println(f"  v={v3}");
+    println("proj_both"); let v4 = proj_both(S3 { a: mk(7), b: mk(8) }); println(f"  v={v4}");
+    println("proj_reads"); let v5 = proj_reads(S3 { a: mk(9), b: mk(10) }); println(f"  v={v5}");
+    println("proj_whole"); let r6 = proj_whole(S3 { a: mk(11), b: mk(12) }); println(f"  v={r6.id}");
+    println("proj_heap"); let v7 = proj_heap(T { r: mk(13), v: [1, 2] }); println(f"  v={v7}");
+    println("self_root"); let v8 = S3 { a: mk(14), b: mk(15) }.m(); println(f"  v={v8}");
+    println("named"); let s9 = S3 { a: mk(16), b: mk(17) }; let v9 = proj_none(s9); println(f"  v={v9}");
+    println("destr"); let v10 = destr(S3 { a: mk(18), b: mk(19) }); println(f"  v={v10}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"proj_none
+  mid
+  dR2
+  dR1
+  v=1
+proj_ret
+  mid
+  dR4
+  dR3
+  v=3
+proj_b
+  mid
+  dR6
+  dR5
+  v=6
+proj_both
+  mid
+  dR8
+  dR7
+  v=15
+proj_reads
+  m9
+  m10
+  dR10
+  dR9
+  v=1
+proj_whole
+  mid
+  dR12
+  v=11
+  dR11
+proj_heap
+  mid
+  dR13
+  v=15
+self_root
+  mid
+  dR15
+  dR14
+  v=14
+named
+  mid
+  dR17
+  dR16
+  v=1
+destr
+  mid
+  dR19
+  dR18
+  v=18
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value
