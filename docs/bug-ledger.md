@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 389 |
+| miscompile | 390 |
 | run-vs-build | 358 |
 | leak | 275 |
 | missing-feature | 194 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1519 |
-| interp | 388 |
+| codegen | 1520 |
+| interp | 389 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -156,8 +156,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-36 | 2026-09-06 | codegen | low | A MATCH OVER A LOCAL STRUCT SCRUTINEE WITH AN UNCONSUMED ENUM LEAF LOSES THE LEAF'S `Drop` BODY ON THE COMPILED BACKENDS -- `let c = H1 { e: E.A(mk(34)) }; match c { H1 { e } => .. }` with `e` never touched prints `dE dR34` under `--interp` and NOTHING on run/build/AUTO_PAR=0 (memory balanced -- a lost BODY, not a leak). The by-value PARAM spelling is correct (the caller runs the body); only a LOCAL scrutinee has no such owner | — |
 | B-2026-09-06-39 | 2026-09-06 | interp+codegen | low | A READ-ONLY ARM OVER AN OWNED ENUM RECEIVER RUNS THE PAYLOAD'S `Drop` BODY BEFORE THE SHELL'S ON EVERY SURFACE -- `a.m_read()` prints `dR1 dE`, the reverse of the local-scrutinee order B-2026-08-28-67 established (`dE dR`, shell then fields per design.md § Part 8), so the same read-only arm orders its two bodies differently depending on whether the scrutinee is `self` or a local | — |
 | B-2026-09-06-40 | 2026-09-06 | interp+codegen | low | A REORDERED STRUCT `let` PATTERN DROPS ITS LEAVES IN REVERSE PATTERN ORDER ON THE INTERPRETER AND REVERSE DECLARATION ORDER ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(7), b: mk(8) }; let S3 { b, a } = s; return b.id * 100 + a.id;` prints `dR7 dR8 dR6 v=807` under `--interp` and `dR8 dR7 dR6 v=807` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs once, the sequence alone diverges | — |
-| B-2026-09-06-42 | 2026-09-06 | interp+codegen | high | `let e = self` INSIDE AN OWNED-`self` METHOD ON A VALUE ENUM WITH ITS OWN `Drop` DOUBLE-FREES THE PAYLOAD AT -O0 AND UNDER THE JIT -- `impl E { fn m_let(self) -> i64 { let e = self; match e { E.A(r) => { return r.id; } E.B => { return 0; } } } }` aborts with `free(): double free detected` for a named-local receiver AND a fresh temp, is clean at -O2, and at -O2 / --interp the named-local spelling runs the shell's body TWICE (`dE dR1 dE x1`); the no-shell enum, the struct twin and the by-value-param twin are clean everywhere | — |
 | B-2026-09-06-44 | 2026-09-06 | codegen | medium | A WHOLE-FIELD `let` PROJECTION OFF A BY-VALUE PARAM RUNS THE SIBLING FIELD'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn g(s: S3) -> i64 { let a = s.a; println("mid"); return 1; }` prints `mid dR6 dR6 dR5` on jit / aot / `KARAC_AUTO_PAR=0` against `mid dR6 dR5` under `--interp`, with or without a read of `a`, for a fresh-temp and a named argument alike; projecting `b` doubles `a` instead (`mid dR5 dR6 dR5`); the destructure spelling `let S3 { a, .. } = s` is at one body everywhere | — |
+| B-2026-09-06-45 | 2026-09-06 | interp+codegen | low | A REBIND OF `self` NESTED IN A BRANCH OF AN OWNED-`self` METHOD RUNS THE RECEIVER'S OWN `Drop` BODY TWICE ON EVERY SURFACE -- `fn m_cond(self, c: bool) -> i64 { if c { let e = self; match e { .. } } else { match self { .. } } }` on a named-local enum receiver prints `dE dR11 dE x11` when `c` is true (the local `e`'s body, then the caller's retained walk) and the right `dR12 dE x112` when false; B-2026-09-06-42's top-level-only `fn_rebinds_self_whole` declines the nested spelling on purpose | — |
 
 ### Relocated
 
@@ -2311,6 +2311,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-37 | interp+codegen | medium | A WILDCARD ARM OVER AN OWNED ENUM RECEIVER RUNS THE PAYLOAD'S `Drop` BODY ON NO SURFACE -- `impl E { fn m_none(self) -> i64 { match self { E.A(_) =>… | 3df184c |
 | B-2026-09-06-38 | interp+codegen | low | A FRESH-TEMP OWNED ENUM RECEIVER LOSES THE ENUM SHELL'S OWN `Drop` BODY ON EVERY SURFACE -- `E.A(mk(2)).m_read()` prints `dR2 x2` and never `dE` on -… | 420338b |
 | B-2026-09-06-41 | interp | high | THE INTERPRETER PANICS WHEN A SCALAR FIELD IS READ OFF A LEAF DESTRUCTURED OUT OF A BY-VALUE PARAM WHOSE TYPE HAS ITS OWN `Drop` -- `fn g(s: S3) -> i… | 66ccafe |
+| B-2026-09-06-42 | interp+codegen | high | `let e = self` INSIDE AN OWNED-`self` METHOD ON A VALUE ENUM WITH ITS OWN `Drop` DOUBLE-FREES THE PAYLOAD AT -O0 AND UNDER THE JIT -- `impl E { fn m_… | 21b6553 |
 | B-2026-09-06-43 | codegen | low | A DISCARDED BOXED `Result` PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Result[T, E]` with a heap-carrying payload past the 5-… | 4cec40c |
 
 </details>
