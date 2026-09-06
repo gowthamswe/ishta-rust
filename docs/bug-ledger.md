@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 391 |
 | run-vs-build | 360 |
-| leak | 278 |
+| leak | 279 |
 | missing-feature | 194 |
 | double-free | 193 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1529 |
+| codegen | 1530 |
 | interp | 393 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -156,12 +156,12 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-40 | 2026-09-06 | interp+codegen | low | A REORDERED STRUCT `let` PATTERN DROPS ITS LEAVES IN REVERSE PATTERN ORDER ON THE INTERPRETER AND REVERSE DECLARATION ORDER ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(7), b: mk(8) }; let S3 { b, a } = s; return b.id * 100 + a.id;` prints `dR7 dR8 dR6 v=807` under `--interp` and `dR8 dR7 dR6 v=807` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs once, the sequence alone diverges | — |
 | B-2026-09-06-48 | 2026-09-06 | codegen | low | THE GENERIC HALF OF B-2026-09-04-12 STILL LOSES A BOXED TUPLE PAYLOAD'S INTERIOR -- `generic[T](x: Option[T])` leaks the same 54 B in 6 blocks the non-generic `plainT(x: Option[(String, String)])` did before its fix, and by a DIFFERENT owner, so the parent row's "identical on both paths, therefore not monomorph-specific" premise is refuted rather than confirmed | — |
 | B-2026-09-06-49 | 2026-09-06 | codegen | low | AN INLINE-BUILT `Array` PAYLOAD LOSES ITS INTERIOR EXACTLY AS THE TUPLE DID -- 54 B in 6 blocks for `f(Some([f"a{i}", f"b{i}"]))`, while the same array through a NAMED LOCAL is clean, because the array's interior is owned by a caller-side drop that a missing move-suppressor leaves armed | — |
-| B-2026-09-06-50 | 2026-09-06 | codegen | high | A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE PARAM ABORTS ON BOTH COMPILED BACKENDS -- `free(): double free detected in tcache 2`, exit 134, at -O0 and -O2 alike, for `match x { Some(P { a, b, .. }) => ... }` over `x: Option[P]`, while the interpreter prints the right answer | — |
 | B-2026-09-06-51 | 2026-09-06 | codegen | medium | THE -O0 ASAN RATCHET HAS BEEN RED ON `main` SINCE edb7236 -- six fixtures that commit ADDED fail `scripts/asan-o0-leg.sh` unquarantined, so the gate that is supposed to fail on any new -O0 regression now reports the same six to every session and can no longer distinguish a fresh one | — |
 | B-2026-09-06-52 | 2026-09-06 | codegen | high | A TOP-LEVEL WHOLE REBIND OF A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `shared` FIELD DOUBLE-FREES ON EVERY COMPILED SURFACE -- `fn topreb(r: R) -> i64 { let m = r; return m.inner.v; }` over `struct R { id: i64, name: String, inner: Inner }` with `shared struct Inner` aborts `free(): double free detected in tcache 2` under `karac run`, `karac build` at -O2 and at -O0 alike (3 valgrind errors from 3 contexts) while `--interp` prints `dR43 tp=43 end` correctly. The `shared` field makes the struct decline copy support, so the callee FORWARDS the caller's object instead of entry-copying it -- but `compile_let`'s param-view arm registers a memory-only `StructDrop` for the destination anyway, on the strength of a deep copy that was never made. Dropping the rebind makes the same program clean | — |
 | B-2026-09-06-53 | 2026-09-06 | interp+codegen | medium | A `Drop`-BEARING LOCAL BUILT FROM THE ENCLOSING FUNCTION'S PARAMETER RUNS NO `Drop` BODY AT ALL, ON EVERY SURFACE -- `fn a(i: i64) { let x = mkUses(i); .. }` over `fn mkUses(i: i64) -> R { return R { id: i, name: f"h{i}" }; }` prints `A1` and never `dR1`, identically under `--interp`, `karac run` and `karac build` at both opt levels, so NO A/B gate sees it; valgrind is clean, so the MEMORY is freed and only the user body is lost. Four cells isolate it to the callee storing the BARE param into the returned aggregate while the call site passes a bare identifier naming the caller's own param: `mkIgnores(i)`, `mkName(i)` (f-string, not stored bare), `mkUses(9)` and `mk(i + 0)` all run the body. The CALL-SITE sibling of B-2026-09-06-26 / B-2026-09-06-41's scalar false positive -- an `i64` argument owns nothing, so making the result its view leaves the body with no owner | — |
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-55 | 2026-09-06 | interp+codegen | low | A DEEP-CHAIN FIELD MOVE-OUT STILL LOSES THE MOVED HOP'S SIBLING ONE LEVEL DOWN, ON EVERY SURFACE -- `let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r;` prints `dR1 dR3` on `--interp` / jit / aot / `KARAC_AUTO_PAR=0` alike; `q`'s body (`dR2`) runs nowhere | — |
+| B-2026-09-06-56 | 2026-09-06 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-50 LEAKS ITS WHOLE BOXED STRUCT PAYLOAD -- 192 B in 3 blocks over three calls for `fn show(x: Result[P, i64])` matched `Ok(P { a, b, .. })`, because NEITHER frame owns the box: the caller-side arm is `Option`-only by construction and the callee's loop skips every non-`Option` enum | — |
 
 ### Relocated
 
@@ -2323,6 +2323,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-45 | interp+codegen | low | A REBIND OF `self` NESTED IN A BRANCH OF AN OWNED-`self` METHOD RUNS THE RECEIVER'S OWN `Drop` BODY TWICE ON EVERY SURFACE -- `fn m_cond(self, c: boo… | 6138e02 |
 | B-2026-09-06-46 | codegen | medium | A PARTIAL `let` DESTRUCTURE OF A LOCAL WHOSE OTHER FIELD WAS MOVED OUT EARLIER LOSES THE BOUND LEAF'S `Drop` BODY ON EVERY COMPILED BACKEND -- `let s… | 736a4fc |
 | B-2026-09-06-47 | interp | medium | THE `let`-DESTRUCTURE DISCARD RE-RUNS THE `Drop` BODY OF A FIELD ALREADY MOVED OUT OF THE SOURCE -- `let s = S3 { a: mk(8), b: mk(9) }; let x: R = s.… | 20e9ebc |
+| B-2026-09-06-50 | codegen | high | A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE PARAM ABORTS ON BOTH COMPILED BACKENDS -- `free(): double free detected in tcache 2`, exit 134,… | 7020445 |
 
 </details>
 
