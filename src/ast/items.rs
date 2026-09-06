@@ -1833,6 +1833,24 @@ pub fn fn_whole_param_aliases(
     out
 }
 
+/// Is `callee` the path `Enum.Variant` of a tuple variant declared in
+/// `program`? A user enum constructor is spelled exactly like an associated
+/// function call, and only the declarations can tell the two apart.
+pub fn is_user_variant_ctor(program: &crate::Program, callee: &Expr) -> bool {
+    let ExprKind::Path { segments, .. } = &callee.kind else {
+        return false;
+    };
+    let [enum_name, variant] = segments.as_slice() else {
+        return false;
+    };
+    program.items.iter().any(|item| match item {
+        Item::EnumDef(def) if &def.name == enum_name => {
+            def.variants.iter().any(|v| &v.name == variant)
+        }
+        _ => false,
+    })
+}
+
 /// A callee key as a call site spells it — a bare free-function name, or
 /// `Type.assoc` for an associated function — resolved to its AST. Instance
 /// methods are never returned: their receiver shifts the argument indices, and
@@ -2466,14 +2484,25 @@ pub fn fn_conditionally_returns_param_bare(
     /// it left `fn f(r: R, k: bool) -> Box2 { if k { return Box2 { r: mk() };
     /// } return Box2 { r: r }; }` with no owner on the dies-inside path for a
     /// fresh temp and two on the hand-back path for a named one.
-    fn yields_wrapped(e: &Expr, name: &[String]) -> bool {
+    fn yields_wrapped(e: &Expr, name: &[String], program: Option<&crate::Program>) -> bool {
         match &e.kind {
             ExprKind::Identifier(_) => is_bare(e, name),
-            ExprKind::StructLiteral { fields, .. } => {
-                fields.iter().any(|f| yields_wrapped(&f.value, name))
+            ExprKind::StructLiteral { fields, .. } => fields
+                .iter()
+                .any(|f| yields_wrapped(&f.value, name, program)),
+            ExprKind::Tuple(elems) => elems.iter().any(|el| yields_wrapped(el, name, program)),
+            // B-2026-09-06-18 — a USER enum variant constructor
+            // (`Slot.Held(r)`, `Slot.Pair(r, 1)`), told apart from an
+            // associated function of the same spelling by the program's enum
+            // declarations; without a program it stays declined. The
+            // struct-variant spelling (`Slot.Boxed { r: r, n: 1 }`) is a
+            // `StructLiteral` and was already admitted above.
+            ExprKind::Call { callee, args }
+                if program.is_some_and(|p| is_user_variant_ctor(p, callee)) =>
+            {
+                args.iter().any(|a| yields_wrapped(&a.value, name, program))
             }
-            ExprKind::Tuple(elems) => elems.iter().any(|el| yields_wrapped(el, name)),
-            _ => option_result_ctor_payload(e).is_some_and(|p| yields_wrapped(p, name)),
+            _ => option_result_ctor_payload(e).is_some_and(|p| yields_wrapped(p, name, program)),
         }
     }
     /// The leaf tails of an escaping tail position, following exactly the
@@ -2592,7 +2621,7 @@ pub fn fn_conditionally_returns_param_bare(
         // per-path flag clears it through the same source walk.
         // B-2026-09-02-4 — and the param moved into a returned aggregate
         // literal; see `yields_wrapped`.
-        if yields_wrapped(leaf, name) {
+        if yields_wrapped(leaf, name, program) {
             yields_bare = true;
         } else if may_mention(leaf, name) {
             // Condition 3 — an escape route the flag cannot clear.

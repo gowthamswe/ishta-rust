@@ -55231,6 +55231,64 @@ fn main() {
     );
 }
 
+/// B-2026-09-06-18 — the INTERPRETER twin of
+/// `e2e_param_wrapped_in_returned_enum_variant_on_some_paths_has_one_owner`,
+/// same program and the same expected string: the hand-back path doubled on
+/// all four surfaces (the method spelling on the compiled ones only), and the
+/// one predicate both backends read now settles every cell.
+#[test]
+fn test_param_wrapped_in_returned_enum_variant_on_some_paths_has_one_owner() {
+    assert_eq!(
+        run(r#"struct R { id: i64, s: String }
+impl Drop for R { fn drop(mut ref self) { println(f"d{self.id}") } }
+enum Slot { Held(R), Pair(R, i64), Boxed { r: R, n: i64 }, Empty }
+enum Tagged { Held(R), Empty }
+impl Drop for Tagged { fn drop(mut ref self) { println("dT") } }
+struct H { n: i64 }
+fn mk(i: i64) -> String { return f"pay-{i}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; }
+fn mr(i: i64) -> R { return R { id: i, s: mk(i) }; }
+fn show(x: Slot) { match x { Slot.Held(v) => println(f"C{v.id}"), Slot.Pair(v, n) => println(f"P{v.id}"), Slot.Boxed { r, n } => println(f"X{r.id}"), Slot.Empty => println("CE") } }
+fn fslot(r: R, k: bool) -> Slot { if k { return Slot.Empty; } return Slot.Held(r); }
+fn fpair(r: R, k: bool) -> Slot { if k { return Slot.Empty; } return Slot.Pair(r, 1); }
+fn fboxed(r: R, k: bool) -> Slot { if k { return Slot.Empty; } return Slot.Boxed { r: r, n: 1 }; }
+fn ffresh(r: R, k: bool) -> Slot { if k { return Slot.Held(mr(90)); } return Slot.Held(r); }
+fn ftail(r: R, k: bool) -> Slot { if k { Slot.Empty } else { Slot.Held(r) } }
+fn fnest(r: R, k: bool, j: bool) -> Slot { if k { if j { return Slot.Held(r); } } return Slot.Empty; }
+fn ftag(r: R, k: bool) -> Tagged { if k { return Tagged.Empty; } return Tagged.Held(r); }
+impl H {
+    fn aslot(r: R, k: bool) -> Slot { if k { return Slot.Empty; } return Slot.Held(r); }
+    fn mslot(ref self, r: R, k: bool) -> Slot { if k { return Slot.Empty; } return Slot.Held(r); }
+}
+fn main() {
+    let h = H { n: 0 };
+    println("st"); { let x = fslot(mr(1), true); show(x); }
+    println("sf"); { let x = fslot(mr(2), false); show(x); }
+    println("pt"); { let x = fpair(mr(3), true); show(x); }
+    println("pf"); { let x = fpair(mr(4), false); show(x); }
+    println("bt"); { let x = fboxed(mr(5), true); show(x); }
+    println("bf"); { let x = fboxed(mr(6), false); show(x); }
+    println("frt"); { let x = ffresh(mr(7), true); show(x); }
+    println("frf"); { let x = ffresh(mr(8), false); show(x); }
+    println("tlt"); { let x = ftail(mr(9), true); show(x); }
+    println("tlf"); { let x = ftail(mr(10), false); show(x); }
+    println("ntt"); { let x = fnest(mr(11), true, true); show(x); }
+    println("ntf"); { let x = fnest(mr(12), true, false); show(x); }
+    println("nff"); { let x = fnest(mr(13), false, false); show(x); }
+    println("tgt"); { let x = ftag(mr(14), true); match x { Tagged.Held(v) => println(f"C{v.id}"), Tagged.Empty => println("CE") } }
+    println("tgf"); { let x = ftag(mr(15), false); match x { Tagged.Held(v) => println(f"C{v.id}"), Tagged.Empty => println("CE") } }
+    println("at"); { let x = H.aslot(mr(16), true); show(x); }
+    println("af"); { let x = H.aslot(mr(17), false); show(x); }
+    println("mt"); { let x = h.mslot(mr(18), true); show(x); }
+    println("mf"); { let x = h.mslot(mr(19), false); show(x); }
+    println("nt"); { let a = mr(20); let x = fslot(a, true); show(x); }
+    println("nf"); { let b = mr(21); let x = fslot(b, false); show(x); }
+    println("end");
+}"#),
+        "st\nd1\nCE\nsf\nC2\nd2\npt\nd3\nCE\npf\nP4\nd4\nbt\nd5\nCE\nbf\nX6\nd6\nfrt\nd7\nC90\nd90\nfrf\nC8\nd8\ntlt\nd9\nCE\ntlf\nC10\nd10\nntt\nC11\nd11\nntf\nd12\nCE\nnff\nd13\nCE\ntgt\nd14\nCE\ndT\ntgf\nC15\ndT\nd15\nat\nd16\nCE\naf\nC17\nd17\nmt\nd18\nCE\nmf\nC19\nd19\nnt\nd20\nCE\nnf\nC21\nd21\nend\n",
+        "a param wrapped in a returned enum variant on some paths has one owner per path"
+    );
+}
+
 /// B-2026-08-29-31 — the INTERPRETER twin of
 /// `e2e_wildcard_let_discard_owns_what_its_arm_hands_out`, landed in the same
 /// commit with the SAME shapes in the same order, so the two backends cannot
