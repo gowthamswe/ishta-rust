@@ -758,6 +758,98 @@ impl<'ctx> super::Codegen<'ctx> {
             .insert(binding_name.to_string());
     }
 
+    /// B-2026-09-06-8 — the UNCONDITIONAL sibling of
+    /// [`Self::register_param_view_mem_drop`], for `let x: R = t.0` / `let x = s.f`
+    /// projecting a `Drop`-carrying element OUT of a by-value param place.
+    ///
+    /// That let-site marks `x` a param VIEW and suppresses its body (the caller
+    /// runs it, `field_move_out_source_is_param_view`), while the source
+    /// element's memory is cap-zeroed out of the param's own drop
+    /// (`suppress_tuple_index_move_source` / the field-move-out suppressor). For
+    /// a type with its OWN `impl Drop` the suppressed drop was `karac_drop_<T>`
+    /// — body AND field free together, mutually exclusive with `StructDrop` — so
+    /// withholding the body ALSO withheld the free, and with the source zeroed
+    /// nobody freed `x`'s moved-in interior: measured 10 B per projection
+    /// (`tag` 2 B + `xs` 8 B) at `KARAC_OPT_LEVEL=0`, output otherwise correct
+    /// (one body, byte-identical to `--interp`). The tuple-DESTRUCTURE leaf
+    /// already registers this memory-only synthesis under an owner-runs-bodies
+    /// source (B-2026-09-02-41); the whole-element PROJECTION did not.
+    ///
+    /// Unlike its sibling this pushes an ordinary scope-exit `StructDrop`, not a
+    /// flag-gated `param_view_mem_drops` entry: the projection binding is
+    /// unconditional, so `emit_user_drop_call_guarded`'s flagged else-edge never
+    /// runs for it. The GUARDS are identical, and load-bearing: only a
+    /// non-shared struct that owns its own `Drop` (a bodies-only carrier keeps
+    /// its live `StructDrop`, so a second free would double it — B-2026-09-05-19),
+    /// only when the source carries callee-owned param memory (so the cap-zero
+    /// really did happen and this is the sole remaining owner, not a second one),
+    /// and only when the callee owns the copy.
+    pub(super) fn register_projection_view_mem_drop(
+        &mut self,
+        binding_name: &str,
+        source_name: &str,
+        type_name: &str,
+        slot: PointerValue<'ctx>,
+    ) {
+        if self.type_decls.shared_types.contains_key(type_name)
+            || !self.type_decls.struct_types.contains_key(type_name)
+        {
+            return;
+        }
+        if self
+            .drop_rc
+            .rc_fallback_heap_types
+            .contains_key(binding_name)
+        {
+            return;
+        }
+        // Only a type with its OWN `impl Drop`: a bodies-only carrier
+        // (`struct Holder { r: Res }`) keeps its live `StructDrop`, so a second
+        // memory free here would double it (B-2026-09-05-19, the sibling's
+        // measurement).
+        let target_has_own_drop_impl = self
+            .program_snapshot
+            .as_deref()
+            .is_some_and(|p| p.drop_method_keys.contains_key(type_name));
+        if !target_has_own_drop_impl {
+            return;
+        }
+        // The source must carry callee-owned memory — otherwise the cap-zero did
+        // not happen and the source is still the owner, so a drop here would be
+        // the second.
+        if !self.source_carries_callee_owned_param_memory(source_name) {
+            return;
+        }
+        let callee_owns = self.aggregate_param_copy_supported_struct(type_name, &mut Vec::new())
+            || (!self.struct_owns_shared_field(type_name, &mut Vec::new())
+                && !self.struct_is_self_referential(type_name));
+        if !callee_owns {
+            return;
+        }
+        let subst = self
+            .type_decls
+            .enum_inst_var_types
+            .get(binding_name)
+            .cloned()
+            .map(|i| self.generic_struct_subst_from_inst(type_name, &i))
+            .unwrap_or_default();
+        let Some(mem_fn) = self.emit_struct_drop_synthesis_mono(type_name, &subst) else {
+            return;
+        };
+        if let Some(frame) = self.drop_rc.scope_cleanup_actions.last_mut() {
+            frame.push(crate::codegen::state::CleanupAction::StructDrop {
+                struct_alloca: slot,
+                drop_fn: mem_fn,
+            });
+        }
+        // The induction's step, as the sibling records it: the target now carries
+        // the callee-owned memory, so a further hand-off (`let y = x`) is
+        // admissible in turn.
+        self.drop_rc
+            .param_view_callee_owned
+            .insert(binding_name.to_string());
+    }
+
     /// B-2026-09-02-5 — does `source_name` hold heap this FRAME owns, as opposed
     /// to a view onto the caller's?
     ///

@@ -10199,6 +10199,24 @@ impl<'ctx> super::Codegen<'ctx> {
                                 self.payload_vars
                                     .param_view_locals
                                     .insert(var_name.to_string());
+                                // B-2026-09-06-8 — suppressing the body of an
+                                // own-`Drop` type suppressed `karac_drop_<T>`,
+                                // which frees the interior too, and the source
+                                // element was cap-zeroed: nobody freed `x`'s
+                                // moved-in buffers (10 B/projection at -O0).
+                                // `x` is the sole owner now, so give it the
+                                // memory-only synthesis the destructure leaf
+                                // already gets (B-2026-09-02-41). Guarded so it
+                                // fires only where the source really was
+                                // suppressed — no second free.
+                                if let Some(root) = Self::place_root_ident(value) {
+                                    self.register_projection_view_mem_drop(
+                                        var_name,
+                                        root,
+                                        &struct_name,
+                                        alloca,
+                                    );
+                                }
                             }
                         }
                     }
@@ -15249,6 +15267,18 @@ impl<'ctx> super::Codegen<'ctx> {
                                             },
                                         );
                                     }
+                                    // B-2026-09-06-8 — this leaf now owns
+                                    // callee-side memory, so a further
+                                    // projection OUT of it (`let x: R =
+                                    // inner.0`) is the sole owner of the moved
+                                    // element and must get its own memory-only
+                                    // drop (`register_projection_view_mem_drop`
+                                    // reads this set through
+                                    // `source_carries_callee_owned_param_memory`).
+                                    // Without it the two-level
+                                    // destructure-then-project cell leaked while
+                                    // the direct `t.0` sibling was clean.
+                                    self.drop_rc.param_view_callee_owned.insert(name.clone());
                                 }
                                 if let Some(bodies) = bodies {
                                     self.track_user_drop_var_with_fn(

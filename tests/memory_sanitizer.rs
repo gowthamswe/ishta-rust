@@ -5085,6 +5085,68 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-8 — projecting a `Drop`-carrying element OUT of a by-value
+    /// param place (`let x: R = t.0` / `h.pe.0`, and the two-level
+    /// destructure-then-project `let (inner, y) = h.pe; let x: R = inner.0`)
+    /// frees `x`'s moved-in interior exactly once.
+    ///
+    /// The let-site marks `x` a param VIEW and suppresses its body (the caller
+    /// runs it); for an own-`Drop` type that also suppressed the free
+    /// (`karac_drop_<T>` is body + fields together), and the source element was
+    /// cap-zeroed, so nobody freed `x`'s `tag`/`xs` buffers — 10 B per
+    /// projection at `KARAC_OPT_LEVEL=0`, output otherwise correct. The fix
+    /// gives the sole-owner view its own memory-only synthesis
+    /// (`register_projection_view_mem_drop`), and marks a destructure leaf that
+    /// owns callee memory so a projection out of IT is reached too. The cells
+    /// read `x`'s heap (`x.tag`, `x.xs.len()`) so the buffers are live at `-O2`
+    /// as well, not only on the `-O0` leg where the leak was first measured.
+    #[test]
+    fn asan_tuple_param_drop_element_projection_freed_once() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"tag{i}", xs: [i, i] }; }
+struct H1 { pe: (R, i64) }
+struct H2 { pe: ((R, i64), i64) }
+fn t_proj(t: (R, i64)) { let x: R = t.0; println(f"tp {x.id} {x.tag} {x.xs.len()}"); }
+fn f_proj(h: H1) { let x: R = h.pe.0; println(f"fp {x.id} {x.tag}"); }
+fn v_proj(h: H2) { let (inner, y) = h.pe; let x: R = inner.0; println(f"vp {x.id} {x.tag}"); }
+fn main() {
+    let mut i = 0;
+    while i < 3 {
+        t_proj((mk(1), 9));
+        f_proj(H1 { pe: (mk(2), 9) });
+        v_proj(H2 { pe: ((mk(3), 1), 2) });
+        i = i + 1;
+    }
+}
+"#,
+            &[
+                "tp 1 tag1 2",
+                "dR1",
+                "fp 2 tag2",
+                "dR2",
+                "vp 3 tag3",
+                "dR3",
+                "tp 1 tag1 2",
+                "dR1",
+                "fp 2 tag2",
+                "dR2",
+                "vp 3 tag3",
+                "dR3",
+                "tp 1 tag1 2",
+                "dR1",
+                "fp 2 tag2",
+                "dR2",
+                "vp 3 tag3",
+                "dR3",
+            ],
+            "tuple_param_drop_element_projection_freed_once",
+            18,
+        );
+    }
+
     /// B-2026-09-03-33 — the memory side of the `Result` husk fix. The defect
     /// was a BODY that should not have run, and the fix masks the source's
     /// field-bodies walk rather than removing the payload-area zero that walk
