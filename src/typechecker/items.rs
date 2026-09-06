@@ -4637,7 +4637,7 @@ impl<'a> super::TypeChecker<'a> {
     /// built only out of those and `Copy` scalars. Deliberately shallow past
     /// that: a `Vec[shared T]` copy DOES duplicate the element buffer (while
     /// retaining each element), so it is a real copy and stays reportable.
-    fn copy_is_only_an_rc_retain(&self, ty: &Type) -> bool {
+    pub(super) fn copy_is_only_an_rc_retain(&self, ty: &Type) -> bool {
         match ty {
             Type::Shared(_) => true,
             Type::Named { name, args } if self.name_is_shared_decl(name) => {
@@ -5355,6 +5355,10 @@ impl<'a> super::TypeChecker<'a> {
                     self.record_uninferrable_binding_origin(pattern, &inferred, value);
                     inferred
                 };
+                // B-2026-09-06-14 — the `let … else` spelling of the read the
+                // plain `let` warns about (W0299): its bindings own a copy taken
+                // off the borrow exactly as `let e = h.e`'s binding does.
+                self.warn_borrow_projection_copy(value, &expected_ty);
                 // The else block runs on the NON-matching edge, so the
                 // pattern's bindings are NOT in scope there — infer it first,
                 // before binding the pattern. It must diverge.

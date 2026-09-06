@@ -56,25 +56,98 @@ pub(crate) fn binding_only_borrowed(name: &str, e: &Expr) -> bool {
 // match-arm classifier) asks this exact question, so the `#[cfg(feature =
 // "llvm")]` gate this carried while codegen was its only caller is gone.
 pub(crate) fn binding_only_borrowed_block(name: &str, b: &crate::ast::Block) -> bool {
-    let consumed = b
-        .final_expr
+    !block_consumes(&Ctx::syntactic(name), b)
+}
+
+/// Does `name`, bound by a pattern over a scrutinee that projects off a
+/// BORROW, get MATERIALIZED by `e` — used somewhere that turns the view into
+/// an independent value with its own `Drop` bodies? This is the question W0299
+/// `borrow_projection_copy` asks for the `match` / `if let` spellings
+/// (B-2026-09-06-14), and it differs from [`binding_only_borrowed`] in two
+/// TYPED ways the RC-analysis callers of that function must not see:
+///
+/// * `copy_read` — a projection whose type is `Copy` (`r.id` on an `i64`
+///   field), an RC retain, or a borrow is a READ, not a transfer: it copies a
+///   word, and no user `Drop` body runs for it. The syntactic classifier calls
+///   every projection rooted at the binding a partial move, which is the safe
+///   bias for a drop-disarm decision and a false claim for a warning
+///   (measured: `E.A(r) => { return r.id; }` runs ONE body on every backend).
+/// * a FREE-FUNCTION argument transfers. The classifier models it as
+///   entry-copied and non-consuming, which is right for the disarm question
+///   (the callee runs no body), but the entry copy IS the materialization
+///   this warning is about: `E.A(r) => { return consume(r); }` through `ref h`
+///   runs the payload body twice on every backend, exactly as `let m = r` does.
+pub(crate) fn binding_materialized(
+    name: &str,
+    e: &Expr,
+    copy_read: &dyn Fn(&Expr) -> bool,
+) -> bool {
+    let c = Ctx {
+        name,
+        copy_read,
+        free_fn_arg_transfers: true,
+    };
+    value_derived_from(&c, e) || has_consuming_sink(&c, e)
+}
+
+/// Block sibling of [`binding_materialized`] — the `if let` / `while let`
+/// scopes.
+pub(crate) fn binding_materialized_block(
+    name: &str,
+    b: &crate::ast::Block,
+    copy_read: &dyn Fn(&Expr) -> bool,
+) -> bool {
+    let c = Ctx {
+        name,
+        copy_read,
+        free_fn_arg_transfers: true,
+    };
+    block_consumes(&c, b)
+}
+
+fn block_consumes(c: &Ctx<'_>, b: &crate::ast::Block) -> bool {
+    b.final_expr
         .as_deref()
-        .is_some_and(|t| value_derived_from(name, t))
-        || block_has_sink(name, b);
-    !consumed
+        .is_some_and(|t| value_derived_from(c, t))
+        || block_has_sink(c, b)
+}
+
+/// What one classification walk knows: the binding it is tracking and the two
+/// knobs that separate the syntactic RC-analysis question from the typed
+/// diagnostic one (see [`binding_materialized`]).
+struct Ctx<'a> {
+    name: &'a str,
+    /// A value derived from `name` whose read is a plain copy — `Copy`-typed,
+    /// an RC retain, a borrow. Always `false` for the syntactic walk, which
+    /// has no types and keeps its conservative "every projection is a partial
+    /// move" bias.
+    copy_read: &'a dyn Fn(&Expr) -> bool,
+    /// Whether a derived FREE-FUNCTION argument counts as a transfer.
+    free_fn_arg_transfers: bool,
+}
+
+impl<'a> Ctx<'a> {
+    fn syntactic(name: &'a str) -> Self {
+        Ctx {
+            name,
+            copy_read: &|_| false,
+            free_fn_arg_transfers: false,
+        }
+    }
 }
 
 /// Classify how `name` is used across the whole of `e`. `Consumed` if ANY use
 /// transfers ownership; `NonConsuming` only if every use is a borrow or an
 /// entry-copied free-function call argument.
 pub(crate) fn classify_binding_in_expr(name: &str, e: &Expr) -> Consumption {
+    let c = Ctx::syntactic(name);
     // The value of `e` itself flowing out (the arm/expression result) is a
     // transfer if it is derived from `name` (the bare binding, or a
     // field/tuple/index projection rooted at it — a partial move).
-    if value_derived_from(name, e) {
+    if value_derived_from(&c, e) {
         return Consumption::Consumed;
     }
-    if has_consuming_sink(name, e) {
+    if has_consuming_sink(&c, e) {
         return Consumption::Consumed;
     }
     Consumption::NonConsuming
@@ -85,16 +158,16 @@ pub(crate) fn classify_binding_in_expr(name: &str, e: &Expr) -> Consumption {
 /// forwarded through a value-transparent wrapper (block tail, `if`/`match`
 /// arms)? Crucially this does NOT see through a call, method call, or operator:
 /// those produce a fresh/entry-copied value that no longer aliases `name`.
-fn value_derived_from(name: &str, e: &Expr) -> bool {
+fn value_derived_from(c: &Ctx<'_>, e: &Expr) -> bool {
     match &e.kind {
-        ExprKind::Identifier(n) => n == name,
+        ExprKind::Identifier(n) => n == c.name && !(c.copy_read)(e),
         ExprKind::FieldAccess { object, .. }
         | ExprKind::TupleIndex { object, .. }
-        | ExprKind::Index { object, .. } => value_derived_from(name, object),
+        | ExprKind::Index { object, .. } => value_derived_from(c, object) && !(c.copy_read)(e),
         ExprKind::Block(b) => b
             .final_expr
             .as_deref()
-            .is_some_and(|t| value_derived_from(name, t)),
+            .is_some_and(|t| value_derived_from(c, t)),
         ExprKind::If {
             then_block,
             else_branch,
@@ -108,12 +181,12 @@ fn value_derived_from(name: &str, e: &Expr) -> bool {
             then_block
                 .final_expr
                 .as_deref()
-                .is_some_and(|t| value_derived_from(name, t))
+                .is_some_and(|t| value_derived_from(c, t))
                 || else_branch
                     .as_deref()
-                    .is_some_and(|t| value_derived_from(name, t))
+                    .is_some_and(|t| value_derived_from(c, t))
         }
-        ExprKind::Match { arms, .. } => arms.iter().any(|a| value_derived_from(name, &a.body)),
+        ExprKind::Match { arms, .. } => arms.iter().any(|a| value_derived_from(c, &a.body)),
         _ => false,
     }
 }
@@ -126,35 +199,31 @@ fn value_derived_from(name: &str, e: &Expr) -> bool {
 /// closure capture. Each sink checks `value_derived_from` on its operand; the
 /// walk recurses into non-consuming children (free-fn call args, receivers,
 /// operator operands) to catch sinks nested inside them.
-fn has_consuming_sink(name: &str, e: &Expr) -> bool {
-    let derived = |x: &Expr| value_derived_from(name, x);
+fn has_consuming_sink(c: &Ctx<'_>, e: &Expr) -> bool {
+    let derived = |x: &Expr| value_derived_from(c, x);
     match &e.kind {
         // ── Sinks ──────────────────────────────────────────────────────────
         ExprKind::Return(inner) => {
             inner.as_deref().is_some_and(derived)
-                || inner
-                    .as_deref()
-                    .is_some_and(|x| has_consuming_sink(name, x))
+                || inner.as_deref().is_some_and(|x| has_consuming_sink(c, x))
         }
         ExprKind::StructLiteral { fields, spread, .. } => {
             fields.iter().any(|f| derived(&f.value))
                 || spread.as_deref().is_some_and(derived)
-                || fields.iter().any(|f| has_consuming_sink(name, &f.value))
-                || spread
-                    .as_deref()
-                    .is_some_and(|s| has_consuming_sink(name, s))
+                || fields.iter().any(|f| has_consuming_sink(c, &f.value))
+                || spread.as_deref().is_some_and(|s| has_consuming_sink(c, s))
         }
         ExprKind::Tuple(items) | ExprKind::ArrayLiteral(items) => {
-            items.iter().any(derived) || items.iter().any(|x| has_consuming_sink(name, x))
+            items.iter().any(derived) || items.iter().any(|x| has_consuming_sink(c, x))
         }
         ExprKind::PrefixCollectionLiteral { items, .. } => {
-            items.iter().any(derived) || items.iter().any(|x| has_consuming_sink(name, x))
+            items.iter().any(derived) || items.iter().any(|x| has_consuming_sink(c, x))
         }
         ExprKind::RepeatLiteral { value, count, .. } => {
-            derived(value) || has_consuming_sink(name, value) || has_consuming_sink(name, count)
+            derived(value) || has_consuming_sink(c, value) || has_consuming_sink(c, count)
         }
         ExprKind::MapLiteral(pairs) => pairs.iter().any(|(k, v)| {
-            derived(k) || derived(v) || has_consuming_sink(name, k) || has_consuming_sink(name, v)
+            derived(k) || derived(v) || has_consuming_sink(c, k) || has_consuming_sink(c, v)
         }),
         // A `Call` is a free-function call ONLY when its callee is a bare
         // lowercase-ish identifier. Anything else (a `Path` such as
@@ -164,15 +233,15 @@ fn has_consuming_sink(name: &str, e: &Expr) -> bool {
         ExprKind::Call { callee, args } => {
             let is_free_fn = matches!(&callee.kind, ExprKind::Identifier(_))
                 || is_lowered_primitive_operator(callee);
-            if is_free_fn {
+            if is_free_fn && !c.free_fn_arg_transfers {
                 // Entry-copied args: a derived arg is fine; only recurse for
                 // nested sinks.
-                args.iter().any(|a| has_consuming_sink(name, &a.value))
-                    || has_consuming_sink(name, callee)
+                args.iter().any(|a| has_consuming_sink(c, &a.value))
+                    || has_consuming_sink(c, callee)
             } else {
                 args.iter().any(|a| derived(&a.value))
-                    || args.iter().any(|a| has_consuming_sink(name, &a.value))
-                    || has_consuming_sink(name, callee)
+                    || args.iter().any(|a| has_consuming_sink(c, &a.value))
+                    || has_consuming_sink(c, callee)
             }
         }
         // Method calls: the RECEIVER is a borrow (non-consuming), but an
@@ -180,43 +249,41 @@ fn has_consuming_sink(name: &str, e: &Expr) -> bool {
         // `v.push(x)` / `m.insert(k, x)` without an allowlist of mutators.
         ExprKind::MethodCall { object, args, .. } => {
             args.iter().any(|a| derived(&a.value))
-                || has_consuming_sink(name, object)
-                || args.iter().any(|a| has_consuming_sink(name, &a.value))
+                || has_consuming_sink(c, object)
+                || args.iter().any(|a| has_consuming_sink(c, &a.value))
         }
         // A closure that references `name` captures it (by value/move under the
         // heap-env model) — a transfer out of the current control flow.
-        ExprKind::Closure { body, .. } => expr_mentions(name, body),
+        ExprKind::Closure { body, .. } => expr_mentions(c.name, body),
         // ── Non-consuming reads: recurse for nested sinks only ─────────────
         ExprKind::FieldAccess { object, .. }
         | ExprKind::TupleIndex { object, .. }
         | ExprKind::Unary {
             operand: object, ..
         }
-        | ExprKind::Cast { expr: object, .. } => has_consuming_sink(name, object),
+        | ExprKind::Cast { expr: object, .. } => has_consuming_sink(c, object),
         ExprKind::Index { object, index } => {
-            has_consuming_sink(name, object) || has_consuming_sink(name, index)
+            has_consuming_sink(c, object) || has_consuming_sink(c, index)
         }
         ExprKind::Binary { left, right, .. } => {
-            has_consuming_sink(name, left) || has_consuming_sink(name, right)
+            has_consuming_sink(c, left) || has_consuming_sink(c, right)
         }
         ExprKind::Range { start, end, .. } => {
-            start
-                .as_deref()
-                .is_some_and(|s| has_consuming_sink(name, s))
-                || end.as_deref().is_some_and(|s| has_consuming_sink(name, s))
+            start.as_deref().is_some_and(|s| has_consuming_sink(c, s))
+                || end.as_deref().is_some_and(|s| has_consuming_sink(c, s))
         }
         // ── Control flow: recurse into all sub-exprs / stmts ───────────────
-        ExprKind::Block(b) => block_has_sink(name, b),
+        ExprKind::Block(b) => block_has_sink(c, b),
         ExprKind::If {
             condition,
             then_block,
             else_branch,
         } => {
-            has_consuming_sink(name, condition)
-                || block_has_sink(name, then_block)
+            has_consuming_sink(c, condition)
+                || block_has_sink(c, then_block)
                 || else_branch
                     .as_deref()
-                    .is_some_and(|e| has_consuming_sink(name, e))
+                    .is_some_and(|e| has_consuming_sink(c, e))
         }
         ExprKind::IfLet {
             value,
@@ -224,20 +291,20 @@ fn has_consuming_sink(name: &str, e: &Expr) -> bool {
             else_branch,
             ..
         } => {
-            has_consuming_sink(name, value)
-                || block_has_sink(name, then_block)
+            has_consuming_sink(c, value)
+                || block_has_sink(c, then_block)
                 || else_branch
                     .as_deref()
-                    .is_some_and(|e| has_consuming_sink(name, e))
+                    .is_some_and(|e| has_consuming_sink(c, e))
         }
         ExprKind::Match { scrutinee, arms } => {
-            has_consuming_sink(name, scrutinee)
+            has_consuming_sink(c, scrutinee)
                 || arms.iter().any(|a| {
-                    a.guard.as_ref().is_some_and(|g| has_consuming_sink(name, g))
+                    a.guard.as_ref().is_some_and(|g| has_consuming_sink(c, g))
                         // An arm whose RESULT forwards `name` transfers it out
                         // of this expression (the match value flows onward).
-                        || value_derived_from(name, &a.body)
-                        || has_consuming_sink(name, &a.body)
+                        || value_derived_from(c, &a.body)
+                        || has_consuming_sink(c, &a.body)
                 })
         }
         // Everything else (literals, identifiers, paths, …) holds no sink.
@@ -245,30 +312,30 @@ fn has_consuming_sink(name: &str, e: &Expr) -> bool {
     }
 }
 
-fn block_has_sink(name: &str, b: &crate::ast::Block) -> bool {
+fn block_has_sink(c: &Ctx<'_>, b: &crate::ast::Block) -> bool {
     for s in &b.stmts {
-        if stmt_has_sink(name, s) {
+        if stmt_has_sink(c, s) {
             return true;
         }
     }
     b.final_expr
         .as_deref()
-        .is_some_and(|e| has_consuming_sink(name, e))
+        .is_some_and(|e| has_consuming_sink(c, e))
 }
 
-fn stmt_has_sink(name: &str, s: &Stmt) -> bool {
+fn stmt_has_sink(c: &Ctx<'_>, s: &Stmt) -> bool {
     match &s.kind {
         // A `let w = <derived-from-name>` moves ownership into `w`.
         StmtKind::Let { value, .. } | StmtKind::LetElse { value, .. } => {
-            value_derived_from(name, value) || has_consuming_sink(name, value)
+            value_derived_from(c, value) || has_consuming_sink(c, value)
         }
         // `target = <derived>` / `target op= <derived>` — a store transfers.
         StmtKind::Assign { target, value } | StmtKind::CompoundAssign { target, value, .. } => {
-            value_derived_from(name, value)
-                || has_consuming_sink(name, value)
-                || has_consuming_sink(name, target)
+            value_derived_from(c, value)
+                || has_consuming_sink(c, value)
+                || has_consuming_sink(c, target)
         }
-        StmtKind::Expr(e) => has_consuming_sink(name, e),
+        StmtKind::Expr(e) => has_consuming_sink(c, e),
         _ => false,
     }
 }

@@ -5380,6 +5380,10 @@ impl<'a> super::TypeChecker<'a> {
                 let dispatch_ty = dispatch_ty.clone();
                 self.local_scope.push();
                 self.check_pattern_against(pattern, &dispatch_ty, mode);
+                // B-2026-09-06-14 — see `arm_materializes_scrutinee_copy`.
+                if self.block_materializes_scrutinee_copy(pattern, then_block) {
+                    self.warn_borrow_projection_copy(value, &scrut_ty);
+                }
                 let then_ty = self.infer_block(then_block);
                 self.local_scope.pop();
                 if let Some(ref else_expr) = else_branch {
@@ -5999,6 +6003,10 @@ impl<'a> super::TypeChecker<'a> {
                 let dispatch_ty = dispatch_ty.clone();
                 self.local_scope.push();
                 self.check_pattern_against(pattern, &dispatch_ty, mode);
+                // B-2026-09-06-14 — see `arm_materializes_scrutinee_copy`.
+                if self.block_materializes_scrutinee_copy(pattern, body) {
+                    self.warn_borrow_projection_copy(value, &scrut_ty);
+                }
                 // See the `While` arm.
                 self.break_value_types
                     .push(BreakFrame::for_valueless_loop(label.clone()));

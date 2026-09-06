@@ -8258,6 +8258,19 @@ stating out loud is the consequence, because nothing at the use site shows it:
 behaviour-**preserving**: the copy already happens, and `.clone()` only spells
 it.
 
+**The pattern spellings copy at the materialization, not at the scrutinee.**
+`match s.e { E.A(r) => … }`, `if let E.A(r) = s.e { … }` and `while let` over
+the same projection bind `r` as a *view* while the arm only reads it — one
+`Drop` body, on every backend — and copy exactly where the arm **materializes**
+the binding: moves it whole (`let m = r`, `return r`, `v.push(r)`, an arm whose
+value is `r`), moves a non-`Copy` projection of it, or passes it by value to a
+function (the callee's entry copy is the copy). `r.id` on a `Copy` field is a
+read. The lint follows that line: it reports the scrutinee when some arm
+materializes a binding and stays silent on a read-only arm, because there the
+claim "the body runs twice" would be false. `let E.A(r) = s.e else { … }` is
+the one pattern spelling that copies unconditionally — its binding owns the
+copy whatever follows — and it warns as the plain `let` does.
+
 **This is not the kind of clone the enum-payload rule forbids.** That rule
 (B-2026-08-09-9, pinned by the `enum_payload_clone_is_faithful` codegen test)
 refuses to duplicate a payload on the ground that "a clone is a

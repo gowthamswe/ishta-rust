@@ -414,7 +414,7 @@ impl<'a> super::TypeChecker<'a> {
     /// structs are non-generic (empty `generic_params`) so pass through. When the
     /// arg count doesn't line up (an under-inferred receiver), fall back to the
     /// raw declared type — no worse than the prior always-bare behavior.
-    fn field_type_with_receiver_args(
+    pub(super) fn field_type_with_receiver_args(
         &self,
         obj_ty: &Type,
         struct_info: &StructInfo,

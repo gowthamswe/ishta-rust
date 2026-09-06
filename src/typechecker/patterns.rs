@@ -172,6 +172,10 @@ impl<'a> super::TypeChecker<'a> {
         let dispatch_ty = dispatch_ty.clone();
         self.local_scope.push();
         self.check_pattern_against(pattern, &dispatch_ty, mode);
+        // B-2026-09-06-14 — see `arm_materializes_scrutinee_copy`.
+        if self.block_materializes_scrutinee_copy(pattern, then_block) {
+            self.warn_borrow_projection_copy(value, &scrut_ty);
+        }
         let then_ty = self.check_block_against(then_block, expected);
         self.local_scope.pop();
         if let Some(else_expr) = else_branch {
@@ -218,10 +222,12 @@ impl<'a> super::TypeChecker<'a> {
             self.index_read_names_a_borrowed_element(scrutinee, &dispatch_ty);
         let mut arm_types: Vec<Type> = Vec::new();
         let mut scrutinee_mismatch = false;
+        let mut materializes = false;
         for arm in arms {
             self.local_scope.push();
             let errs_before = self.errors.len();
             self.check_pattern_against(&arm.pattern, &dispatch_ty, mode);
+            materializes |= self.arm_materializes_scrutinee_copy(arm);
             scrutinee_mismatch |= self.errors[errs_before..]
                 .iter()
                 .any(|e| e.kind == TypeErrorKind::PatternScrutineeMismatch);
@@ -250,6 +256,10 @@ impl<'a> super::TypeChecker<'a> {
             }
             arm_types.push(arm_ty);
             self.local_scope.pop();
+        }
+        // B-2026-09-06-14 — see `arm_materializes_scrutinee_copy`.
+        if materializes {
+            self.warn_borrow_projection_copy(scrutinee, &scrut_ty);
         }
         // A variant-pattern/scrutinee mismatch already poisons the match; the
         // scrutinee isn't the enum the arms destructure, so a follow-on
@@ -392,6 +402,93 @@ impl<'a> super::TypeChecker<'a> {
         }
     }
 
+    /// B-2026-09-06-14 — the `match` spelling of the read W0299
+    /// `borrow_projection_copy` reports on `let e = h.e`. A scrutinee that
+    /// projects off a borrow binds VIEWS in a read-only arm (measured: one
+    /// `Drop` body on every backend for `E.A(r) => { return r.id; }`), and
+    /// the copy the warning describes happens where an arm MATERIALIZES a
+    /// binding — moves it whole (`let m = r`, `return r`, `v.push(r)`), moves
+    /// a non-`Copy` projection of it, or passes it by value to a function —
+    /// at which point the copy is an independent owner whose bodies run a
+    /// second time. So the warning is per ARM, decided with the arm's
+    /// bindings in scope so their types are known (`consume_class::
+    /// binding_materialized` carries the typed `Copy` test), and emitted once
+    /// per `match`. Called from BOTH `infer_match` and `check_match_against`:
+    /// a `match` in tail position comes through the check-position twin and
+    /// never touches `infer_match` — the B-2026-08-31-3 split, which is where
+    /// the first draft of this went silent.
+    pub(super) fn arm_materializes_scrutinee_copy(&self, arm: &MatchArm) -> bool {
+        let copy_read = |e: &Expr| self.place_read_is_copy(e);
+        arm.pattern.binding_names().iter().any(|n| {
+            crate::consume_class::binding_materialized(n, &arm.body, &copy_read)
+                || arm
+                    .guard
+                    .as_ref()
+                    .is_some_and(|g| crate::consume_class::binding_materialized(n, g, &copy_read))
+        })
+    }
+
+    /// `if let` / `while let` sibling of
+    /// [`Self::arm_materializes_scrutinee_copy`]: one pattern, one block, the
+    /// bindings in scope.
+    pub(super) fn block_materializes_scrutinee_copy(
+        &self,
+        pattern: &Pattern,
+        block: &Block,
+    ) -> bool {
+        let copy_read = |e: &Expr| self.place_read_is_copy(e);
+        pattern
+            .binding_names()
+            .iter()
+            .any(|n| crate::consume_class::binding_materialized_block(n, block, &copy_read))
+    }
+
+    /// Is reading the place `e` (a pattern binding, or a field / tuple
+    /// projection chain rooted at one) a plain copy of a word rather than a
+    /// materialization — `Copy`-typed, an RC retain, a borrow, a function
+    /// value? Answers `false` when the place's type cannot be read off the
+    /// binding's scope entry, so an unknown shape falls back to the
+    /// classifier's own verdict.
+    fn place_read_is_copy(&self, e: &Expr) -> bool {
+        let Some(ty) = self.place_type_rooted_at_binding(e) else {
+            return false;
+        };
+        self.is_copy_type_during_check(&ty)
+            || self.copy_is_only_an_rc_retain(&ty)
+            || matches!(ty, Type::Ref(_) | Type::MutRef(_) | Type::Function { .. })
+    }
+
+    /// The type of a place expression rooted at an in-scope binding, read off
+    /// the scope entry and the struct table — no inference, no diagnostics.
+    /// `None` for any shape this does not model (a call, an index, an
+    /// unknown field).
+    fn place_type_rooted_at_binding(&self, e: &Expr) -> Option<Type> {
+        match &e.kind {
+            ExprKind::Identifier(n) => self.local_scope.lookup(n.as_str()).cloned(),
+            ExprKind::FieldAccess { object, field } => {
+                let obj_ty = self.place_type_rooted_at_binding(object)?;
+                let struct_name = match &obj_ty {
+                    Type::Named { name, .. } | Type::Shared(name) => name.as_str(),
+                    Type::Ref(inner) | Type::MutRef(inner) => match inner.as_ref() {
+                        Type::Named { name, .. } | Type::Shared(name) => name.as_str(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let info = self.env.structs.get(struct_name)?;
+                let (_, field_ty, _) = info.fields.iter().find(|(n, _, _)| n == field)?;
+                Some(self.field_type_with_receiver_args(&obj_ty, info, field_ty))
+            }
+            ExprKind::TupleIndex { object, index } => {
+                match self.place_type_rooted_at_binding(object)? {
+                    Type::Tuple(items) => items.get(*index as usize).cloned(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn infer_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: &Span) -> Type {
         let scrut_ty = self.infer_expr(scrutinee);
         let (mode, dispatch_ty) = ScrutineeMode::classify(&scrut_ty);
@@ -412,10 +509,12 @@ impl<'a> super::TypeChecker<'a> {
         let mut arm_types: Vec<Type> = Vec::new();
         let mut scrutinee_mismatch = false;
 
+        let mut materializes = false;
         for arm in arms {
             self.local_scope.push();
             let errs_before = self.errors.len();
             self.check_pattern_against(&arm.pattern, &dispatch_ty, mode);
+            materializes |= self.arm_materializes_scrutinee_copy(arm);
             scrutinee_mismatch |= self.errors[errs_before..]
                 .iter()
                 .any(|e| e.kind == TypeErrorKind::PatternScrutineeMismatch);
@@ -440,6 +539,10 @@ impl<'a> super::TypeChecker<'a> {
             }
             arm_types.push(arm_ty);
             self.local_scope.pop();
+        }
+        // B-2026-09-06-14 — see `arm_materializes_scrutinee_copy`.
+        if materializes {
+            self.warn_borrow_projection_copy(scrutinee, &scrut_ty);
         }
 
         // Check exhaustiveness for enum types — but not when a variant

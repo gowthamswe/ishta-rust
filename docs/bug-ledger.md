@@ -92,8 +92,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 383 |
-| run-vs-build | 348 |
+| miscompile | 384 |
+| run-vs-build | 350 |
 | leak | 273 |
 | missing-feature | 194 |
 | double-free | 189 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1502 |
-| interp | 374 |
+| codegen | 1504 |
+| interp | 376 |
 | typecheck | 294 |
 | ownership | 74 |
 | other | 73 |
@@ -155,6 +155,9 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-19 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM WRAPPED TWICE THROUGH A LOCAL ON SOME EXITS RUNS THE BODY TWICE ON THE HAND-BACK PATH -- `fn ftwo(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(82) }; } let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }` prints `d72 C72 B72 d72` for `k = false` on all four surfaces, while `k = true` is one body (`d71 C82 B82 d82`) | — |
 | B-2026-09-06-21 | 2026-09-06 | interp+codegen | low | TWO FRESH PAYLOADS BOUND OUT OF A `match` ARM DIE IN OPPOSITE ORDERS ON THE TWO BACKENDS -- `let w = W2.Two(mk(16), mk(17)); match w { W2.Two(a, b) => { return a.id; } .. }` prints `dR16 dR17` on jit / aot / `KARAC_AUTO_PAR=0` (declaration order) and `dR17 dR16` under `--interp` (reverse); the body COUNT is right on both, only the arm-end sequence differs | — |
 | B-2026-09-06-22 | 2026-09-06 | codegen | medium | A `match` THAT DESTRUCTURES A MIXED STRUCT LITERAL'S VIEW FIELD RUNS THE VIEW'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `let s = S3 { a: r, b: mk(19) }; match s { S3 { a, b } => { return b.id; } }` prints `dR19 dR18 dR18` on jit / aot / `KARAC_AUTO_PAR=0` against the interpreter's `dR19 dR18`; the struct sibling of B-2026-09-06-20, with the backends swapped | — |
+| B-2026-09-06-23 | 2026-09-06 | interp+codegen | low | THE COPY A MATERIALIZING `match` ARM TAKES OFF A BORROW-PROJECTION SCRUTINEE NEVER RUNS THE ENUM SHELL'S OWN `Drop` BODY, ON EVERY BACKEND -- `match h.e { E.A(r) => { let m = r; return m.id; } .. }` through `mut ref h` prints `dR1 dE dR1` (the copy's payload body, then the original's shell and payload) where the `let e = h.e; match e { .. }` spelling of the same copy prints `dE dR1 dE dR1`; a fresh-temp or local scrutinee (`match mk(7) { .. }`, `let e = mk(8); match e { .. }`) does run its shell's `dE` after the payload moves out | — |
+| B-2026-09-06-24 | 2026-09-06 | codegen | medium | A READ-ONLY `if let` / `while let` OVER A BORROW-PROJECTION SCRUTINEE COPIES THE PAYLOAD OUT UNDER CODEGEN AND BINDS A VIEW IN THE INTERPRETER -- `if let E.A(r) = h.e { return r.id; }` through `ref h`, `mut ref h` or `ref self` prints `dR5 5 dE dR5` on jit / aot / `KARAC_AUTO_PAR=0` against `5 dE dR5` under `--interp`; the read-only `match h.e { E.A(r) => { return r.id; } .. }` binds a view on EVERY backend (`5 dE dR5`), so codegen's `if let` disagrees with its own `match` as well as with the interpreter | — |
+| B-2026-09-06-25 | 2026-09-06 | interp | medium | THE INTERPRETER TAKES NO COPY WHEN A VIEW BOUND OFF A BORROW-PROJECTION SCRUTINEE IS MATERIALIZED BY AN ARM VALUE OR A BY-VALUE CALL ARGUMENT -- `let r2 = match h.e { E.A(r) => r, .. }` through `ref h` / `mut ref h` MOVES the caller's payload out of the borrow (`dE 5 dR5`: the original struct drops with an empty shell) against `dE dR5 5 dR5` on jit / aot; `match self.e { E.A(r) => { return consume(r); } .. }` through `ref self` / `mut ref self` (and the `if let` spelling) runs ONE payload body (`3 dE dR3`) against two (`dR3 3 dE dR3`); the `let m = r` spelling copies correctly on every root | — |
 
 ### Relocated
 

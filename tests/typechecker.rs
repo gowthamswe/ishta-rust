@@ -49149,6 +49149,117 @@ fn match_over_an_index_rejects_a_consuming_arm_binding() {
     );
 }
 
+/// B-2026-09-06-14 — W0299 `borrow_projection_copy` reaches the PATTERN
+/// spellings of the read it already reports on `let e = h.e`. The scrutinee
+/// of a `match` / `if let` / `while let` that projects off a borrow binds a
+/// VIEW in a read-only arm (one `Drop` body on every backend, measured), and
+/// copies exactly where an arm MATERIALIZES a binding — moves it whole, moves
+/// a non-`Copy` projection of it, or passes it by value to a function — so the
+/// warning follows the materialization, not the scrutinee shape. `let … else`
+/// copies unconditionally (measured: `let E.A(r) = h.e else { .. }; return
+/// r.id;` runs two bodies) and warns unconditionally, as the plain `let` does.
+///
+/// The site matters as much as the shape: a `match` in tail position goes
+/// through `check_match_against`, not `infer_match`, and the first draft of
+/// this fix warned only from the latter — every statement-position cell below
+/// was silent. So each shape is pinned in BOTH positions.
+#[test]
+fn borrow_projection_copy_reaches_the_pattern_scrutinee_spellings() {
+    let fires = |src: &str| -> usize {
+        typecheck_ok(src)
+            .warnings
+            .iter()
+            .filter(|w| w.lint_name.as_deref() == Some("borrow_projection_copy"))
+            .count()
+    };
+    const HDR: &str = "struct R { id: i64 }\n\
+        impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+        enum E { A(R), B }\n\
+        struct S { e: E }\n\
+        struct H { e: E }\n\
+        struct H2 { s: S }\n\
+        fn consume(x: R) -> i64 { return x.id }\n";
+    let prog = |body: &str| format!("{HDR}{body}\nfn main() {{ }}");
+
+    // ── the row's three cells: `mut ref h`, `mut ref self`, `ref self` ──
+    assert_eq!(
+        fires(&prog(
+            "fn take(h: mut ref H) -> i64 { match h.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }"
+        )),
+        1,
+        "a `match` in tail position through `mut ref h` whose arm moves the binding"
+    );
+    assert_eq!(
+        fires(&prog(
+            "impl H { fn take(mut ref self) -> i64 { match self.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } } }"
+        )),
+        1,
+        "`mut ref self` roots the chain under the name `self`"
+    );
+    assert_eq!(
+        fires(&prog(
+            "impl H2 { fn take(ref self) -> i64 { match self.s.e { E.A(r) => { return consume(r); } E.B => { return 0; } } } }"
+        )),
+        1,
+        "`ref self`, two hops, a by-value free-function argument materializes the view"
+    );
+    // Expression position — `infer_match` — the same shape.
+    assert_eq!(
+        fires(&prog(
+            "fn take(h: mut ref H) -> i64 { let x = match h.e { E.A(r) => { let m = r; m.id } E.B => { 0 } }; return x; }"
+        )),
+        1,
+        "the expression-position `match` goes through `infer_match`"
+    );
+
+    // ── read-only arms bind views: silent, in both positions ──
+    for body in [
+        "fn f(h: ref H) -> i64 { match h.e { E.A(r) => { return r.id; } E.B => { return 0; } } }",
+        "fn f(h: ref H) -> i64 { let x = match h.e { E.A(r) => { r.id } E.B => { 0 } }; return x; }",
+        "fn f(h: ref H) -> i64 { match h.e { E.A(r) => { let n = r.id; return n + 1; } E.B => { return 0; } } }",
+        "fn f(h: ref H) -> i64 { match h.e { E.A(r) if r.id > 3 => { return 1; } E.A(r) => { return r.id; } E.B => { return 0; } } }",
+        "impl R { fn show(ref self) -> i64 { return self.id } }\n\
+         fn f(h: ref H) -> i64 { match h.e { E.A(r) => { println(f\"{r.id}\"); return r.show(); } E.B => { return 0; } } }",
+        "fn f(h: ref H) -> i64 { if let E.A(r) = h.e { return r.id; } else { return 0; } }",
+        "fn f(h: ref H) -> i64 { let mut t = 0; if let E.A(r) = h.e { t = r.id; } return t; }",
+        "fn f(h: ref H) -> i64 { while let E.A(r) = h.e { return r.id; } return 0; }",
+        "impl H { fn f(ref self) -> i64 { match self.e { E.A(r) => { return r.id; } E.B => { return 0; } } } }",
+    ] {
+        assert_eq!(
+            fires(&prog(body)),
+            0,
+            "a read-only arm takes no copy, so there is nothing to report:\n{body}"
+        );
+    }
+    // An OWNED root is a move, not a copy — the rule's own precondition.
+    assert_eq!(
+        fires(&prog(
+            "fn f(h: H) -> i64 { match h.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }"
+        )),
+        0,
+        "an owned root moves; only a borrowed root copies"
+    );
+
+    // ── every materializing shape warns, in the block spellings too ──
+    for body in [
+        "fn f(h: ref H) -> i64 { if let E.A(r) = h.e { let m = r; return m.id; } else { return 0; } }",
+        "fn f(h: ref H) -> i64 { if let E.A(r) = h.e { return consume(r); } return 0; }",
+        "fn f(h: ref H) -> i64 { while let E.A(r) = h.e { let m = r; return m.id; } return 0; }",
+        "fn f(h: ref H) -> R { let r2 = match h.e { E.A(r) => r, E.B => R { id: 0 } }; return r2; }",
+        "struct W { r: R }\n\
+         fn f(h: ref H) -> i64 { match h.e { E.A(r) => { let w = W { r: r }; return w.r.id; } E.B => { return 0; } } }",
+        "fn f(h: ref H) -> i64 { let mut v: Vec[R] = Vec.new(); match h.e { E.A(r) => { v.push(r); } E.B => { } } return v.len(); }",
+        // `let … else`: the binding owns a copy whatever follows.
+        "fn f(h: ref H) -> i64 { let E.A(r) = h.e else { return 0; }; return r.id; }",
+    ] {
+        assert_eq!(
+            fires(&prog(body)),
+            1,
+            "the arm materializes the binding, so the copy is real:\n{body}"
+        );
+    }
+}
+
 /// B-2026-09-01-4 — the `.clone()` fix-it, and its absence.
 ///
 /// The edit is behaviour-PRESERVING (the read already copies; `.clone()` only
