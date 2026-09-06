@@ -20355,6 +20355,19 @@ impl<'ctx> super::Codegen<'ctx> {
             && !handled_option_map
             && not_borrow
             && self.try_track_discarded_shared_option(tail, val);
+        // B-2026-09-06-43 — a discarded BOXED-payload Result temp
+        // (`let _ = f();`, `f -> Result[Wide, E]`). Ordered right
+        // after the inline Result tracker, which declines a purely
+        // boxed payload (it zeroes a boxed side's drop per half), so
+        // a boxed Result discard reached `materialize_owned_temp`
+        // and leaked its box + interior — there was no boxed-Result
+        // sibling of the boxed-Option tracker below.
+        let handled_boxed_result = !handled_option
+            && !handled_result
+            && !handled_option_map
+            && !handled_shared_option
+            && not_borrow
+            && self.try_track_discarded_boxed_result(tail, val);
         // Slice 3r: a discarded BOXED-payload Option temp
         // (`m.insert(k, v2);` displacing a struct value,
         // `m.remove(k);` moving one out) owns both the box and
@@ -20364,6 +20377,7 @@ impl<'ctx> super::Codegen<'ctx> {
             && !handled_result
             && !handled_option_map
             && !handled_shared_option
+            && !handled_boxed_result
             && not_borrow
             && self.try_track_discarded_boxed_option(tail, val);
         // B-2026-07-01-7 (discard position): `make();` where
@@ -20379,6 +20393,7 @@ impl<'ctx> super::Codegen<'ctx> {
             && !handled_result
             && !handled_option_map
             && !handled_shared_option
+            && !handled_boxed_result
             && !handled_boxed_option
         {
             // B-2026-08-25-17 — last resort, and only once every handler above

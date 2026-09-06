@@ -8074,6 +8074,75 @@ impl<'ctx> super::Codegen<'ctx> {
         true
     }
 
+    /// B-2026-09-06-43 — the boxed-`Result` sibling of
+    /// [`Self::try_track_discarded_boxed_option`]. A discarded `Result` temp
+    /// (`let _ = f();`, `f -> Result[T, E]`) whose live-side heap payload is
+    /// wider than `Result`'s 5-word inline area is spilled behind a pointer by
+    /// `coerce_to_payload_words`. The discard battery had NO boxed-`Result`
+    /// member: `try_track_discarded_inline_result` zeroes a boxed side's drop
+    /// per half (its action would read the box pointer word as the payload
+    /// struct's first word), so a purely-boxed payload makes it return `false`,
+    /// and `try_track_discarded_boxed_option` is `Option`-only. The temp then
+    /// fell through to `materialize_owned_temp` (no Option/Result arm) and freed
+    /// nothing — the box plus its interior leaked, once per call, for a STRUCT
+    /// payload (82 B, `Result[W, i64]`) as much as a tuple one (74 B,
+    /// `Result[(R, String), i64]`).
+    ///
+    /// `emit_result_drop_fn` is the complete, MEMORY-only, tag-dispatching drop:
+    /// it frees the live side's box + interior (or, on an inline side, its
+    /// buffer), and each side's interior drop routes through
+    /// `emit_drop_fn_for_type_expr`, which is memory-only for a `Drop`-bearing
+    /// struct/enum and the tuple drop for a tuple — so it runs no user body. The
+    /// body walker (`track_discarded_optres_payload_bodies` ->
+    /// `emit_optres_payload_user_drop_bodies_fn`'s `Result` arm) runs those
+    /// separately, so the two compose without doubling — exactly as the
+    /// boxed-`Option` tuple arm above does. Ordered AFTER the inline tracker in
+    /// the battery: it fires only when a side is boxed-and-heap, which is
+    /// precisely where the inline tracker declines.
+    pub(super) fn try_track_discarded_boxed_result(
+        &mut self,
+        tail: &Expr,
+        val: BasicValueEnum<'ctx>,
+    ) -> bool {
+        if self.discarded_temp_aliases_armed_source(tail) {
+            return false;
+        }
+        let key = (tail.span.offset, tail.span.length);
+        let Some(te) = self.type_decls.enum_inst_type_exprs.get(&key).cloned() else {
+            return false;
+        };
+        let Some((ok_te, err_te)) = Self::result_payload_tes(&te) else {
+            return false;
+        };
+        let ok_boxed_heap =
+            self.result_payload_is_boxed(&ok_te) && self.te_owns_heap_below_buffer(&ok_te);
+        let err_boxed_heap =
+            self.result_payload_is_boxed(&err_te) && self.te_owns_heap_below_buffer(&err_te);
+        if !ok_boxed_heap && !err_boxed_heap {
+            return false;
+        }
+        let Some(drop_fn) = self.emit_result_drop_fn(&ok_te, &err_te) else {
+            return false;
+        };
+        let Some(cur_fn) = self
+            .builder
+            .get_insert_block()
+            .and_then(|bb| bb.get_parent())
+        else {
+            return false;
+        };
+        let slot = self.create_entry_alloca(cur_fn, "__owned_boxed_res_tmp", val.get_type());
+        self.builder.build_store(slot, val).unwrap();
+        if let Some(frame) = self.drop_rc.scope_cleanup_actions.last_mut() {
+            frame.push(CleanupAction::EnumDrop {
+                enum_alloca: slot,
+                drop_fn,
+            });
+            return true;
+        }
+        false
+    }
+
     /// `Result[T, E]` sibling of `track_inline_option_payload_var`. Registers
     /// a scope-exit free of a `Result` binding's inline heap `Ok`/`Err`
     /// payload keyed on the concrete per-variant element types — the erased

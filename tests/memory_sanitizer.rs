@@ -15574,6 +15574,72 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-43 — A DISCARDED BOXED `Result` PAYLOAD TEMP NEVER FREED
+    /// ITS BOX OR INTERIOR.
+    ///
+    /// The discard-position memory battery had `try_track_discarded_inline_result`
+    /// (inline payload) and `try_track_discarded_boxed_option` (boxed Option),
+    /// but NO boxed-`Result` member. A `Result` payload wider than the 5-word
+    /// inline area boxes; the inline tracker zeroes a boxed side's drop per half
+    /// and so returns false for a purely-boxed payload, and the boxed-Option
+    /// tracker is Option-only — so a discarded boxed `Result` temp fell through
+    /// to `materialize_owned_temp` (no Option/Result arm) and freed nothing. The
+    /// box + interior leaked, once per call, for a STRUCT payload (82 B,
+    /// `Result[W, i64]`) as much as a tuple one (74 B, `Result[(R, String),
+    /// i64]`), on the `Err` side as much as `Ok`. The fix adds
+    /// `try_track_discarded_boxed_result`, registering the complete
+    /// tag-dispatching `emit_result_drop_fn` (memory only) beside the body
+    /// walker that already runs the payload's user `Drop`.
+    ///
+    /// A leak-only class the default `-O2` folds away, so the
+    /// `KARAC_OPT_LEVEL=0` (`asan-o0-leg.sh`) leg is what caught it; this
+    /// fixture allocates for real there. Looped so any per-call imbalance
+    /// accumulates for LSan; ASan would flag a double-free if this side and the
+    /// body walker both freed the interior.
+    ///
+    /// THE CELLS:
+    /// - `rstruct` — a boxed STRUCT `Ok` payload, `Result[W, i64]`.
+    /// - `rtuple`  — a boxed TUPLE `Ok` payload, `Result[(R, String), i64]`.
+    /// - `rerr`    — a boxed STRUCT `Err` payload, `Result[i64, W]`; proves the
+    ///   drop dispatches on the live tag, not only `Ok`.
+    /// - `rinline` — `Result[(R, i64)]` at exactly 5 words, which stays INLINE
+    ///   and is freed by the inline tracker; a control that must stay clean,
+    ///   proving the boxed arm did not perturb the inline path. Each body
+    ///   renders a heap field, so a body run against a cap-zeroed husk would
+    ///   print an empty tail and fail the transcript rather than pass as a bare
+    ///   count.
+    #[test]
+    fn asan_discarded_boxed_result_payload_frees_box_and_interior() {
+        assert_clean_asan_run(
+            "struct R { id: i64, s: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}:{self.s}:{self.xs.len()}\") } }\n\
+             struct W { a: String, b: String, c: i64, d: i64, e: i64 }\n\
+             impl Drop for W { fn drop(mut ref self) { println(f\"dW{self.c}:{self.a}\") } }\n\
+             fn mk(n: i64) -> R { return R { id: n, s: f\"s{n}\", xs: [n, n] }; }\n\
+             fn mkw(n: i64) -> W { return W { a: f\"a{n}\", b: f\"b{n}\", c: n, d: 0, e: 0 }; }\n\
+             fn rstruct(n: i64) -> Result[W, i64] { return Result.Ok(mkw(n)); }\n\
+             fn rtuple(n: i64) -> Result[(R, String), i64] { return Result.Ok((mk(n), f\"x{n}\")); }\n\
+             fn rerr(n: i64) -> Result[i64, W] { return Result.Err(mkw(n)); }\n\
+             fn rinline(n: i64) -> Result[(R, i64), i64] { return Result.Ok((mk(n), 9)); }\n\
+             fn main() {\n\
+             \x20   let mut n = 0;\n\
+             \x20   while n < 3 {\n\
+             \x20       let _ = rstruct(n + 10);\n\
+             \x20       let _ = rtuple(n + 20);\n\
+             \x20       let _ = rerr(n + 30);\n\
+             \x20       let _ = rinline(n + 40);\n\
+             \x20       n = n + 1;\n\
+             \x20   }\n\
+             }\n",
+            &[
+                "dW10:a10", "dR20:s20:2", "dW30:a30", "dR40:s40:2",
+                "dW11:a11", "dR21:s21:2", "dW31:a31", "dR41:s41:2",
+                "dW12:a12", "dR22:s22:2", "dW32:a32", "dR42:s42:2",
+            ],
+            "asan_discarded_boxed_result_payload_frees_box_and_interior",
+        );
+    }
+
     #[test]
     fn asan_sorted_map_string_key_iter_no_leak() {
         // B-2026-07-09-17: `SortedMap[String, String]` ordered observation. The
