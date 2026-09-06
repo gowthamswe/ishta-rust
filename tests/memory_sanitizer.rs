@@ -4848,6 +4848,70 @@ fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); 
         );
     }
 
+    /// B-2026-09-06-2 — the MEMORY gate for a generic METHOD that hands its
+    /// by-value param back. The E2E twin reads the body counts; this one reads
+    /// the 240 B in 5 blocks that valgrind measured lost per evaluation
+    /// pre-fix, unbounded in a loop (24,000 B in 500 blocks at the DEFAULT
+    /// optimization level), and — in the other direction — it is what would
+    /// catch the fix overshooting into a double free.
+    ///
+    /// Cell `g` is the one that holds the gates together. `D` owns a direct
+    /// `shared` field, so copy support declines and the callee takes the
+    /// binding's OWN object rather than a copy: admitting it would free one
+    /// object twice, and standing the binding's body down would leave nothing
+    /// running it. Both halves of the fix are gated on the same entry-copy
+    /// predicate for exactly that reason, and this cell is what proves they
+    /// stayed identical rather than merely compatible.
+    ///
+    /// The payload is `Vec[String]` for the reason B-2026-09-05-31 recorded:
+    /// with a `String` + `Vec[i64]` struct the discarded entry copy is dead and
+    /// LLVM deletes it, hiding the leak everywhere except `-O0`. Three rounds
+    /// so a per-round imbalance accumulates rather than cancelling.
+    #[test]
+    fn asan_generic_method_whole_param_frees_the_entry_copy() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct R { id: i64, names: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, names: [f"a{i}", f"b{i}"] }; }
+shared struct Sh { v: i64 }
+struct D { s: Sh, tag: String }
+impl Drop for D { fn drop(mut ref self) { println(f"dD{self.tag}") } }
+fn mkd(i: i64) -> D { return D { s: Sh { v: i }, tag: f"x{i}" }; }
+struct H { n: i64 }
+impl H {
+  fn keep[T](ref self, x: T) -> T { println("inK"); return x; }
+  fn keepN(ref self, x: R) -> R { println("inN"); return x; }
+  fn maybe[T](ref self, x: T, k: bool) -> T { println("inM"); if k { return x; } return x; }
+  fn scalar[T](ref self, x: T) -> i64 { println("inS"); return 3; }
+}
+fn round() {
+  let h = H { n: 1 };
+  let g1 = mk(82); let _ = h.keep(g1);          println("a");
+  let g2 = mk(88); let o2 = h.keep(g2);         println(f"k{o2.id}");
+  let g3 = mk(89); let _ = h.maybe(g3, true);   println("c");
+  let g4 = mk(90); let o4 = h.maybe(g4, false); println(f"m{o4.id}");
+  let g5 = mk(91); let _ = h.keepN(g5);         println("e");
+  let g6 = mk(92); let _ = h.scalar(g6);        println("f");
+  let d7 = mkd(93); let _ = h.keep(d7);         println("g");
+  let _ = h.keep(mk(94));                       println("h");
+}
+fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); }
+"#,
+            &[
+                "inK", "dR82", "a", "inK", "k88", "dR88", "inM", "dR89", "c", "inM", "m90", "dR90",
+                "inN", "dR91", "e", "inS", "dR92", "f", "inK", "dDx93", "g", "inK", "dR94", "h",
+                "inK", "dR82", "a", "inK", "k88", "dR88", "inM", "dR89", "c", "inM", "m90", "dR90",
+                "inN", "dR91", "e", "inS", "dR92", "f", "inK", "dDx93", "g", "inK", "dR94", "h",
+                "inK", "dR82", "a", "inK", "k88", "dR88", "inM", "dR89", "c", "inM", "m90", "dR90",
+                "inN", "dR91", "e", "inS", "dR92", "f", "inK", "dDx93", "g", "inK", "dR94", "h",
+                "done",
+            ],
+            "b0906-2-generic-method-whole-param",
+            110,
+        );
+    }
+
     #[test]
     fn asan_place_struct_arg_escaping_field_frees_once() {
         assert_clean_asan_run_min_allocs(

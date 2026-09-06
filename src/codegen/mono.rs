@@ -2601,19 +2601,44 @@ impl<'ctx> super::Codegen<'ctx> {
             // site. `discarded_whole_param_arg_type_name`'s named-local arm is
             // the other half, and neither is sound alone.
             //
-            // FREE FUNCTIONS ONLY. The generic METHOD sibling is left at its
-            // prior behaviour deliberately: this loop's index is
-            // receiver-inclusive while `callee_takes_over_arg_drop_body` is
-            // documented to take the non-self index, and no method shape was
-            // measured here. Retracting a body on an unmeasured path is how a
-            // divergence fix becomes a lost `Drop`, the same reason the enum
-            // sibling above stays absent.
+            // B-2026-09-06-2 — METHODS TOO, which B-2026-09-05-31 scoped itself
+            // out of. That row declined the method path because THIS LOOP'S
+            // INDEX IS RECEIVER-INCLUSIVE while `callee_takes_over_arg_drop_-
+            // body` is documented to take the NON-SELF index, and it had
+            // measured no method shape. Both are now settled: the adjustment is
+            // made explicitly below (the same one the `handed_off` term above
+            // makes, for the same reason), and the shape is measured —
+            // `impl H { fn keep[T](ref self, x: T) -> T }` leaked 24,000 B in
+            // 500 blocks at the DEFAULT optimization level, and its BOUND
+            // spelling ran the `Drop` body twice against the interpreter's
+            // once, while both CONCRETE method twins were correct.
+            //
+            // `call_arg_flows_into_return` is NOT the predicate here: it scans
+            // `Item::Function` only, so it answers `false` for a `Type.method`
+            // key and would silently keep the method path excluded. Resolving
+            // through `find_function_ast` instead answers for both shapes by
+            // one route, and preserves the free-function behaviour exactly —
+            // it is the same `fn_returns_param` union, asked of the same AST.
             if let ExprKind::Identifier(var_name) = &a.value.kind {
-                let free_fn = self
+                let ast_i = self
                     .program_snapshot
                     .as_deref()
                     .and_then(|p| super::declarations::find_function_ast(p, name))
-                    .is_some_and(|f| f.self_param.is_none());
+                    .and_then(|f| {
+                        if f.self_param.is_some() {
+                            i.checked_sub(1)
+                        } else {
+                            Some(i)
+                        }
+                    });
+                let returns_param = ast_i.is_some_and(|ast_i| {
+                    self.program_snapshot.as_deref().is_some_and(|p| {
+                        super::declarations::find_function_ast(p, name).is_some_and(|f| {
+                            crate::ast::fn_returns_param(f, ast_i)
+                                || crate::ast::fn_returns_param_via_call(p, f, ast_i)
+                        })
+                    })
+                });
                 // The ENTRY-COPY condition is what pairs this retraction with
                 // the registration that replaces it, and it is load-bearing in
                 // BOTH directions. Where the callee entry-copies, the value
@@ -2634,10 +2659,9 @@ impl<'ctx> super::Codegen<'ctx> {
                     .get(var_name.as_str())
                     .cloned()
                     .is_some_and(|tn| self.struct_type_is_entry_copied_heap(&tn));
-                if free_fn
+                if returns_param
                     && entry_copied
-                    && self.call_arg_flows_into_return(name, i)
-                    && self.callee_takes_over_arg_drop_body(name, i)
+                    && ast_i.is_some_and(|ast_i| self.callee_takes_over_arg_drop_body(name, ast_i))
                 {
                     let var_name = var_name.clone();
                     self.suppress_user_drop_body_keeping_memory(&var_name);

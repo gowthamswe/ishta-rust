@@ -4116,6 +4116,72 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-06-2 — the METHOD sibling of
+    /// [`Self::discarded_whole_param_type_name`]. Same question, same
+    /// admission test, different resolution: a generic method is keyed
+    /// `Type.method`, which the free-function scan (`Item::Function` only)
+    /// answers `None` for, so `impl H { fn keep[T](ref self, x: T) -> T }`
+    /// under `let _ = h.keep(g);` reached no layout lookup at all and its
+    /// entry copy was orphaned — 24,000 B in 500 blocks over a 500-iteration
+    /// loop, at the DEFAULT optimization level, against a concrete method twin
+    /// that is 15 allocs / 15 frees clean.
+    ///
+    /// THE INDEX NEEDS NO ADJUSTMENT HERE, unlike the monomorph argument loop
+    /// this pairs with. A `MethodCall`'s `args` exclude the receiver (it is
+    /// carried separately as `object`) and `find_function_ast` returns a
+    /// method whose `params` exclude it too, so the two line up directly. The
+    /// receiver-inclusive convention is `compile_mono_call`'s alone, and
+    /// conflating the two is exactly what B-2026-09-05-31 declined to guess
+    /// at; both were established by reading the shapes rather than inferred.
+    fn discarded_whole_param_method_type_name(
+        &self,
+        recv_ty: &str,
+        method: &str,
+        args: &[CallArg],
+    ) -> Option<String> {
+        let program = self.program_snapshot.as_deref()?;
+        let f = super::declarations::find_function_ast(program, &format!("{recv_ty}.{method}"))?;
+        let ret = Self::te_head_name(f.return_type.as_ref()?)?;
+        // A TEMPLATE only, exactly as the free-function leg: a concrete
+        // `-> R` method answers through `fn_return_type_names`'s
+        // `Type.method` entry above and must not be re-resolved here.
+        if !f
+            .generic_params
+            .as_ref()
+            .is_some_and(|g| g.params.iter().any(|p| !p.is_const && p.name == ret))
+        {
+            return None;
+        }
+        let labelled = args.iter().filter(|a| a.label.is_some()).count();
+        if labelled != 0 && labelled != args.len() {
+            return None;
+        }
+        let mut found: Option<String> = None;
+        for (i, a) in args.iter().enumerate() {
+            let p = match &a.label {
+                Some(l) => f.params.iter().find(
+                    |p| matches!(&p.pattern.kind, crate::ast::PatternKind::Binding(n) if n == l),
+                ),
+                None => f.params.get(i),
+            };
+            let Some(p) = p else { continue };
+            if Self::te_head_name(&p.ty).as_deref() != Some(ret.as_str()) {
+                continue;
+            }
+            let Some(name) = self.discarded_whole_param_arg_type_name(&a.value) else {
+                continue;
+            };
+            if !self.names_a_drop_type(name.as_str()) {
+                continue;
+            }
+            match &found {
+                Some(prev) if prev != &name => return None,
+                _ => found = Some(name),
+            }
+        }
+        found
+    }
+
     pub(super) fn try_track_discarded_user_drop_temp(
         &mut self,
         tail: &Expr,
@@ -4199,9 +4265,13 @@ impl<'ctx> super::Codegen<'ctx> {
             // (the payload walker below handles them, same as the free-fn
             // arm). Interp twin: the widened MethodCall arm of
             // `discard_rhs_produces_owned_value`.
-            ExprKind::MethodCall { object, method, .. }
-                if !self.user_ref_method_names.contains(method.as_str())
-                    && !matches!(method.as_str(), "get" | "first" | "last" | "peek") =>
+            ExprKind::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } if !self.user_ref_method_names.contains(method.as_str())
+                && !matches!(method.as_str(), "get" | "first" | "last" | "peek") =>
             {
                 let recv_ty = match &object.kind {
                     // Associated call: `Type.new(...)` parses as a MethodCall
@@ -4216,7 +4286,8 @@ impl<'ctx> super::Codegen<'ctx> {
                     }
                     _ => self.type_name_of_expr(object),
                 };
-                recv_ty
+                let declared = recv_ty
+                    .clone()
                     .and_then(|t| {
                         self.fn_sig
                             .fn_return_type_names
@@ -4257,11 +4328,32 @@ impl<'ctx> super::Codegen<'ctx> {
                             TypeKind::Path(p) => p.segments.first().cloned(),
                             _ => None,
                         }
-                    })
-                    .filter(|ret| {
-                        self.type_decls.struct_types.contains_key(ret.as_str())
-                            || self.type_decls.enum_layouts.contains_key(ret.as_str())
-                    })
+                    });
+                // B-2026-09-06-2 — the generic-METHOD leg, chained exactly as
+                // the free-function arm chains its own two resolvers: it only
+                // ever ANSWERS where the declared lookup could not, and falls
+                // back to whatever that returned. The ordering matters for a
+                // reason the `.or_else` shape would hide — a generic method's
+                // declared return is the TYPE PARAMETER's name, which is
+                // `Some("T")` rather than `None`, so an `or_else` would never
+                // fire and the arm's own `filter` would then reject `T` and
+                // register nothing. Asking `names_a_drop_type` of the declared
+                // answer first is what routes the template here.
+                let resolved = if declared
+                    .as_deref()
+                    .is_some_and(|d| self.names_a_drop_type(d))
+                {
+                    declared
+                } else {
+                    recv_ty
+                        .as_deref()
+                        .and_then(|t| self.discarded_whole_param_method_type_name(t, method, args))
+                        .or(declared)
+                };
+                resolved.filter(|ret| {
+                    self.type_decls.struct_types.contains_key(ret.as_str())
+                        || self.type_decls.enum_layouts.contains_key(ret.as_str())
+                })
             }
             _ => None,
         };

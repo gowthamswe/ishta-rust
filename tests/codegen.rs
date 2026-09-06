@@ -5364,6 +5364,85 @@ fn main() {
         }
     }
 
+    /// B-2026-09-06-2 — the generic METHOD sibling of
+    /// `..._generic_whole_param_named_local_frees_the_entry_copy`, which
+    /// B-2026-09-05-31 scoped itself out of. A method is keyed `Type.method`,
+    /// which the discard registrar's free-function resolver answers `None` for,
+    /// and the monomorph argument loop's caller-side stand-down was gated to
+    /// `self_param.is_none()` because that loop's index is receiver-inclusive.
+    /// Both halves therefore skipped every method, and THREE separate defects
+    /// followed — measured pre-fix on this exact program, 77 allocs / 62 frees
+    /// with 240 B definitely lost in 5 blocks:
+    ///
+    ///   * the LEAK the row was filed for (`a`): the callee's entry copy had no
+    ///     owner. Unbounded — 24,000 B in 500 blocks over a 500-iteration loop,
+    ///     at the DEFAULT optimization level.
+    ///   * the BOUND spelling ran the `Drop` body TWICE (`k88`, `m90` printed
+    ///     `dR88 k88 dR88` / `dR90 m90 dR90`), against the interpreter's once
+    ///     and against both CONCRETE method twins, which were correct.
+    ///   * a LOST body for the fresh TEMPORARY (`h`): `let _ = h.keep(mk(94));`
+    ///     ran NO body on any compiled surface. That is B-2026-09-05-29's own
+    ///     defect in method form, which nothing had filed — its fix resolved
+    ///     free functions only, and this cell is what shows the method half was
+    ///     still open.
+    ///
+    /// Cells, beyond those three: a CONDITIONAL-return generic method
+    /// discarded (`c`) and bound (`m90`); the CONCRETE method twin (`e`),
+    /// correct throughout; the SCALAR-returning generic method (`f`), which
+    /// must stay declined; a FORWARDING callee (`g`) — `D` owns a `shared`
+    /// field so copy support declines, the callee takes the binding's own
+    /// object, and admitting it would be a double free rather than a leak; and
+    /// the LOOP, unbounded pre-fix.
+    ///
+    /// THE INTERPRETER DISAGREES ON THE DISCARD CELLS AND THAT IS NOT THIS
+    /// TEST'S BUG. `karac run --interp` drops the body for a discarded generic
+    /// call outright (B-2026-09-06-1) — `a`, `c`, `g`, `h` and the loop are all
+    /// silent there — so this pins the COMPILED columns, which agree with each
+    /// other and with the concrete twins. Do not "fix" the expectation to match
+    /// the interpreter; the interpreter is the wrong column here.
+    #[test]
+    fn test_e2e_generic_method_whole_param_frees_the_entry_copy() {
+        let out = run_program(
+            r#"
+struct R { id: i64, names: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, names: [f"a{i}", f"b{i}"] }; }
+shared struct Sh { v: i64 }
+struct D { s: Sh, tag: String }
+impl Drop for D { fn drop(mut ref self) { println(f"dD{self.tag}") } }
+fn mkd(i: i64) -> D { return D { s: Sh { v: i }, tag: f"x{i}" }; }
+struct H { n: i64 }
+impl H {
+  fn keep[T](ref self, x: T) -> T { println("inK"); return x; }
+  fn keepN(ref self, x: R) -> R { println("inN"); return x; }
+  fn maybe[T](ref self, x: T, k: bool) -> T { println("inM"); if k { return x; } return x; }
+  fn scalar[T](ref self, x: T) -> i64 { println("inS"); return 3; }
+}
+fn main() {
+  let h = H { n: 1 };
+  let g1 = mk(82); let _ = h.keep(g1);          println("a");
+  let g2 = mk(88); let o2 = h.keep(g2);         println(f"k{o2.id}");
+  let g3 = mk(89); let _ = h.maybe(g3, true);   println("c");
+  let g4 = mk(90); let o4 = h.maybe(g4, false); println(f"m{o4.id}");
+  let g5 = mk(91); let _ = h.keepN(g5);         println("e");
+  let g6 = mk(92); let _ = h.scalar(g6);        println("f");
+  let d7 = mkd(93); let _ = h.keep(d7);         println("g");
+  let _ = h.keep(mk(94));                       println("h");
+  let mut i = 0; while i < 3 { let gl = mk(95 + i); let _ = h.keep(gl); i = i + 1; } println("j");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "inK\ndR82\na\ninK\nk88\ndR88\ninM\ndR89\nc\ninM\nm90\ndR90\ninN\ndR91\ne\ninS\ndR92\nf\ninK\ndDx93\ng\ninK\ndR94\nh\ninK\ndR95\ninK\ndR96\ninK\ndR97\nj\nend\n",
+                "a generic METHOD that hands its by-value param back owes one body \
+                 per object and a free for its entry copy, on every compiled \
+                 column; got {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_e2e_place_struct_arg_escaping_field_runs_one_body() {
         let out = run_program(
