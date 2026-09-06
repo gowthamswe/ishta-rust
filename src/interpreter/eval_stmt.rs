@@ -5802,8 +5802,15 @@ impl<'a> super::Interpreter<'a> {
                 // `take(mut sink, Res { id: 1 })` ran one body and
                 // `take(mut sink, carg)` ran two — the binding's NLL fire at
                 // the call plus the container's at its drain.
-                let escapes_into_outliving_place =
-                    callee.is_some_and(|f| crate::ast::fn_moves_param_into_outliving_place(f, i));
+                let escapes_into_outliving_place = callee.is_some_and(|f| {
+                    crate::ast::fn_moves_param_into_outliving_place(f, i)
+                        // B-2026-09-05-36 — or handed to a callee that stores it.
+                        || crate::ast::fn_moves_param_into_outliving_place_via_call(
+                            self.program,
+                            f,
+                            i,
+                        )
+                });
                 // B-2026-08-09-15 — `fn_returns_param_payload` is the same
                 // rule one level down: the callee hands back not the param but
                 // something a `match` arm bound OUT of it, so the param reaches

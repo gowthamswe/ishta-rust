@@ -73739,4 +73739,78 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-05-36 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_destructured_part_or_bare_param_handed_to_a_taking_callee_has_one_owner`:
+    /// a destructured part or bare param handed to a returning / storing
+    /// callee is freed exactly once and its body runs exactly once. Heap `R`
+    /// (`String` + `Vec`) so a lost free is a leak LSan sees.
+    #[test]
+    fn asan_destructured_part_or_bare_param_handed_to_a_taking_callee_clean() {
+        let label = "destructured_part_or_bare_param_handed_to_a_taking_callee";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+struct W { r: R, n: i64 }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+fn wrap(x: R) -> R { return x }
+fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }
+fn wrapw(x: R) -> W { return W { r: x, n: 1 } }
+fn t_fwd_let(t: (R, i64)) -> R { let (r, k) = t; wrap(r) }
+fn t_fwd_let_ret(t: (R, i64)) -> R { let (r, k) = t; return wrap(r); }
+fn t_stash_let(t: (R, i64), v: mut ref Vec[R]) -> i64 { let (r, k) = t; stash(r, v); k }
+fn t_consume_let(t: (R, i64)) -> i64 { let (r, k) = t; consume(r) }
+fn t_fwdw_let(t: (R, i64)) -> W { let (r, k) = t; wrapw(r) }
+fn s_fwd_let(w: W) -> R { let W { r, n } = w; wrap(r) }
+fn s_stash_let(w: W, v: mut ref Vec[R]) -> i64 { let W { r, n } = w; stash(r, v); n }
+fn b_stash(x: R, v: mut ref Vec[R]) { stash(x, v) }
+fn b_stash_ret(x: R, v: mut ref Vec[R]) -> i64 { stash(x, v); 7 }
+fn b_fwd(x: R) -> R { wrap(x) }
+fn b_consume(x: R) -> i64 { consume(x) }
+fn main() {
+    { let a: R = t_fwd_let((mk(1), 0)); println(f"r{a.id}"); println("one") }
+    { let a: R = t_fwd_let_ret((mk(2), 0)); println(f"r{a.id}"); println("two") }
+    { let mut v: Vec[R] = []; let d: i64 = t_stash_let((mk(3), 0), mut v); println(f"r{d} n{v.len()}"); println("three") }
+    { let d: i64 = t_consume_let((mk(4), 0)); println(f"r{d}"); println("four") }
+    { let w: W = t_fwdw_let((mk(5), 0)); println(f"r{w.r.id}"); println("five") }
+    { let a: R = s_fwd_let(W { r: mk(6), n: 1 }); println(f"r{a.id}"); println("six") }
+    { let mut v: Vec[R] = []; let d: i64 = s_stash_let(W { r: mk(7), n: 1 }, mut v); println(f"r{d} n{v.len()}"); println("seven") }
+    { let mut v: Vec[R] = []; b_stash(mk(8), mut v); println(f"n{v.len()}"); println("eight") }
+    { let mut v: Vec[R] = []; let d: i64 = b_stash_ret(mk(9), mut v); println(f"r{d} n{v.len()}"); println("nine") }
+    { let a: R = b_fwd(mk(10)); println(f"r{a.id}"); println("ten") }
+    { let d: i64 = b_consume(mk(11)); println(f"r{d}"); println("eleven") }
+    { let t: (R, i64) = (mk(13), 0); let a: R = t_fwd_let(t); println(f"r{a.id}"); println("thirteen") }
+    { let t: (R, i64) = (mk(14), 0); let mut v: Vec[R] = []; let d: i64 = t_stash_let(t, mut v); println(f"r{d} n{v.len()}"); println("fourteen") }
+    { let x: R = mk(15); let mut v: Vec[R] = []; b_stash(x, mut v); println(f"n{v.len()}"); println("fifteen") }
+    { let w: W = W { r: mk(16), n: 1 }; let a: R = s_fwd_let(w); println(f"r{a.id}"); println("sixteen") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "r1", "dR1", "one", "r2", "dR2", "two", "r0 n1", "dR3", "three", "dR4", "r4",
+                "four", "r5", "dR5", "five", "r6", "dR6", "six", "r1 n1", "dR7", "seven", "n1",
+                "dR8", "eight", "r7 n1", "dR9", "nine", "r10", "dR10", "ten", "dR11", "r11",
+                "eleven", "r13", "dR13", "thirteen", "r0 n1", "dR14", "fourteen", "n1", "dR15",
+                "fifteen", "r16", "dR16", "sixteen", "end",
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

@@ -145164,6 +145164,74 @@ fn main() {
         };
         assert_eq!(out, "r1\ndR1\none\nr0 n1\ndR2\ntwo\nr0 n1\ndR3\nthree\ndR50\nr4\ndR4\nfour\nr5\ndR5\nfive\ndR6\nr7\ndR7\nsix\nr9 n1\ndR8\neight\nr10\ndR10\nten\nr0 n1\ndR11\neleven\nr12\ndR12\ntwelve\nr1314\ndR14\ndR13\nthirteen\nend\n");
     }
+
+    /// B-2026-09-05-36 — a `let`-destructured tuple element or struct field,
+    /// or a bare by-value parameter, handed to a callee that RETURNS or STORES
+    /// it has one owner on every surface. Two predicates were intraprocedural
+    /// where the escape is interprocedural: the part channel
+    /// (`fn_returns_param_part_paths`) classified only a returned expression
+    /// that denotes the part, so `let (r, k) = t; wrap(r)` reported nothing
+    /// and the caller's element walk fired beside the result's owner; the
+    /// store channel (`fn_moves_param_into_outliving_place`) treated a free
+    /// function call as opaque, so `fn b_stash(x, v) { stash(x, v) }` kept the
+    /// caller's temp drop beside the container's drain. Both now have a
+    /// program-aware sibling (`fn_escaping_param_part_paths`,
+    /// `fn_moves_param_into_outliving_place_via_call`; one level, argument
+    /// bare) consulted by the caller-side gates on both backends.
+    ///
+    /// `one`/`two` forward through `wrap` (tail and explicit `return`),
+    /// `three` stashes, `four` consumes (must stay at one body inside the
+    /// call), `five` forwards into a returned struct literal, `six`/`seven`
+    /// the struct-field destructure, `eight`..`eleven` the bare-param
+    /// spellings, `thirteen`..`sixteen` named-local arguments. The two-hop
+    /// chain (`b_stash2` → `b_stash` → `stash`) is deliberately absent: the
+    /// family's one-level rule leaves it at two bodies, recorded on the row.
+    #[test]
+    fn e2e_destructured_part_or_bare_param_handed_to_a_taking_callee_has_one_owner() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+struct W { r: R, n: i64 }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+fn wrap(x: R) -> R { return x }
+fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }
+fn wrapw(x: R) -> W { return W { r: x, n: 1 } }
+fn t_fwd_let(t: (R, i64)) -> R { let (r, k) = t; wrap(r) }
+fn t_fwd_let_ret(t: (R, i64)) -> R { let (r, k) = t; return wrap(r); }
+fn t_stash_let(t: (R, i64), v: mut ref Vec[R]) -> i64 { let (r, k) = t; stash(r, v); k }
+fn t_consume_let(t: (R, i64)) -> i64 { let (r, k) = t; consume(r) }
+fn t_fwdw_let(t: (R, i64)) -> W { let (r, k) = t; wrapw(r) }
+fn s_fwd_let(w: W) -> R { let W { r, n } = w; wrap(r) }
+fn s_stash_let(w: W, v: mut ref Vec[R]) -> i64 { let W { r, n } = w; stash(r, v); n }
+fn b_stash(x: R, v: mut ref Vec[R]) { stash(x, v) }
+fn b_stash_ret(x: R, v: mut ref Vec[R]) -> i64 { stash(x, v); 7 }
+fn b_fwd(x: R) -> R { wrap(x) }
+fn b_consume(x: R) -> i64 { consume(x) }
+fn main() {
+    { let a: R = t_fwd_let((mk(1), 0)); println(f"r{a.id}"); println("one") }
+    { let a: R = t_fwd_let_ret((mk(2), 0)); println(f"r{a.id}"); println("two") }
+    { let mut v: Vec[R] = []; let d: i64 = t_stash_let((mk(3), 0), mut v); println(f"r{d} n{v.len()}"); println("three") }
+    { let d: i64 = t_consume_let((mk(4), 0)); println(f"r{d}"); println("four") }
+    { let w: W = t_fwdw_let((mk(5), 0)); println(f"r{w.r.id}"); println("five") }
+    { let a: R = s_fwd_let(W { r: mk(6), n: 1 }); println(f"r{a.id}"); println("six") }
+    { let mut v: Vec[R] = []; let d: i64 = s_stash_let(W { r: mk(7), n: 1 }, mut v); println(f"r{d} n{v.len()}"); println("seven") }
+    { let mut v: Vec[R] = []; b_stash(mk(8), mut v); println(f"n{v.len()}"); println("eight") }
+    { let mut v: Vec[R] = []; let d: i64 = b_stash_ret(mk(9), mut v); println(f"r{d} n{v.len()}"); println("nine") }
+    { let a: R = b_fwd(mk(10)); println(f"r{a.id}"); println("ten") }
+    { let d: i64 = b_consume(mk(11)); println(f"r{d}"); println("eleven") }
+    { let t: (R, i64) = (mk(13), 0); let a: R = t_fwd_let(t); println(f"r{a.id}"); println("thirteen") }
+    { let t: (R, i64) = (mk(14), 0); let mut v: Vec[R] = []; let d: i64 = t_stash_let(t, mut v); println(f"r{d} n{v.len()}"); println("fourteen") }
+    { let x: R = mk(15); let mut v: Vec[R] = []; b_stash(x, mut v); println(f"n{v.len()}"); println("fifteen") }
+    { let w: W = W { r: mk(16), n: 1 }; let a: R = s_fwd_let(w); println(f"r{a.id}"); println("sixteen") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "r1\ndR1\none\nr2\ndR2\ntwo\nr0 n1\ndR3\nthree\ndR4\nr4\nfour\nr5\ndR5\nfive\nr6\ndR6\nsix\nr1 n1\ndR7\nseven\nn1\ndR8\neight\nr7 n1\ndR9\nnine\nr10\ndR10\nten\ndR11\nr11\neleven\nr13\ndR13\nthirteen\nr0 n1\ndR14\nfourteen\nn1\ndR15\nfifteen\nr16\ndR16\nsixteen\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]

@@ -2619,8 +2619,62 @@ pub enum ParamPart {
 /// (`let W { inner, n } = w; let I { r } = inner; r`) for free: the second `let`
 /// extends the first's path instead of failing a whole-param gate.
 pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamPath> {
+    returned_param_part_paths_impl(f, arg_index, None)
+}
+
+/// B-2026-09-05-36 — [`fn_returns_param_part_paths`] plus the routes only a
+/// PROGRAM can classify: a part handed BARE to a free function that takes
+/// that parameter over (returns it, or stores it under a root outliving its
+/// call — [`callee_takes_param_over`]), or pushed directly under one of `f`'s
+/// own outliving roots (`v.push(r)` with `v: mut ref Vec[R]`). Statement
+/// position included, which the return-site walk never sees: `let (r, k) =
+/// t; stash(r, v); k` hands `t.0` to `v` and only `k` back.
+///
+/// Reported on the same channel as a returned part because the consumer's
+/// question is the same — which parts must the caller-side walk SKIP because
+/// some other owner runs their body — and both channels' consumers union it
+/// with the tuple-arm predicate the same way. `wrap(r)` on `let (r, k) = t`
+/// ran `dR5 r5 dR5` on every surface before; a call to an unknown callee still
+/// reports nothing, the under-approximating direction this channel keeps.
+pub fn fn_escaping_param_part_paths(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> Vec<ParamPath> {
+    returned_param_part_paths_impl(f, arg_index, Some(program))
+}
+
+fn returned_param_part_paths_impl(
+    f: &Function,
+    arg_index: usize,
+    program: Option<&crate::Program>,
+) -> Vec<ParamPath> {
     let Some(param) = f.params.get(arg_index) else {
         return Vec::new();
+    };
+    // The roots whose storage outlives the call, as
+    // `fn_moves_param_into_outliving_place` computes them; only consulted on
+    // the program-aware path.
+    let mut roots: Vec<&str> = Vec::new();
+    if program.is_some() {
+        if matches!(f.self_param, Some(SelfParam::Ref) | Some(SelfParam::MutRef)) {
+            roots.push("self");
+        }
+        for p in &f.params {
+            if !matches!(
+                p.ty.kind,
+                crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+            ) {
+                continue;
+            }
+            if let PatternKind::Binding(n) = &p.pattern.kind {
+                roots.push(n.as_str());
+            }
+        }
+    }
+    let cx = PartScanCx {
+        program,
+        roots: &roots,
     };
     let PatternKind::Binding(param_name) = &param.pattern.kind else {
         return Vec::new();
@@ -2857,25 +2911,91 @@ pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamP
         }
     }
 
-    fn scan_expr(e: &Expr, aliases: &[(String, ParamPath)], out: &mut Vec<ParamPath>) {
+    /// B-2026-09-05-36 — a part handed to a call that takes it over, or
+    /// pushed under an outliving root. Program-aware path only.
+    fn taken_over(
+        e: &Expr,
+        aliases: &[(String, ParamPath)],
+        cx: PartScanCx<'_>,
+        out: &mut Vec<ParamPath>,
+    ) {
+        let mut note = |a: &Expr| {
+            if let Some(path) = denote(a, aliases) {
+                if !path.is_empty() && !out.contains(&path) {
+                    out.push(path);
+                }
+            }
+        };
+        match &e.kind {
+            ExprKind::Call { callee, args, .. } => {
+                let Some(program) = cx.program else { return };
+                let ExprKind::Identifier(g) = &callee.kind else {
+                    return;
+                };
+                let Some(gf) = program.items.iter().find_map(|item| match item {
+                    Item::Function(gf) if &gf.name == g => Some(gf),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                for (j, a) in args.iter().enumerate() {
+                    if matches!(&a.value.kind, ExprKind::Identifier(_))
+                        && callee_takes_param_over(program, gf, j)
+                    {
+                        note(&a.value);
+                    }
+                }
+            }
+            ExprKind::MethodCall { object, args, .. } => {
+                if cx.program.is_some() && outliving_store::place_root_outlives(object, cx.roots) {
+                    for a in args {
+                        if matches!(&a.value.kind, ExprKind::Identifier(_)) {
+                            note(&a.value);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_expr(
+        e: &Expr,
+        aliases: &[(String, ParamPath)],
+        cx: PartScanCx<'_>,
+        out: &mut Vec<ParamPath>,
+    ) {
         match &e.kind {
             ExprKind::Return(Some(inner)) => {
                 yielded(inner, aliases, out);
-                scan_expr(inner, aliases, out);
+                scan_expr(inner, aliases, cx, out);
+            }
+            ExprKind::Call { args, .. } => {
+                taken_over(e, aliases, cx, out);
+                for a in args {
+                    scan_expr(&a.value, aliases, cx, out);
+                }
+            }
+            ExprKind::MethodCall { object, args, .. } => {
+                taken_over(e, aliases, cx, out);
+                scan_expr(object, aliases, cx, out);
+                for a in args {
+                    scan_expr(&a.value, aliases, cx, out);
+                }
             }
             ExprKind::Block(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Try(b)
             | ExprKind::Seq(b)
-            | ExprKind::Par(b) => scan_block(b, aliases, out),
+            | ExprKind::Par(b) => scan_block(b, aliases, cx, out),
             ExprKind::If {
                 then_block,
                 else_branch,
                 ..
             } => {
-                scan_block(then_block, aliases, out);
+                scan_block(then_block, aliases, cx, out);
                 if let Some(x) = else_branch.as_deref() {
-                    scan_expr(x, aliases, out);
+                    scan_expr(x, aliases, cx, out);
                 }
             }
             ExprKind::IfLet {
@@ -2883,45 +3003,57 @@ pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamP
                 else_branch,
                 ..
             } => {
-                scan_block(then_block, aliases, out);
+                scan_block(then_block, aliases, cx, out);
                 if let Some(x) = else_branch.as_deref() {
-                    scan_expr(x, aliases, out);
+                    scan_expr(x, aliases, cx, out);
                 }
             }
             ExprKind::Match { arms, .. } => {
                 for a in arms {
                     yielded(&a.body, aliases, out);
-                    scan_expr(&a.body, aliases, out);
+                    scan_expr(&a.body, aliases, cx, out);
                 }
             }
             ExprKind::While { body, .. }
             | ExprKind::WhileLet { body, .. }
             | ExprKind::For { body, .. }
             | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => scan_block(body, aliases, out),
+            | ExprKind::LabeledBlock { body, .. } => scan_block(body, aliases, cx, out),
             _ => {}
         }
     }
 
-    fn scan_block(b: &Block, aliases: &[(String, ParamPath)], out: &mut Vec<ParamPath>) {
+    fn scan_block(
+        b: &Block,
+        aliases: &[(String, ParamPath)],
+        cx: PartScanCx<'_>,
+        out: &mut Vec<ParamPath>,
+    ) {
         for st in &b.stmts {
             match &st.kind {
-                StmtKind::Expr(e) => scan_expr(e, aliases, out),
-                StmtKind::Let { value, .. } => scan_expr(value, aliases, out),
+                StmtKind::Expr(e) => scan_expr(e, aliases, cx, out),
+                StmtKind::Let { value, .. } => scan_expr(value, aliases, cx, out),
                 _ => {}
             }
         }
         if let Some(fe) = b.final_expr.as_deref() {
             yielded(fe, aliases, out);
-            scan_expr(fe, aliases, out);
+            scan_expr(fe, aliases, cx, out);
         }
     }
 
     let mut aliases: Vec<(String, ParamPath)> = vec![(param_name.clone(), Vec::new())];
     grow_block(&f.body, &mut aliases);
     let mut out = Vec::new();
-    scan_block(&f.body, &aliases, &mut out);
+    scan_block(&f.body, &aliases, cx, &mut out);
     out
+}
+
+/// What the program-aware part scan carries (B-2026-09-05-36).
+#[derive(Clone, Copy)]
+struct PartScanCx<'a> {
+    program: Option<&'a crate::Program>,
+    roots: &'a [&'a str],
 }
 
 /// B-2026-08-09-15 — the PAYLOAD sibling of [`fn_returns_param`]: does `f`
@@ -3368,6 +3500,62 @@ fn stored_via_call_block(b: &Block, name: &str, program: &crate::Program) -> boo
         .is_some_and(|fe| stored_via_call(fe, name, program))
 }
 
+/// B-2026-09-05-28 / -36 — does free function `gf` take by-value parameter
+/// `j` OVER from its caller: hand it back (bare, always, conditionally, as a
+/// payload or element bound out of it, or through a further call), or move it
+/// into a home that outlives the call? The one interprocedural question every
+/// "handed to a call" arm in this family asks, so it lives in one place. A
+/// returned FIELD projection (`fn consume(x: R) -> i64 { x.id }`) is not
+/// counted: only a copy of one field leaves, the value itself dies in the
+/// callee.
+fn callee_takes_param_over(program: &crate::Program, gf: &Function, j: usize) -> bool {
+    fn_returns_param(gf, j)
+        || fn_always_returns_param(gf, j)
+        || fn_conditionally_returns_param_bare(gf, j)
+        || fn_returns_param_payload(gf, j)
+        || fn_returns_param_via_call(program, gf, j)
+        || fn_moves_param_into_outliving_place(gf, j)
+        || fn_moves_param_into_outliving_place_via_call(program, gf, j)
+        || !fn_returns_param_tuple_arm_elems(program, gf, j).is_empty()
+}
+
+/// B-2026-09-05-36 — the program-aware sibling of
+/// [`fn_moves_param_into_outliving_place`]: is by-value parameter `arg_index`
+/// handed BARE to a free function that moves that parameter into a place
+/// outliving ITS call? `fn b_stash(x: R, v: mut ref Vec[R]) { stash(x, v) }`
+/// with `fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }`: `x` is alive in the
+/// caller's `v` when `b_stash` returns, exactly as if `b_stash` had pushed it
+/// itself, yet the intraprocedural predicate treats the call as opaque and the
+/// caller's temp drop ran alongside the container's drain — two bodies for
+/// one value on all four surfaces.
+///
+/// A separate entry point rather than a widening, for the reason
+/// [`fn_returns_param_via_call`] gives: the intraprocedural predicate's
+/// callee-side consumers (`compile_function`'s conditional-store
+/// registration, the interpreter's twin) were measured on its current answer,
+/// and only the CALLER-side stand-down asks this one. ONE LEVEL, argument
+/// bare, statement position included; an unresolvable callee counts as
+/// nothing here, the part channel's conservative direction.
+pub fn fn_moves_param_into_outliving_place_via_call(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> bool {
+    let Some(param) = f.params.get(arg_index) else {
+        return false;
+    };
+    if matches!(
+        param.ty.kind,
+        crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+    ) {
+        return false;
+    }
+    let PatternKind::Binding(param_name) = &param.pattern.kind else {
+        return false;
+    };
+    stored_via_call_block(&f.body, param_name, program)
+}
+
 /// How the payload-escape walks below treat a CALL that takes the tracked
 /// binding as an argument (B-2026-09-05-28).
 #[derive(Clone, Copy)]
@@ -3415,18 +3603,7 @@ fn payload_yields(e: &Expr, name: &str, rule: CallYieldRule<'_>) -> bool {
             }) else {
                 return true;
             };
-            // The whole value, or a payload / element bound out of it, or a
-            // home that outlives the call. A returned FIELD projection
-            // (`fn consume(x: R) -> i64 { x.id }`) is not counted, for the
-            // reason the bare-binding rule above gives: only a copy of one
-            // field leaves, the element itself dies in the callee.
-            fn_returns_param(gf, j)
-                || fn_always_returns_param(gf, j)
-                || fn_conditionally_returns_param_bare(gf, j)
-                || fn_returns_param_payload(gf, j)
-                || fn_returns_param_via_call(program, gf, j)
-                || fn_moves_param_into_outliving_place(gf, j)
-                || !fn_returns_param_tuple_arm_elems(program, gf, j).is_empty()
+            callee_takes_param_over(program, gf, j)
         }),
         _ => false,
     }

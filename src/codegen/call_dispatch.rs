@@ -3502,6 +3502,12 @@ impl<'ctx> super::Codegen<'ctx> {
                     // return predicates give, reached through a borrow instead
                     // of through the result.
                     || crate::ast::fn_moves_param_into_outliving_place(f, arg_index)
+                    // B-2026-09-05-36 — or handed to a callee that stores it
+                    // (`fn b_stash(x, v) { stash(x, v) }`): the same new home,
+                    // one call further away.
+                    || self.program_snapshot.as_deref().is_some_and(|p| {
+                        crate::ast::fn_moves_param_into_outliving_place_via_call(p, f, arg_index)
+                    })
             })
     }
 
@@ -3567,6 +3573,14 @@ impl<'ctx> super::Codegen<'ctx> {
             arg_index
         };
         crate::ast::fn_moves_param_into_outliving_place(f, declared)
+            // B-2026-09-05-36 — or handed bare to a free function that stores
+            // it (one level): `fn b_stash(x: R, v: mut ref Vec[R]) { stash(x,
+            // v) }` leaves `x` alive in the caller's `v` exactly as a direct
+            // push would, and the registrar's bodies-vs-memory split turns on
+            // that outcome rather than on which frame did the push.
+            || self.program_snapshot.as_deref().is_some_and(|p| {
+                crate::ast::fn_moves_param_into_outliving_place_via_call(p, f, declared)
+            })
     }
 
     /// B-2026-07-01-7 (discard position): register the caller-side
@@ -4602,7 +4616,12 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(f) = super::declarations::find_function_ast(program, callee_name) else {
             return Vec::new();
         };
-        let mut parts = crate::ast::fn_returns_param_part_paths(f, arg_index);
+        // B-2026-09-05-36 — the program-aware form: a part handed to a call
+        // that takes it over (`let (r, k) = t; wrap(r)` / `stash(r, v)`) or
+        // pushed under an outliving root joins the returned parts, since the
+        // consumer's question — which parts some OTHER owner runs the body
+        // of — is the same for all of them.
+        let mut parts = crate::ast::fn_escaping_param_part_paths(program, f, arg_index);
         // B-2026-09-05-33 — the match-arm routes the part channel cannot see:
         // an element forwarded through a call that returns it (`wrap(r)`),
         // handed to a callee that stores it (`stash(r, v)`), stored under an

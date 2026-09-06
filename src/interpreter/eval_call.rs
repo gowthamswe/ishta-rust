@@ -2894,6 +2894,7 @@ impl<'a> super::Interpreter<'a> {
                     || crate::ast::fn_returns_param(f, i)
                     || crate::ast::fn_returns_param_payload(f, i)
                     || crate::ast::fn_moves_param_into_outliving_place(f, i)
+                    || crate::ast::fn_moves_param_into_outliving_place_via_call(self.program, f, i)
                 {
                     return None;
                 }
@@ -3039,6 +3040,7 @@ impl<'a> super::Interpreter<'a> {
                 let escapes = crate::ast::fn_returns_param(f, i)
                     || crate::ast::fn_returns_param_payload(f, i)
                     || crate::ast::fn_moves_param_into_outliving_place(f, i)
+                    || crate::ast::fn_moves_param_into_outliving_place_via_call(self.program, f, i)
                     || crate::ast::fn_conditionally_returns_param_bare(f, i);
                 if !escapes {
                     return None;
@@ -3139,19 +3141,22 @@ impl<'a> super::Interpreter<'a> {
         // caller-side arg walk now runs on the method path too, and an
         // unconditional "nothing escapes" there would fire a body the callee
         // hands back.
+        // B-2026-09-05-36 — the program-aware form on both legs: a part
+        // handed to a call that takes it over, or pushed under an outliving
+        // root, joins the returned parts (see `fn_escaping_param_part_paths`).
         if let Some(ty) = method_owner {
             return self
                 .impl_method_ast(ty, callee_name)
-                .map(|f| crate::ast::fn_returns_param_part_paths(f, arg_index))
+                .map(|f| crate::ast::fn_escaping_param_part_paths(self.program, f, arg_index))
                 .unwrap_or_default();
         }
         self.program
             .items
             .iter()
             .find_map(|item| match item {
-                crate::ast::Item::Function(f) if f.name == callee_name => {
-                    Some(crate::ast::fn_returns_param_part_paths(f, arg_index))
-                }
+                crate::ast::Item::Function(f) if f.name == callee_name => Some(
+                    crate::ast::fn_escaping_param_part_paths(self.program, f, arg_index),
+                ),
                 _ => None,
             })
             .unwrap_or_default()
@@ -3806,6 +3811,7 @@ impl<'a> super::Interpreter<'a> {
                     || crate::ast::fn_returns_param_via_call(self.program, f, i)
                     || crate::ast::fn_returns_param_payload(f, i)
                     || crate::ast::fn_moves_param_into_outliving_place(f, i)
+                    || crate::ast::fn_moves_param_into_outliving_place_via_call(self.program, f, i)
                     // B-2026-08-31-46 — a conditional hand-back the callee
                     // frame owns per path; `fn_returns_param`'s union used to
                     // cover the bare form, but not a constructor wrap.
