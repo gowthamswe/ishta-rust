@@ -96,7 +96,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | run-vs-build | 345 |
 | leak | 272 |
 | missing-feature | 194 |
-| double-free | 188 |
+| double-free | 189 |
 | codegen-gap | 166 |
 | diagnostics | 123 |
 | false-positive | 106 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1485 |
+| codegen | 1486 |
 | interp | 362 |
 | typecheck | 293 |
 | ownership | 74 |
@@ -161,6 +161,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-1 | 2026-09-06 | interp | medium | THE INTERPRETER LOSES A DISCARDED GENERIC CALL'S MOVED-IN ARGUMENT `Drop` BODY ENTIRELY -- `let g = mk(3); passG(g);` as a BARE STATEMENT over `fn passG[T](x: T) -> T` prints `end` where `karac run`, `karac build` and `KARAC_AUTO_PAR=0` all print `dR3 end`, and `let _ = h.keep(g)` over a GENERIC METHOD loses it under the `let _ =` spelling too; both CONCRETE twins are correct in the interpreter, so it is the GENERIC path -- and the interpreter is the WRONG column here, a LOST body rather than the extra one this family usually produces | — |
 | B-2026-09-06-2 | 2026-09-06 | codegen | medium | A NAMED-LOCAL ARGUMENT TO A GENERIC *METHOD* THAT RETURNS ITS WHOLE BY-VALUE PARAM LEAKS THE CALLEE'S ENTRY COPY -- `let _ = h.keep(g)` over `impl H { fn keep[T](ref self, x: T) -> T }` orphans one object per call, 24,000 B in 500 blocks over a 500-iteration loop at the DEFAULT optimization level, while the CONCRETE method twin is 15 allocs / 15 frees clean; the FREE-FUNCTION twin was fixed by B-2026-09-05-31, which scoped itself out of the method path because that loop's argument index is receiver-inclusive and the discard registrar resolves `Item::Function` names only | — |
 | B-2026-09-06-3 | 2026-09-06 | codegen | low | A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Option[(R, i64)]` with a heap-carrying element (5+ words, boxed) leaks the whole box + interior; `try_track_discarded_boxed_option` frees a boxed STRUCT payload but declines a boxed TUPLE one. Split from B-2026-09-05-14 (the lost-BODY twin), which this leak is independent of -- identical with the body fix absent or present | — |
+| B-2026-09-06-4 | 2026-09-06 | codegen | high | THE SELF-HOSTED RESOLVER ORACLE DOUBLE-FREES ON LINUX AND THE EMITTER ORACLE SEGFAULTS, AT THE IMPORT COMMIT AND ON CURRENT `main` ALIKE -- `tests/selfhost_resolver.rs`'s two tests abort `free(): double free detected in tcache 2` (SIGABRT, four per run) and `tests/selfhost_codegen.rs`'s `selfhost_codegen_matches_seed_run` dies SIGSEGV, identically at 51368a1 (the import that claims them green), e028255 and 822334c; the other six self-host oracles pass; CI's `codegen-e2e` job excludes both, so nothing has ever run them on glibc | — |
 
 ### Relocated
 
