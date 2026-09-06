@@ -2019,6 +2019,39 @@ impl<'ctx> super::Codegen<'ctx> {
         self.no_arm_payload_escapes(arms)
     }
 
+    /// `if let` / `while let` twin of [`Self::scrutinee_is_readonly_borrowed_place`]
+    /// (B-2026-09-06-24): one pattern, one block. The `match` path classed a
+    /// read-only projection off a `ref` / `mut ref` param or a borrowed `self`
+    /// as a borrow, so its payload bindings were views; the block spellings
+    /// had no such term, their bindings took UserDrop slots of their own, and
+    /// `if let E.A(r) = h.e { return r.id; }` through `ref h` ran the payload
+    /// body twice on every compiled backend (`dR5 5 dE dR5`) against once on
+    /// the same program's `match` spelling and on the interpreter (`5 dE dR5`).
+    /// The escape guard is the same safety boundary: a block that moves the
+    /// payload out stays on the owned path, whose clone-on-escape nets
+    /// (`clone_escaping_borrowed_ref_chain_enum` and siblings) already cover it.
+    pub(super) fn scrutinee_is_readonly_borrowed_place_block(
+        &self,
+        scrutinee: &Expr,
+        pattern: &Pattern,
+        block: &crate::ast::Block,
+    ) -> bool {
+        if !matches!(
+            scrutinee.kind,
+            ExprKind::FieldAccess { .. } | ExprKind::Index { .. } | ExprKind::TupleIndex { .. }
+        ) {
+            return false;
+        }
+        let Some(root) = self.place_expr_root_ident(scrutinee) else {
+            return false;
+        };
+        if !self.scrutinee_is_borrowed_binding(root) {
+            return false;
+        }
+        self.pattern_is_unit_variant_test(pattern)
+            || !self.pattern_bindings_escape_in_block(pattern, block)
+    }
+
     /// Does every payload binding this arm's pattern makes get used ONLY as the
     /// scrutinee of a nested `match` / `if let` (B-2026-08-30-52 (b))?
     ///

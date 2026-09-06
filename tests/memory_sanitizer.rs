@@ -2368,6 +2368,112 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-24 — the read-only `if let` / `while let` payload binding
+    /// over a borrow projection is now a VIEW on the compiled side: this pins
+    /// that suppressing its slot frees nothing twice and leaks nothing (the
+    /// caller's original still owns the `String` / `Vec` buffers), and that
+    /// the escaping controls still take a real copy with one owner.
+    #[test]
+    fn asan_readonly_if_let_over_borrow_projection_view_is_not_freed() {
+        assert_clean_asan_run(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] } }\n\
+             enum E { A(R), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"  dE\") } }\n\
+             struct S { e: E }\n\
+             struct H { e: E }\n\
+             struct H2 { s: S }\n\
+             fn consume(x: R) -> i64 { return x.id }\n\
+             \n\
+             fn p_iflet(h: ref H) -> i64 { if let E.A(r) = h.e { return r.id; } else { return 0; } }\n\
+             fn p_iflet_mut(h: mut ref H) -> i64 { if let E.A(r) = h.e { return r.id; } else { return 0; } }\n\
+             fn p_iflet_assign(h: ref H) -> i64 { let mut t = 0; if let E.A(r) = h.e { t = r.id + 1; } return t; }\n\
+             fn p_whilelet(h: ref H) -> i64 { while let E.A(r) = h.e { return r.id; } return 0; }\n\
+             fn p_iflet2(h: ref H2) -> i64 { if let E.A(r) = h.s.e { return r.id; } else { return 0; } }\n\
+             fn p_match(h: ref H) -> i64 { match h.e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             fn p_iflet_move(h: ref H) -> i64 { if let E.A(r) = h.e { let m = r; return m.id; } else { return 0; } }\n\
+             fn p_iflet_consume(h: ref H) -> i64 { if let E.A(r) = h.e { return consume(r); } return 0; }\n\
+             impl H {\n\
+             \x20   fn m_iflet(ref self) -> i64 { if let E.A(r) = self.e { return r.id; } else { return 0; } }\n\
+             \x20   fn m_iflet_mut(mut ref self) -> i64 { if let E.A(r) = self.e { return r.id; } else { return 0; } }\n\
+             \x20   fn m_whilelet(ref self) -> i64 { while let E.A(r) = self.e { return r.id; } return 0; }\n\
+             \x20   fn m_iflet_move(ref self) -> i64 { if let E.A(r) = self.e { let m = r; return m.id; } else { return 0; } }\n\
+             }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"p_iflet\"); let a1 = H { e: E.A(mk(1)) }; let x1 = p_iflet(a1); println(f\"  got{x1}\");\n\
+             \x20   println(\"p_iflet_mut\"); let mut a2 = H { e: E.A(mk(2)) }; let x2 = p_iflet_mut(mut a2); println(f\"  got{x2}\");\n\
+             \x20   println(\"p_iflet_assign\"); let a3 = H { e: E.A(mk(3)) }; let x3 = p_iflet_assign(a3); println(f\"  got{x3}\");\n\
+             \x20   println(\"p_whilelet\"); let a4 = H { e: E.A(mk(4)) }; let x4 = p_whilelet(a4); println(f\"  got{x4}\");\n\
+             \x20   println(\"p_iflet2\"); let a5 = H2 { s: S { e: E.A(mk(5)) } }; let x5 = p_iflet2(a5); println(f\"  got{x5}\");\n\
+             \x20   println(\"p_match\"); let a6 = H { e: E.A(mk(6)) }; let x6 = p_match(a6); println(f\"  got{x6}\");\n\
+             \x20   println(\"p_iflet_move\"); let a7 = H { e: E.A(mk(7)) }; let x7 = p_iflet_move(a7); println(f\"  got{x7}\");\n\
+             \x20   println(\"p_iflet_consume\"); let a8 = H { e: E.A(mk(8)) }; let x8 = p_iflet_consume(a8); println(f\"  got{x8}\");\n\
+             \x20   println(\"m_iflet\"); let a9 = H { e: E.A(mk(9)) }; let x9 = a9.m_iflet(); println(f\"  got{x9}\");\n\
+             \x20   println(\"m_iflet_mut\"); let mut a10 = H { e: E.A(mk(10)) }; let x10 = a10.m_iflet_mut(); println(f\"  got{x10}\");\n\
+             \x20   println(\"m_whilelet\"); let a11 = H { e: E.A(mk(11)) }; let x11 = a11.m_whilelet(); println(f\"  got{x11}\");\n\
+             \x20   println(\"m_iflet_move\"); let a12 = H { e: E.A(mk(12)) }; let x12 = a12.m_iflet_move(); println(f\"  got{x12}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "p_iflet",
+                "  dE",
+                "  dR1",
+                "  got1",
+                "p_iflet_mut",
+                "  dE",
+                "  dR2",
+                "  got2",
+                "p_iflet_assign",
+                "  dE",
+                "  dR3",
+                "  got4",
+                "p_whilelet",
+                "  dE",
+                "  dR4",
+                "  got4",
+                "p_iflet2",
+                "  dE",
+                "  dR5",
+                "  got5",
+                "p_match",
+                "  dE",
+                "  dR6",
+                "  got6",
+                "p_iflet_move",
+                "  dR7",
+                "  dE",
+                "  dR7",
+                "  got7",
+                "p_iflet_consume",
+                "  dR8",
+                "  dE",
+                "  dR8",
+                "  got8",
+                "m_iflet",
+                "  dE",
+                "  dR9",
+                "  got9",
+                "m_iflet_mut",
+                "  dE",
+                "  dR10",
+                "  got10",
+                "m_whilelet",
+                "  dE",
+                "  dR11",
+                "  got11",
+                "m_iflet_move",
+                "  dR12",
+                "  dE",
+                "  dR12",
+                "  got12",
+                "end"
+            ],
+            "readonly_if_let_over_borrow_projection",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the
