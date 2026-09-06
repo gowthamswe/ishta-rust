@@ -13233,12 +13233,35 @@ impl<'ctx> super::Codegen<'ctx> {
             PatternKind::Wildcard => Ok(()),
             // Struct destructuring: let Foo { x, y } = val
             PatternKind::Struct {
-                path: _,
+                path,
                 fields,
                 has_rest: _,
             } => {
                 if let BasicValueEnum::StructValue(sv) = val {
-                    for (idx, field_pat) in fields.iter().enumerate() {
+                    // B-2026-09-06-33 — the field's DECLARED index, resolved by
+                    // NAME. This loop indexed the value by the pattern field's
+                    // POSITION, which is only right when the pattern names
+                    // every field in declaration order: a partial pattern
+                    // (`let S3 { b, .. } = s`) read field `a` into `b`, and a
+                    // reordered one (`let P3 { z, x, y } = p`) permuted all
+                    // three — `v=1` for `z` where `z` is 3, on every compiled
+                    // surface, with a double free on top when the misread
+                    // field carried heap. The cleanup registration below
+                    // already resolves by name; only this extraction did not.
+                    // Position stays the fallback for a path that is not a
+                    // plain user struct (an enum struct-variant reaches here
+                    // through its own binder and never used this arm's index).
+                    let struct_name = path.last().cloned().unwrap_or_default();
+                    let decl_names = self
+                        .type_decls
+                        .struct_field_names
+                        .get(&struct_name)
+                        .cloned();
+                    for (pos, field_pat) in fields.iter().enumerate() {
+                        let idx = decl_names
+                            .as_ref()
+                            .and_then(|names| names.iter().position(|n| n == &field_pat.name))
+                            .unwrap_or(pos);
                         let field_val = self
                             .builder
                             .build_extract_value(sv, idx as u32, "field")

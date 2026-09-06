@@ -63820,3 +63820,38 @@ fn main() {
         "dR2\ndR1\nv=2\none\ndR4\ndR3\nv=3\ntwo\ndR6\ndR5\nv=1\nthree\ndR8\ndR7\nv=8\nfour\ndR10\ndR9\nv=9\nfive\ndR12\ndR11\nv=12\nsix\ndR15\ndR14\ndR13\nv=14\nseven\ndR19\ndR18\nv=19\neight\ndR21\ndR20\nv=20\nnine\nend\n"
     );
 }
+
+/// B-2026-09-06-33 — twin of `tests/codegen.rs`'s
+/// `e2e_partial_or_reordered_struct_let_pattern_binds_by_name`, same
+/// program and string. The interpreter was already right here (it binds
+/// struct-pattern fields by name); the twin pins the agreed output so the
+/// compiled backends' by-position extraction cannot silently come back.
+///
+/// `one` a partial pattern over a Drop-bearing struct with a view in the
+/// other field, `two`..`five` scalar partial / reordered / middle-field /
+/// renamed-with-rest patterns.
+#[test]
+fn test_partial_or_reordered_struct_let_pattern_binds_by_name() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct S3 { a: R, b: R }
+struct P3 { x: i64, y: i64, z: i64 }
+fn p_view_b(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(5) }; let S3 { b, .. } = s; return b.id; }
+fn p_scalar_partial() -> i64 { let p: P3 = P3 { x: 1, y: 2, z: 3 }; let P3 { z, .. } = p; return z; }
+fn p_scalar_swapped() -> i64 { let p: P3 = P3 { x: 1, y: 2, z: 3 }; let P3 { z, x, y } = p; return z * 100 + y * 10 + x; }
+fn p_scalar_mid() -> i64 { let p: P3 = P3 { x: 1, y: 2, z: 3 }; let P3 { y, .. } = p; return y; }
+fn p_scalar_rename() -> i64 { let p: P3 = P3 { x: 1, y: 2, z: 3 }; let P3 { z: w, x: v, .. } = p; return w * 10 + v; }
+fn main() {
+    { let v: i64 = p_view_b(mk(4)); println(f"v={v}"); println("one") }
+    { let v: i64 = p_scalar_partial(); println(f"v={v}"); println("two") }
+    { let v: i64 = p_scalar_swapped(); println(f"v={v}"); println("three") }
+    { let v: i64 = p_scalar_mid(); println(f"v={v}"); println("four") }
+    { let v: i64 = p_scalar_rename(); println(f"v={v}"); println("five") }
+    println("end")
+}
+"#),
+        "dR5\ndR4\nv=5\none\nv=3\ntwo\nv=321\nthree\nv=2\nfour\nv=31\nfive\nend\n"
+    );
+}
