@@ -3401,7 +3401,10 @@ impl<'a> super::Interpreter<'a> {
                 .read()
                 .map(|g| g.iter().any(|e| self.value_runs_user_drop(e)))
                 .unwrap_or(false),
-            Value::Tuple(items) => items.iter().any(|e| self.value_runs_user_drop(e)),
+            // B-2026-09-02-41 — recurse, so a NESTED tuple element (`pe:
+            // ((R, i64), i64)`) is seen; the walk it gates learned the same
+            // element in the same row.
+            Value::Tuple(items) => items.iter().any(|e| self.field_value_carries_user_drop(e)),
             Value::Map(entries) => {
                 let entries = entries.read().unwrap().clone();
                 entries
@@ -3649,6 +3652,18 @@ impl<'a> super::Interpreter<'a> {
                                 }
                                 self.run_enum_payload_user_drops_value(&e);
                             }
+                            continue;
+                        }
+                        // B-2026-09-02-41 — a NESTED tuple element (`pe:
+                        // ((R, i64), i64)`) was skipped outright, so the `R`
+                        // inside it never ran its body: not at the struct's
+                        // scope end, not for a fresh-temp argument, not for a
+                        // named-local one — zero bodies against the compiled
+                        // backends' one (the flat `(R, i64)` field was fine).
+                        // The discard walk unrolls a tuple value recursively,
+                        // which is exactly this loop one level down.
+                        if matches!(&e, Value::Tuple(_)) {
+                            self.run_discarded_value_user_drops(e.clone());
                             continue;
                         }
                         let Value::Struct { name: tn, .. } = &e else {

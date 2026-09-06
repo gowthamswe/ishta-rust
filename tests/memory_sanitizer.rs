@@ -74095,4 +74095,66 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-02-41 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_two_step_destructure_of_a_nested_tuple_field_has_one_owner`: the
+    /// nested tuple leaf is freed once and its body runs once. Heap `R`
+    /// (`String` + `Vec`), which is what made the pre-fix state a double free
+    /// rather than a body miscount.
+    #[test]
+    fn asan_two_step_destructure_of_a_nested_tuple_field_clean() {
+        let label = "two_step_destructure_of_a_nested_tuple_field";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct H2 { pe: ((R, i64), i64) }
+struct H1 { pe: (R, i64) }
+struct H3 { pe: (((R, i64), i64), i64) }
+fn v3(h: H2) { let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f"v3 {m.id}") }
+fn v3_read(h: H2) { let (inner, y) = h.pe; let (r, x) = inner; println(f"v3r {r.id}") }
+fn v3_unread(h: H2) { let (inner, y) = h.pe; let (r, x) = inner; println("v3u") }
+fn v3_ret(h: H2) -> R { let (inner, y) = h.pe; let (r, x) = inner; return r; }
+fn v3_one(h: H2) { let (inner, y) = h.pe; println("v3o") }
+fn v3_inner_move(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; println(f"v3m {z.0.id}") }
+fn flat(h: H1) { let (r, k) = h.pe; let m: R = r; println(f"flat {m.id}") }
+fn flat_read(h: H1) { let (r, k) = h.pe; println(f"flatr {r.id}") }
+fn deep(h: H3) { let (mid, a) = h.pe; let (inner, b) = mid; let (r, c) = inner; let m: R = r; println(f"deep {m.id}") }
+fn local3() { let h: H2 = H2 { pe: ((mk(9), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f"l3 {m.id}") }
+fn main() {
+    { v3(H2 { pe: ((mk(1), 1), 2) }); println("one") }
+    { v3_read(H2 { pe: ((mk(2), 1), 2) }); println("two") }
+    { v3_unread(H2 { pe: ((mk(3), 1), 2) }); println("three") }
+    { v3_one(H2 { pe: ((mk(5), 1), 2) }); println("five") }
+    { flat(H1 { pe: (mk(7), 1) }); println("seven") }
+    { flat_read(H1 { pe: (mk(8), 1) }); println("eight") }
+    { deep(H3 { pe: (((mk(10), 1), 2), 3) }); println("ten") }
+    { let h: H2 = H2 { pe: ((mk(11), 1), 2) }; v3(h); println("eleven") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "v3 1", "dR1", "one", "v3r 2", "dR2", "two", "v3u", "dR3", "three", "v3o", "dR5",
+                "five", "flat 7", "dR7", "seven", "flatr 8", "dR8", "eight", "deep 10", "dR10",
+                "ten", "v3 11", "dR11", "eleven", "end",
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

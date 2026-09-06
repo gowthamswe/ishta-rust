@@ -4971,6 +4971,24 @@ impl<'ctx> super::Codegen<'ctx> {
         if tree.here.contains(&idx) {
             return;
         }
+        // B-2026-09-02-41 — a TUPLE-typed field with exactly one tuple index
+        // left on the path (`[Field("pe"), TupleIndex(0)]`): the walker reads
+        // `nested[field].here` as the element indices masked inside that
+        // tuple, so this is expressible one level deep. A deeper tuple path
+        // (`pe.0.0`) is not, and keeps the channel's under-approximating
+        // answer (no mask).
+        if let [crate::ast::ParamPart::TupleIndex(elem)] = rest {
+            let is_tuple_field = self
+                .type_decls
+                .struct_field_type_exprs
+                .get(struct_name)
+                .and_then(|tes| tes.get(idx))
+                .is_some_and(|fte| matches!(fte.kind, TypeKind::Tuple(_)));
+            if is_tuple_field {
+                tree.nested.entry(idx).or_default().here.insert(*elem);
+            }
+            return;
+        }
         let Some(Some(field_type)) = self
             .type_decls
             .struct_field_type_names

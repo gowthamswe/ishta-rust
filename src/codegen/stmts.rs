@@ -15145,7 +15145,30 @@ impl<'ctx> super::Codegen<'ctx> {
                 self.var_types
                     .tuple_var_elem_type_exprs
                     .insert(name.clone(), inner_tes.clone());
-                if !owner_runs_bodies {
+                // B-2026-09-02-41 — a TUPLE-typed leaf under an owner-runs-bodies
+                // source is a param VIEW exactly as a struct-typed leaf is
+                // (the Path arm below marks it), and was the one leaf that
+                // recorded nothing: `let (inner, y) = h.pe; let (r, x) = inner;`
+                // then saw `inner` as an ordinary local, gave `r` a body of
+                // its own beside the caller's walk, and `let m = r` a third
+                // slot — two bodies on every compiled backend (a double free
+                // with a heap payload) against the one that is due. With the
+                // view recorded, the second destructure takes the
+                // owner-runs-bodies path through `param_view_locals`, and
+                // its element types are already in the registry above.
+                if mark_views {
+                    self.payload_vars.param_view_locals.insert(name.clone());
+                }
+                // B-2026-09-02-41 — MEMORY and the source zeroing on BOTH legs,
+                // as the struct-typed leaf below has them
+                // (`track_destructure_leaf_cleanup` + `zero_tuple_elem_cap_at`);
+                // BODIES only when this leaf owns them. Under an
+                // owner-runs-bodies source the leaf used to get nothing at all,
+                // so its buffers were freed by the source's own drop AND by
+                // whatever the leaf was later moved into (`let (r, x) = inner;
+                // let m = r;`) — two invalid frees at -O0, a glibc abort on
+                // the JIT.
+                {
                     let inner_tes = inner_tes.clone();
                     self.register_var_from_type_expr(name, &te);
                     let slot = self.variables.get(name.as_str()).copied();
@@ -15178,8 +15201,11 @@ impl<'ctx> super::Codegen<'ctx> {
                             // no owner. The cap-zero follows whether EITHER half
                             // was taken: either one makes the leaf an owner the
                             // source must stop competing with.
-                            let bodies =
-                                self.emit_tuple_elem_user_drop_bodies_fn(agg_ty, &inner_tes);
+                            let bodies = if owner_runs_bodies {
+                                None
+                            } else {
+                                self.emit_tuple_elem_user_drop_bodies_fn(agg_ty, &inner_tes)
+                            };
                             let mem = self.synthesize_tuple_drop_fn_te(agg_ty, &inner_tes);
                             if bodies.is_some() || mem.is_some() {
                                 if let Some(mem) = mem {

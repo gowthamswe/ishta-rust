@@ -3221,17 +3221,21 @@ impl<'a> super::Interpreter<'a> {
         method_owner: Option<&str>,
         i: usize,
     ) -> Vec<Vec<String>> {
+        // B-2026-09-02-41 — a tuple index INSIDE the path is carried as
+        // `#<i>` so `mask_struct_fields` can step into a tuple-typed field
+        // (`h.pe.0.0` handed back out of `pe: ((R, i64), i64)`); a path whose
+        // HEAD is a tuple index is still the tuple arm's business.
         self.callee_returned_param_parts(callee_name, method_owner, i)
             .into_iter()
-            .filter_map(|path| {
+            .filter(|path| matches!(path.first(), Some(crate::ast::ParamPart::Field(_))))
+            .map(|path| {
                 path.into_iter()
                     .map(|p| match p {
-                        crate::ast::ParamPart::Field(n) => Some(n),
-                        crate::ast::ParamPart::TupleIndex(_) => None,
+                        crate::ast::ParamPart::Field(n) => n,
+                        crate::ast::ParamPart::TupleIndex(i) => format!("#{i}"),
                     })
-                    .collect::<Option<Vec<String>>>()
+                    .collect::<Vec<String>>()
             })
-            .filter(|path| !path.is_empty())
             .collect()
     }
 
@@ -3255,6 +3259,28 @@ impl<'a> super::Interpreter<'a> {
     ) -> super::value::Value {
         if escaping.is_empty() {
             return value.clone();
+        }
+        // B-2026-09-02-41 — a TUPLE value masks by element index (`#<i>`):
+        // the element is replaced by a unit so the walk finds nothing there.
+        if let super::value::Value::Tuple(items) = value {
+            let mut items = items.clone();
+            for path in escaping {
+                let Some((head, rest)) = path.split_first() else {
+                    continue;
+                };
+                let Some(idx) = head.strip_prefix('#').and_then(|d| d.parse::<usize>().ok()) else {
+                    continue;
+                };
+                if idx >= items.len() {
+                    continue;
+                }
+                if rest.is_empty() {
+                    items[idx] = super::value::Value::Unit;
+                } else {
+                    items[idx] = Self::mask_struct_fields(&items[idx], &[rest.to_vec()]);
+                }
+            }
+            return super::value::Value::Tuple(items);
         }
         let super::value::Value::Struct { name, fields } = value else {
             return value.clone();
