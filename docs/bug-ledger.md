@@ -96,7 +96,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | run-vs-build | 360 |
 | leak | 279 |
 | missing-feature | 194 |
-| double-free | 193 |
+| double-free | 194 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
 | false-positive | 106 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1530 |
+| codegen | 1531 |
 | interp | 393 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -162,6 +162,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-55 | 2026-09-06 | interp+codegen | low | A DEEP-CHAIN FIELD MOVE-OUT STILL LOSES THE MOVED HOP'S SIBLING ONE LEVEL DOWN, ON EVERY SURFACE -- `let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r;` prints `dR1 dR3` on `--interp` / jit / aot / `KARAC_AUTO_PAR=0` alike; `q`'s body (`dR2`) runs nowhere | — |
 | B-2026-09-06-56 | 2026-09-06 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-50 LEAKS ITS WHOLE BOXED STRUCT PAYLOAD -- 192 B in 3 blocks over three calls for `fn show(x: Result[P, i64])` matched `Ok(P { a, b, .. })`, because NEITHER frame owns the box: the caller-side arm is `Option`-only by construction and the callee's loop skips every non-`Option` enum | — |
+| B-2026-09-06-57 | 2026-09-06 | codegen | high | `main` IS RED: B-2026-09-06-45's OWN TWO REGRESSION TESTS FAIL ON A CLEAN CHECKOUT OF 6138e02 -- `asan_nested_self_rebind_keeps_one_owner` double-frees a 3-byte buffer via `karac_drop_S` (ASAN exit 23) and `e2e_nested_self_rebind_runs_each_body_once` fails with it, so every session's gate cycle now inherits two red tests | — |
 
 ### Relocated
 
