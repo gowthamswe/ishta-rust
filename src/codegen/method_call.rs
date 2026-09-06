@@ -7993,8 +7993,15 @@ impl<'ctx> super::Codegen<'ctx> {
                             // registration in place: two bodies for one object
                             // on all three compiled backends, against one in the
                             // interpreter.
-                            crate::ast::fn_always_returns_param(f, i)
-                                || crate::ast::fn_conditionally_returns_param_bare(f, i)
+                            crate::ast::fn_always_returns_param(
+                                self.program_snapshot.as_deref(),
+                                f,
+                                i,
+                            ) || crate::ast::fn_conditionally_returns_param_bare(
+                                self.program_snapshot.as_deref(),
+                                f,
+                                i,
+                            )
                         });
                     // B-2026-08-29-38 — the FRESH-TEMP leg of the same
                     // passthrough rule the named-binding guard above applies.

@@ -2519,8 +2519,12 @@ impl<'ctx> super::Codegen<'ctx> {
                     } else {
                         i
                     };
-                    crate::ast::fn_always_returns_param(f, ast_i)
-                        || crate::ast::fn_conditionally_returns_param_bare(f, ast_i)
+                    crate::ast::fn_always_returns_param(self.program_snapshot.as_deref(), f, ast_i)
+                        || crate::ast::fn_conditionally_returns_param_bare(
+                            self.program_snapshot.as_deref(),
+                            f,
+                            ast_i,
+                        )
                 });
             let flows_into_return = self.call_arg_flows_into_return(name, i) || handed_off;
             // B-2026-08-26-9 — the monomorphized leg of the same union the
@@ -4282,7 +4286,11 @@ impl<'ctx> super::Codegen<'ctx> {
             // alloca an ordinary opaque `ptr`. The corruption the row measured
             // came from the unseeded escaping site, not from the slot.
             if !self.is_coroutine_compiled(&func.name)
-                && crate::ast::fn_conditionally_returns_param_bare(func, i)
+                && crate::ast::fn_conditionally_returns_param_bare(
+                    self.program_snapshot.as_deref(),
+                    func,
+                    i,
+                )
                 && !crate::ast::fn_moves_param_into_outliving_place(func, i)
             {
                 // B-2026-09-02-3 — the SUBSTITUTED parameter type, not the raw

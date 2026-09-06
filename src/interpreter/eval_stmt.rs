@@ -2540,7 +2540,7 @@ impl<'a> super::Interpreter<'a> {
             .find_map(|(i, a)| match &a.value.kind {
                 ExprKind::Identifier(src)
                     if whole.contains(src.as_str())
-                        && crate::ast::fn_always_returns_param(f, i) =>
+                        && crate::ast::fn_always_returns_param(Some(self.program), f, i) =>
                 {
                     Some(src.clone())
                 }
@@ -5980,8 +5980,8 @@ impl<'a> super::Interpreter<'a> {
                             i,
                             variant.as_deref(),
                         )
-                        || crate::ast::fn_always_returns_param(f, i)
-                        || crate::ast::fn_conditionally_returns_param_bare(f, i)
+                        || crate::ast::fn_always_returns_param(Some(self.program), f, i)
+                        || crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i)
                 });
                 if !is_passthrough && !escapes_into_outliving_place {
                     return None;
@@ -6010,8 +6010,12 @@ impl<'a> super::Interpreter<'a> {
                 // container-walk one.
                 let callee_owns_body = escapes_into_outliving_place
                     || callee.is_some_and(|f| {
-                        crate::ast::fn_always_returns_param(f, i)
-                            || crate::ast::fn_conditionally_returns_param_bare(f, i)
+                        crate::ast::fn_always_returns_param(Some(self.program), f, i)
+                            || crate::ast::fn_conditionally_returns_param_bare(
+                                Some(self.program),
+                                f,
+                                i,
+                            )
                     });
                 Some((n.clone(), callee_owns_body))
             })

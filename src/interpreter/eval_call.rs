@@ -2605,8 +2605,9 @@ impl<'a> super::Interpreter<'a> {
             // value simply died. Codegen's twin is the conditional-store
             // registration in `compile_function`'s parameter loop, gated on the
             // same pair of predicates so both backends claim the same set.
-            let cond_returned = crate::ast::fn_conditionally_returns_param_bare(f, i)
-                && !crate::ast::fn_moves_param_into_outliving_place(f, i);
+            let cond_returned =
+                crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i)
+                    && !crate::ast::fn_moves_param_into_outliving_place(f, i);
             let cond_stored = crate::ast::fn_conditionally_moves_param_into_outliving_place(f, i);
             if !cond_returned && !cond_stored {
                 continue;
@@ -2711,7 +2712,7 @@ impl<'a> super::Interpreter<'a> {
             // B-2026-08-28-51's per-path flag to disarm on the path that
             // returned it — the same split codegen's method-argument site
             // makes, with the same two predicates.
-            if crate::ast::fn_always_returns_param(f, i) {
+            if crate::ast::fn_always_returns_param(Some(self.program), f, i) {
                 continue;
             }
             // A GENERIC method's conditionally-returned param used to be the
@@ -2759,10 +2760,11 @@ impl<'a> super::Interpreter<'a> {
             //
             // `fn_always_returns_param` is not in the union because the loop
             // above already skipped those params outright.
-            let caller_still_owns = matches!(
-                args.get(i).map(|a| &a.value.kind),
-                Some(ExprKind::Identifier(_))
-            ) && !crate::ast::fn_conditionally_returns_param_bare(f, i);
+            let caller_still_owns =
+                matches!(
+                    args.get(i).map(|a| &a.value.kind),
+                    Some(ExprKind::Identifier(_))
+                ) && !crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i);
             if caller_still_owns {
                 continue;
             }
@@ -2858,8 +2860,8 @@ impl<'a> super::Interpreter<'a> {
                 Some(ExprKind::Identifier(_))
             ) || args.get(i).is_some_and(|a| {
                 self.caller_fires_fresh_temp_arg(method, Some(type_name), i, &a.value)
-            })) && !crate::ast::fn_always_returns_param(f, i)
-                && !crate::ast::fn_conditionally_returns_param_bare(f, i)
+            })) && !crate::ast::fn_always_returns_param(Some(self.program), f, i)
+                && !crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i)
         })
     }
 
@@ -2895,11 +2897,16 @@ impl<'a> super::Interpreter<'a> {
                 ) {
                     return None;
                 }
-                let caller_fires = matches!(
-                    args.get(i).map(|a| &a.value.kind),
-                    Some(ExprKind::Identifier(_))
-                ) && !crate::ast::fn_always_returns_param(f, i)
-                    && !crate::ast::fn_conditionally_returns_param_bare(f, i);
+                let caller_fires =
+                    matches!(
+                        args.get(i).map(|a| &a.value.kind),
+                        Some(ExprKind::Identifier(_))
+                    ) && !crate::ast::fn_always_returns_param(Some(self.program), f, i)
+                        && !crate::ast::fn_conditionally_returns_param_bare(
+                            Some(self.program),
+                            f,
+                            i,
+                        );
                 if caller_fires
                     || crate::ast::fn_returns_param(f, i)
                     || crate::ast::fn_returns_param_payload(f, i)
@@ -3062,7 +3069,7 @@ impl<'a> super::Interpreter<'a> {
                     )
                     || crate::ast::fn_moves_param_into_outliving_place(f, i)
                     || crate::ast::fn_moves_param_into_outliving_place_via_call(self.program, f, i)
-                    || crate::ast::fn_conditionally_returns_param_bare(f, i);
+                    || crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i);
                 if !escapes {
                     return None;
                 }
@@ -3080,8 +3087,12 @@ impl<'a> super::Interpreter<'a> {
                 // gate admits.
                 Some((
                     n.clone(),
-                    crate::ast::fn_always_returns_param(f, i)
-                        || crate::ast::fn_conditionally_returns_param_bare(f, i),
+                    crate::ast::fn_always_returns_param(Some(self.program), f, i)
+                        || crate::ast::fn_conditionally_returns_param_bare(
+                            Some(self.program),
+                            f,
+                            i,
+                        ),
                 ))
             })
             .collect();
@@ -3991,7 +4002,7 @@ impl<'a> super::Interpreter<'a> {
                     // safe because it fires only when EVERY exit hands the param
                     // back, so the result binding owns it on every path. Codegen
                     // reaches its own stand-down through the same predicate.
-                    || crate::ast::fn_always_returns_param(f, i)
+                    || crate::ast::fn_always_returns_param(Some(self.program), f, i)
                     || crate::ast::fn_returns_param_via_call(self.program, f, i)
                     // B-2026-09-05-35 — program-aware and per-variant: a
                     // payload binding handed to a callee that does NOT take
@@ -4004,7 +4015,7 @@ impl<'a> super::Interpreter<'a> {
                     // B-2026-08-31-46 — a conditional hand-back the callee
                     // frame owns per path; `fn_returns_param`'s union used to
                     // cover the bare form, but not a constructor wrap.
-                    || crate::ast::fn_conditionally_returns_param_bare(f, i)
+                    || crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i)
             })
     }
 

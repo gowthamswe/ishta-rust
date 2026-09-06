@@ -2941,7 +2941,11 @@ impl<'ctx> super::Codegen<'ctx> {
                 // path that RETURNED the value.
                 if func.generic_params.is_none()
                     && !self.is_coroutine_compiled(&func.name)
-                    && crate::ast::fn_conditionally_returns_param_bare(func, i)
+                    && crate::ast::fn_conditionally_returns_param_bare(
+                        self.program_snapshot.as_deref(),
+                        func,
+                        i,
+                    )
                     && !crate::ast::fn_moves_param_into_outliving_place(func, i)
                 {
                     if let TypeKind::Path(path) = &param.ty.kind {

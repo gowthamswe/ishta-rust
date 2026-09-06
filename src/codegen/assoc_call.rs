@@ -3271,8 +3271,15 @@ impl<'ctx> super::Codegen<'ctx> {
                         .as_deref()
                         .and_then(|p| super::declarations::find_function_ast(p, &qualified))
                         .is_some_and(|f| {
-                            crate::ast::fn_always_returns_param(f, i)
-                                || crate::ast::fn_conditionally_returns_param_bare(f, i)
+                            crate::ast::fn_always_returns_param(
+                                self.program_snapshot.as_deref(),
+                                f,
+                                i,
+                            ) || crate::ast::fn_conditionally_returns_param_bare(
+                                self.program_snapshot.as_deref(),
+                                f,
+                                i,
+                            )
                         });
                     let escapes_frame = handed_off
                         || self.call_arg_moves_into_outliving_place(&qualified, i, false);

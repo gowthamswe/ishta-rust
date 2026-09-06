@@ -9869,12 +9869,22 @@ impl<'ctx> super::Codegen<'ctx> {
                             // callee that hands the argument back on every
                             // exit (`let w = keeps(r)`); see
                             // `call_result_param_view_source`.
+                            // B-2026-09-06-12 — at THIS site the call form
+                            // is admitted even when the source is flip-owned
+                            // (`cond_returned_body_params`): the hand-off
+                            // block below moves the per-path body from the
+                            // param to `w`, exactly as it does for `let m =
+                            // r;`. Left on `r`, the compiled backends fired
+                            // `r`'s flip body beside `w`'s own wrapper
+                            // (`dR7 got 7 dR7` / `dR8 dR8 got 99 dR99`) while
+                            // the interpreter was already right.
+                            let call_src = self.call_result_param_view_source(value);
                             let rhs_is_param_view = matches!(&value.kind,
                                 ExprKind::Identifier(src)
                                     if (self.fn_ctx.current_fn_param_names.contains(src.as_str())
                                         && !self.borrow_vars.ref_params.contains_key(src.as_str()))
                                         || self.payload_vars.param_view_locals.contains(src.as_str()))
-                                || self.let_call_result_is_param_view(value);
+                                || call_src.is_some();
                             if rhs_is_param_view {
                                 self.payload_vars
                                     .param_view_locals
@@ -9901,6 +9911,15 @@ impl<'ctx> super::Codegen<'ctx> {
                                             .param_view_callee_owned
                                             .insert(var_name.to_string());
                                     }
+                                }
+                                // B-2026-09-06-12 — the hand-off source is the
+                                // rebound param itself, or the argument a
+                                // call-rebind (`let w = keeps(r)`) forwarded.
+                                let handoff_src: Option<String> = match &value.kind {
+                                    ExprKind::Identifier(src) => Some(src.clone()),
+                                    _ => call_src.clone(),
+                                };
+                                if let Some(src) = handoff_src.as_deref() {
                                     // B-2026-09-05-13 — and the per-path BODY,
                                     // where THIS frame owns it. A parameter the
                                     // prologue registered under
@@ -9925,11 +9944,7 @@ impl<'ctx> super::Codegen<'ctx> {
                                     // the entry copy this binding received.
                                     // Recorded in turn so a further `let n = m;`
                                     // hands it on again.
-                                    if self
-                                        .drop_rc
-                                        .cond_returned_body_params
-                                        .contains(src.as_str())
-                                    {
+                                    if self.drop_rc.cond_returned_body_params.contains(src) {
                                         if let Some(bodies) =
                                             self.emit_struct_user_drop_bodies_only_fn(&struct_name)
                                         {

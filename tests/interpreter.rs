@@ -55052,6 +55052,69 @@ fn main() {
     );
 }
 
+/// B-2026-09-06-12 — the INTERPRETER twin of
+/// `e2e_param_rebound_through_returning_callee_then_returned_runs_one_body`,
+/// same program and the same expected string. The unconditional cells were
+/// agreed-wrong on all four surfaces; the conditional ones were already right
+/// here (the frame's per-path slot for `w` plus the hand-over disarm) and
+/// wrong compiled, so the pin holds both backends to one answer.
+#[test]
+fn test_param_rebound_through_returning_callee_then_returned_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+struct W { r: R, n: i64 }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+fn keeps(r: R) -> R { return r; }
+fn keep(t: (R, i64)) -> (R, i64) { return t; }
+fn keepg[T](x: T) -> T { return x; }
+fn s_ret(r: R) -> R { let w: R = keeps(r); return w; }
+fn s_ret_tail(r: R) -> R { let w: R = keeps(r); w }
+fn s_ret_direct(r: R) -> R { return keeps(r); }
+fn s_ret_rebind(r: R) -> R { let z: R = r; let w: R = keeps(z); return w; }
+fn s_ret_twice(r: R) -> R { let w: R = keeps(r); let v: R = keeps(w); return v; }
+fn s_ret_generic(r: R) -> R { let w: R = keepg(r); return w; }
+fn s_ret_cond(r: R, k: bool) -> R { let w: R = keeps(r); if k { return w; } return mk(99); }
+fn s_ret_wrap(r: R) -> W { let w: R = keeps(r); return W { r: w, n: 1 }; }
+fn s_ret_opt(r: R) -> Option[R] { let w: R = keeps(r); return Option.Some(w); }
+fn t_ret(t: (R, i64)) -> (R, i64) { let w: (R, i64) = keep(t); return w; }
+fn s_ret_after(r: R) -> R { let w: R = keeps(r); println(f"mid {w.id}"); return w; }
+fn s_ret_nested(r: R, k: bool) -> R { if k { let w: R = keeps(r); return w; } return mk(98); }
+fn s_ret_chain(r: R) -> R { let w: R = keeps(r); let v: R = w; return v; }
+fn s_ret_unused_path(r: R, k: bool) -> R { let w: R = keeps(r); if k { return w; } println("np"); return w; }
+struct K { n: i64 }
+impl K {
+    fn m_ret(ref self, r: R) -> R { let w: R = keeps(r); return w; }
+}
+fn main() {
+    let k = K { n: 0 };
+    println("one"); let a = s_ret(mk(1)); println(f"got {a.id}");
+    println("two"); let b = s_ret_tail(mk(2)); println(f"got {b.id}");
+    println("three"); let c = s_ret_direct(mk(3)); println(f"got {c.id}");
+    println("four"); let d = s_ret_rebind(mk(4)); println(f"got {d.id}");
+    println("five"); let e = s_ret_twice(mk(5)); println(f"got {e.id}");
+    println("six"); let f = s_ret_generic(mk(6)); println(f"got {f.id}");
+    println("seven-t"); let g = s_ret_cond(mk(7), true); println(f"got {g.id}");
+    println("eight-f"); let h = s_ret_cond(mk(8), false); println(f"got {h.id}");
+    println("nine"); let i = s_ret_wrap(mk(9)); println(f"got {i.r.id}");
+    println("ten"); let j = s_ret_opt(mk(10)); match j { Option.Some(x) => println(f"got {x.id}"), Option.None => println("none") }
+    println("eleven"); let l = t_ret((mk(11), 1)); println(f"got {l.0.id}");
+    println("twelve"); let m = s_ret_after(mk(12)); println(f"got {m.id}");
+    println("thirteen"); let n = k.m_ret(mk(13)); println(f"got {n.id}");
+    println("fourteen-named"); let src = mk(14); let o = s_ret(src); println(f"got {o.id}");
+    println("fifteen-discard"); let _ = s_ret(mk(15)); println("disc");
+    println("sixteen-stmt"); s_ret(mk(16)); println("stmt");
+    println("seventeen-t"); let p = s_ret_nested(mk(17), true); println(f"got {p.id}");
+    println("eighteen-f"); let q = s_ret_nested(mk(18), false); println(f"got {q.id}");
+    println("nineteen"); let s2 = s_ret_chain(mk(19)); println(f"got {s2.id}");
+    println("twenty-f"); let u = s_ret_unused_path(mk(20), false); println(f"got {u.id}");
+    println("end");
+}"#),
+        "one\ngot 1\ndR1\ntwo\ngot 2\ndR2\nthree\ngot 3\ndR3\nfour\ngot 4\ndR4\nfive\ngot 5\ndR5\nsix\ngot 6\ndR6\nseven-t\ngot 7\ndR7\neight-f\ndR8\ngot 99\ndR99\nnine\ngot 9\ndR9\nten\ngot 10\ndR10\neleven\ngot 11\ndR11\ntwelve\nmid 12\ngot 12\ndR12\nthirteen\ngot 13\ndR13\nfourteen-named\ngot 14\ndR14\nfifteen-discard\ndR15\ndisc\nsixteen-stmt\ndR16\nstmt\nseventeen-t\ngot 17\ndR17\neighteen-f\ndR18\ngot 98\ndR98\nnineteen\ngot 19\ndR19\ntwenty-f\nnp\ngot 20\ndR20\nend\n",
+        "a param rebound through an always-returning callee and returned has one owner"
+    );
+}
+
 /// B-2026-08-29-31 — the INTERPRETER twin of
 /// `e2e_wildcard_let_discard_owns_what_its_arm_hands_out`, landed in the same
 /// commit with the SAME shapes in the same order, so the two backends cannot

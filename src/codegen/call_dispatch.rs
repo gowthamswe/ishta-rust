@@ -3543,8 +3543,12 @@ impl<'ctx> super::Codegen<'ctx> {
             .as_deref()
             .and_then(|p| super::declarations::find_function_ast(p, callee_name))
             .is_some_and(|f| {
-                crate::ast::fn_always_returns_param(f, arg_index)
-                    || crate::ast::fn_conditionally_returns_param_bare(f, arg_index)
+                crate::ast::fn_always_returns_param(self.program_snapshot.as_deref(), f, arg_index)
+                    || crate::ast::fn_conditionally_returns_param_bare(
+                        self.program_snapshot.as_deref(),
+                        f,
+                        arg_index,
+                    )
             })
     }
 
@@ -3585,8 +3589,8 @@ impl<'ctx> super::Codegen<'ctx> {
             .as_deref()
             .and_then(|p| super::declarations::find_function_ast(p, callee_name))
             .is_some_and(|f| {
-                crate::ast::fn_always_returns_param(f, arg_index)
-                    || crate::ast::fn_conditionally_returns_param_bare(f, arg_index)
+                crate::ast::fn_always_returns_param(self.program_snapshot.as_deref(), f, arg_index)
+                    || crate::ast::fn_conditionally_returns_param_bare(self.program_snapshot.as_deref(), f, arg_index)
                     // B-2026-08-29-49 — the value's new HOME is the other frame
                     // here. `sink.push(r)` leaves it owned by a container the
                     // caller already holds, so the container's drain runs the

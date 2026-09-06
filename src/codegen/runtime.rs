@@ -6871,7 +6871,11 @@ impl<'ctx> super::Codegen<'ctx> {
             .find_map(|(i, a)| match &a.value.kind {
                 ExprKind::Identifier(src)
                     if self.ident_is_whole_param_alias(src)
-                        && crate::ast::fn_always_returns_param(f, i) =>
+                        && crate::ast::fn_always_returns_param(
+                            self.program_snapshot.as_deref(),
+                            f,
+                            i,
+                        ) =>
                 {
                     Some(src.clone())
                 }

@@ -1812,6 +1812,39 @@ pub fn fn_whole_param_aliases(
     program: &crate::Program,
     f: &Function,
 ) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for p in &f.params {
+        if matches!(
+            p.ty.kind,
+            crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+        ) {
+            continue;
+        }
+        if let Some(name) = p.name() {
+            out.extend(param_whole_aliases(Some(program), f, name));
+        }
+    }
+    out
+}
+
+/// B-2026-09-06-12 — [`param_rebind_aliases`] plus, when a `program` is given,
+/// the CALL spelling of the same rebind: `let x = g(.., a, ..)` where `a` is
+/// already an alias and `g` hands that parameter back on every exit. This is
+/// the per-parameter form the two alias-aware predicates consume, so a caller
+/// that stands down for `fn f(r: R) -> R { let w = keeps(r); return w; }`
+/// and the callee-side flip that registers for its conditional sibling read
+/// one alias set.
+///
+/// ONE LEVEL, the direction this family runs on: `g` is judged by its OWN plain
+/// aliases (`program = None` when asking it), so a chain of call-rebinds across
+/// functions is not followed and mutual recursion cannot loop. `None` — the
+/// answer a consumer with no program at hand gives — is exactly the pre-existing
+/// plain-rebind set.
+pub fn param_whole_aliases(
+    program: Option<&crate::Program>,
+    f: &Function,
+    param_name: &str,
+) -> Vec<String> {
     fn resolve<'p>(program: &'p crate::Program, key: &str) -> Option<&'p Function> {
         match key.split_once('.') {
             None => program.items.iter().find_map(|item| match item {
@@ -1836,36 +1869,52 @@ pub fn fn_whole_param_aliases(
         }
     }
     let w = rebind_walk(f);
-    let mut out = std::collections::HashSet::new();
-    for p in &f.params {
-        if matches!(
-            p.ty.kind,
-            crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
-        ) {
-            continue;
-        }
-        if let Some(name) = p.name() {
-            out.extend(close_rebind_aliases(&w, name));
-        }
-    }
+    let mut aliases = close_rebind_aliases(&w, param_name);
+    let Some(program) = program else {
+        return aliases;
+    };
     loop {
-        let before = out.len();
+        let before = aliases.len();
         for (x, key, idents) in &w.call_rebinds {
-            if out.contains(x) || w.bound.get(x.as_str()) != Some(&1) {
+            if aliases.iter().any(|a| a == x) || w.bound.get(x.as_str()) != Some(&1) {
                 continue;
             }
             let Some(g) = resolve(program, key) else {
                 continue;
             };
-            if idents
-                .iter()
-                .any(|(i, n)| out.contains(n) && fn_always_returns_param(g, *i))
-            {
-                out.insert(x.clone());
+            if idents.iter().any(|(i, n)| {
+                aliases.iter().any(|a| a == n) && fn_always_returns_param(None, g, *i)
+            }) {
+                aliases.push(x.clone());
             }
         }
-        if out.len() == before {
-            return out;
+        if aliases.len() == before {
+            // A plain rebind of a call-alias (`let v = w;`) joins too.
+            let closed = close_many(&w, &aliases);
+            if closed.len() == aliases.len() {
+                return aliases;
+            }
+            aliases = closed;
+        }
+    }
+}
+
+/// Close `seed` (already alias-closed individually) over the plain rebinds once
+/// more, so a `let v = w;` after a call-rebind of `w` is picked up.
+fn close_many(w: &RebindWalk, seed: &[String]) -> Vec<String> {
+    let mut aliases: Vec<String> = seed.to_vec();
+    loop {
+        let before = aliases.len();
+        for (x, y) in &w.rebinds {
+            if aliases.iter().any(|a| a == y)
+                && !aliases.iter().any(|a| a == x)
+                && w.bound.get(x.as_str()) == Some(&1)
+            {
+                aliases.push(x.clone());
+            }
+        }
+        if aliases.len() == before {
+            return aliases;
         }
     }
 }
@@ -1975,7 +2024,11 @@ pub fn param_rebind_aliases(f: &Function, param_name: &str) -> Vec<String> {
 /// deep-copies it (`10,277` vs `8,229` bytes against an inline-construction
 /// oracle, with and without a `Drop` impl alike), so the caller's slot holds a
 /// distinct buffer that its downgraded field cleanup still frees.
-pub fn fn_always_returns_param(f: &Function, arg_index: usize) -> bool {
+pub fn fn_always_returns_param(
+    program: Option<&crate::Program>,
+    f: &Function,
+    arg_index: usize,
+) -> bool {
     let Some(param) = f.params.get(arg_index) else {
         return false;
     };
@@ -1985,7 +2038,9 @@ pub fn fn_always_returns_param(f: &Function, arg_index: usize) -> bool {
     // B-2026-09-05-13 — the param under every name it is rebound to whole
     // (`let m = r;`), so `return Option.Some(m)` reads as handing `r` back.
     // See `param_rebind_aliases` for what qualifies and why declining is safe.
-    let aliases = param_rebind_aliases(f, name);
+    // B-2026-09-06-12 — and to a rebind THROUGH an always-returning callee
+    // (`let w = keeps(r); return w`), when the caller can supply the program.
+    let aliases = param_whole_aliases(program, f, name);
     let name: &[String] = &aliases;
 
     /// The same test [`fn_returns_param`] applies at a return site: the bare
@@ -2281,7 +2336,11 @@ pub fn option_result_ctor_payload(e: &Expr) -> Option<&Expr> {
 /// The conservative direction is unchanged from the rest of this family — a
 /// shape this predicate declines keeps today's missed body, which is a
 /// leak-of-side-effect, never a double drop and never a memory fault.
-pub fn fn_conditionally_returns_param_bare(f: &Function, arg_index: usize) -> bool {
+pub fn fn_conditionally_returns_param_bare(
+    program: Option<&crate::Program>,
+    f: &Function,
+    arg_index: usize,
+) -> bool {
     let Some(param) = f.params.get(arg_index) else {
         return false;
     };
@@ -2300,7 +2359,9 @@ pub fn fn_conditionally_returns_param_bare(f: &Function, arg_index: usize) -> bo
     // The per-path flip this predicate admits follows the same rebind at the
     // callee side, so the caller's stand-down and the callee's drop keep
     // naming one binding per path — see `param_rebind_aliases`.
-    let aliases = param_rebind_aliases(f, param_name);
+    // B-2026-09-06-12 — and through an always-returning callee; see
+    // `param_whole_aliases`.
+    let aliases = param_whole_aliases(program, f, param_name);
     let name: &[String] = &aliases;
 
     /// May `e` mention `name`? Conservative in the DECLINING direction: any
@@ -3938,8 +3999,8 @@ fn callee_takes_param_over(program: &crate::Program, gf: &Function, j: usize) ->
 
 fn callee_takes_param_over_inner(program: &crate::Program, gf: &Function, j: usize) -> bool {
     fn_returns_param(gf, j)
-        || fn_always_returns_param(gf, j)
-        || fn_conditionally_returns_param_bare(gf, j)
+        || fn_always_returns_param(Some(program), gf, j)
+        || fn_conditionally_returns_param_bare(Some(program), gf, j)
         || fn_returns_param_payload_of(program, gf, j, None)
         || fn_returns_param_via_call(program, gf, j)
         || fn_moves_param_into_outliving_place(gf, j)
