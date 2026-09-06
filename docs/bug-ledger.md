@@ -92,13 +92,13 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 378 |
+| miscompile | 381 |
 | run-vs-build | 345 |
 | leak | 273 |
 | missing-feature | 194 |
 | double-free | 189 |
 | codegen-gap | 166 |
-| diagnostics | 123 |
+| diagnostics | 124 |
 | false-positive | 106 |
 | soundness | 95 |
 | perf | 94 |
@@ -110,9 +110,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1495 |
-| interp | 367 |
-| typecheck | 293 |
+| codegen | 1498 |
+| interp | 370 |
+| typecheck | 294 |
 | ownership | 74 |
 | other | 73 |
 | cli | 71 |
@@ -132,7 +132,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 |---|---|---|---|---|---|
 | B-2026-08-28-76 | 2026-08-28 | autopar | high | AUTO-PAR RETURNS 1.08x FOR 15.7 CORES on the M5 (kata:288) and 3.09x (kata:282), against 3.06x/3.87x on 4 HOMOGENEOUS container cores -- the parallel lane burns 3.1-5.1x the sequential lane's USER CPU where the container burned 1.00x, and NO KARAC_PAR_WORKERS setting recovers it | kata:288-README |
 | B-2026-08-28-77 | 2026-08-28 | codegen | medium | kata:895 IS THE ONLY CORPUS ROW THAT GOT SLOWER ON THE FASTER HOST -- 26.50ms on 4 x86 container cores -> 29.63ms on the M5, while rust_ovf went 34.71 -> 16.49 (2.10x faster), go 1.68x and c 1.75x; kara falls from 1.31x AHEAD of checked Rust to 1.80x behind. Prime suspect: the map hash-tag probe is DISABLED on aarch64 for primitive keys | kata:895-README |
-| B-2026-08-31-43 | 2026-08-31 | interp+codegen | medium | A `self`-ROOTED PROJECTION SCRUTINEE IS UNMASKED AT EVERY DEPTH, SO A MATERIALIZING ARM'S PAYLOAD `Drop` BODY RUNS TWICE -- `match self.e { E.A(r) => { let m = r; return m.id; } .. }` inside a `mut ref self` method prints `dR1` twice on all three backends, and the two-hop `self.s.e` doubles identically; the same code with the receiver bound to a LOCAL first runs one body | — |
 | B-2026-08-31-50 | 2026-08-31 | interp+codegen | medium | AN ENUM-CONSTRUCTOR MIXED WRAP LOSES ITS SLOT MASK ACROSS A WHOLE-VALUE REBIND, AND CODEGEN CANNOT INHERIT IT BECAUSE IT STORES NOTHING PER VARIABLE -- `let w = W2.Two(r, mk(2)); let w2 = w;` prints `dR1 dR2 dR1` where `dR2 dR1` is due, on all three backends; the STRUCT and TUPLE spellings of the same rebind were fixed by B-2026-08-29-44 and this one could not be, because `enum_ctor_param_view_payload_slots` derives the masked slots from the ctor EXPRESSION at the `let` and keeps no per-var record for a rebind to copy | — |
 | B-2026-09-01-5 | 2026-09-01 | codegen | low | A DISCARDED BRANCH LITERAL WHOSE FIELD IS A PROJECTION OFF A NAMED LOCAL STILL STRANDS 38 B -- `P { a: t.a, b: 1 }` is the half of B-2026-08-29-32's guard that B-2026-08-31-44 could NOT admit, because the aggregate-literal move takeover does not extend to named locals and admitting it double-frees in a loop | — |
 | B-2026-09-01-17 | 2026-09-01 | interp+codegen | low | THE PROJECTED SPELLING OF B-2026-08-31-35 STILL RUNS THE LOCAL'S `Drop` BODY TWICE -- `let _ = if c { W { r: t.r, b: 1 } } else { .. };` over a local `W` doubles on all three backends because the aggregate-literal source walker resolves a bare NAME and not a field projection, so the disarm e49a85f wired up never names `t` | — |
@@ -156,6 +155,10 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-3 | 2026-09-06 | codegen | low | A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Option[(R, i64)]` with a heap-carrying element (5+ words, boxed) leaks the whole box + interior; `try_track_discarded_boxed_option` frees a boxed STRUCT payload but declines a boxed TUPLE one. Split from B-2026-09-05-14 (the lost-BODY twin), which this leak is independent of -- identical with the body fix absent or present | — |
 | B-2026-09-06-4 | 2026-09-06 | codegen | high | THE SELF-HOSTED RESOLVER ORACLE DOUBLE-FREES ON LINUX AND THE EMITTER ORACLE SEGFAULTS, AT THE IMPORT COMMIT AND ON CURRENT `main` ALIKE -- `tests/selfhost_resolver.rs`'s two tests abort `free(): double free detected in tcache 2` (SIGABRT, four per run) and `tests/selfhost_codegen.rs`'s `selfhost_codegen_matches_seed_run` dies SIGSEGV, identically at 51368a1 (the import that claims them green), e028255 and 822334c; the other six self-host oracles pass; CI's `codegen-e2e` job excludes both, so nothing has ever run them on glibc | — |
 | B-2026-09-06-13 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM HANDED TO A CALLEE THAT RETURNS IT ON SOME PATHS, WITH THE RESULT BOUND TO A LOCAL, RUNS THE BODY TWICE ON BOTH PATHS -- `fn s_keep_cond(r: R, k: bool) { let w: R = keepc(r, k); println(f"skc {w.id}") }` over `fn keepc(r: R, k: bool) -> R { if k { return r; } return mk(99); }` prints `skc 7 dR7 dR7` for `k = true` and `dR8 skc 99 dR99 dR8` for `k = false` on all four surfaces | — |
+| B-2026-09-06-14 | 2026-09-06 | typecheck | low | W0299 `borrow_projection_copy` IS SILENT FOR A `match` SCRUTINEE THAT PROJECTS OFF A BORROW -- `match h.e { E.A(r) => { let m = r; .. } }` through `mut ref h`, `mut ref self` or `ref self` copies the payload out exactly as `let e = h.e` does (two full `Drop` bodies, valgrind-clean with a heap-carrying payload), and where the `let` spelling carries the warning `karac check --output=json` returns no diagnostic for any of the three | — |
+| B-2026-09-06-15 | 2026-09-06 | interp+codegen | medium | A BARE `match self { H1 { e } => .. }` ON AN OWNED RECEIVER RUNS THE PAYLOAD'S `Drop` BODY TWICE FOR A NAMED-LOCAL RECEIVER AND LOSES THE ENUM SHELL'S BODY FOR A FRESH TEMP -- `dR31 dE dR31` / `dR32` on all four surfaces, the whole-`self` transfer path that B-2026-08-31-43's projection fix kept out on purpose | — |
+| B-2026-09-06-16 | 2026-09-06 | interp+codegen | medium | `let e = self.e` INSIDE AN OWNED RECEIVER RUNS BOTH THE FIELD'S AND ITS PAYLOAD'S `Drop` BODIES TWICE FOR A NAMED-LOCAL RECEIVER -- `dR51 dE dE dR51` on all four surfaces while the fresh-temp receiver is correct; a plain `let` binding a field out of `self` stays on the transfer path B-2026-08-31-43's fix did not touch | — |
+| B-2026-09-06-17 | 2026-09-06 | interp+codegen | medium | AN OWNED RECEIVER'S PAYLOAD HANDED OUT BY `return r` FROM `match self.e` RUNS ITS `Drop` BODY IN THE CALLER'S RETAINED WALK AS WELL -- `dE dR7 got7 dR7` on all four surfaces, the body before the read; `callee_returned_param_parts` indexes explicit parameters and `self` is not one at the AST level, so no caller-side mask is ever computed for a receiver | — |
 
 ### Relocated
 
@@ -2078,6 +2081,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-08-31-39 | codegen | medium | AN `Option[T]` INSIDE A GENERIC FN REACHES THE DISPLAY GATE WITH `T` UNSUBSTITUTED, so an aggregate instantiation is declined or ICEs where the inter… | fa85491 |
 | B-2026-08-31-41 | ownership | high | A `Slice[T]` THAT BORROWS A LOCAL `Vec` ESCAPES INTO A RETURN VALUE WITH NO DIAGNOSTIC -- `karac check` says "All checks passed" on `fn f() -> Slice[… | c5b5f6a |
 | B-2026-08-31-42 | codegen | medium | AN AGGREGATE CONTAINING A `bf16` FIELD ABORTS THE WASM BUILD WITH `Cannot select: fp_to_bf16` WHEN IT CROSSES A NON-INLINED BOUNDARY BY VALUE -- a pa… | b1be5b9 |
+| B-2026-08-31-43 | interp+codegen | medium | A `self`-ROOTED PROJECTION SCRUTINEE IS UNMASKED AT EVERY DEPTH, SO A MATERIALIZING ARM'S PAYLOAD `Drop` BODY RUNS TWICE -- `match self.e { E.A(r) =>… | 4f78c21 |
 | B-2026-08-31-44 | codegen | low | B-2026-08-29-32'S FRESHNESS GUARD IS NOW OVER-CONSERVATIVE AND LEAKS 38 B PER EVALUATION IN TWO SHAPES THE UPSTREAM ALIASING FIX HAS SINCE MADE SAFE… | 1b5c026 |
 | B-2026-08-31-45 | ownership | low | A SEMICOLON-LESS `return e` IN TAIL POSITION IS REPORTED AS AN UNSUPPORTED BORROW-RETURN FORM -- `fn f(x: ref S) -> ref S { return x }` is rejected w… | c5b5f6a |
 | B-2026-08-31-46 | interp+codegen | medium | A FRESH-TEMP ARG ESCAPING INSIDE A RETURNED `Option.Some(r)` RUNS ITS `Drop` BODY TWICE ON THE COMPILED BACKENDS -- `let _ = k.f(mk(4), true);` over… | 15ad680 |
