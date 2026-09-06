@@ -56695,6 +56695,39 @@ end
     );
 }
 
+/// B-2026-09-06-47 — the let-destructure discard collector
+/// (`run_wildcard_destructure_leaf_user_drops`) re-ran the `Drop` body of a
+/// field already MOVED OUT of the source (`let x = s.a; let S3 { b, .. } =
+/// s;`): the value the pattern consumes still carries a copy of `a`, so
+/// its body ran at the destructure AND at `x`'s death (`dR2 mid dR3 dR2`).
+/// A field in `moved_out_struct_field_bodies` is now skipped exactly as a
+/// param-view field is. Interpreter-only pin: the compiled backends lose
+/// `b`'s body on this exact shape (B-2026-09-06-46, open), so there is no
+/// agreed four-surface string yet.
+///
+/// `one` the rest spelling, `two` the explicit `a: _` spelling, `three`
+/// the rest spelling with the leaf unread.
+#[test]
+fn test_let_destructure_discard_skips_a_moved_out_field() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct S3 { a: R, b: R }
+fn p_moved_rest(r: R) -> i64 { let s: S3 = S3 { a: mk(2), b: mk(3) }; let x: R = s.a; let S3 { b, .. } = s; println("mid"); return b.id + x.id; }
+fn p_moved_wild(r: R) -> i64 { let s: S3 = S3 { a: mk(5), b: mk(6) }; let x: R = s.a; let S3 { b, a: _ } = s; println("mid"); return b.id + x.id; }
+fn p_moved_unread(r: R) -> i64 { let s: S3 = S3 { a: mk(8), b: mk(9) }; let x: R = s.a; let S3 { b, .. } = s; println("mid"); return 1; }
+fn main() {
+    { let v: i64 = p_moved_rest(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = p_moved_wild(mk(4)); println(f"v={v}"); println("two") }
+    { let v: i64 = p_moved_unread(mk(7)); println(f"v={v}"); println("three") }
+    println("end")
+}
+"#),
+        "mid\ndR3\ndR2\ndR1\nv=5\none\nmid\ndR6\ndR5\ndR4\nv=11\ntwo\ndR8\ndR9\nmid\ndR7\nv=1\nthree\nend\n"
+    );
+}
+
 /// B-2026-09-06-41 — the backend that panicked. The fresh-temp argument
 /// walk's two struct branches now filter escaping parts by a leaf that
 /// carries a user `Drop`, as the tuple branch always did; a scalar read is

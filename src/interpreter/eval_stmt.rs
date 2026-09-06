@@ -3545,10 +3545,17 @@ impl<'a> super::Interpreter<'a> {
                     ExprKind::Identifier(n) => Some(n.clone()),
                     _ => None,
                 };
+                // B-2026-09-06-47 — and a field MOVED OUT of the source
+                // earlier (`let x = s.a; let S3 { b, .. } = s;`,
+                // `moved_out_struct_field_bodies`): its body is `x`'s now,
+                // and the value the pattern consumes still carries a copy,
+                // so discarding it here ran `a`'s body at the destructure
+                // and again at `x`'s death.
                 let is_view = |this: &Self, f: &str| {
                     src_name.as_ref().is_some_and(|n| {
-                        this.param_view_struct_fields
-                            .contains(&(n.clone(), f.to_string()))
+                        let key = (n.clone(), f.to_string());
+                        this.param_view_struct_fields.contains(&key)
+                            || this.moved_out_struct_field_bodies.contains(&key)
                     })
                 };
                 for fp in fields {
