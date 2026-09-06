@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 370 |
 | run-vs-build | 345 |
-| leak | 271 |
+| leak | 272 |
 | missing-feature | 194 |
 | double-free | 188 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1484 |
+| codegen | 1485 |
 | interp | 362 |
 | typecheck | 293 |
 | ownership | 74 |
@@ -150,7 +150,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-04-12 | 2026-09-04 | codegen | low | A BOXED TWO-`String` TUPLE PAYLOAD LOSES ITS INTERIOR ON BOTH THE GENERIC AND NON-GENERIC PATHS -- 54 B in 6 blocks over three calls, IDENTICAL for `generic[T](x: Option[T])` and `plainT(x: Option[(String, String)])`, so this is the boxed-payload interior rather than anything monomorph-specific; the `Array[String, 2]` payload through the same generic fn is clean, and that asymmetry is the thing to explain | — |
 | B-2026-09-04-32 | 2026-09-04 | codegen+other | low | EVERY COMPILED BACKEND RELEASES AN AGGREGATE-HELD `shared` FIELD AT LEXICAL SCOPE EXIT while design.md pins RC decrements at the binding's LIVE-RANGE END -- one holder splits, `struct Mx { r: R, s: S }` giving `v2 dR1 post dS2`, so the plain field obeys the spec and the shared one does not; a BARE shared binding is unaffected | — |
 | B-2026-09-04-36 | 2026-09-04 | interp+codegen | low | A RECEIVER TEMP NESTED IN A LARGER EXPRESSION DRAINS AT THE STATEMENT'S `;` ON THE COMPILED BACKENDS AND AT THE CALL RETURN IN THE INTERPRETER -- `println(f"  {mk(1).peek()}")` prints `dR1/t1` BEFORE the value under `--interp` and AFTER it on jit/aot. Statement position agrees, which is why it hides: `let v = mk(1).peek()` is byte-identical on all four. This is B-2026-08-29-55's drain-point question one row over -- that row moved the three ARGUMENT registrars to a per-call window and deliberately left the fresh-temp RECEIVER (`__urecv_drop_tmp`) on the statement drain, on the grounds that a receiver has its own position-table row with a different end | — |
-| B-2026-09-05-14 | 2026-09-05 | codegen | medium | A DISCARDED `Option`/`Result` TEMPORARY WHOSE PAYLOAD IS AN AGGREGATE CARRYING A `Drop` TYPE (`let _ = f();` where `f -> Option[(R, i64)]`) LOSES THE NESTED `Drop` BODY ON THE COMPILED BACKENDS -- the discard-drop walker descends one payload level but not into a tuple/struct nested inside the ctor; `--interp` runs it, so it is a run-vs-build divergence | — |
 | B-2026-09-05-15 | 2026-09-05 | codegen | medium | A NESTED GENERIC-INSTANTIATION FIELD WITH ITS OWN `impl[T] Drop` LOSES THAT FIELD'S BODY UNDER AN OWN-`Drop` PARENT -- `oOwn(Gouter[R] { inner: Go[R] { r: mk(1), z: 51 }, z: 52 })` prints `in dOut52 dR1` on all three compiled backends against `--interp`'s `in dOut52 dGo51 dR1`. The grandchild `dR1` still fires, so the walk reaches THROUGH the nested field and fails only to run the body AT it; the fully non-generic nesting is correct on all four surfaces. Sibling of B-2026-09-05-16, which is the LLJIT double free the same shape shows under a non-generic parent | — |
 | B-2026-09-05-17 | 2026-09-05 | interp+codegen | medium | A FORWARDING CALLEE DEFEATS THE ESCAPING-FIELD MASK, so a place struct argument whose field is handed back THROUGH ANOTHER CALL still runs that field's `Drop` body TWICE -- `fn fwd(g: Cd) -> R { return cEsc(g); }` over `fn cEsc(h: Cd) -> R { let Cd { r, z } = h; return r; }`, called as `let g = Cd { r: mk(61), z: 9 }; let out = fwd(g);`, prints `in dR61 got61 dR61` on `--interp`, `karac run`, `karac build` and `KARAC_AUTO_PAR=0` alike, against one `R` ever constructed; calling `cEsc(g)` DIRECTLY prints `in got61 dR61`, once, on all four | — |
 | B-2026-09-05-22 | 2026-09-05 | runtime | medium | THE AUTO-PAR WORKER POOL AT N=2 IS SLOWER THAN AT N=1 AND BURNS 3.6x THE CPU -- kata:282 under HOMOGENEOUS all-E placement: N=1 4329.73ms/4272ms user, N=2 7710.74ms/15191ms user, sd 38% of mean; N=4 recovers, so the N>=2 general dispatch path has a degenerate TWO-WORKER case | none |
@@ -162,6 +161,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-37 | 2026-09-05 | codegen | low | A WHOLE REBIND OF A BY-VALUE `Drop` PARAM NESTED IN A BRANCH LEAKS THE PARAM'S ENTRY COPY ON THE NOT-TAKEN PATH -- `fn g(r: R, keep: bool) -> i64 { if keep { let m = r; return 1; } return 0; }` over `struct R { id: i64, name: String }` with `impl Drop for R`, called with `keep = false`, leaks the `String` buffer (3 B per call at `KARAC_OPT_LEVEL=0`; masked at -O2 on the simplest shapes, still 3 B at -O2 once a `println` sits between the branch and the return). Bodies are correct on every surface; the `let`'s own-`Drop` source retraction (`suppress_struct_cleanup_for_tail_identifier`, B-2026-08-09-16's site in `compile_let`) is an ALL-PATHS static removal of `r`'s memory action, reached from inside the branch | — |
 | B-2026-09-06-1 | 2026-09-06 | interp | medium | THE INTERPRETER LOSES A DISCARDED GENERIC CALL'S MOVED-IN ARGUMENT `Drop` BODY ENTIRELY -- `let g = mk(3); passG(g);` as a BARE STATEMENT over `fn passG[T](x: T) -> T` prints `end` where `karac run`, `karac build` and `KARAC_AUTO_PAR=0` all print `dR3 end`, and `let _ = h.keep(g)` over a GENERIC METHOD loses it under the `let _ =` spelling too; both CONCRETE twins are correct in the interpreter, so it is the GENERIC path -- and the interpreter is the WRONG column here, a LOST body rather than the extra one this family usually produces | — |
 | B-2026-09-06-2 | 2026-09-06 | codegen | medium | A NAMED-LOCAL ARGUMENT TO A GENERIC *METHOD* THAT RETURNS ITS WHOLE BY-VALUE PARAM LEAKS THE CALLEE'S ENTRY COPY -- `let _ = h.keep(g)` over `impl H { fn keep[T](ref self, x: T) -> T }` orphans one object per call, 24,000 B in 500 blocks over a 500-iteration loop at the DEFAULT optimization level, while the CONCRETE method twin is 15 allocs / 15 frees clean; the FREE-FUNCTION twin was fixed by B-2026-09-05-31, which scoped itself out of the method path because that loop's argument index is receiver-inclusive and the discard registrar resolves `Item::Function` names only | — |
+| B-2026-09-06-3 | 2026-09-06 | codegen | low | A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Option[(R, i64)]` with a heap-carrying element (5+ words, boxed) leaks the whole box + interior; `try_track_discarded_boxed_option` frees a boxed STRUCT payload but declines a boxed TUPLE one. Split from B-2026-09-05-14 (the lost-BODY twin), which this leak is independent of -- identical with the body fix absent or present | — |
 
 ### Relocated
 
@@ -2256,6 +2256,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-11 | interp+codegen | medium | A NESTED `let o = Option.Some(r)` OVER A BY-VALUE PARAM RUNS `r`'s `Drop` BODY TWICE ON THE TAKEN PATH -- on every compiled surface for BOTH the free… | 2002fda |
 | B-2026-09-05-12 | other | medium | THE NIGHTLY `Fuzz` WORKFLOW'S THREE libFuzzer LEGS HAVE NEVER RUN -- `fuzz/` is named by neither `workspace.members` nor `workspace.exclude`, so carg… | 20cc27f |
 | B-2026-09-05-13 | interp+codegen | medium | A REBOUND BY-VALUE PARAM RETURNED WRAPPED IN AN `Option`/`Result` CTOR (`let m = r; return Option.Some(m)`) RUNS THE `Drop` BODY TWICE -- the passthr… | 7ebe3bf |
+| B-2026-09-05-14 | codegen | medium | A DISCARDED `Option`/`Result` TEMPORARY WHOSE PAYLOAD IS AN AGGREGATE CARRYING A `Drop` TYPE (`let _ = f();` where `f -> Option[(R, i64)]`) LOSES THE… | 1a2ffa3 |
 | B-2026-09-05-16 | codegen | high | A NESTED GENERIC-INSTANTIATION FIELD UNDER A NON-GENERIC OWN-`Drop` PARENT DOUBLE-FREES UNDER LLJIT ONLY -- `nOwn(Nouter { inner: Go[R] { r: mk(3), z… | 0970dcb |
 | B-2026-09-05-18 | codegen | high | A GENERIC CALLEE'S TUPLE ELEMENT HANDED BACK TO A PLACE ARGUMENT DOUBLE-FREES UNDER `karac run` and runs two `Drop` bodies under `karac build`, again… | 2e0b149 |
 | B-2026-09-05-19 | codegen | high | A PARAM-VIEW ASSIGNMENT WHOSE TARGET STRUCT ONLY *CARRIES* A `Drop` FIELD DOUBLE-FREES THE MOVED-IN HEAP -- `h2 = h` over `struct Holder { r: Res }`… | d7e3b44c |
