@@ -2135,6 +2135,15 @@ impl<'a> super::Interpreter<'a> {
                     closure_env.is_some(),
                 );
                 self.owned_param_names_stack.push(seed_params);
+                // B-2026-09-06-9 — the whole-alias sibling; see the field.
+                let whole_aliases = if closure_env.is_some() {
+                    std::collections::HashSet::new()
+                } else {
+                    self.callee_fn_for_param_ownership(&fn_name)
+                        .map(|f| crate::ast::fn_whole_param_aliases(self.program, f))
+                        .unwrap_or_default()
+                };
+                self.whole_param_alias_stack.push(whole_aliases);
                 self.owned_param_frame_is_method.push(false);
                 // B-2026-08-09-10 — `moved_out_user_drop_bindings` is keyed by
                 // NAME with no frame scoping, so a callee that moves a payload
@@ -2230,6 +2239,7 @@ impl<'a> super::Interpreter<'a> {
                 // program has found it yet.
                 self.cond_store_param_names = saved_cond_store_params;
                 self.owned_param_names_stack.pop();
+                self.whole_param_alias_stack.pop();
                 self.owned_param_frame_is_method.pop();
                 if is_stdlib_wrapper {
                     self.stdlib_wrapper_call_spans.pop();
@@ -3085,7 +3095,11 @@ impl<'a> super::Interpreter<'a> {
 
     /// The raw AST of impl method `type_name.method`, receiver excluded from
     /// `params`. Mirrors the lookup `method_owned_param_names` runs.
-    fn impl_method_ast(&self, type_name: &str, method: &str) -> Option<&crate::ast::Function> {
+    pub(crate) fn impl_method_ast(
+        &self,
+        type_name: &str,
+        method: &str,
+    ) -> Option<&crate::ast::Function> {
         self.program.items.iter().find_map(|item| {
             let crate::ast::Item::ImplBlock(imp) = item else {
                 return None;

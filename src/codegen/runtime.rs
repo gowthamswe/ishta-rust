@@ -6827,6 +6827,101 @@ impl<'ctx> super::Codegen<'ctx> {
                 || self.payload_vars.param_view_locals.contains(src.as_str()))
     }
 
+    /// B-2026-09-06-9 — is `e` a call that hands a param VIEW to a callee
+    /// returning that very parameter on EVERY exit? Returns the view's name.
+    ///
+    /// `let w: R = keeps(r)` over `fn keeps(r: R) -> R { return r }` is a
+    /// whole rebind of `r` with a call in the way: the value that lands in `w`
+    /// is the one the caller handed in, and under caller-retains the CALLER
+    /// runs its `Drop` body on its own temp / named binding after the call.
+    /// The let-site treated the result as a fresh value and armed a full
+    /// wrapper for `w`, so the body ran at `w`'s death and again in the
+    /// caller — `skd 3 dR3 dR3` on all four surfaces, the struct, tuple and
+    /// rebind spellings alike. The bare rebind (`let z = r`) and the
+    /// destructured-leaf spelling (`let (inner, y) = h.pe; let z = inner; let
+    /// w = keep(z)`) were already one body, which is what isolated the
+    /// returning CALL as the unhandled route.
+    ///
+    /// Callee resolved through [`super::declarations::find_function_ast`], so
+    /// a free function and a `Type.assoc` key answer by one route; an INSTANCE
+    /// method is declined (its receiver shifts the indices and the method
+    /// registrar owns that leg). `fn_always_returns_param` and not the
+    /// conservative union: a callee that hands the param back on SOME exits
+    /// returns a fresh value on the others, and a view mark would lose that
+    /// value's body. The interpreter's twin is
+    /// `let_call_result_param_view_source`; the two let-sites move together.
+    pub(super) fn call_result_param_view_source(&self, e: &Expr) -> Option<String> {
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return None;
+        };
+        let key = match &callee.kind {
+            ExprKind::Identifier(n) => n.clone(),
+            ExprKind::Path { segments, .. } => segments.join("."),
+            _ => return None,
+        };
+        let f = self
+            .program_snapshot
+            .as_deref()
+            .and_then(|p| super::declarations::find_function_ast(p, &key))?;
+        if f.self_param.is_some() {
+            return None;
+        }
+        args.iter()
+            .enumerate()
+            .find_map(|(i, a)| match &a.value.kind {
+                ExprKind::Identifier(src)
+                    if self.ident_is_whole_param_alias(src)
+                        && crate::ast::fn_always_returns_param(f, i) =>
+                {
+                    Some(src.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Is `src` one of the current function's by-value parameters, or a whole
+    /// rebind of one (`let z = r;`) — the set `fn_whole_param_aliases` names?
+    ///
+    /// Deliberately NARROWER than [`Self::expr_is_param_view`]: a destructured
+    /// leaf (`let (inner, y) = h.pe`) is a view too, but handing it to a
+    /// returning callee is what the part channel
+    /// (`fn_escaping_param_part_paths`) reports to the CALLER, which then
+    /// stands its walk down and leaves the result binding as the one owner.
+    /// Marking that result a view as well ran zero bodies (measured on `let
+    /// z = inner; let w = keep(z)`: `vk 6` with no `dR6` on all four
+    /// surfaces). A whole parameter has no such channel — the caller keeps
+    /// firing — so there the result must be the view.
+    ///
+    /// Resolved from the current function's AST by name; a frame whose AST is
+    /// not found (a closure body) answers only for the bare parameter, the
+    /// direction that keeps today's double rather than losing a body.
+    pub(super) fn ident_is_whole_param_alias(&self, src: &str) -> bool {
+        if self.borrow_vars.ref_params.contains_key(src) {
+            return false;
+        }
+        if self.fn_ctx.current_fn_param_names.contains(src) {
+            return true;
+        }
+        if !self.payload_vars.param_view_locals.contains(src) {
+            return false;
+        }
+        let Some(p) = self.program_snapshot.as_deref() else {
+            return false;
+        };
+        super::declarations::find_function_ast(p, &self.fn_ctx.current_fn_name)
+            .is_some_and(|f| crate::ast::fn_whole_param_aliases(p, f).contains(src))
+    }
+
+    /// The let-site question [`Self::call_result_param_view_source`] answers,
+    /// as the gate the four `let` registrations consult: a view, UNLESS this
+    /// frame owns the source's body per path (`cond_returned_body_params`) —
+    /// there the caller has stood down and the call site's hand-over retracts
+    /// the source's action, so the result binding must keep a body of its own.
+    pub(super) fn let_call_result_is_param_view(&self, e: &Expr) -> bool {
+        self.call_result_param_view_source(e)
+            .is_some_and(|src| !self.drop_rc.cond_returned_body_params.contains(&src))
+    }
+
     /// B-2026-08-29-45 — is `value` an ARRAY / `Vec`-prefix literal EVERY
     /// element of which is a param view, so the element bodies belong to the
     /// CALLER and this binding must not arm a walker of its own?

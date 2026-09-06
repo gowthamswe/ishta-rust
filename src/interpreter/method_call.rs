@@ -560,6 +560,12 @@ impl<'a> super::Interpreter<'a> {
                 // stack must too or the gates diverge per-backend.
                 let seed_params = self.method_owned_param_names(&type_name, method);
                 self.owned_param_names_stack.push(seed_params);
+                // B-2026-09-06-9 — the whole-alias sibling; see the field.
+                let whole_aliases = self
+                    .impl_method_ast(&type_name, method)
+                    .map(|f| crate::ast::fn_whole_param_aliases(self.program, f))
+                    .unwrap_or_default();
+                self.whole_param_alias_stack.push(whole_aliases);
                 // A method frame hands its args to no caller-side fire — see
                 // `owned_param_frame_is_method`.
                 self.owned_param_frame_is_method.push(true);
@@ -704,6 +710,7 @@ impl<'a> super::Interpreter<'a> {
                 // caller's to walk. See `record_method_arg_moves`.
                 self.record_method_arg_moves(&type_name, method, args);
                 self.owned_param_names_stack.pop();
+                self.whole_param_alias_stack.pop();
                 self.owned_param_frame_is_method.pop();
                 self.method_frame_caller_retains_args.pop();
                 self.method_frame_sole_owned.pop();

@@ -1599,6 +1599,277 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
     walk_block(&f.body)
 }
 
+/// `(target, callee key, [(arg index, bare-identifier arg)])` of one
+/// `let target = callee(..)` candidate — see `RebindWalk::call_rebinds`.
+type CallRebind = (String, String, Vec<(usize, String)>);
+
+/// `(target, source)` of every candidate whole-value rebind, and how many
+/// times each name is bound anywhere the walk reaches.
+struct RebindWalk {
+    rebinds: Vec<(String, String)>,
+    /// B-2026-09-06-9 — `(target, callee key, [(arg index, bare-identifier
+    /// arg)])` of every `let x = g(..)` candidate; only the program-aware
+    /// [`fn_whole_param_aliases`] reads these, the predicates never do.
+    call_rebinds: Vec<CallRebind>,
+    bound: std::collections::HashMap<String, usize>,
+}
+impl RebindWalk {
+    fn bind(&mut self, pat: &Pattern) {
+        for n in pat.binding_names() {
+            *self.bound.entry(n).or_insert(0) += 1;
+        }
+    }
+    fn block(&mut self, b: &Block) {
+        for st in &b.stmts {
+            match &st.kind {
+                StmtKind::Let {
+                    is_mut,
+                    pattern,
+                    value,
+                    ..
+                } => {
+                    self.bind(pattern);
+                    if let (false, PatternKind::Binding(x), ExprKind::Identifier(y)) =
+                        (*is_mut, &pattern.kind, &value.kind)
+                    {
+                        self.rebinds.push((x.clone(), y.clone()));
+                    }
+                    if let (false, PatternKind::Binding(x), ExprKind::Call { callee, args }) =
+                        (*is_mut, &pattern.kind, &value.kind)
+                    {
+                        let key = match &callee.kind {
+                            ExprKind::Identifier(g) => Some(g.clone()),
+                            ExprKind::Path { segments, .. } => Some(segments.join(".")),
+                            _ => None,
+                        };
+                        if let Some(key) = key {
+                            let idents = args
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, a)| match &a.value.kind {
+                                    ExprKind::Identifier(n) => Some((i, n.clone())),
+                                    _ => None,
+                                })
+                                .collect();
+                            self.call_rebinds.push((x.clone(), key, idents));
+                        }
+                    }
+                    self.expr(value);
+                }
+                StmtKind::LetElse {
+                    pattern,
+                    value,
+                    else_block,
+                    ..
+                } => {
+                    self.bind(pattern);
+                    self.expr(value);
+                    self.block(else_block);
+                }
+                StmtKind::LetUninit { name, .. } => {
+                    *self.bound.entry(name.clone()).or_insert(0) += 1;
+                }
+                StmtKind::Assign { value, .. } | StmtKind::CompoundAssign { value, .. } => {
+                    self.expr(value)
+                }
+                StmtKind::Expr(e) => self.expr(e),
+                _ => {}
+            }
+        }
+        if let Some(fe) = b.final_expr.as_deref() {
+            self.expr(fe);
+        }
+    }
+    fn expr(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::Block(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Try(b)
+            | ExprKind::Seq(b)
+            | ExprKind::Par(b) => self.block(b),
+            ExprKind::If {
+                condition,
+                then_block,
+                else_branch,
+            } => {
+                self.expr(condition);
+                self.block(then_block);
+                if let Some(x) = else_branch.as_deref() {
+                    self.expr(x);
+                }
+            }
+            ExprKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_branch,
+            } => {
+                self.bind(pattern);
+                self.expr(value);
+                self.block(then_block);
+                if let Some(x) = else_branch.as_deref() {
+                    self.expr(x);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.expr(scrutinee);
+                for a in arms {
+                    self.bind(&a.pattern);
+                    if let Some(g) = &a.guard {
+                        self.expr(g);
+                    }
+                    self.expr(&a.body);
+                }
+            }
+            ExprKind::While {
+                condition, body, ..
+            } => {
+                self.expr(condition);
+                self.block(body);
+            }
+            ExprKind::WhileLet {
+                pattern,
+                value,
+                body,
+                ..
+            } => {
+                self.bind(pattern);
+                self.expr(value);
+                self.block(body);
+            }
+            ExprKind::For {
+                pattern,
+                iterable,
+                body,
+                ..
+            } => {
+                self.bind(pattern);
+                self.expr(iterable);
+                self.block(body);
+            }
+            ExprKind::Loop { body, .. } | ExprKind::LabeledBlock { body, .. } => self.block(body),
+            ExprKind::Return(Some(inner)) => self.expr(inner),
+            _ => {}
+        }
+    }
+}
+
+/// The rebind walk over `f`'s body, seeded with its parameter names.
+fn rebind_walk(f: &Function) -> RebindWalk {
+    let mut w = RebindWalk {
+        rebinds: Vec::new(),
+        call_rebinds: Vec::new(),
+        bound: std::collections::HashMap::new(),
+    };
+    for p in &f.params {
+        if let Some(n) = p.name() {
+            *w.bound.entry(n.to_string()).or_insert(0) += 1;
+        }
+    }
+    w.block(&f.body);
+    w
+}
+
+/// The transitive whole-rebind closure of `seed` over `w.rebinds`, admitting
+/// only targets bound exactly once (see [`param_rebind_aliases`]).
+fn close_rebind_aliases(w: &RebindWalk, seed: &str) -> Vec<String> {
+    let mut aliases = vec![seed.to_string()];
+    loop {
+        let before = aliases.len();
+        for (x, y) in &w.rebinds {
+            if aliases.iter().any(|a| a == y)
+                && !aliases.iter().any(|a| a == x)
+                && w.bound.get(x.as_str()) == Some(&1)
+            {
+                aliases.push(x.clone());
+            }
+        }
+        if aliases.len() == before {
+            return aliases;
+        }
+    }
+}
+
+/// B-2026-09-06-9 — every name that IS one of `f`'s by-value parameters for
+/// ownership purposes: each such parameter, its [`param_rebind_aliases`], and
+/// — PROGRAM-AWARE, which is why the predicates do not share this — any
+/// `let x = g(.., a, ..)` where `a` is already in the set and `g` returns that
+/// parameter on every exit (`fn_always_returns_param`), transitively. A
+/// callee is a free function or a `Type.assoc` fn; an unknown or instance
+/// callee contributes nothing. Borrowed (`ref` / `mut ref`) parameters are
+/// excluded; a destructuring parameter binds no whole name and contributes
+/// nothing.
+///
+/// This is the set a `let w = keeps(x)` site consults to decide whether the
+/// call is a whole rebind of a parameter the CALLER still fires (caller
+/// retains: `x` is the param, a whole rebind of it, or such a call's result)
+/// or hands over a PART bound out of one (`let (inner, y) = h.pe;
+/// keep(inner)`), where the caller's walk already stands down through the
+/// part channel (`fn_escaping_param_part_paths`) and the result binding is the
+/// one owner. Measured: marking the part spelling a view as well ran ZERO
+/// bodies. Both backends read this one set, so the split cannot drift.
+pub fn fn_whole_param_aliases(
+    program: &crate::Program,
+    f: &Function,
+) -> std::collections::HashSet<String> {
+    fn resolve<'p>(program: &'p crate::Program, key: &str) -> Option<&'p Function> {
+        match key.split_once('.') {
+            None => program.items.iter().find_map(|item| match item {
+                Item::Function(g) if g.name == key => Some(g),
+                _ => None,
+            }),
+            Some((ty, m)) => program.items.iter().find_map(|item| match item {
+                Item::ImplBlock(b) => {
+                    let crate::ast::TypeKind::Path(pth) = &b.target_type.kind else {
+                        return None;
+                    };
+                    if pth.segments.last().map(String::as_str) != Some(ty) {
+                        return None;
+                    }
+                    b.items.iter().find_map(|ii| match ii {
+                        ImplItem::Method(g) if g.name == m && g.self_param.is_none() => Some(&**g),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }),
+        }
+    }
+    let w = rebind_walk(f);
+    let mut out = std::collections::HashSet::new();
+    for p in &f.params {
+        if matches!(
+            p.ty.kind,
+            crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+        ) {
+            continue;
+        }
+        if let Some(name) = p.name() {
+            out.extend(close_rebind_aliases(&w, name));
+        }
+    }
+    loop {
+        let before = out.len();
+        for (x, key, idents) in &w.call_rebinds {
+            if out.contains(x) || w.bound.get(x.as_str()) != Some(&1) {
+                continue;
+            }
+            let Some(g) = resolve(program, key) else {
+                continue;
+            };
+            if idents
+                .iter()
+                .any(|(i, n)| out.contains(n) && fn_always_returns_param(g, *i))
+            {
+                out.insert(x.clone());
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
 /// B-2026-09-05-13 — the names by-value parameter `param_name` is REBOUND to,
 /// whole and unchanged, by a plain `let m = r;` — transitively, so `let m = r;
 /// let n = m;` yields `[r, m, n]`. The parameter itself is always element 0.
@@ -1641,160 +1912,7 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
 /// stand-down and the callee's per-path drop naming the same binding on
 /// every path.
 pub fn param_rebind_aliases(f: &Function, param_name: &str) -> Vec<String> {
-    use std::collections::HashMap;
-    /// `(target, source)` of every candidate whole-value rebind, and how many
-    /// times each name is bound anywhere the walk reaches.
-    struct Walk {
-        rebinds: Vec<(String, String)>,
-        bound: HashMap<String, usize>,
-    }
-    impl Walk {
-        fn bind(&mut self, pat: &Pattern) {
-            for n in pat.binding_names() {
-                *self.bound.entry(n).or_insert(0) += 1;
-            }
-        }
-        fn block(&mut self, b: &Block) {
-            for st in &b.stmts {
-                match &st.kind {
-                    StmtKind::Let {
-                        is_mut,
-                        pattern,
-                        value,
-                        ..
-                    } => {
-                        self.bind(pattern);
-                        if let (false, PatternKind::Binding(x), ExprKind::Identifier(y)) =
-                            (*is_mut, &pattern.kind, &value.kind)
-                        {
-                            self.rebinds.push((x.clone(), y.clone()));
-                        }
-                        self.expr(value);
-                    }
-                    StmtKind::LetElse {
-                        pattern,
-                        value,
-                        else_block,
-                        ..
-                    } => {
-                        self.bind(pattern);
-                        self.expr(value);
-                        self.block(else_block);
-                    }
-                    StmtKind::LetUninit { name, .. } => {
-                        *self.bound.entry(name.clone()).or_insert(0) += 1;
-                    }
-                    StmtKind::Assign { value, .. } | StmtKind::CompoundAssign { value, .. } => {
-                        self.expr(value)
-                    }
-                    StmtKind::Expr(e) => self.expr(e),
-                    _ => {}
-                }
-            }
-            if let Some(fe) = b.final_expr.as_deref() {
-                self.expr(fe);
-            }
-        }
-        fn expr(&mut self, e: &Expr) {
-            match &e.kind {
-                ExprKind::Block(b)
-                | ExprKind::Unsafe(b)
-                | ExprKind::Try(b)
-                | ExprKind::Seq(b)
-                | ExprKind::Par(b) => self.block(b),
-                ExprKind::If {
-                    condition,
-                    then_block,
-                    else_branch,
-                } => {
-                    self.expr(condition);
-                    self.block(then_block);
-                    if let Some(x) = else_branch.as_deref() {
-                        self.expr(x);
-                    }
-                }
-                ExprKind::IfLet {
-                    pattern,
-                    value,
-                    then_block,
-                    else_branch,
-                } => {
-                    self.bind(pattern);
-                    self.expr(value);
-                    self.block(then_block);
-                    if let Some(x) = else_branch.as_deref() {
-                        self.expr(x);
-                    }
-                }
-                ExprKind::Match { scrutinee, arms } => {
-                    self.expr(scrutinee);
-                    for a in arms {
-                        self.bind(&a.pattern);
-                        if let Some(g) = &a.guard {
-                            self.expr(g);
-                        }
-                        self.expr(&a.body);
-                    }
-                }
-                ExprKind::While {
-                    condition, body, ..
-                } => {
-                    self.expr(condition);
-                    self.block(body);
-                }
-                ExprKind::WhileLet {
-                    pattern,
-                    value,
-                    body,
-                    ..
-                } => {
-                    self.bind(pattern);
-                    self.expr(value);
-                    self.block(body);
-                }
-                ExprKind::For {
-                    pattern,
-                    iterable,
-                    body,
-                    ..
-                } => {
-                    self.bind(pattern);
-                    self.expr(iterable);
-                    self.block(body);
-                }
-                ExprKind::Loop { body, .. } | ExprKind::LabeledBlock { body, .. } => {
-                    self.block(body)
-                }
-                ExprKind::Return(Some(inner)) => self.expr(inner),
-                _ => {}
-            }
-        }
-    }
-    let mut w = Walk {
-        rebinds: Vec::new(),
-        bound: HashMap::new(),
-    };
-    for p in &f.params {
-        if let Some(n) = p.name() {
-            *w.bound.entry(n.to_string()).or_insert(0) += 1;
-        }
-    }
-    w.block(&f.body);
-    let mut aliases = vec![param_name.to_string()];
-    loop {
-        let before = aliases.len();
-        for (x, y) in &w.rebinds {
-            if aliases.iter().any(|a| a == y)
-                && !aliases.iter().any(|a| a == x)
-                && w.bound.get(x.as_str()) == Some(&1)
-            {
-                aliases.push(x.clone());
-            }
-        }
-        if aliases.len() == before {
-            return aliases;
-        }
-    }
+    close_rebind_aliases(&rebind_walk(f), param_name)
 }
 
 /// B-2026-08-28-70 — does `f` hand parameter `arg_index` back to its caller on

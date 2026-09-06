@@ -31993,6 +31993,82 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-9 — a by-value `Drop` param handed to a callee that
+    /// returns it on EVERY exit, with the result bound to a local that dies
+    /// there (`let w: R = keeps(r); println(..)`), runs the body ONCE: the
+    /// let-site marks `w` a param VIEW (the caller runs the body on its own
+    /// temp / named binding after the call), through the four let-site gates
+    /// (struct, tuple, enum, `Option`/`Result`) and the shared
+    /// `fn_whole_param_aliases` set — the param, its whole rebinds, and such a
+    /// call's own result (so `keeps(keeps(r))` chains). Cells: the row's four
+    /// (tuple/struct x direct/rebind), unread, the two-hop chain, a generic
+    /// and an associated callee, nested in a branch (both paths), an arm-tail
+    /// spelling (both paths), an enum, a method frame (fresh and named),
+    /// named struct/tuple arguments, and two controls that must stay at one
+    /// body from the RESULT binding: a local source and a destructured LEAF
+    /// through the same callee (the part channel's case, excluded from the
+    /// view mark on purpose — marking it too ran zero bodies). Interpreter
+    /// twin: `test_param_through_returning_callee_bound_locally_runs_one_body`.
+    #[test]
+    fn e2e_param_through_returning_callee_bound_locally_runs_one_body() {
+        assert_eq!(
+            run_program(
+                r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+struct H2 { pe: ((R, i64), i64) }
+enum E { A(R), B }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+fn keep(t: (R, i64)) -> (R, i64) { return t; }
+fn keeps(r: R) -> R { return r; }
+fn keepg[T](x: T) -> T { return x; }
+fn keepe(e: E) -> E { return e; }
+fn t_keep_direct(t: (R, i64)) { let w: (R, i64) = keep(t); println(f"tkd {w.0.id}") }
+fn t_keep_rebind(t: (R, i64)) { let z: (R, i64) = t; let w: (R, i64) = keep(z); println(f"tkr {w.0.id}") }
+fn s_keep_direct(r: R) { let w: R = keeps(r); println(f"skd {w.id}") }
+fn s_keep_rebind(r: R) { let z: R = r; let w: R = keeps(z); println(f"skr {w.id}") }
+fn s_keep_unread(r: R) { let w: R = keeps(r); println("sku") }
+fn s_keep_twice(r: R) { let w: R = keeps(r); let v: R = keeps(w); println(f"skt {v.id}") }
+fn s_keep_generic(r: R) { let w: R = keepg(r); println(f"skg {w.id}") }
+fn s_keep_assoc(r: R) { let w: R = K.id(r); println(f"ska {w.id}") }
+fn s_keep_nested(r: R, k: bool) { if k { let w: R = keeps(r); println(f"skn {w.id}"); } println("skn-out") }
+fn s_keep_arm(r: R, k: bool) -> i64 { let w: R = keeps(r); if k { return 1; } println(f"skm {w.id}"); return 0 }
+fn e_keep(e: E) { let w: E = keepe(e); match w { E.A(x) => println(f"ek {x.id}"), E.B => println("ekB") } }
+fn s_local() { let l = mk(30); let w: R = keeps(l); println(f"sl {w.id}") }
+fn v_keep(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; let w: (R, i64) = keep(z); println(f"vk {w.0.id}") }
+struct K { n: i64 }
+impl K {
+    fn id(r: R) -> R { return r; }
+    fn m_keep(ref self, r: R) { let w: R = keeps(r); println(f"mk {w.id}") }
+}
+fn main() {
+    let k = K { n: 0 };
+    println("one"); t_keep_direct((mk(1), 1));
+    println("two"); t_keep_rebind((mk(2), 2));
+    println("three"); s_keep_direct(mk(3));
+    println("four"); s_keep_rebind(mk(4));
+    println("five"); s_keep_unread(mk(5));
+    println("six"); s_keep_twice(mk(6));
+    println("seven"); s_keep_generic(mk(7));
+    println("eight"); s_keep_assoc(mk(8));
+    println("nine-t"); s_keep_nested(mk(9), true);
+    println("ten-f"); s_keep_nested(mk(10), false);
+    println("eleven-t"); let _ = s_keep_arm(mk(11), true);
+    println("twelve-f"); let _ = s_keep_arm(mk(12), false);
+    println("thirteen"); e_keep(E.A(mk(13)));
+    println("fourteen"); k.m_keep(mk(14));
+    println("fifteen-named"); let a = mk(15); s_keep_direct(a);
+    println("sixteen-mnamed"); let b = mk(16); k.m_keep(b);
+    println("seventeen-tnamed"); let t: (R, i64) = (mk(17), 1); t_keep_direct(t);
+    println("eighteen-local"); s_local();
+    println("nineteen-leaf"); v_keep(H2 { pe: ((mk(19), 1), 2) });
+    println("end");
+}"#
+            ),
+            Some("one\ntkd 1\ndR1\ntwo\ntkr 2\ndR2\nthree\nskd 3\ndR3\nfour\nskr 4\ndR4\nfive\nsku\ndR5\nsix\nskt 6\ndR6\nseven\nskg 7\ndR7\neight\nska 8\ndR8\nnine-t\nskn 9\nskn-out\ndR9\nten-f\nskn-out\ndR10\neleven-t\ndR11\ntwelve-f\nskm 12\ndR12\nthirteen\nek 13\ndR13\nfourteen\nmk 14\ndR14\nfifteen-named\nskd 15\ndR15\nsixteen-mnamed\nmk 16\ndR16\nseventeen-tnamed\ntkd 17\ndR17\neighteen-local\nsl 30\ndR30\nnineteen-leaf\nvk 19\ndR19\nend\n".to_string()),
+            "a by-value param rebound through an always-returning callee has one owner"
+        );
+    }
+
     /// B-2026-08-29-31 — the `let _ =` spelling of a discarded branch now owns
     /// whatever its arm hands out, on all three backends.
     ///

@@ -8188,6 +8188,10 @@ impl<'ctx> super::Codegen<'ctx> {
                                 .unwrap_or_default();
                             if self.enum_ctor_payload_bodies_are_caller_owned(&name, value)
                                 || self.expr_is_param_view(value)
+                                // B-2026-09-06-9 — the rebind through an
+                                // always-returning callee, as at the struct
+                                // and tuple sites.
+                                || self.let_call_result_is_param_view(value)
                             {
                                 self.payload_vars.param_view_locals.insert(var_name.clone());
                             } else if let Some(bodies) = self
@@ -8618,7 +8622,12 @@ impl<'ctx> super::Codegen<'ctx> {
                                     // `let x = z.0;` / `let (r, x) = z;` hits
                                     // the same param gates a direct param
                                     // projection does.
-                                    let rhs_is_param_view = self.expr_is_param_view(value);
+                                    // B-2026-09-06-9 — or through a callee
+                                    // that hands the tuple back on every exit
+                                    // (`let w = keep(t)`); same rule as the
+                                    // struct site.
+                                    let rhs_is_param_view = self.expr_is_param_view(value)
+                                        || self.let_call_result_is_param_view(value);
                                     if rhs_is_param_view {
                                         self.payload_vars
                                             .param_view_locals
@@ -9203,7 +9212,10 @@ impl<'ctx> super::Codegen<'ctx> {
                         let optres_is_param_view = self
                             .optres_ctor_payloads_are_all_param_views(value)
                             || matches!(&value.kind, ExprKind::Identifier(n)
-                                if self.payload_vars.param_view_locals.contains(n.as_str()));
+                                if self.payload_vars.param_view_locals.contains(n.as_str()))
+                            // B-2026-09-06-9 — the rebind through an
+                            // always-returning callee, as at the struct site.
+                            || self.let_call_result_is_param_view(value);
                         if optres_is_param_view {
                             self.payload_vars.param_view_locals.insert(var_name.clone());
                         }
@@ -9853,11 +9865,16 @@ impl<'ctx> super::Codegen<'ctx> {
                             // empty name). The view-ness PROPAGATES so a
                             // destructure of h2 hits the same param gates
                             // a direct param destructure does.
+                            // B-2026-09-06-9 — or the same rebind THROUGH a
+                            // callee that hands the argument back on every
+                            // exit (`let w = keeps(r)`); see
+                            // `call_result_param_view_source`.
                             let rhs_is_param_view = matches!(&value.kind,
                                 ExprKind::Identifier(src)
                                     if (self.fn_ctx.current_fn_param_names.contains(src.as_str())
                                         && !self.borrow_vars.ref_params.contains_key(src.as_str()))
-                                        || self.payload_vars.param_view_locals.contains(src.as_str()));
+                                        || self.payload_vars.param_view_locals.contains(src.as_str()))
+                                || self.let_call_result_is_param_view(value);
                             if rhs_is_param_view {
                                 self.payload_vars
                                     .param_view_locals

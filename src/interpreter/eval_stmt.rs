@@ -2487,6 +2487,44 @@ impl<'a> super::Interpreter<'a> {
     /// shares one walk between both slots, so suppressing wholesale would trade
     /// this double for a MISSING body on the fresh payload. The mixed case keeps
     /// its slot and stays wrong (B-2026-08-29-24).
+    /// B-2026-09-06-9 — is `value` a call handing a param VIEW to a callee
+    /// that returns that parameter on EVERY exit? Returns the view's name.
+    ///
+    /// Resolved through `callee_fn_for_param_ownership` — free functions and
+    /// associated fns, never an instance method — so the free and `Type.f`
+    /// spellings answer by one route, and `fn_always_returns_param` rather
+    /// than the conservative union: a callee that hands the param back on
+    /// SOME exits returns a fresh value on the others, and a view mark would
+    /// lose that value's body. Codegen's twin is
+    /// `call_result_param_view_source`.
+    fn let_call_result_param_view_source(&self, value: &Expr) -> Option<String> {
+        let ExprKind::Call { callee, args } = &value.kind else {
+            return None;
+        };
+        let name = match &callee.kind {
+            ExprKind::Identifier(n) => n.as_str(),
+            ExprKind::Path { segments, .. } => segments.last()?.as_str(),
+            _ => return None,
+        };
+        let f = self.callee_fn_for_param_ownership(name)?;
+        // The WHOLE-alias set, not the view set: a destructured leaf handed to
+        // a returning callee is the part channel's case, where the caller
+        // stands down and the result binding owns the body (measured: marking
+        // it a view too ran zero bodies).
+        let whole = self.whole_param_alias_stack.last()?;
+        args.iter()
+            .enumerate()
+            .find_map(|(i, a)| match &a.value.kind {
+                ExprKind::Identifier(src)
+                    if whole.contains(src.as_str())
+                        && crate::ast::fn_always_returns_param(f, i) =>
+                {
+                    Some(src.clone())
+                }
+                _ => None,
+            })
+    }
+
     fn let_ctor_payloads_are_param_views(&self, bname: &str, value: &Expr) -> bool {
         let ExprKind::Call { callee, args } = &value.kind else {
             return false;
@@ -2901,6 +2939,30 @@ impl<'a> super::Interpreter<'a> {
                     // the bodies-only action at its `let` param-view arm.
                     if self.cond_store_param_names.contains(src.as_str()) {
                         self.cond_store_param_names.insert(bname.clone());
+                        return false;
+                    }
+                    let bname = bname.clone();
+                    if let Some(top) = self.owned_param_names_stack.last_mut() {
+                        top.insert(bname);
+                    }
+                    return true;
+                }
+            }
+            // B-2026-09-06-9 — the same rebind THROUGH a callee that hands
+            // the argument back on every exit: `let w: R = keeps(r)` over `fn
+            // keeps(r: R) -> R { return r }`. The value in `w` is the one the
+            // caller handed in, and the caller runs its body after the call
+            // (caller-retains), so a slot for `w` ran it twice — `skd 3 dR3
+            // dR3`, agreed on all four surfaces. UNLESS this frame owns the
+            // source's body per path (`cond_store_param_names`): then the
+            // caller has stood down, `disarm_cond_store_param_on_handover`
+            // retracts the source at this very statement, and `w`'s slot is
+            // the one body — returning `false` lets `push_drops_for_stmt`
+            // register it. Codegen's twin is `let_call_result_is_param_view`
+            // at its four let-sites.
+            if let PatternKind::Binding(bname) = &pattern.kind {
+                if let Some(src) = self.let_call_result_param_view_source(value) {
+                    if self.cond_store_param_names.contains(src.as_str()) {
                         return false;
                     }
                     let bname = bname.clone();

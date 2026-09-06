@@ -642,6 +642,14 @@ pub struct Interpreter<'a> {
     /// caller-side only. Registering Drop slots for the bound fields
     /// double-fired the body under `karac run` only (B-2026-08-01-12).
     pub(crate) owned_param_names_stack: Vec<HashSet<String>>,
+    /// B-2026-09-06-9 — parallel to `owned_param_names_stack`, one entry per
+    /// frame: the frame's by-value parameters plus their whole rebinds
+    /// (`fn_whole_param_aliases`), the names a `let w = keeps(x)` site treats
+    /// as a rebind of a parameter the CALLER still fires. Narrower than the
+    /// view set above on purpose — a destructured leaf is a view whose
+    /// hand-over the caller's part channel already stands down for. Empty for
+    /// a closure frame.
+    pub(crate) whole_param_alias_stack: Vec<HashSet<String>>,
     /// B-2026-08-27-48 — parallel to `owned_param_names_stack`, one entry per
     /// frame: `true` when that frame is an IMPL METHOD body, `false` for a
     /// free fn (and for a closure, whose param set is empty anyway).
@@ -1111,6 +1119,7 @@ impl<'a> Interpreter<'a> {
             tuple_var_elem_tes: HashMap::new(),
             self_param_stack: Vec::new(),
             owned_param_names_stack: Vec::new(),
+            whole_param_alias_stack: Vec::new(),
             owned_param_frame_is_method: Vec::new(),
             method_frame_caller_retains_args: Vec::new(),
             method_frame_sole_owned: Vec::new(),
