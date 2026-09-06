@@ -74293,4 +74293,68 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-10 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_named_local_handing_back_a_nested_part_runs_one_body`: the part a
+    /// named local hands back through the callee is freed once and its body
+    /// runs once. Heap `R` (`String` + `Vec`), so the widened mask must not
+    /// have moved any free.
+    #[test]
+    fn asan_named_local_handing_back_a_nested_part_clean() {
+        let label = "named_local_handing_back_a_nested_part";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct H1 { pe: (R, i64) }
+struct H2 { pe: ((R, i64), i64) }
+struct S { r: R, n: i64 }
+struct G { s: S, n: i64 }
+struct H2b { pe: ((R, R), i64) }
+fn flat_ret(h: H1) -> R { let (r, k) = h.pe; return r; }
+fn flat_proj(h: H1) -> R { return h.pe.0; }
+fn v3_ret(h: H2) -> R { let (inner, y) = h.pe; let (r, x) = inner; return r; }
+fn g_ret(g: G) -> R { return g.s.r; }
+fn g_destr(g: G) -> R { let G { s, n } = g; let S { r, n: m } = s; return r; }
+fn vb_ret1(h: H2b) -> R { let (inner, y) = h.pe; let (r, s) = inner; return s; }
+fn flat_in(h: H1) -> R { println("in"); let (r, k) = h.pe; println("mid"); return r; }
+fn main() {
+    { let h: H1 = H1 { pe: (mk(1), 1) }; let a: R = flat_ret(h); println(f"got{a.id}"); println("one") }
+    { let h: H2 = H2 { pe: ((mk(2), 1), 2) }; let a: R = v3_ret(h); println(f"got{a.id}"); println("two") }
+    { let g: G = G { s: S { r: mk(3), n: 1 }, n: 2 }; let a: R = g_ret(g); println(f"got{a.id}"); println("three") }
+    { let a: R = flat_ret(H1 { pe: (mk(4), 1) }); println(f"got{a.id}"); println("four") }
+    { let a: R = g_ret(G { s: S { r: mk(5), n: 1 }, n: 2 }); println(f"got{a.id}"); println("five") }
+    { let h: H1 = H1 { pe: (mk(6), 1) }; let a: R = flat_in(h); println("out"); println(f"got{a.id}"); println("six") }
+    { let h: H1 = H1 { pe: (mk(7), 1) }; let a: R = flat_in(h); println("out"); println(f"got{a.id}"); println(f"h{h.pe.1}"); println("seven") }
+    { let h: H1 = H1 { pe: (mk(8), 1) }; let a: R = flat_proj(h); println(f"got{a.id}"); println("eight") }
+    { let g: G = G { s: S { r: mk(9), n: 1 }, n: 2 }; let a: R = g_destr(g); println(f"got{a.id}"); println("nine") }
+    { let h: H2b = H2b { pe: ((mk(10), mk(11)), 2) }; let a: R = vb_ret1(h); println(f"got{a.id}"); println("ten") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "got1", "dR1", "one", "got2", "dR2", "two", "got3", "dR3", "three", "got4", "dR4",
+                "four", "got5", "dR5", "five", "in", "mid", "out", "got6", "dR6", "six", "in",
+                "mid", "out", "got7", "dR7", "h1", "seven", "got8", "dR8", "eight", "got9", "dR9",
+                "nine", "dR10", "got11", "dR11", "ten", "end"
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

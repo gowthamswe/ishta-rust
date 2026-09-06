@@ -3536,11 +3536,58 @@ impl<'a> super::Interpreter<'a> {
                 // NAME, so a deeper path has no key here. The path-keyed
                 // `moved_out_nested_field_bodies` is where that case would go;
                 // no measurement asks for it yet (B-2026-08-28-23's rule).
-                if matches!(arg_vals.get(i), Some(Value::Struct { .. })) {
+                if let Some(Value::Struct { .. }) = arg_vals.get(i) {
                     for path in self.callee_returned_param_parts(callee_name, method_owner, i) {
                         if let [crate::ast::ParamPart::Field(f)] = path.as_slice() {
                             self.moved_out_struct_field_bodies
                                 .insert((src.clone(), f.clone()));
+                            continue;
+                        }
+                        // B-2026-09-06-10 — the deeper path the comment above
+                        // deferred, now that a measurement asks for it: a part
+                        // NESTED below a field (`h.pe.0`, `g.s.r`, `h.pe.0.0`)
+                        // goes to the path-keyed `moved_out_nested_field_bodies`,
+                        // a tuple hop spelled `#<i>` exactly as the fresh-temp
+                        // mask spells it, and the local's walk removes it at
+                        // that depth (`remove_field_at_path`). Without it the
+                        // walk ran the handed-back leaf's body at the local's
+                        // live-range end on a value the callee had already
+                        // given away — `dR1 got1 dR1` on all four surfaces, at
+                        // ONE level too, while the fresh-temp spelling of the
+                        // same call was already right.
+                        //
+                        // Gated on the leaf being something a body can own,
+                        // for the reason the projection writer gives: a scalar
+                        // or `shared` leaf owns nothing, so declining the mask
+                        // cannot lose an owner, while removing it could hand a
+                        // parent's own `Drop` body a hole to read.
+                        if !matches!(path.first(), Some(crate::ast::ParamPart::Field(_))) {
+                            continue;
+                        }
+                        let names: Vec<String> = path
+                            .iter()
+                            .map(|p| match p {
+                                crate::ast::ParamPart::Field(n) => n.clone(),
+                                crate::ast::ParamPart::TupleIndex(i) => format!("#{i}"),
+                            })
+                            .collect();
+                        let leaf_owns = arg_vals
+                            .get(i)
+                            .and_then(|v| Self::value_at_name_path(v, &names))
+                            .is_some_and(|leaf| {
+                                !matches!(
+                                    leaf,
+                                    Value::Int(_)
+                                        | Value::Float(_)
+                                        | Value::Bool(_)
+                                        | Value::Char(_)
+                                        | Value::Unit
+                                        | Value::SharedStruct(_)
+                                )
+                            });
+                        if leaf_owns {
+                            self.moved_out_nested_field_bodies
+                                .insert((src.clone(), names));
                         }
                     }
                 }

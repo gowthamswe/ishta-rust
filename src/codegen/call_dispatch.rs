@@ -4840,20 +4840,52 @@ impl<'ctx> super::Codegen<'ctx> {
         if self.borrow_vars.owned_struct_params.contains(src.as_str()) {
             return;
         }
-        let fields: Vec<String> = self
-            .callee_returned_param_parts(callee_name, arg_index)
+        let parts = self.callee_returned_param_parts(callee_name, arg_index);
+        let fields: Vec<String> = parts
             .iter()
             .filter_map(|path| match path.as_slice() {
                 [crate::ast::ParamPart::Field(f)] => Some(f.clone()),
                 _ => None,
             })
             .collect();
-        if fields.is_empty() {
-            return;
-        }
         let Some(struct_name) = self.var_types.var_type_names.get(src.as_str()).cloned() else {
             return;
         };
+        // B-2026-09-06-10 — a part NESTED below a field (`h.pe.0`, `g.s.r`,
+        // `h.pe.0.0`). The flat filter above keys one top-level field, so a
+        // deeper path had no key here and the local's own walk ran the
+        // handed-back leaf's body at its live-range end, on a value the
+        // callee had already given away — `dR1 got1 dR1` on all four
+        // surfaces, at ONE level too, where the fresh-temp spelling of the
+        // same call was already right through the path-resolved skip tree.
+        // Resolve the path to index hops through the declared types and
+        // write the path-keyed mask, which `field_skip_tree_for_var` reads
+        // as "skip this index at the node the prefix reaches" — the same
+        // statement for a tuple element as for a struct field — and which
+        // `disarm_struct_field_tuple_elem_bodies_at` re-registers under.
+        // Gated on the LEAF running a body, for B-2026-09-05-6's reason: a
+        // scalar handed back has nothing to mask, and a mask re-registration
+        // over nothing would mint a second walk.
+        for path in &parts {
+            if path.len() < 2 || !matches!(path.first(), Some(crate::ast::ParamPart::Field(_))) {
+                continue;
+            }
+            let Some((hops, leaf_te)) = self.param_path_index_hops(&struct_name, path) else {
+                continue;
+            };
+            if !self.elem_te_runs_user_drop(&leaf_te) {
+                continue;
+            }
+            let Some((last, prefix)) = hops.split_last() else {
+                continue;
+            };
+            let mut only: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            only.insert(*last as u32);
+            self.disarm_struct_field_tuple_elem_bodies_at(&src, prefix, &only);
+        }
+        if fields.is_empty() {
+            return;
+        }
         // The same subst `disarm_struct_field_bodies_at` computes for this
         // binding, so the membership test below asks its question of the same
         // instantiation the walker was emitted under.
@@ -4894,6 +4926,72 @@ impl<'ctx> super::Codegen<'ctx> {
                 continue;
             }
             self.disarm_struct_field_bodies_at(&src, fidx);
+        }
+    }
+
+    /// B-2026-09-06-10 — resolve a part path rooted at a value of type
+    /// `struct_name` into INDEX HOPS (a struct field's declared index, a tuple
+    /// element's index) plus the leaf's declared `TypeExpr`, walking the
+    /// declared types level by level. `None` the moment a level does not
+    /// resolve — a generic field whose declared type is a bare parameter, a
+    /// name the layout does not carry — so the caller drops the path WHOLE
+    /// rather than masking a prefix the callee did not hand back.
+    fn param_path_index_hops(
+        &self,
+        struct_name: &str,
+        path: &[crate::ast::ParamPart],
+    ) -> Option<(Vec<usize>, TypeExpr)> {
+        let mut hops = Vec::with_capacity(path.len());
+        let mut cur: Option<TypeExpr> = None;
+        let mut cur_struct: Option<String> = Some(struct_name.to_string());
+        for part in path {
+            match part {
+                crate::ast::ParamPart::Field(name) => {
+                    let sname = cur_struct.take()?;
+                    let idx = self
+                        .type_decls
+                        .struct_field_names
+                        .get(&sname)?
+                        .iter()
+                        .position(|f| f == name)?;
+                    let te = self
+                        .type_decls
+                        .struct_field_type_exprs
+                        .get(&sname)?
+                        .get(idx)?
+                        .clone();
+                    hops.push(idx);
+                    cur_struct = Self::user_struct_name_of_te(self, &te);
+                    cur = Some(te);
+                }
+                crate::ast::ParamPart::TupleIndex(i) => {
+                    let te = cur.take()?;
+                    let TypeKind::Tuple(elems) = &te.kind else {
+                        return None;
+                    };
+                    let ete = elems.get(*i)?.clone();
+                    hops.push(*i);
+                    cur_struct = Self::user_struct_name_of_te(self, &ete);
+                    cur = Some(ete);
+                }
+            }
+        }
+        Some((hops, cur?))
+    }
+
+    /// The non-shared user struct `te` names, if any — the type the next
+    /// `Field` hop of [`Self::param_path_index_hops`] resolves against.
+    fn user_struct_name_of_te(&self, te: &TypeExpr) -> Option<String> {
+        let TypeKind::Path(p) = &te.kind else {
+            return None;
+        };
+        let name = p.segments.first()?;
+        if self.type_decls.struct_types.contains_key(name)
+            && !self.type_decls.shared_types.contains_key(name)
+        {
+            Some(name.clone())
+        } else {
+            None
         }
     }
 

@@ -2680,20 +2680,55 @@ impl<'a> super::Interpreter<'a> {
     /// declining to apply one is the pre-fix behaviour rather than a new
     /// failure mode.
     fn remove_field_at_path(v: &mut Value, path: &[String]) {
-        let Value::Struct { fields, .. } = v else {
+        let Some((head, rest)) = path.split_first() else {
             return;
         };
-        match path.split_first() {
-            Some((leaf, [])) => {
-                fields.remove(leaf.as_str());
-            }
-            Some((head, rest)) => {
-                if let Some(inner) = fields.get_mut(head.as_str()) {
+        match v {
+            Value::Struct { fields, .. } => {
+                if rest.is_empty() {
+                    fields.remove(head.as_str());
+                } else if let Some(inner) = fields.get_mut(head.as_str()) {
                     Self::remove_field_at_path(inner, rest);
                 }
             }
-            None => {}
+            // B-2026-09-06-10 — a TUPLE hop, carried as `#<i>` exactly as
+            // `escaping_field_paths` spells it for the fresh-temp mask
+            // (`mask_struct_fields`' tuple arm): the element is replaced by a
+            // unit so the walk finds nothing there, or descended into when the
+            // path goes on. Without this arm a path through a tuple-typed
+            // field (`h.pe.0`) stopped at the tuple and masked nothing.
+            Value::Tuple(items) => {
+                let Some(idx) = head.strip_prefix('#').and_then(|d| d.parse::<usize>().ok()) else {
+                    return;
+                };
+                if idx >= items.len() {
+                    return;
+                }
+                if rest.is_empty() {
+                    items[idx] = Value::Unit;
+                } else {
+                    Self::remove_field_at_path(&mut items[idx], rest);
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// B-2026-09-06-10 — the value a `#<i>`-encoded name path reaches inside
+    /// `v`, if every hop resolves. `None` for a hop the value does not carry.
+    pub(crate) fn value_at_name_path<'v>(v: &'v Value, path: &[String]) -> Option<&'v Value> {
+        let mut cur = v;
+        for hop in path {
+            cur = match cur {
+                Value::Struct { fields, .. } => fields.get(hop.as_str())?,
+                Value::Tuple(items) => {
+                    let idx = hop.strip_prefix('#')?.parse::<usize>().ok()?;
+                    items.get(idx)?
+                }
+                _ => return None,
+            };
+        }
+        Some(cur)
     }
 
     /// B-2026-09-03-11 — resolve a pure `FieldAccess` chain into its root
