@@ -8179,13 +8179,38 @@ impl<'ctx> super::Codegen<'ctx> {
                             // doubling. Mask the view slots instead: the fresh
                             // payload keeps its body, the view's goes back to
                             // the caller, and nothing is traded either way.
-                            let view_slots: std::collections::BTreeSet<(String, usize)> = self
+                            let mut view_slots: std::collections::BTreeSet<(String, usize)> = self
                                 .enum_ctor_param_view_payload_slots(&name, value)
                                 .filter(|(_, _, visited)| *visited > 0)
                                 .map(|(variant, views, _)| {
                                     views.into_iter().map(|i| (variant.clone(), i)).collect()
                                 })
                                 .unwrap_or_default();
+                            // B-2026-08-31-50 — the mask is PER BINDING now.
+                            // A fresh binding under this name starts clean (a
+                            // stale mask from an earlier same-name move-out
+                            // silently dropped bodies when B-2026-08-29-44
+                            // read its stores at every `let`); a bare-
+                            // identifier REBIND (`let w2 = w;`) inherits the
+                            // source's slots, which is what the struct and
+                            // tuple spellings got in -44 and this one could
+                            // not, having nothing stored to copy. The mask is
+                            // recorded again for the destination so a chain
+                            // (`let w3 = w2;`) keeps it.
+                            self.enum_ctor_moved_payload_slots.remove(var_name.as_str());
+                            if let ExprKind::Identifier(src) = &value.kind {
+                                if src != var_name {
+                                    if let Some(inherited) =
+                                        self.enum_ctor_moved_payload_slots.get(src.as_str())
+                                    {
+                                        view_slots.extend(inherited.iter().cloned());
+                                    }
+                                }
+                            }
+                            if !view_slots.is_empty() {
+                                self.enum_ctor_moved_payload_slots
+                                    .insert(var_name.clone(), view_slots.clone());
+                            }
                             if self.enum_ctor_payload_bodies_are_caller_owned(&name, value)
                                 || self.expr_is_param_view(value)
                                 // B-2026-09-06-9 — the rebind through an

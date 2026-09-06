@@ -2311,6 +2311,17 @@ pub(super) struct Codegen<'ctx> {
     /// into the `FieldSkipTree` the tree-driven tuple walker consumes.
     pub(crate) tuple_moved_nested_elem_bodies:
         HashMap<String, std::collections::BTreeMap<Vec<usize>, std::collections::BTreeSet<usize>>>,
+    /// B-2026-08-31-50 — per-binding record of the enum-constructor payload
+    /// slots `(variant, index)` whose bodies belong to somebody else (a param
+    /// VIEW moved in by the constructor, B-2026-08-29-24). The mask used to be
+    /// derived from the ctor EXPRESSION at the `let` and stored nowhere, so a
+    /// whole-value rebind (`let w2 = w;`) had nothing to inherit and re-armed
+    /// the full walk. Written at the enum `let` branch, inherited under the
+    /// bare-identifier rebind gate there, carried by
+    /// `transfer_move_masks_on_rebind`; the enum peer of
+    /// `struct_moved_field_bodies` / `tuple_moved_elem_bodies`.
+    pub(crate) enum_ctor_moved_payload_slots:
+        HashMap<String, std::collections::BTreeSet<(String, usize)>>,
     /// The synthesized `void __karac_static_init()` function, declared
     /// in `declare_module_bindings` when `map_set_module_inits` is
     /// non-empty so `main`'s entry can emit a forward `call` to it, and
@@ -6647,6 +6658,7 @@ impl<'ctx> Codegen<'ctx> {
             tuple_moved_elem_bodies: HashMap::new(),
             tuple_moved_elem_payload_bodies: HashMap::new(),
             tuple_moved_nested_elem_bodies: HashMap::new(),
+            enum_ctor_moved_payload_slots: HashMap::new(),
             mod_bindings: ModBindings {
                 consts: HashMap::new(),
                 module_bindings: HashMap::new(),

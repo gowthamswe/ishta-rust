@@ -10235,6 +10235,13 @@ impl<'ctx> super::Codegen<'ctx> {
                 e.entry(path).or_default().extend(inner);
             }
         }
+        // B-2026-08-31-50 — the enum-ctor slot mask travels too.
+        if let Some(v) = self.enum_ctor_moved_payload_slots.get(src).cloned() {
+            self.enum_ctor_moved_payload_slots
+                .entry(dst.to_string())
+                .or_default()
+                .extend(v);
+        }
         // B-2026-09-06-11 — the deep tuple masks travel with the flat ones.
         if let Some(v) = self.tuple_moved_nested_elem_bodies.get(src).cloned() {
             let e = self

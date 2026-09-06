@@ -2185,18 +2185,24 @@ impl<'a> super::Interpreter<'a> {
         for i in velems {
             self.param_view_tuple_elems.insert((dst.clone(), i));
         }
-        // The ENUM-CTOR slot mask is DELIBERATELY NOT transferred, and this is
-        // the one line of this fix that had to be measured rather than
-        // reasoned. Copying it here works — the interpreter prints the due
-        // `dR2 dR1` for `let w = W2.Two(r, mk(2)); let w2 = w;`. But codegen
-        // CANNOT follow: it derives a constructor's view slots from the ctor
-        // EXPRESSION at the `let` and stores nothing per variable, so a rebind
-        // there has no mask to inherit and keeps its double. Transferring only
-        // here therefore turns an AGREED defect into a run-vs-build divergence
-        // — measured, `dR2 dR1` against `dR1 dR2 dR1` — which is the worse of
-        // the two and the trade this row's family keeps refusing. The enum
-        // spelling needs a per-var store on the codegen side first; it is
-        // filed separately and stays agreed-but-wrong until then.
+        // B-2026-08-31-50 — the ENUM-CTOR slot mask travels too. This line was
+        // written during B-2026-08-29-44 and withheld, because codegen derived
+        // a constructor's view slots from the ctor EXPRESSION at the `let` and
+        // stored nothing per variable, so transferring here alone turned an
+        // agreed defect into a run-vs-build divergence (`dR2 dR1` against
+        // `dR1 dR2 dR1`). Codegen now keeps `enum_ctor_moved_payload_slots`
+        // per binding and inherits it under the same rebind gate, so the two
+        // land together: `let w = W2.Two(r, mk(2)); let w2 = w;` prints the
+        // due `dR2 dR1` on every backend.
+        let slots: Vec<usize> = self
+            .moved_out_enum_payload_slots
+            .iter()
+            .filter(|(n, _)| n == &src)
+            .map(|(_, i)| *i)
+            .collect();
+        for i in slots {
+            self.moved_out_enum_payload_slots.insert((dst.clone(), i));
+        }
     }
 
     fn mask_param_view_struct_literal_fields(&mut self, stmt: &Stmt) {
@@ -6074,6 +6080,9 @@ impl<'a> super::Interpreter<'a> {
             .retain(|(n, _)| n != name);
         self.moved_out_drop_field_bindings.remove(name);
         self.moved_out_enum_payload_bindings.remove(name);
+        // B-2026-08-31-50 — the enum-ctor slot mask is per binding now that a
+        // rebind inherits it; a FRESH value under the same name must not.
+        self.moved_out_enum_payload_slots.retain(|(n, _)| n != name);
         self.moved_out_user_drop_bindings.remove(name);
     }
 

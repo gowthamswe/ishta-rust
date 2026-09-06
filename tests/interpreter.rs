@@ -39674,16 +39674,17 @@ fn test_wrapped_param_view_nonenum_and_mixed_wraps_drop_once() {
             ),
             "dSd3\ndR2\ndR1\nv=7\n",
         ),
-        // A whole-value rebind after a MIXED wrap re-arms the full walk — the
+        // A whole-value rebind after a MIXED wrap used to re-arm the full walk — the
         // mask is keyed on the binding and the destination registers afresh.
-        // UNFIXED (B-2026-08-29-44).
+        // FIXED by B-2026-08-31-50: the enum-ctor slot mask is stored per
+        // binding on both backends now and a rebind inherits it.
         (
             "pin-mixed-then-rebind",
             format!(
                 "{HDR}fn take(r: R) -> i64 {{ let w = W2.Two(r, R {{ id: 2 }}); let w2 = w; 7 }}\n\
                  fn main() {{ let v = take(R {{ id: 1 }}); println(f\"v={{v}}\") }}\n"
             ),
-            "dR1\ndR2\ndR1\nv=7\n",
+            "dR2\ndR1\nv=7\n",
         ),
         // A `Vec` literal doubled too, but a plain LOCAL moved into one doubled
         // identically — so it was a move-suppression hole, not this rule. Both
@@ -55578,25 +55579,22 @@ fn test_whole_value_rebind_inherits_the_wrap_mask() {
         let src = format!("{hdr}{fns}\nfn main() {{ {main} }}\n");
         assert_eq!(run(&src), want, "[{label}]");
     }
-    // PINNED AT THE DEFECT, and deliberately so. The ENUM-CTOR spelling
-    // still doubles, on BOTH backends, so it stays an agreed gap rather
-    // than a divergence. The interpreter CAN fix it alone — transferring
-    // `moved_out_enum_payload_slots` on the rebind makes it print the due
-    // `dR2 dR1` — but codegen cannot follow: it derives a constructor's
-    // view slots from the ctor EXPRESSION at the `let` and stores nothing
-    // per variable, so a rebind has no mask to inherit. Landing the
-    // interpreter half alone was MEASURED here during this fix and gave
-    // `dR2 dR1` against `dR1 dR2 dR1` — an agreed defect turned into a
-    // run-vs-build split, the trade this family keeps refusing. Filed
-    // separately; it needs a per-var store on the codegen side first.
+    // B-2026-08-31-50 — the ENUM-CTOR spelling, pinned at the DEFECT until
+    // this row: it doubled on both backends, because codegen derived a
+    // constructor's view slots from the ctor EXPRESSION at the `let` and
+    // stored nothing per variable, so a rebind had no mask to inherit — and
+    // this backend's ready transfer was withheld so the two would land
+    // together. Codegen now keeps `enum_ctor_moved_payload_slots` per
+    // binding and inherits it under the rebind gate, this backend transfers
+    // `moved_out_enum_payload_slots`, and both print the due `dR2 dR1`.
     let enum_rebind = format!(
         "{hdr}fn take(r: R) -> i64 {{ let w = W2.Two(r, mk(2)); let w2 = w; return 7; }}\n\
          fn main() {{ let v = take(mk(1)); println(f\"v={{v}}\"); }}\n"
     );
     assert_eq!(
         run(&enum_rebind),
-        "dR1\ndR2\ndR1\nv=7\n",
-        "[pinned DEFECT: enum ctor MIXED then rebind — agreed, awaiting a codegen per-var store]"
+        "dR2\ndR1\nv=7\n",
+        "[enum ctor MIXED then rebind — the mask is inherited (B-2026-08-31-50)]"
     );
 }
 
@@ -62546,5 +62544,37 @@ fn main() {
 }
 "#),
         "dR1\none\ndR2\ntwo\ndR3\nthree\ndR4\nfour\ndR5\nfive\ndR6\nsix\ndR7\nseven\ndR8\neight\ndR9\nnine\ndR10\nten\ndR11\neleven\nw12\ndR12\ntwelve\nend\n"
+    );
+}
+
+/// B-2026-08-31-50 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_enum_ctor_mixed_wrap_rebind_inherits_the_slot_mask`, same program
+/// and string. This backend's transfer of `moved_out_enum_payload_slots` on
+/// a rebind was written during B-2026-08-29-44 and withheld until codegen
+/// could inherit the same mask; both landed in one commit, and this pins
+/// the five shapes from this side.
+#[test]
+fn test_enum_ctor_mixed_wrap_rebind_inherits_the_slot_mask() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+enum W2 { Two(R, R), None2 }
+enum W1 { One(R), None1 }
+fn take(r: R) -> i64 { let w: W2 = W2.Two(r, mk(2)); let w2: W2 = w; return 7; }
+fn take_ctl(r: R) -> i64 { let w: W2 = W2.Two(r, mk(4)); return 7; }
+fn take1(r: R) -> i64 { let w: W1 = W1.One(r); let w2: W1 = w; return 7; }
+fn take_twice(r: R) -> i64 { let w: W2 = W2.Two(r, mk(8)); let w2: W2 = w; let w3: W2 = w2; return 7; }
+fn take_swap(r: R) -> i64 { let w: W2 = W2.Two(mk(10), r); let w2: W2 = w; return 7; }
+fn main() {
+    { let v: i64 = take(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = take_ctl(mk(3)); println(f"v={v}"); println("two") }
+    { let v: i64 = take1(mk(5)); println(f"v={v}"); println("three") }
+    { let v: i64 = take_twice(mk(7)); println(f"v={v}"); println("four") }
+    { let v: i64 = take_swap(mk(9)); println(f"v={v}"); println("five") }
+    println("end")
+}
+"#),
+        "dR2\ndR1\nv=7\none\ndR4\ndR3\nv=7\ntwo\ndR5\nv=7\nthree\ndR8\ndR7\nv=7\nfour\ndR10\ndR9\nv=7\nfive\nend\n"
     );
 }
