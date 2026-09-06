@@ -3231,6 +3231,84 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-41 — the compiled side of the interpreter-crash row under
+    /// ASAN + LSan: a scalar or `String`-length read off a destructured leaf
+    /// of a by-value param leaves the caller-retained walk whole, one owner
+    /// per field, nothing freed twice, nothing leaked.
+    #[test]
+    fn asan_scalar_read_off_a_param_destructure_leaf_keeps_one_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"n{i}\", xs: [i] }; }\n\
+             struct S3 { a: R, b: R }\n\
+             \n\
+             fn full_ret(s: S3) -> i64 { let S3 { a, b } = s; println(\"  mid\"); return b.id; }\n\
+             fn full_let(s: S3) -> i64 { let S3 { a, b } = s; println(\"  mid\"); let x = a.id + b.id; return x; }\n\
+             fn rest_ret(s: S3) -> i64 { let S3 { a, .. } = s; println(\"  mid\"); return a.id; }\n\
+             fn wild_ret(s: S3) -> i64 { let S3 { a, b: _ } = s; println(\"  mid\"); return a.id; }\n\
+             fn rest_len(s: S3) -> i64 { let S3 { a, .. } = s; println(\"  mid\"); let n = a.name.len(); return n; }\n\
+             fn rest_none(s: S3) -> i64 { let S3 { a, .. } = s; println(\"  mid\"); return 1; }\n\
+             fn whole_b(s: S3) -> R { let S3 { a, b } = s; println(\"  mid\"); return b; }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"full_ret\"); let v1 = full_ret(S3 { a: mk(1), b: mk(2) }); println(f\"  v={v1}\");\n\
+             \x20   println(\"full_let\"); let v2 = full_let(S3 { a: mk(3), b: mk(4) }); println(f\"  v={v2}\");\n\
+             \x20   println(\"rest_ret\"); let v3 = rest_ret(S3 { a: mk(5), b: mk(6) }); println(f\"  v={v3}\");\n\
+             \x20   println(\"wild_ret\"); let v4 = wild_ret(S3 { a: mk(7), b: mk(8) }); println(f\"  v={v4}\");\n\
+             \x20   println(\"rest_len\"); let v5 = rest_len(S3 { a: mk(9), b: mk(10) }); println(f\"  v={v5}\");\n\
+             \x20   println(\"rest_none\"); let v6 = rest_none(S3 { a: mk(11), b: mk(12) }); println(f\"  v={v6}\");\n\
+             \x20   println(\"whole_b\"); let r7 = whole_b(S3 { a: mk(13), b: mk(14) }); println(f\"  v={r7.id}\");\n\
+             \x20   println(\"named\"); let s8 = S3 { a: mk(15), b: mk(16) }; let v8 = full_ret(s8); println(f\"  v={v8}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "full_ret",
+                "  mid",
+                "  dR2",
+                "  dR1",
+                "  v=2",
+                "full_let",
+                "  mid",
+                "  dR4",
+                "  dR3",
+                "  v=7",
+                "rest_ret",
+                "  mid",
+                "  dR6",
+                "  dR5",
+                "  v=5",
+                "wild_ret",
+                "  mid",
+                "  dR8",
+                "  dR7",
+                "  v=7",
+                "rest_len",
+                "  mid",
+                "  dR10",
+                "  dR9",
+                "  v=2",
+                "rest_none",
+                "  mid",
+                "  dR12",
+                "  dR11",
+                "  v=1",
+                "whole_b",
+                "  mid",
+                "  dR13",
+                "  v=14",
+                "  dR14",
+                "named",
+                "  mid",
+                "  dR16",
+                "  dR15",
+                "  v=16",
+                "end"
+            ],
+            "scalar_read_off_param_destructure_leaf",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

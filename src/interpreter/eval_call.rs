@@ -3965,7 +3965,29 @@ impl<'a> super::Interpreter<'a> {
                 // read the field it is about to hand back, so it sees the whole
                 // value. Split into the two halves the helper is already made of
                 // rather than masking its input.
-                let escaping = self.escaping_field_paths(callee_name, method_owner, i);
+                // B-2026-09-06-41 — only a part whose leaf carries a user `Drop`
+                // is masked out of the walk. The scanner reports every returned
+                // projection as an escaping part, a scalar `s.b.id` included;
+                // masking THAT removed `id` from the value handed to `R`'s own
+                // body, which read it and hit the struct-field `unreachable!`
+                // (`fn g(s: S3) -> i64 { let S3 { a, b } = s; return b.id; }`
+                // panicked after `mid` on this backend alone). The tuple branch
+                // above already filters by leaf; this is its struct twin.
+                let escaping: Vec<Vec<String>> = self
+                    .escaping_field_paths(callee_name, method_owner, i)
+                    .into_iter()
+                    .filter(|names| {
+                        // Unresolvable here (a path this resolver does not
+                        // walk) keeps its mask; only a leaf seen to be a plain
+                        // read — a scalar, a `String`, a shared handle — is
+                        // dropped. `value_runs_user_drop` is not the test: it
+                        // answers false for an ENUM leaf, and `return e` off a
+                        // destructured `H2 { e, n }` must keep its mask.
+                        Self::value_at_name_path(v, names).is_none_or(|leaf| {
+                            Self::value_leaf_can_own(leaf) && !matches!(leaf, Value::String(_))
+                        })
+                    })
+                    .collect();
                 self.run_user_drop_body_only(&tn, v.clone());
                 let payloads = self.escaping_field_payload_paths(callee_name, method_owner, i);
                 let masked = Self::mask_struct_fields(v, &escaping);
@@ -4006,7 +4028,29 @@ impl<'a> super::Interpreter<'a> {
                 // other callers are untouched. Codegen twin: the struct arm of
                 // `track_inline_owned_aggregate_arg_inst` re-emits the walker
                 // with the same field indices masked.
-                let escaping = self.escaping_field_paths(callee_name, method_owner, i);
+                // B-2026-09-06-41 — only a part whose leaf carries a user `Drop`
+                // is masked out of the walk. The scanner reports every returned
+                // projection as an escaping part, a scalar `s.b.id` included;
+                // masking THAT removed `id` from the value handed to `R`'s own
+                // body, which read it and hit the struct-field `unreachable!`
+                // (`fn g(s: S3) -> i64 { let S3 { a, b } = s; return b.id; }`
+                // panicked after `mid` on this backend alone). The tuple branch
+                // above already filters by leaf; this is its struct twin.
+                let escaping: Vec<Vec<String>> = self
+                    .escaping_field_paths(callee_name, method_owner, i)
+                    .into_iter()
+                    .filter(|names| {
+                        // Unresolvable here (a path this resolver does not
+                        // walk) keeps its mask; only a leaf seen to be a plain
+                        // read — a scalar, a `String`, a shared handle — is
+                        // dropped. `value_runs_user_drop` is not the test: it
+                        // answers false for an ENUM leaf, and `return e` off a
+                        // destructured `H2 { e, n }` must keep its mask.
+                        Self::value_at_name_path(v, names).is_none_or(|leaf| {
+                            Self::value_leaf_can_own(leaf) && !matches!(leaf, Value::String(_))
+                        })
+                    })
+                    .collect();
                 let payloads = self.escaping_field_payload_paths(callee_name, method_owner, i);
                 let masked = Self::mask_struct_fields(v, &escaping);
                 self.drop_user_drop_fields_of_value(&Self::mask_struct_field_payloads(

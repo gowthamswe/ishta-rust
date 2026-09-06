@@ -56695,6 +56695,85 @@ end
     );
 }
 
+/// B-2026-09-06-41 — the backend that panicked. The fresh-temp argument
+/// walk's two struct branches now filter escaping parts by a leaf that
+/// carries a user `Drop`, as the tuple branch always did; a scalar read is
+/// not a mask.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_scalar_read_off_a_param_destructure_leaf_does_not_mask_the_walk`, pinned to the same string.
+#[test]
+fn test_scalar_read_off_a_param_destructure_leaf_does_not_mask_the_walk() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}", xs: [i] }; }
+struct S3 { a: R, b: R }
+
+fn full_ret(s: S3) -> i64 { let S3 { a, b } = s; println("  mid"); return b.id; }
+fn full_let(s: S3) -> i64 { let S3 { a, b } = s; println("  mid"); let x = a.id + b.id; return x; }
+fn rest_ret(s: S3) -> i64 { let S3 { a, .. } = s; println("  mid"); return a.id; }
+fn wild_ret(s: S3) -> i64 { let S3 { a, b: _ } = s; println("  mid"); return a.id; }
+fn rest_len(s: S3) -> i64 { let S3 { a, .. } = s; println("  mid"); let n = a.name.len(); return n; }
+fn rest_none(s: S3) -> i64 { let S3 { a, .. } = s; println("  mid"); return 1; }
+fn whole_b(s: S3) -> R { let S3 { a, b } = s; println("  mid"); return b; }
+
+fn main() {
+    println("full_ret"); let v1 = full_ret(S3 { a: mk(1), b: mk(2) }); println(f"  v={v1}");
+    println("full_let"); let v2 = full_let(S3 { a: mk(3), b: mk(4) }); println(f"  v={v2}");
+    println("rest_ret"); let v3 = rest_ret(S3 { a: mk(5), b: mk(6) }); println(f"  v={v3}");
+    println("wild_ret"); let v4 = wild_ret(S3 { a: mk(7), b: mk(8) }); println(f"  v={v4}");
+    println("rest_len"); let v5 = rest_len(S3 { a: mk(9), b: mk(10) }); println(f"  v={v5}");
+    println("rest_none"); let v6 = rest_none(S3 { a: mk(11), b: mk(12) }); println(f"  v={v6}");
+    println("whole_b"); let r7 = whole_b(S3 { a: mk(13), b: mk(14) }); println(f"  v={r7.id}");
+    println("named"); let s8 = S3 { a: mk(15), b: mk(16) }; let v8 = full_ret(s8); println(f"  v={v8}");
+    println("end");
+}
+"#),
+        r#"full_ret
+  mid
+  dR2
+  dR1
+  v=2
+full_let
+  mid
+  dR4
+  dR3
+  v=7
+rest_ret
+  mid
+  dR6
+  dR5
+  v=5
+wild_ret
+  mid
+  dR8
+  dR7
+  v=7
+rest_len
+  mid
+  dR10
+  dR9
+  v=2
+rest_none
+  mid
+  dR12
+  dR11
+  v=1
+whole_b
+  mid
+  dR13
+  v=14
+  dR14
+named
+  mid
+  dR16
+  dR15
+  v=16
+end
+"#
+    );
+}
+
 /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
 /// field's and its payload's `Drop` bodies twice for a named-local receiver
 /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value
