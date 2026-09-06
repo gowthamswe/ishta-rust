@@ -93,7 +93,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 387 |
-| run-vs-build | 354 |
+| run-vs-build | 355 |
 | leak | 274 |
 | missing-feature | 194 |
 | double-free | 190 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1511 |
+| codegen | 1512 |
 | interp | 382 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -154,12 +154,12 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-21 | 2026-09-06 | interp+codegen | low | TWO FRESH PAYLOADS BOUND OUT OF A `match` ARM DIE IN OPPOSITE ORDERS ON THE TWO BACKENDS -- `let w = W2.Two(mk(16), mk(17)); match w { W2.Two(a, b) => { return a.id; } .. }` prints `dR16 dR17` on jit / aot / `KARAC_AUTO_PAR=0` (declaration order) and `dR17 dR16` under `--interp` (reverse); the body COUNT is right on both, only the arm-end sequence differs | — |
 | B-2026-09-06-23 | 2026-09-06 | interp+codegen | low | THE COPY A MATERIALIZING `match` ARM TAKES OFF A BORROW-PROJECTION SCRUTINEE NEVER RUNS THE ENUM SHELL'S OWN `Drop` BODY, ON EVERY BACKEND -- `match h.e { E.A(r) => { let m = r; return m.id; } .. }` through `mut ref h` prints `dR1 dE dR1` (the copy's payload body, then the original's shell and payload) where the `let e = h.e; match e { .. }` spelling of the same copy prints `dE dR1 dE dR1`; a fresh-temp or local scrutinee (`match mk(7) { .. }`, `let e = mk(8); match e { .. }`) does run its shell's `dE` after the payload moves out | — |
 | B-2026-09-06-27 | 2026-09-06 | interp+codegen | medium | A READ-ONLY ARM ON AN OWNED ENUM RECEIVER LOSES THE PAYLOAD'S `Drop` BODY UNDER `--interp` -- `impl E { fn m_read(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } } }` prints `dE r63` for a named local (`dE r63 dR63` compiled) and `r64` for a fresh temp (`r64 dR64` compiled); the temp additionally loses the enum shell's `dE` on EVERY surface | — |
-| B-2026-09-06-28 | 2026-09-06 | codegen | low | A PLAIN-STRUCT PATTERN LEAF BOUND OUT OF A BY-VALUE PARAM AND NEVER CONSUMED LEAKS ITS HEAP AT -O0 -- `fn shell(h: H1) -> i64 { match h { H1 { e } => { return 9; } } }` with `e: E` carrying `R { tag: String, xs: Vec[i64] }` loses 3 B + 8 B per call (valgrind, `KARAC_OPT_LEVEL=0`), clean at -O2; the bare owned `self` spelling identically; stdout is correct on every surface | — |
 | B-2026-09-06-29 | 2026-09-06 | interp+codegen | medium | A PAYLOAD HANDED BACK OUT OF A TWO-LEVEL OWNED-PARAM DESTRUCTURE RUNS ITS `Drop` BODY TWICE ON EVERY SURFACE -- `fn p_h(h: H1) -> R { match h { H1 { e } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } }` prints `dE dR5 r5 dR5` for `let g = ..; let r5 = p_h(g); println(f"r{r5.id}")` on --interp / jit / -O0 / -O2, where the one-level `fn p_r(e: E) -> R { match e { E.A(r) => { return r; } .. } }` prints `dE r1 dR1`; the owned-`self` receiver spelling (`fn hand(self) -> R`) is identical | — |
 | B-2026-09-06-31 | 2026-09-06 | typecheck | low | W0299 `borrow_projection_copy` IS SILENT FOR EVERY VALUE POSITION OF A BORROW PROJECTION EXCEPT `let` / ASSIGNMENT / A PATTERN SCRUTINEE -- `return w.r`, `consume(w.r)`, `W { r: w.r }`, `v.push(w.r)` and a tail-expression `w.r` through `w: ref W` each copy a non-`Copy` field out of the borrow on every backend (two `Drop` bodies, measured) and `karac check --output=json` returns 0 diagnostics for all five | — |
 | B-2026-09-06-33 | 2026-09-06 | codegen | high | A PARTIAL STRUCT `let` PATTERN BINDS THE FIRST DECLARED FIELD REGARDLESS OF WHICH FIELD IS NAMED, and double-frees on the JIT -- `let s = S3 { a: mk(2), b: mk(3) }; let S3 { b, .. } = s; return b.id;` prints `dR2 dR2 dR1 v=2` under aot and `KARAC_AUTO_PAR=0` (`b` holds field `a`'s value, `a`'s body runs twice, `b`'s never) and aborts with `free(): double free detected in tcache 2` under jit; the interpreter reads `v=3` | — |
 | B-2026-09-06-34 | 2026-09-06 | interp | medium | THE INTERPRETER NEVER RUNS THE `..` REST FIELDS' `Drop` BODIES IN A PARTIAL STRUCT `let` DESTRUCTURE -- `let s = S3 { a: mk(9), b: mk(10) }; let S3 { a, .. } = s; return a.id;` prints `dR9 dR8` under `--interp` against `dR10 dR9 dR8` on jit / aot / `KARAC_AUTO_PAR=0`; field `b` is moved out of `s` by the pattern and then owned by nobody | — |
 | B-2026-09-06-35 | 2026-09-06 | interp+codegen | low | A PARTIAL STRUCT `match` PATTERN DROPS THE `..` REST FIELD BEFORE THE BOUND FIELD ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(2), b: mk(3) }; match s { S3 { a, .. } => { return a.id; } }` prints `dR3 dR2` under `--interp` and `dR2 dR3` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs exactly once on every surface, the sequence alone diverges | — |
+| B-2026-09-06-36 | 2026-09-06 | codegen | low | A MATCH OVER A LOCAL STRUCT SCRUTINEE WITH AN UNCONSUMED ENUM LEAF LOSES THE LEAF'S `Drop` BODY ON THE COMPILED BACKENDS -- `let c = H1 { e: E.A(mk(34)) }; match c { H1 { e } => .. }` with `e` never touched prints `dE dR34` under `--interp` and NOTHING on run/build/AUTO_PAR=0 (memory balanced -- a lost BODY, not a leak). The by-value PARAM spelling is correct (the caller runs the body); only a LOCAL scrutinee has no such owner | — |
 
 ### Relocated
 
@@ -2301,6 +2301,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-24 | codegen | medium | A READ-ONLY `if let` / `while let` OVER A BORROW-PROJECTION SCRUTINEE COPIES THE PAYLOAD OUT UNDER CODEGEN AND BINDS A VIEW IN THE INTERPRETER -- `if… | d20a701 |
 | B-2026-09-06-25 | interp | medium | THE INTERPRETER TAKES NO COPY WHEN A VIEW BOUND OFF A BORROW-PROJECTION SCRUTINEE IS MATERIALIZED BY AN ARM VALUE OR A BY-VALUE CALL ARGUMENT -- `let… | b3aa3e3 |
 | B-2026-09-06-26 | interp | medium | A FREE FUNCTION WHOSE ARM RETURNS A SCALAR LEAF OF AN OWNED-PARAM STRUCT DESTRUCTURE RUNS NO `Drop` BODY AT ALL UNDER `--interp` -- `fn p_two(h: H2)… | d9b567c |
+| B-2026-09-06-28 | codegen | low | A PLAIN-STRUCT PATTERN LEAF BOUND OUT OF A BY-VALUE PARAM AND NEVER CONSUMED LEAKS ITS HEAP AT -O0 -- `fn shell(h: H1) -> i64 { match h { H1 { e } =>… | 5d83ae7 |
 | B-2026-09-06-30 | interp+codegen | medium | A `let` DESTRUCTURE OF A MIXED STRUCT LITERAL RUNS THE VIEW FIELD'S `Drop` BODY TWICE ON ALL FOUR SURFACES -- `let s = S3 { a: r, b: mk(19) }; let S3… | 676a369 |
 | B-2026-09-06-32 | codegen | high | A `Drop`-CARRYING ENUM LEAF HANDED BACK OUT OF A `let` DESTRUCTURE OF A BY-VALUE PARAM, OR OUT OF A BARE-TUPLE `match` ARM, DOUBLE-FREES ON jit AND -… | 1de1486 |
 
