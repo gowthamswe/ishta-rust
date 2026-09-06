@@ -96,7 +96,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | run-vs-build | 352 |
 | leak | 274 |
 | missing-feature | 194 |
-| double-free | 189 |
+| double-free | 190 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
 | false-positive | 106 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1508 |
+| codegen | 1509 |
 | interp | 380 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -153,12 +153,12 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-19 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM WRAPPED TWICE THROUGH A LOCAL ON SOME EXITS RUNS THE BODY TWICE ON THE HAND-BACK PATH -- `fn ftwo(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(82) }; } let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }` prints `d72 C72 B72 d72` for `k = false` on all four surfaces, while `k = true` is one body (`d71 C82 B82 d82`) | — |
 | B-2026-09-06-21 | 2026-09-06 | interp+codegen | low | TWO FRESH PAYLOADS BOUND OUT OF A `match` ARM DIE IN OPPOSITE ORDERS ON THE TWO BACKENDS -- `let w = W2.Two(mk(16), mk(17)); match w { W2.Two(a, b) => { return a.id; } .. }` prints `dR16 dR17` on jit / aot / `KARAC_AUTO_PAR=0` (declaration order) and `dR17 dR16` under `--interp` (reverse); the body COUNT is right on both, only the arm-end sequence differs | — |
 | B-2026-09-06-23 | 2026-09-06 | interp+codegen | low | THE COPY A MATERIALIZING `match` ARM TAKES OFF A BORROW-PROJECTION SCRUTINEE NEVER RUNS THE ENUM SHELL'S OWN `Drop` BODY, ON EVERY BACKEND -- `match h.e { E.A(r) => { let m = r; return m.id; } .. }` through `mut ref h` prints `dR1 dE dR1` (the copy's payload body, then the original's shell and payload) where the `let e = h.e; match e { .. }` spelling of the same copy prints `dE dR1 dE dR1`; a fresh-temp or local scrutinee (`match mk(7) { .. }`, `let e = mk(8); match e { .. }`) does run its shell's `dE` after the payload moves out | — |
-| B-2026-09-06-26 | 2026-09-06 | interp | medium | A FREE FUNCTION WHOSE ARM RETURNS A SCALAR LEAF OF AN OWNED-PARAM STRUCT DESTRUCTURE RUNS NO `Drop` BODY AT ALL UNDER `--interp` -- `fn p_two(h: H2) -> i64 { match h { H2 { e, n } => { match e { E.A(r) => { return r.id + n; } E.B => { return n; } } } } }` prints `r155` alone against `dE dR55 r155` on jit / -O0 / -O2; any mention of the `i64` leaf `n` in the returned expression loses BOTH bodies, `return r.id + 1` keeps them | — |
 | B-2026-09-06-27 | 2026-09-06 | interp+codegen | medium | A READ-ONLY ARM ON AN OWNED ENUM RECEIVER LOSES THE PAYLOAD'S `Drop` BODY UNDER `--interp` -- `impl E { fn m_read(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } } }` prints `dE r63` for a named local (`dE r63 dR63` compiled) and `r64` for a fresh temp (`r64 dR64` compiled); the temp additionally loses the enum shell's `dE` on EVERY surface | — |
 | B-2026-09-06-28 | 2026-09-06 | codegen | low | A PLAIN-STRUCT PATTERN LEAF BOUND OUT OF A BY-VALUE PARAM AND NEVER CONSUMED LEAKS ITS HEAP AT -O0 -- `fn shell(h: H1) -> i64 { match h { H1 { e } => { return 9; } } }` with `e: E` carrying `R { tag: String, xs: Vec[i64] }` loses 3 B + 8 B per call (valgrind, `KARAC_OPT_LEVEL=0`), clean at -O2; the bare owned `self` spelling identically; stdout is correct on every surface | — |
 | B-2026-09-06-29 | 2026-09-06 | interp+codegen | medium | A PAYLOAD HANDED BACK OUT OF A TWO-LEVEL OWNED-PARAM DESTRUCTURE RUNS ITS `Drop` BODY TWICE ON EVERY SURFACE -- `fn p_h(h: H1) -> R { match h { H1 { e } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } }` prints `dE dR5 r5 dR5` for `let g = ..; let r5 = p_h(g); println(f"r{r5.id}")` on --interp / jit / -O0 / -O2, where the one-level `fn p_r(e: E) -> R { match e { E.A(r) => { return r; } .. } }` prints `dE r1 dR1`; the owned-`self` receiver spelling (`fn hand(self) -> R`) is identical | — |
 | B-2026-09-06-30 | 2026-09-06 | interp+codegen | medium | A `let` DESTRUCTURE OF A MIXED STRUCT LITERAL RUNS THE VIEW FIELD'S `Drop` BODY TWICE ON ALL FOUR SURFACES -- `let s = S3 { a: r, b: mk(19) }; let S3 { a, b } = s; return b.id;` prints `dR18 dR19 dR18` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike where `dR19 dR18` is due; the `match` spelling of the same destructure is one body on every surface since B-2026-09-06-22 | — |
 | B-2026-09-06-31 | 2026-09-06 | typecheck | low | W0299 `borrow_projection_copy` IS SILENT FOR EVERY VALUE POSITION OF A BORROW PROJECTION EXCEPT `let` / ASSIGNMENT / A PATTERN SCRUTINEE -- `return w.r`, `consume(w.r)`, `W { r: w.r }`, `v.push(w.r)` and a tail-expression `w.r` through `w: ref W` each copy a non-`Copy` field out of the borrow on every backend (two `Drop` bodies, measured) and `karac check --output=json` returns 0 diagnostics for all five | — |
+| B-2026-09-06-32 | 2026-09-06 | codegen | high | A `Drop`-CARRYING ENUM LEAF HANDED BACK OUT OF A `let` DESTRUCTURE OF A BY-VALUE PARAM, OR OUT OF A BARE-TUPLE `match` ARM, DOUBLE-FREES ON jit AND -O0 -- `fn p(h: H2) -> E { let H2 { e, n } = h; return e; }` and `fn p(t: (E, i64)) -> E { match t { (e, n) => { return e; } } }` abort with glibc's `free(): double free detected in tcache 2` under `karac run` and `KARAC_OPT_LEVEL=0 karac build`, clean at -O2 and under `--interp`; the `match h { H2 { e, n } => return e }` and `return h.e` spellings, and every `R`-leaf twin, are correct | — |
 
 ### Relocated
 
@@ -2299,6 +2299,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-22 | codegen | medium | A `match` THAT DESTRUCTURES A MIXED STRUCT LITERAL'S VIEW FIELD RUNS THE VIEW'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `let s = S3 { a: r, b:… | 94b4c94 |
 | B-2026-09-06-24 | codegen | medium | A READ-ONLY `if let` / `while let` OVER A BORROW-PROJECTION SCRUTINEE COPIES THE PAYLOAD OUT UNDER CODEGEN AND BINDS A VIEW IN THE INTERPRETER -- `if… | d20a701 |
 | B-2026-09-06-25 | interp | medium | THE INTERPRETER TAKES NO COPY WHEN A VIEW BOUND OFF A BORROW-PROJECTION SCRUTINEE IS MATERIALIZED BY AN ARM VALUE OR A BY-VALUE CALL ARGUMENT -- `let… | b3aa3e3 |
+| B-2026-09-06-26 | interp | medium | A FREE FUNCTION WHOSE ARM RETURNS A SCALAR LEAF OF AN OWNED-PARAM STRUCT DESTRUCTURE RUNS NO `Drop` BODY AT ALL UNDER `--interp` -- `fn p_two(h: H2)… | d9b567c |
 
 </details>
 
