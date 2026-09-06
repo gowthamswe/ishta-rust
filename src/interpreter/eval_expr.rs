@@ -1129,7 +1129,11 @@ impl<'a> super::Interpreter<'a> {
                             | PatternKind::Tuple(..)
                     ) && matches!(
                         &value.kind,
-                        ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. }
+                        // B-2026-09-06-15 — a bare owned struct `self` too,
+                        // decided inside `place_root_is_owned_param`.
+                        ExprKind::FieldAccess { .. }
+                            | ExprKind::TupleIndex { .. }
+                            | ExprKind::SelfValue
                     ) && self.place_root_is_owned_param(value);
                     if projects_owned_param
                         || matches!(&value.kind, ExprKind::Identifier(n)
@@ -1471,7 +1475,11 @@ impl<'a> super::Interpreter<'a> {
                             | PatternKind::Tuple(..)
                     ) && matches!(
                         &value.kind,
-                        ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. }
+                        // B-2026-09-06-15 — a bare owned struct `self` too,
+                        // decided inside `place_root_is_owned_param`.
+                        ExprKind::FieldAccess { .. }
+                            | ExprKind::TupleIndex { .. }
+                            | ExprKind::SelfValue
                     ) && self.place_root_is_owned_param(value);
                     if projects_owned_param
                         || matches!(&value.kind, ExprKind::Identifier(n)

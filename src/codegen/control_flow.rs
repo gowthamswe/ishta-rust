@@ -1568,18 +1568,57 @@ impl<'ctx> super::Codegen<'ctx> {
                 // }` bound `r` as an owner beside the caller-retained walk
                 // over the receiver and ran the payload's body twice.
                 //
-                // A PROJECTION only (`self.e`, `self.s.e`, `self.t.0`). A bare
-                // `match self { .. }` stays where it was: that receiver reaches
-                // the callee by TRANSFER (B-2026-09-04-29) and its arms own
-                // what they bind, so admitting it here would hand those
-                // bodies to a caller walk that does not exist.
-                ExprKind::SelfValue if hops > 0 => "self",
+                // A PROJECTION (`self.e`, `self.s.e`, `self.t.0`) at any
+                // depth — and, since B-2026-09-06-15, the BARE `self` of an
+                // owned plain-STRUCT receiver as well
+                // (`bare_self_is_owned_struct_receiver`). That bare scrutinee
+                // was kept on the transfer path on the premise that no caller
+                // walk existed for it; the caller's walk DOES exist for a
+                // struct receiver — a named local's own binding, or the
+                // receiver-temp registrar (B-2026-09-04-30) — which is what
+                // made `match self { H1 { e } => match e { E.A(r) => .. } }`
+                // run the payload's body in the arm AND in that walk. A bare
+                // owned ENUM `self` stays on the transfer path: both
+                // registrars leave enum receiver bodies to the arm channel.
+                ExprKind::SelfValue if hops > 0 || self.bare_self_is_owned_struct_receiver() => {
+                    "self"
+                }
                 _ => return false,
             };
             return (self.fn_ctx.current_fn_param_names.contains(name)
                 && !self.borrow_vars.ref_params.contains_key(name))
                 || self.payload_vars.param_view_locals.contains(name);
         }
+    }
+
+    /// B-2026-09-06-15 — is a bare `self` scrutinee an OWNED, plain-STRUCT
+    /// receiver, i.e. a by-value parameter whose `Drop` bodies the CALLER
+    /// retains and runs?
+    ///
+    /// The struct restriction is the line the two receiver-temp registrars
+    /// already draw: `try_compile_nonident_...` registers a value-ENUM temp
+    /// receiver memory-only and leaves its bodies to the match-arm channel
+    /// (B-2026-08-01-6), and the interpreter's `run_fresh_recv_temp_drop`
+    /// walks `Value::Struct` receivers only. So a struct receiver has a
+    /// caller-side body owner on every surface and its arms must bind VIEWS,
+    /// while an enum receiver's arms are still the only place its payload
+    /// body can run. A shared struct is refcounted and never a view source.
+    pub(super) fn bare_self_is_owned_struct_receiver(&self) -> bool {
+        if !self.fn_ctx.current_fn_param_names.contains("self")
+            || self.borrow_vars.ref_params.contains_key("self")
+        {
+            return false;
+        }
+        let Some(slot) = self.variables.get("self") else {
+            return false;
+        };
+        let inkwell::types::BasicTypeEnum::StructType(st) = slot.ty else {
+            return false;
+        };
+        self.type_decls
+            .struct_types
+            .iter()
+            .any(|(name, &t)| t == st && !self.type_decls.shared_types.contains_key(name.as_str()))
     }
 
     /// Is this scrutinee expression a FRESH OWNING temp — a call, or a

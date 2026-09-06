@@ -2340,6 +2340,23 @@ impl<'ctx> super::Codegen<'ctx> {
             let mut bt_names: Vec<String> = Vec::new();
             Self::collect_bare_tuple_binding_names(pattern, false, &mut bt_names);
             self.payload_vars.param_view_locals.extend(bt_names);
+            // B-2026-09-06-15 — the plain-STRUCT pattern's leaves too
+            // (`match h { H1 { e } => .. }` over a by-value `h`, or over a
+            // bare owned struct `self`). The interpreter marks every name an
+            // owned-param arm binds; codegen marked variant payloads
+            // (B-2026-08-29-17) and bare-tuple elements (B-2026-08-31-7) and
+            // never the struct leaf, so a NESTED `match e { E.A(r) => .. }`
+            // inside the arm failed `scrutinee_is_owned_param_binding`, gave
+            // `r` a body of its own, and the caller's retained walk ran it
+            // again: `dR1 dE dR1` on jit / -O0 / -O2 against `--interp`'s
+            // `dE dR1`, with or without a rebind. Bodies only: a leaf's
+            // memory registration is unchanged by the mark (every let-site
+            // reader of `param_view_locals` withholds a bodies walker and
+            // nothing else), and the nested arm's payload binding takes the
+            // memory-only channel exactly as a one-level `match h.e` does.
+            let mut st_names: Vec<String> = Vec::new();
+            self.collect_plain_struct_pattern_binding_names(pattern, &mut st_names);
+            self.payload_vars.param_view_locals.extend(st_names);
         }
         self.pattern_state.current_bare_tuple_bindings.clear();
         {
@@ -2348,6 +2365,63 @@ impl<'ctx> super::Codegen<'ctx> {
             self.pattern_state
                 .current_bare_tuple_bindings
                 .extend(bt_all);
+        }
+    }
+
+    /// B-2026-09-06-15 — the names a plain-STRUCT pattern binds directly
+    /// (shorthand `H1 { e }`, renamed `H1 { e: x }`, `@`-aliased, and the
+    /// leaves of a NESTED plain-struct sub-pattern). Stops at a
+    /// `TupleVariant` / `Tuple` sub-pattern (payload positions with their own
+    /// collectors) and declines an enum struct-VARIANT pattern
+    /// (`E.S { r }`), whose bindings are variant payloads and route through
+    /// `current_variant_payload_bindings`.
+    pub(super) fn collect_plain_struct_pattern_binding_names(
+        &self,
+        pattern: &Pattern,
+        out: &mut Vec<String>,
+    ) {
+        match &pattern.kind {
+            PatternKind::Struct { path, fields, .. } => {
+                if self.variant_pattern_enum_name(pattern).is_some() {
+                    return;
+                }
+                let Some(name) = path.last() else {
+                    return;
+                };
+                if !self
+                    .type_decls
+                    .struct_field_names
+                    .contains_key(name.as_str())
+                    || self.type_decls.shared_types.contains_key(name.as_str())
+                {
+                    return;
+                }
+                for f in fields {
+                    match &f.pattern {
+                        None => out.push(f.name.clone()),
+                        Some(sub) => match &sub.kind {
+                            PatternKind::Binding(n) => out.push(n.clone()),
+                            PatternKind::AtBinding { name, pattern, .. } => {
+                                out.push(name.clone());
+                                self.collect_plain_struct_pattern_binding_names(pattern, out);
+                            }
+                            PatternKind::Struct { .. } => {
+                                self.collect_plain_struct_pattern_binding_names(sub, out);
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+            }
+            PatternKind::Or(ps) => {
+                for p in ps {
+                    self.collect_plain_struct_pattern_binding_names(p, out);
+                }
+            }
+            PatternKind::AtBinding { pattern, .. } => {
+                self.collect_plain_struct_pattern_binding_names(pattern, out);
+            }
+            _ => {}
         }
     }
 

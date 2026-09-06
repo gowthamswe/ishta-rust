@@ -3059,8 +3059,12 @@ impl<'a> super::Interpreter<'a> {
             // gate as the `match` leg's `place_root_is_owned_param` — a
             // PROJECTION only, so a bare `let x = self` keeps its transfer.
             None => {
-                matches!(&value.kind, ExprKind::FieldAccess { .. })
-                    && self.place_root_is_owned_param(value)
+                // B-2026-09-06-15 — a bare owned struct `self` too, decided
+                // inside `place_root_is_owned_param`.
+                matches!(
+                    &value.kind,
+                    ExprKind::FieldAccess { .. } | ExprKind::SelfValue
+                ) && self.place_root_is_owned_param(value)
             }
         };
         if !root_is_owned {

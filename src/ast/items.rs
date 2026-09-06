@@ -1542,17 +1542,28 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
     /// any by-value parameter's, so its arms bind VIEWS of the caller-retained
     /// value and run no body of their own. Declining those here left a
     /// fresh-temp receiver (`H1 { .. }.take()`) with nobody running its bodies
-    /// at all. A bare `self` scrutinee stays a bind-out: that receiver reaches
-    /// the callee by transfer (B-2026-09-04-29) and its arms own their parts.
+    /// at all.
+    ///
+    /// B-2026-09-06-15 — and neither is a BARE `self` scrutinee, for the same
+    /// reason one row later: both backends now bind a bare owned STRUCT
+    /// receiver's arms as views too (codegen's
+    /// `bare_self_is_owned_struct_receiver`, the interpreter's twin), so
+    /// `match self { H1 { e } => .. }` hands nothing out and the caller's
+    /// walk — this registrar, for a temp — is the one body owner. Declining
+    /// it here was the fresh-temp half of that row (`dR32` and no `dE`: the
+    /// enum shell's body ran nowhere). Only a `let` from bare `self`
+    /// (`let x = self`, `let H1 { e } = self`) remains a bind-out: that is
+    /// the transfer B-2026-09-04-29 built, and its leaves own their parts.
+    /// The scrutinee predicate below is therefore consulted by the `let`
+    /// arm of `walk_block` alone; a match scrutinee is only WALKED, for a
+    /// bind-out nested inside it.
     fn scrutinee_binds_out(e: &Expr) -> bool {
         matches!(&e.kind, ExprKind::SelfValue)
     }
     fn walk_expr(e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Match { scrutinee, arms } => {
-                scrutinee_binds_out(scrutinee)
-                    || walk_expr(scrutinee)
-                    || arms.iter().any(|a| walk_expr(&a.body))
+                walk_expr(scrutinee) || arms.iter().any(|a| walk_expr(&a.body))
             }
             ExprKind::IfLet {
                 value,
@@ -1560,14 +1571,11 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
                 else_branch,
                 ..
             } => {
-                scrutinee_binds_out(value)
-                    || walk_expr(value)
+                walk_expr(value)
                     || walk_block(then_block)
                     || else_branch.as_deref().is_some_and(walk_expr)
             }
-            ExprKind::WhileLet { value, body, .. } => {
-                scrutinee_binds_out(value) || walk_expr(value) || walk_block(body)
-            }
+            ExprKind::WhileLet { value, body, .. } => walk_expr(value) || walk_block(body),
             ExprKind::Block(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Try(b)

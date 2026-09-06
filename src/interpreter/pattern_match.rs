@@ -805,20 +805,48 @@ impl<'a> super::Interpreter<'a> {
                 // projection off a borrow is an implicit COPY (design.md
                 // "A projection off a borrow is an implicit copy"), and the
                 // copy's binding is its own owner.
-                // A PROJECTION only: a bare `match self { .. }` keeps its
-                // transfer semantics (the `SelfValue` arm of
-                // `scrutinee_expr_is_consuming`), where the arms own what
-                // they bind.
+                // A PROJECTION at any depth — and, since B-2026-09-06-15,
+                // the BARE `self` of an owned plain-STRUCT receiver as well
+                // (`bare_self_is_owned_struct_receiver`): that receiver has a
+                // caller-side body owner on every surface (a named local's
+                // binding, or `run_fresh_recv_temp_drop` for a temp), so its
+                // arms bind views exactly as a by-value param's do. Keeping it
+                // on the transfer path (the `SelfValue` arm of
+                // `scrutinee_expr_is_consuming`) ran the payload's body in the
+                // arm AND in that walk for a named local, and nowhere for a
+                // temp. A bare owned ENUM `self` keeps its transfer semantics:
+                // neither registrar walks an enum receiver's bodies, so the
+                // arm channel is still their only owner.
                 ExprKind::SelfValue => {
-                    return hops > 0
-                        && matches!(
-                            self.self_param_stack.last(),
-                            Some(crate::ast::SelfParam::Owned)
-                        );
+                    return matches!(
+                        self.self_param_stack.last(),
+                        Some(crate::ast::SelfParam::Owned)
+                    ) && (hops > 0 || self.bare_self_is_owned_struct_receiver());
                 }
                 _ => return false,
             }
         }
+    }
+
+    /// B-2026-09-06-15 — is a bare `self` an OWNED, plain-STRUCT receiver?
+    /// The interpreter twin of codegen's `bare_self_is_owned_struct_receiver`:
+    /// the struct restriction is the line `run_fresh_recv_temp_drop` (this
+    /// side) and the codegen receiver-temp registrar already draw — both walk
+    /// a STRUCT receiver's bodies caller-side and leave an ENUM receiver's to
+    /// the match-arm channel — so a struct receiver's arms must bind views and
+    /// an enum receiver's must keep owning what they bind. Peeks the frame's
+    /// `self` slot without cloning it.
+    pub(super) fn bare_self_is_owned_struct_receiver(&self) -> bool {
+        matches!(
+            self.self_param_stack.last(),
+            Some(crate::ast::SelfParam::Owned)
+        ) && self
+            .env
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get("self"))
+            .is_some_and(|v| matches!(v, Value::Struct { .. }))
     }
 
     /// Is `name` an owned parameter of a method frame that the CALLER is not
@@ -872,10 +900,16 @@ impl<'a> super::Interpreter<'a> {
             // call result: `match P { r: R { .. }, n: 4 } { .. }` builds the
             // value at the match and nothing else can free it.
             ExprKind::StructLiteral { .. } => true,
-            ExprKind::SelfValue => matches!(
-                self.self_param_stack.last(),
-                Some(crate::ast::SelfParam::Owned)
-            ),
+            // B-2026-09-06-15 — an owned STRUCT receiver is a by-value param
+            // like any other (the caller retains its bodies), so it is NOT
+            // consuming; an owned ENUM receiver keeps the transfer (see
+            // `place_root_is_owned_param`'s `SelfValue` arm).
+            ExprKind::SelfValue => {
+                matches!(
+                    self.self_param_stack.last(),
+                    Some(crate::ast::SelfParam::Owned)
+                ) && !self.bare_self_is_owned_struct_receiver()
+            }
             ExprKind::MethodCall { method, .. } => {
                 !matches!(method.as_str(), "get" | "first" | "last")
             }

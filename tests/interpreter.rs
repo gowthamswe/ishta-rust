@@ -56461,6 +56461,180 @@ end
     );
 }
 
+/// B-2026-09-06-15 — a BARE `match self { H1 { e } => .. }` on an OWNED struct
+/// receiver ran the payload's `Drop` body twice for a named-local receiver (`dR31 dE
+/// dR31`) and lost the enum shell's body for a fresh temp (`dR32`, no `dE`), on all
+/// four surfaces. Both backends kept a bare `self` scrutinee on the TRANSFER path
+/// (arms own what they bind) on the premise that no caller walk existed for it; a
+/// struct receiver's caller walk does exist — the named local's own binding, or the
+/// receiver-temp registrar (B-2026-09-04-30) — so the arm's body was a second one,
+/// and for a temp the `fn_binds_self_part_out` gate declined the registrar, so the
+/// shell's body ran nowhere. Bare owned struct `self` now takes the owned-param VIEW
+/// walks on both backends (codegen `bare_self_is_owned_struct_receiver`, the
+/// interpreter twin) and a `match self` scrutinee is no longer a bind-out; an owned
+/// ENUM receiver keeps the transfer (`enum_recv/*` guard cells, unchanged).
+///
+/// The free-function twin was the oracle and had a compiled-only defect of its own
+/// in the same shape: codegen never marked a plain-STRUCT pattern's leaves as param
+/// views, so the NESTED `match e { .. }` inside `match h { H1 { e } => .. }` gave
+/// `r` a body beside the caller's walk — `dR51 dE dR51` on jit / -O0 / -O2 against
+/// `--interp`'s `dE dR51`, with or without a rebind (`p_whole`, `p_plain`,
+/// `p_rebind`). `stage_bare_tuple_bindings_for_bind` now marks them
+/// (`collect_plain_struct_pattern_binding_names`). `strleaf` pins a `String` leaf
+/// rebound inside the arm (memory unchanged by the mark); `two` pins a scalar leaf
+/// beside the enum one; `shell` pins a leaf bound and never consumed.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_bare_owned_struct_self_scrutinee_binds_views`, pinned to the same string.
+#[test]
+fn test_bare_owned_struct_self_scrutinee_binds_views() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct H1 { e: E }
+struct H2 { e: E, n: i64 }
+struct Hs { e: E, s: String }
+fn consume(x: R) -> i64 { return x.id }
+
+impl H1 {
+    fn whole(self) -> i64 { match self { H1 { e } => { match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } } } }
+    fn plain(self) -> i64 { match self { H1 { e } => { match e { E.A(r) => { return r.id; } E.B => { return 0; } } } } }
+    fn viacall(self) -> i64 { match self { H1 { e } => { match e { E.A(r) => { return consume(r); } E.B => { return 0; } } } } }
+    fn rebind(self) -> i64 { match self { H1 { e } => { let k = e; match k { E.A(r) => { return r.id; } E.B => { return 0; } } } } }
+    fn shell(self) -> i64 { match self { H1 { e } => { return 9; } } }
+}
+impl H2 {
+    fn two(self) -> i64 { match self { H2 { e, n } => { match e { E.A(r) => { return r.id + n; } E.B => { return n; } } } } }
+}
+impl Hs {
+    fn strleaf(self) -> i64 { match self { Hs { e, s } => { let m = s; println(f"  s{m}"); match e { E.A(r) => { return r.id; } E.B => { return 0; } } } } }
+}
+impl E {
+    fn m_r(self) -> R { match self { E.A(r) => { return r; } E.B => { return mk(0); } } }
+}
+fn p_whole(h: H1) -> i64 { match h { H1 { e } => { match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } } } }
+fn p_plain(h: H1) -> i64 { match h { H1 { e } => { match e { E.A(r) => { return r.id; } E.B => { return 0; } } } } }
+fn p_rebind(h: H1) -> i64 { match h { H1 { e } => { let k = e; match k { E.A(r) => { return r.id; } E.B => { return 0; } } } } }
+fn p_strleaf(h: Hs) -> i64 { match h { Hs { e, s } => { let m = s; println(f"  s{m}"); match e { E.A(r) => { return r.id; } E.B => { return 0; } } } } }
+
+fn main() {
+    println("whole/local"); let a1 = H1 { e: E.A(mk(31)) }; let x1 = a1.whole(); println(f"  r{x1}");
+    println("whole/temp"); let x2 = H1 { e: E.A(mk(32)) }.whole(); println(f"  r{x2}");
+    println("plain/local"); let a3 = H1 { e: E.A(mk(33)) }; let x3 = a3.plain(); println(f"  r{x3}");
+    println("plain/temp"); let x4 = H1 { e: E.A(mk(34)) }.plain(); println(f"  r{x4}");
+    println("viacall/local"); let a5 = H1 { e: E.A(mk(35)) }; let x5 = a5.viacall(); println(f"  r{x5}");
+    println("viacall/temp"); let x6 = H1 { e: E.A(mk(36)) }.viacall(); println(f"  r{x6}");
+    println("rebind/local"); let a7 = H1 { e: E.A(mk(37)) }; let x7 = a7.rebind(); println(f"  r{x7}");
+    println("rebind/temp"); let x8 = H1 { e: E.A(mk(38)) }.rebind(); println(f"  r{x8}");
+    println("shell/local"); let a9 = H1 { e: E.A(mk(39)) }; let x9 = a9.shell(); println(f"  r{x9}");
+    println("shell/temp"); let x10 = H1 { e: E.A(mk(40)) }.shell(); println(f"  r{x10}");
+    println("two/local"); let a11 = H2 { e: E.A(mk(41)), n: 100 }; let x11 = a11.two(); println(f"  r{x11}");
+    println("two/temp"); let x12 = H2 { e: E.A(mk(42)), n: 100 }.two(); println(f"  r{x12}");
+    println("strleaf/local"); let a13 = Hs { e: E.A(mk(43)), s: "sa".to_string() }; let x13 = a13.strleaf(); println(f"  r{x13}");
+    println("strleaf/temp"); let x14 = Hs { e: E.A(mk(44)), s: "sb".to_string() }.strleaf(); println(f"  r{x14}");
+    println("p_whole/local"); let b1 = H1 { e: E.A(mk(51)) }; let y1 = p_whole(b1); println(f"  r{y1}");
+    println("p_whole/temp"); let y2 = p_whole(H1 { e: E.A(mk(52)) }); println(f"  r{y2}");
+    println("p_plain/local"); let b3 = H1 { e: E.A(mk(53)) }; let y3 = p_plain(b3); println(f"  r{y3}");
+    println("p_rebind/local"); let b4 = H1 { e: E.A(mk(54)) }; let y4 = p_rebind(b4); println(f"  r{y4}");
+    println("p_strleaf/local"); let b6 = Hs { e: E.A(mk(56)), s: "sc".to_string() }; let y6 = p_strleaf(b6); println(f"  r{y6}");
+    println("enum_recv/local"); let c1 = E.A(mk(61)); let r1 = c1.m_r(); println(f"  r{r1.id}");
+    println("enum_recv/temp"); let r2 = E.A(mk(62)).m_r(); println(f"  r{r2.id}");
+    println("end");
+}
+"#),
+        r#"whole/local
+  dE
+  dR31
+  r31
+whole/temp
+  dE
+  dR32
+  r32
+plain/local
+  dE
+  dR33
+  r33
+plain/temp
+  dE
+  dR34
+  r34
+viacall/local
+  dE
+  dR35
+  r35
+viacall/temp
+  dE
+  dR36
+  r36
+rebind/local
+  dE
+  dR37
+  r37
+rebind/temp
+  dE
+  dR38
+  r38
+shell/local
+  dE
+  dR39
+  r9
+shell/temp
+  dE
+  dR40
+  r9
+two/local
+  dE
+  dR41
+  r141
+two/temp
+  dE
+  dR42
+  r142
+strleaf/local
+  ssa
+  dE
+  dR43
+  r43
+strleaf/temp
+  ssb
+  dE
+  dR44
+  r44
+p_whole/local
+  dE
+  dR51
+  r51
+p_whole/temp
+  dE
+  dR52
+  r52
+p_plain/local
+  dE
+  dR53
+  r53
+p_rebind/local
+  dE
+  dR54
+  r54
+p_strleaf/local
+  ssc
+  dE
+  dR56
+  r56
+enum_recv/local
+  dE
+  r61
+  dR61
+enum_recv/temp
+  r62
+  dR62
+end
+"#
+    );
+}
+
 #[test]
 fn test_deep_projection_scrutinee_runs_one_payload_body() {
     let hdr = "struct R { id: i64 }\n\
