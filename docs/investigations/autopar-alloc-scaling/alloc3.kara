@@ -1,0 +1,29 @@
+// Fourth probe: allocates two Strings per inner step like alloc2.kara, but
+// with NO f-string interpolation — `substring` + concat instead of `f"..."`.
+// alloc2 vs alloc3 isolates libc string FORMATTING (snprintf) from
+// ALLOCATION, which the `sample` profile of alloc_long.kara put in question:
+// its hot frames were __vfprintf / __ultoa / localeconv_l / os_unfair_lock,
+// not the malloc path.
+fn work(seed: i64, base: ref String) -> i64 {
+    let mut acc = seed + 1;
+    let mut k = 0;
+    while k < 600 {
+        let s = base.substring(0, (acc % 8) + 1);
+        let t = s + "x";
+        acc = (acc * 7 + t.len()) % 100000;
+        k = k + 1;
+    }
+    return acc % 1000;
+}
+
+fn main() {
+    let base = "abcdefghij";
+    let n = 720;
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n {
+        acc = acc + work(i, base);
+        i = i + 1;
+    }
+    println(f"sum {acc}");
+}

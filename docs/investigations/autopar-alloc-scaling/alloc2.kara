@@ -1,0 +1,27 @@
+// Third probe for B-2026-09-05-22 / -23: allocation-heavy, but the inner
+// loop carries a SEQUENTIAL dependence (each step reads the previous `acc`)
+// so it cannot be mistaken for a nested reduction. Exactly one parallel
+// region, same as uniform.kara — the only remaining difference between the
+// two is that this one allocates two short-lived Strings per inner step.
+fn work(seed: i64) -> i64 {
+    let mut acc = seed + 1;
+    let mut k = 0;
+    while k < 600 {
+        let s = f"n{acc}-{k}";
+        let t = s + "x";
+        acc = (acc * 7 + t.len()) % 100000;
+        k = k + 1;
+    }
+    return acc % 1000;
+}
+
+fn main() {
+    let n = 720;
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n {
+        acc = acc + work(i);
+        i = i + 1;
+    }
+    println(f"sum {acc}");
+}

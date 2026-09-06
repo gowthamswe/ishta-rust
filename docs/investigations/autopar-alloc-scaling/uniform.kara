@@ -1,0 +1,26 @@
+// Uniform-cost reduction probe for B-2026-09-05-22.
+// Every iteration costs EXACTLY the same, so load imbalance cannot explain
+// any difference between worker counts — only the dispatch machinery can.
+// kata:282, which the row was filed from, is an exhaustive search whose
+// per-iteration cost varies by orders of magnitude; that confounds
+// imbalance with the machinery this row is about.
+fn work(seed: i64) -> i64 {
+    let mut x = seed + 1;
+    let mut k = 0;
+    while k < 20000 {
+        x = (x * 1103515 + 12345) % 2147483647;
+        k = k + 1;
+    }
+    return x % 1000;
+}
+
+fn main() {
+    let n = 720;
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n {
+        acc = acc + work(i);
+        i = i + 1;
+    }
+    println(f"sum {acc}");
+}
