@@ -145658,6 +145658,64 @@ fn main() {
         };
         assert_eq!(out, "v3m 1\ndR1\none\nv3mu\ndR2\ntwo\nv3md 3\ndR3\nthree\nv3mt 4\ndR4\nfour\ngot5\ndR5\nfive\nfm 6\ndR6\nsix\ntm 7\ndR7\nseven\nv3m 8\ndR8\neight\nvu 9\ndR9\nnine\ntake 10\nvt\ndR10\nten\ntd 11 11\ndR11\neleven\ntake 12\ntt\ndR12\ntwelve\ngot13\ndR13\nthirteen\ntu 14\ndR14\nfourteen\ntm 15\ndR15\nfifteen\nend\n");
     }
+
+    /// B-2026-09-06-5 — a nested tuple element handed back TWO tuple levels
+    /// deep (`fn v3_ret(h: H2) -> R { let (inner, y) = h.pe; let (r, x) =
+    /// inner; return r; }` over `H2 { pe: ((R, i64), i64) }`) runs its user
+    /// `Drop` body ONCE. The part channel reported the escape correctly
+    /// (`[Field("pe"), TupleIndex(0), TupleIndex(0)]`); the caller-side skip
+    /// tree could express a tuple index only ONE level inside a field, so
+    /// the deeper path was dropped and the caller's field walk fired the
+    /// body beside the result's owner — `dR1 got1 dR1` on jit / aot /
+    /// AUTO_PAR=0 against the interpreter's `got1 dR1`. `insert_skip_path`
+    /// now recurses through `TupleIndex` parts the way it recurses through
+    /// `Field` parts, and the tuple bodies walker consumes the resulting
+    /// per-element subtree (`emit_tuple_elem_user_drop_bodies_fn_tree`).
+    ///
+    /// `one` the row's shape, `two` the direct projection `return
+    /// h.pe.0.0`, `three` through a rebound inner tuple, `four` three levels
+    /// deep, `five`/`six` a two-`R` inner tuple handing back either element
+    /// (the sibling's body stays the callee's), `seven` a struct field
+    /// below the tuple levels, `eight` the one-level shape that was already
+    /// right. Not here, filed separately: the NAMED-LOCAL argument
+    /// (`let h = H2 {..}; v3_ret(h)`) doubles on all four surfaces, at one
+    /// level too.
+    #[test]
+    fn e2e_nested_tuple_element_handed_back_two_levels_deep_runs_one_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct H2 { pe: ((R, i64), i64) }
+struct H3 { pe: (((R, i64), i64), i64) }
+struct H2b { pe: ((R, R), i64) }
+struct S { r: R, n: i64 }
+struct H4 { pe: ((S, i64), i64) }
+fn v3_ret(h: H2) -> R { let (inner, y) = h.pe; let (r, x) = inner; return r; }
+fn v3_ret_direct(h: H2) -> R { return h.pe.0.0; }
+fn v3_ret_z(h: H2) -> R { let z: (R, i64) = h.pe.0; let (r, x) = z; return r; }
+fn v4_ret(h: H3) -> R { let (mid, a) = h.pe; let (inner, b) = mid; let (r, c) = inner; return r; }
+fn vb_ret0(h: H2b) -> R { let (inner, y) = h.pe; let (r, s) = inner; return r; }
+fn vb_ret1(h: H2b) -> R { let (inner, y) = h.pe; let (r, s) = inner; return s; }
+fn vs_ret(h: H4) -> R { let (inner, y) = h.pe; let (s, x) = inner; let S { r, n } = s; return r; }
+fn v3_ret_tuple(h: H2) -> (R, i64) { let (inner, y) = h.pe; return inner; }
+fn main() {
+    { let a: R = v3_ret(H2 { pe: ((mk(1), 1), 2) }); println(f"got{a.id}"); println("one") }
+    { let a: R = v3_ret_direct(H2 { pe: ((mk(2), 1), 2) }); println(f"got{a.id}"); println("two") }
+    { let a: R = v3_ret_z(H2 { pe: ((mk(3), 1), 2) }); println(f"got{a.id}"); println("three") }
+    { let a: R = v4_ret(H3 { pe: (((mk(4), 1), 2), 3) }); println(f"got{a.id}"); println("four") }
+    { let a: R = vb_ret0(H2b { pe: ((mk(5), mk(6)), 2) }); println(f"got{a.id}"); println("five") }
+    { let a: R = vb_ret1(H2b { pe: ((mk(7), mk(8)), 2) }); println(f"got{a.id}"); println("six") }
+    { let a: R = vs_ret(H4 { pe: ((S { r: mk(9), n: 1 }, 1), 2) }); println(f"got{a.id}"); println("seven") }
+    { let a: (R, i64) = v3_ret_tuple(H2 { pe: ((mk(10), 1), 2) }); println(f"got{a.0.id}"); println("eight") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "got1\ndR1\none\ngot2\ndR2\ntwo\ngot3\ndR3\nthree\ngot4\ndR4\nfour\ndR6\ngot5\ndR5\nfive\ndR7\ngot8\ndR8\nsix\ngot9\ndR9\nseven\ngot10\ndR10\neight\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]

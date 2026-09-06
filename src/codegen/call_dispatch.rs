@@ -4977,15 +4977,30 @@ impl<'ctx> super::Codegen<'ctx> {
         // tuple, so this is expressible one level deep. A deeper tuple path
         // (`pe.0.0`) is not, and keeps the channel's under-approximating
         // answer (no mask).
-        if let [crate::ast::ParamPart::TupleIndex(elem)] = rest {
-            let is_tuple_field = self
+        //
+        // B-2026-09-06-5 — and ANY depth below that: `insert_tuple_skip_path`
+        // walks `TupleIndex` parts through the field's declared element types
+        // the way this fn walks `Field` parts through declared field types,
+        // creating one `nested` level per tuple crossed, so `pe.0.0` masks
+        // the leaf two levels in (the walker consumes the subtree since the
+        // same row). A path that does not resolve is dropped WHOLE, never
+        // its prefix — the under-approximating direction.
+        if let Some(crate::ast::ParamPart::TupleIndex(_)) = rest.first() {
+            let tuple_elems = self
                 .type_decls
                 .struct_field_type_exprs
                 .get(struct_name)
                 .and_then(|tes| tes.get(idx))
-                .is_some_and(|fte| matches!(fte.kind, TypeKind::Tuple(_)));
-            if is_tuple_field {
-                tree.nested.entry(idx).or_default().here.insert(*elem);
+                .and_then(|fte| match &fte.kind {
+                    TypeKind::Tuple(elems) => Some(elems.clone()),
+                    _ => None,
+                });
+            if let Some(elems) = tuple_elems {
+                let sub = tree.nested.entry(idx).or_default();
+                self.insert_tuple_skip_path(sub, &elems, rest);
+                if sub.is_empty() {
+                    tree.nested.remove(&idx);
+                }
             }
             return;
         }
@@ -5002,6 +5017,64 @@ impl<'ctx> super::Codegen<'ctx> {
         self.insert_skip_path(sub, &field_type, rest);
         if sub.is_empty() {
             tree.nested.remove(&idx);
+        }
+    }
+
+    /// B-2026-09-06-5 — the tuple-level half of [`Self::insert_skip_path`]:
+    /// `path` starts with a `TupleIndex` into a tuple whose element types are
+    /// `elem_tes`. A one-part path masks the element outright; a longer one
+    /// descends into the element — a nested tuple through this fn again, a
+    /// struct through `insert_skip_path` — and the path is dropped whole the
+    /// moment a level does not resolve.
+    fn insert_tuple_skip_path(
+        &self,
+        tree: &mut super::synth_drop::FieldSkipTree,
+        elem_tes: &[TypeExpr],
+        path: &[crate::ast::ParamPart],
+    ) {
+        let Some((head, rest)) = path.split_first() else {
+            return;
+        };
+        let crate::ast::ParamPart::TupleIndex(elem) = head else {
+            return;
+        };
+        let elem = *elem;
+        let Some(ete) = elem_tes.get(elem) else {
+            return;
+        };
+        if rest.is_empty() {
+            tree.here.insert(elem);
+            tree.nested.remove(&elem);
+            return;
+        }
+        if tree.here.contains(&elem) {
+            return;
+        }
+        match &ete.kind {
+            TypeKind::Tuple(inner) => {
+                let inner = inner.clone();
+                let sub = tree.nested.entry(elem).or_default();
+                self.insert_tuple_skip_path(sub, &inner, rest);
+                if sub.is_empty() {
+                    tree.nested.remove(&elem);
+                }
+            }
+            TypeKind::Path(p) => {
+                let Some(name) = p.segments.first().cloned() else {
+                    return;
+                };
+                if !self.type_decls.struct_types.contains_key(&name)
+                    || self.type_decls.shared_types.contains_key(&name)
+                {
+                    return;
+                }
+                let sub = tree.nested.entry(elem).or_default();
+                self.insert_skip_path(sub, &name, rest);
+                if sub.is_empty() {
+                    tree.nested.remove(&elem);
+                }
+            }
+            _ => {}
         }
     }
 

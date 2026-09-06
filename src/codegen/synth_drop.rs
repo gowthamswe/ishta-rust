@@ -4004,14 +4004,16 @@ impl<'ctx> super::Codegen<'ctx> {
                         // too — against the slot the destructure had just
                         // cap-zeroed, which is why the body rendered an empty
                         // `String` and a zero-length `Vec`.
-                        let elem_skip: std::collections::HashSet<u32> = skip
-                            .nested
-                            .get(&field_idx)
-                            .map(|sub| sub.here.iter().map(|i| *i as u32).collect())
-                            .unwrap_or_default();
-                        if let Some(w) = self.emit_tuple_elem_user_drop_bodies_fn_skipping(
-                            agg, &elem_tes, &elem_skip,
-                        ) {
+                        //
+                        // B-2026-09-06-5 — and `skip.nested[i].nested` is the
+                        // per-ELEMENT sub-mask below that, so a path crossing
+                        // two tuple levels (`pe.0.0`) lands on the leaf it
+                        // names. The whole subtree goes over, as it does for
+                        // a struct field.
+                        let sub = skip.nested.get(&field_idx).cloned().unwrap_or_default();
+                        if let Some(w) =
+                            self.emit_tuple_elem_user_drop_bodies_fn_tree(agg, &elem_tes, &sub)
+                        {
                             self.builder.build_call(w, &[field_ptr.into()], "").unwrap();
                         }
                     }
@@ -8064,6 +8066,56 @@ impl<'ctx> super::Codegen<'ctx> {
         skip: &std::collections::HashSet<u32>,
         payload_skip: &std::collections::HashSet<u32>,
     ) -> Option<FunctionValue<'ctx>> {
+        self.emit_tuple_elem_user_drop_bodies_fn_nested(
+            agg_ty,
+            elem_tes,
+            skip,
+            payload_skip,
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
+    /// B-2026-09-06-5 — the tuple walker driven by a whole [`FieldSkipTree`]
+    /// level: `here` is the element mask, `nested` the per-element sub-masks.
+    /// This is what a struct walker hands its TUPLE-typed field, exactly as it
+    /// hands a struct-typed field's subtree to
+    /// [`Self::emit_user_drop_field_bodies_fn_skipping`], so a path that
+    /// crosses a tuple level (`pe.0.0`) masks at the depth it names instead of
+    /// stopping one level in.
+    pub(super) fn emit_tuple_elem_user_drop_bodies_fn_tree(
+        &mut self,
+        agg_ty: inkwell::types::StructType<'ctx>,
+        elem_tes: &[TypeExpr],
+        tree: &FieldSkipTree,
+    ) -> Option<FunctionValue<'ctx>> {
+        let skip: std::collections::HashSet<u32> = tree.here.iter().map(|i| *i as u32).collect();
+        let payload_skip: std::collections::HashSet<u32> =
+            tree.payload_here.iter().map(|i| *i as u32).collect();
+        self.emit_tuple_elem_user_drop_bodies_fn_nested(
+            agg_ty,
+            elem_tes,
+            &skip,
+            &payload_skip,
+            &tree.nested,
+        )
+    }
+
+    /// [`Self::emit_tuple_elem_user_drop_bodies_fn_masked`] plus PER-ELEMENT
+    /// sub-masks (B-2026-09-06-5): an element with an entry in `nested` is
+    /// walked through [`Self::emit_slot_drop_bodies_at_tree`] under that
+    /// subtree — a nested tuple recurses into this walker, a struct into the
+    /// masked field walker — so a callee that hands back `pe.0.0` masks
+    /// exactly that leaf while the owner keeps every sibling's body. The
+    /// subtree is folded into the symbol name (`$t..`) so a nested-masked
+    /// walker never aliases the flat-masked one.
+    fn emit_tuple_elem_user_drop_bodies_fn_nested(
+        &mut self,
+        agg_ty: inkwell::types::StructType<'ctx>,
+        elem_tes: &[TypeExpr],
+        skip: &std::collections::HashSet<u32>,
+        payload_skip: &std::collections::HashSet<u32>,
+        nested: &std::collections::BTreeMap<usize, FieldSkipTree>,
+    ) -> Option<FunctionValue<'ctx>> {
         // Indices of every element that runs a body — a DIRECT Drop-running
         // struct, or (B-2026-08-02-26) ONE CONTAINER LEVEL around one. The
         // old walk accepted only a `Path` naming a user struct, so a
@@ -8138,8 +8190,24 @@ impl<'ctx> super::Codegen<'ctx> {
         // (`synthesize_tuple_drop_fn_te`), which had the identical defect and
         // now takes the identical key. One helper, so the two cannot drift.
         let shape: String = Self::llvm_agg_shape_sig(agg_ty);
+        // B-2026-09-06-5 — the per-element sub-masks, if any. Only entries
+        // that mask something count; an empty subtree is the unmasked walk.
+        let nested_live: std::collections::BTreeMap<usize, FieldSkipTree> = nested
+            .iter()
+            .filter(|(i, sub)| !sub.is_empty() && targets.contains(&(**i as u32)))
+            .map(|(i, sub)| (*i, sub.clone()))
+            .collect();
+        let nested_sig: String = if nested_live.is_empty() {
+            String::new()
+        } else {
+            let t = FieldSkipTree {
+                nested: nested_live.clone(),
+                ..Default::default()
+            };
+            format!("$t{}", t.mangle())
+        };
         let fn_name = format!(
-            "__karac_dropelems_tuple_{}{payload_sig}$in{shape}",
+            "__karac_dropelems_tuple_{}{payload_sig}{nested_sig}$in{shape}",
             key.join("_")
         );
         if let Some(f) = self.module.get_function(&fn_name) {
@@ -8164,7 +8232,12 @@ impl<'ctx> super::Codegen<'ctx> {
                 .ok();
             let Some(ep) = ep else { continue };
             let te = elem_tes[idx as usize].clone();
-            self.emit_slot_drop_bodies_at_opt(ep, &te, payload_skip.contains(&idx));
+            if let Some(sub) = nested_live.get(&(idx as usize)) {
+                let sub = sub.clone();
+                self.emit_slot_drop_bodies_at_tree(ep, &te, &sub);
+            } else {
+                self.emit_slot_drop_bodies_at_opt(ep, &te, payload_skip.contains(&idx));
+            }
         }
 
         self.builder.build_return(None).unwrap();
@@ -8172,6 +8245,55 @@ impl<'ctx> super::Codegen<'ctx> {
             self.builder.position_at_end(bb);
         }
         Some(walker)
+    }
+
+    /// B-2026-09-06-5 — [`Self::emit_slot_drop_bodies_at_opt`] under a
+    /// [`FieldSkipTree`] for the slot's OWN interior: a nested tuple takes the
+    /// tree-driven tuple walker, a user struct its own body plus the masked
+    /// field walker (the two calls the unmasked struct arm makes, with the
+    /// subtree threaded through the second). Any other slot type carries no
+    /// maskable interior at this granularity and falls back to the unmasked
+    /// walk, which is the channel's under-approximating direction.
+    fn emit_slot_drop_bodies_at_tree(
+        &mut self,
+        ep: PointerValue<'ctx>,
+        te: &TypeExpr,
+        tree: &FieldSkipTree,
+    ) {
+        if tree.is_empty() {
+            self.emit_slot_drop_bodies_at_opt(ep, te, false);
+            return;
+        }
+        if let TypeKind::Tuple(inner) = &te.kind {
+            let inner = inner.clone();
+            if let inkwell::types::BasicTypeEnum::StructType(agg) = self.llvm_type_for_type_expr(te)
+            {
+                if let Some(w) = self.emit_tuple_elem_user_drop_bodies_fn_tree(agg, &inner, tree) {
+                    self.builder.build_call(w, &[ep.into()], "").unwrap();
+                }
+            }
+            return;
+        }
+        let head = match &te.kind {
+            TypeKind::Path(p) => p.segments.first().cloned(),
+            _ => None,
+        };
+        let Some(head) = head else {
+            return;
+        };
+        if self.type_decls.shared_types.contains_key(&head)
+            || !self.type_decls.struct_types.contains_key(&head)
+        {
+            self.emit_slot_drop_bodies_at_opt(ep, te, false);
+            return;
+        }
+        let subst = self.generic_struct_subst_from_inst(&head, te);
+        if let Some(f) = self.user_drop_body_fn_mono(&head, &subst) {
+            self.builder.build_call(f, &[ep.into()], "").unwrap();
+        }
+        if let Some(f) = self.emit_user_drop_field_bodies_fn_skipping(&head, &subst, tree) {
+            self.builder.build_call(f, &[ep.into()], "").unwrap();
+        }
     }
 
     /// B-2026-08-28-57 — `__karac_dropelems_array_<T>_<N>`: the BODIES-ONLY

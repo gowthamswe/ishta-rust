@@ -74231,4 +74231,66 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-5 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_nested_tuple_element_handed_back_two_levels_deep_runs_one_body`:
+    /// the leaf handed back two tuple levels deep is freed once and its body
+    /// runs once. Heap `R` (`String` + `Vec`), so the masked walk must not
+    /// have moved any free.
+    #[test]
+    fn asan_nested_tuple_element_handed_back_two_levels_deep_clean() {
+        let label = "nested_tuple_element_handed_back_two_levels_deep";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct H2 { pe: ((R, i64), i64) }
+struct H3 { pe: (((R, i64), i64), i64) }
+struct H2b { pe: ((R, R), i64) }
+struct S { r: R, n: i64 }
+struct H4 { pe: ((S, i64), i64) }
+fn v3_ret(h: H2) -> R { let (inner, y) = h.pe; let (r, x) = inner; return r; }
+fn v3_ret_direct(h: H2) -> R { return h.pe.0.0; }
+fn v3_ret_z(h: H2) -> R { let z: (R, i64) = h.pe.0; let (r, x) = z; return r; }
+fn v4_ret(h: H3) -> R { let (mid, a) = h.pe; let (inner, b) = mid; let (r, c) = inner; return r; }
+fn vb_ret0(h: H2b) -> R { let (inner, y) = h.pe; let (r, s) = inner; return r; }
+fn vb_ret1(h: H2b) -> R { let (inner, y) = h.pe; let (r, s) = inner; return s; }
+fn vs_ret(h: H4) -> R { let (inner, y) = h.pe; let (s, x) = inner; let S { r, n } = s; return r; }
+fn v3_ret_tuple(h: H2) -> (R, i64) { let (inner, y) = h.pe; return inner; }
+fn main() {
+    { let a: R = v3_ret(H2 { pe: ((mk(1), 1), 2) }); println(f"got{a.id}"); println("one") }
+    { let a: R = v3_ret_direct(H2 { pe: ((mk(2), 1), 2) }); println(f"got{a.id}"); println("two") }
+    { let a: R = v3_ret_z(H2 { pe: ((mk(3), 1), 2) }); println(f"got{a.id}"); println("three") }
+    { let a: R = v4_ret(H3 { pe: (((mk(4), 1), 2), 3) }); println(f"got{a.id}"); println("four") }
+    { let a: R = vb_ret0(H2b { pe: ((mk(5), mk(6)), 2) }); println(f"got{a.id}"); println("five") }
+    { let a: R = vb_ret1(H2b { pe: ((mk(7), mk(8)), 2) }); println(f"got{a.id}"); println("six") }
+    { let a: R = vs_ret(H4 { pe: ((S { r: mk(9), n: 1 }, 1), 2) }); println(f"got{a.id}"); println("seven") }
+    { let a: (R, i64) = v3_ret_tuple(H2 { pe: ((mk(10), 1), 2) }); println(f"got{a.0.id}"); println("eight") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "got1", "dR1", "one", "got2", "dR2", "two", "got3", "dR3", "three", "got4", "dR4",
+                "four", "dR6", "got5", "dR5", "five", "dR7", "got8", "dR8", "six", "got9", "dR9",
+                "seven", "got10", "dR10", "eight", "end"
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }
