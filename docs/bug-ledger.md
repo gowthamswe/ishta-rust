@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 376 |
+| miscompile | 378 |
 | run-vs-build | 345 |
 | leak | 273 |
 | missing-feature | 194 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1493 |
-| interp | 365 |
+| codegen | 1495 |
+| interp | 367 |
 | typecheck | 293 |
 | ownership | 74 |
 | other | 73 |
@@ -157,6 +157,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-4 | 2026-09-06 | codegen | high | THE SELF-HOSTED RESOLVER ORACLE DOUBLE-FREES ON LINUX AND THE EMITTER ORACLE SEGFAULTS, AT THE IMPORT COMMIT AND ON CURRENT `main` ALIKE -- `tests/selfhost_resolver.rs`'s two tests abort `free(): double free detected in tcache 2` (SIGABRT, four per run) and `tests/selfhost_codegen.rs`'s `selfhost_codegen_matches_seed_run` dies SIGSEGV, identically at 51368a1 (the import that claims them green), e028255 and 822334c; the other six self-host oracles pass; CI's `codegen-e2e` job excludes both, so nothing has ever run them on glibc | — |
 | B-2026-09-06-9 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM HANDED TO A CALLEE THAT RETURNS IT, WITH THE RESULT BOUND TO A LOCAL, RUNS THE BODY TWICE ON ALL FOUR SURFACES -- `fn s_keep(r: R) { let w: R = keeps(r); println(f"skd {w.id}") }` over `fn keeps(r: R) -> R { return r }` prints `skd 3 dR3 dR3` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike; the tuple-param spelling (`let w: (R, i64) = keep(t)`) and the rebind spelling (`let z = t; let w = keep(z)`) match; valgrind-clean at both opt levels | — |
 | B-2026-09-06-11 | 2026-09-06 | interp+codegen | medium | A TUPLE ARGUMENT WHOSE CALLEE HANDS BACK A PART BELOW ITS TOP-LEVEL ELEMENTS RUNS THAT PART'S `Drop` BODY TWICE ON ALL FOUR SURFACES, NAMED LOCAL AND FRESH TEMP ALIKE -- `fn tv_ret(t: ((R, i64), i64)) -> R { let (inner, y) = t; let (r, x) = inner; return r; }` prints `dR1 got1 dR1` for `let t = ((mk(1), 1), 2); tv_ret(t)` AND for `tv_ret(((mk(4), 1), 2))` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike; a struct under a tuple (`fn ts_ret(t: (S, i64)) -> R { let (s, k) = t; return s.r; }`) matches; the one-level `flat_t(t)` is right | — |
+| B-2026-09-06-12 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM REBOUND THROUGH AN ALWAYS-RETURNING CALLEE AND THEN RETURNED RUNS THE BODY TWICE ON ALL FOUR SURFACES -- `fn s_keep_ret(r: R) -> R { let w: R = keeps(r); return w; }` over `fn keeps(r: R) -> R { return r }` prints `dR6 got 6 dR6` for `let got = s_keep_ret(mk(6))` under --interp, jit, aot and KARAC_AUTO_PAR=0 alike | — |
+| B-2026-09-06-13 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM HANDED TO A CALLEE THAT RETURNS IT ON SOME PATHS, WITH THE RESULT BOUND TO A LOCAL, RUNS THE BODY TWICE ON BOTH PATHS -- `fn s_keep_cond(r: R, k: bool) { let w: R = keepc(r, k); println(f"skc {w.id}") }` over `fn keepc(r: R, k: bool) -> R { if k { return r; } return mk(99); }` prints `skc 7 dR7 dR7` for `k = true` and `dR8 skc 99 dR99 dR8` for `k = false` on all four surfaces | — |
 
 ### Relocated
 
