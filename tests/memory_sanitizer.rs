@@ -15917,6 +15917,95 @@ fn main() {
         );
     }
 
+    /// B-2026-09-04-12 — A BOXED TUPLE PAYLOAD REACHED THROUGH A BY-VALUE PARAM
+    /// LOST ITS INTERIOR IN EVERY ARM SHAPE.
+    ///
+    /// `fn plainT(x: Option[(String, String)])` boxes its payload (6 words,
+    /// past the 3-word `Option` area). The callee's owned-param registration
+    /// (`functions.rs`, B-2026-08-06-9 leg A) freed the BOX and nothing walked
+    /// the tuple's own heap elements, because that arm derives its inner drop
+    /// from a struct NAME and a tuple has none. Measured at `-O0` under
+    /// valgrind, three calls each: 54 B in 6 blocks for `(String, String)`,
+    /// 81 B in 9 for a 3-`String` tuple, 27 B in 3 for
+    /// `(String, i64, i64, i64)`, and 288 B direct + 27 indirect for a
+    /// `Vec[String]` element.
+    ///
+    /// The identical shape bound as a NAMED LOCAL was already clean, which is
+    /// what located the fix: the let site (B-2026-08-05-3) arms the tuple's own
+    /// drop on the same `BoxedEnumDrop`, and the param site is now its twin.
+    ///
+    /// All three arm shapes are pinned because the fix has to leave the
+    /// ownership split intact, and two of them are the double-free directions:
+    ///   - `Some(t)` whole binding, read-only — the interior drop must SURVIVE
+    ///     (this is the reported leak);
+    ///   - `Some((a, b))` per-element destructure that CONSUMES the leaves into
+    ///     a `Vec` — `retract_boxed_tuple_inner_drop_for_arm` must downgrade the
+    ///     box back to box-only, or the box and the `Vec` free the same buffers;
+    ///   - `Some(_)` wildcard — binds nothing, so the box is the only owner the
+    ///     interior can have.
+    ///
+    /// The `Array[String, 2]` cell is the CONTROL and must stay clean: its
+    /// interior is owned by the caller's never-disarmed array drop, so
+    /// `option_payload_struct_or_enum_drop_ok` declining an array is what keeps
+    /// the fix from making a second owner of it.
+    #[test]
+    fn asan_boxed_tuple_param_payload_frees_its_interior() {
+        assert_clean_asan_run(
+            r#"
+fn whole(x: Option[(String, String)]) {
+    match x { Some(t) => { println(f"w:{t.0}"); } None => { println("wn"); } }
+}
+
+fn wild(x: Option[(String, String)]) {
+    match x { Some(_) => { println("i"); } None => { println("in"); } }
+}
+
+fn consume(x: Option[(String, String)], out: mut ref Vec[String]) {
+    match x { Some((a, b)) => { out.push(a); out.push(b); } None => {} }
+}
+
+fn wide(x: Option[(String, i64, i64, i64)]) {
+    match x { Some(t) => { println(f"x:{t.0}"); } None => { println("xn"); } }
+}
+
+fn arr(x: Option[Array[String, 2]]) {
+    match x { Some(t) => { println(f"a:{t[0]}"); } None => { println("an"); } }
+}
+
+fn main() {
+    let mut out: Vec[String] = Vec.new();
+    let mut n = 0;
+    while n < 3 {
+        whole(Some((f"whole-{n}-padpad", f"snd-{n}-padpad")));
+        wild(Some((f"wild-{n}-padpad", f"snd-{n}-padpad")));
+        consume(Some((f"con-{n}-padpad", f"snd-{n}-padpad")), mut out);
+        wide(Some((f"wide-{n}-padpad", 1, 2, 3)));
+        let a: Array[String, 2] = [f"arr-{n}-padpad", f"snd-{n}-padpad"];
+        arr(Some(a));
+        n = n + 1;
+    }
+    println(f"c:{out.len()}");
+}
+"#,
+            &[
+                "w:whole-0-padpad",
+                "i",
+                "x:wide-0-padpad",
+                "a:arr-0-padpad",
+                "w:whole-1-padpad",
+                "i",
+                "x:wide-1-padpad",
+                "a:arr-1-padpad",
+                "w:whole-2-padpad",
+                "i",
+                "x:wide-2-padpad",
+                "a:arr-2-padpad",
+                "c:6",
+            ],
+            "asan_boxed_tuple_param_payload_frees_its_interior",
+        );
+    }
+
     #[test]
     fn asan_sorted_map_string_key_iter_no_leak() {
         // B-2026-07-09-17: `SortedMap[String, String]` ordered observation. The

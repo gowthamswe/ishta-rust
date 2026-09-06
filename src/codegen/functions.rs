@@ -2668,19 +2668,63 @@ impl<'ctx> super::Codegen<'ctx> {
                         // which is why the pre-fix measurement was a LEAK of one
                         // envelope rather than a double free of it.
                         //
-                        // Mutual exclusion with `inner_drop_fn` holds trivially
-                        // here: this arm passes `None`, and the
-                        // `inner_struct.is_some()` gate above already excludes
-                        // every shape that would want one.
+                        // Mutual exclusion with `inner_drop_fn` holds here by
+                        // TYPE, not by the arm passing `None`: a TUPLE payload
+                        // (below) is not an `Option`, so its chain is length
+                        // zero, and a payload that DOES carry a chain is an
+                        // `Option` and never a tuple.
                         let deeper = Self::option_generic_arg_type_expr(&mono_ty)
                             .map(|p| self.nested_box_deeper_tag_chain(&p))
                             .unwrap_or_default();
+                        // B-2026-09-04-12 — a boxed TUPLE payload
+                        // (`Option[(String, String)]`) reaches this arm with
+                        // `inner_struct = None`, because that field is a struct
+                        // NAME and a tuple has none. The box-only free that
+                        // followed left the tuple's own heap elements owned by
+                        // NOBODY: 54 B in 6 blocks over three calls, and one
+                        // lost element per heap element of the tuple —
+                        // 81 B for a 3-`String` tuple, 27 B for
+                        // `(String, i64, i64, i64)`, and a whole `Vec` buffer
+                        // (288 B direct + 27 indirect) for a `Vec` element.
+                        //
+                        // This is verbatim the derivation the LET site uses
+                        // (B-2026-08-05-3, `stmts.rs`), and the reason the two
+                        // had diverged is that only the let site had a declared
+                        // `TypeExpr` in hand — the param does too, once the
+                        // monomorph subst has run. A local
+                        // `let o: Option[(String, String)] = …` matched in the
+                        // same three arm shapes is clean at every opt level;
+                        // the identical shape reached through a by-value PARAM
+                        // leaked in all three.
+                        //
+                        // ONE OWNER, the lesson the let site's own note
+                        // records: this hands the interior drop to the SAME
+                        // `BoxedEnumDrop` rather than registering a second
+                        // action, and a consuming arm retracts it back to
+                        // box-only through `clear_boxed_enum_inner_drop`
+                        // (`retract_boxed_tuple_inner_drop_for_arm`), which
+                        // already keys on any `Identifier` scrutinee in
+                        // `boxed_enum_payload_vars` — a param included. So the
+                        // per-element destructure `Some((a, b))`, whose leaves
+                        // each take their own owner, is downgraded by the same
+                        // machinery that downgrades the let site's.
+                        //
+                        // `option_payload_struct_or_enum_drop_ok` is what keeps
+                        // an all-scalar `(i64, i64)` from getting a drop it does
+                        // not need, and what declines a tuple whose recursive
+                        // drop is not fully supported.
+                        let tuple_inner_drop = Self::option_generic_arg_type_expr(&mono_ty)
+                            .filter(|p| {
+                                matches!(p.kind, TypeKind::Tuple(_))
+                                    && self.option_payload_struct_or_enum_drop_ok(p)
+                            })
+                            .map(|p| self.emit_drop_fn_for_type_expr(&p));
                         self.track_boxed_enum_var_with_chain(
                             &param_name,
                             alloca,
                             enum_lit,
                             variant,
-                            None,
+                            tuple_inner_drop,
                             deeper,
                         );
                     }
