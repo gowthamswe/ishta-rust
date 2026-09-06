@@ -34128,6 +34128,141 @@ end
         );
     }
 
+    /// B-2026-09-06-32 — a `Drop`-carrying ENUM leaf handed back out of a `let`
+    /// destructure of a by-value param (`let H2 { e, n } = h; return e;`) or out of a
+    /// bare-tuple `match` arm (`match t { (e, n) => { return e; } }`) aborted with
+    /// glibc's `free(): double free detected in tcache 2` under `karac run` and at
+    /// `KARAC_OPT_LEVEL=0`, clean at -O2 and under `--interp`. Two axes localised it:
+    /// the struct-leaf twins (`Hr { r, n } => r`, `(r, n) => r`) were clean, and so were
+    /// the `match h { H2 { e, n } => e }` and `return h.e` spellings. Both failing paths
+    /// left the enum leaf's payload live in the SOURCE: the `let` ladder's callee-owned
+    /// transfer listed "Vec/String/non-shared-struct fields" and kept an enum field on
+    /// the source-owns path, so the param's `StructDrop` freed the payload the returned
+    /// value's owner freed again; the bare-tuple hand-out neutralizer
+    /// (`zero_bare_tuple_elem_source_for_moved`) recognised struct elements only, so
+    /// the tuple drop at the merge freed the enum element the result still held. Both
+    /// now take the enum's own transfer: the `let` leaf registers an `EnumDrop`
+    /// (`track_enum_var`) and the source field's payload caps are zeroed through
+    /// `zero_struct_field_move_cap`'s enum arm; the tuple element's source words are
+    /// zeroed with `zero_enum_payload_caps`, the same cap-zero a moved enum local gets.
+    ///
+    /// The neighbours pin that nothing else moved: an UNCONSUMED enum leaf now frees
+    /// itself once (`let_unused`, `tuple_unused` — the leaf owns the memory, the source
+    /// skips it), a rebound leaf (`let_rebind`) and one handed to a by-value callee
+    /// (`let_call`, `tuple_call`) compose through the existing move suppressors, the
+    /// struct-leaf twins are unchanged, and the `if let` / `let (e, n) = t` spellings of
+    /// the tuple agree. Bodies were never the question here — the interpreter's
+    /// transcript is what every compiled surface now prints — so the ASAN twin is the
+    /// load-bearing pin.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_enum_leaf_handed_back_out_of_a_destructure`, pinned to the same string.
+    #[test]
+    fn e2e_enum_leaf_handed_back_out_of_a_destructure() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct H2 { e: E, n: i64 }
+struct Hr { r: R, n: i64 }
+fn consume_e(x: E) -> i64 { match x { E.A(r) => { return r.id; } E.B => { return 0; } } }
+
+fn p_let(h: H2) -> E { let H2 { e, n } = h; return e; }
+fn p_let_unused(h: H2) -> i64 { let H2 { e, n } = h; return n; }
+fn p_let_rebind(h: H2) -> E { let H2 { e, n } = h; let k = e; return k; }
+fn p_let_call(h: H2) -> i64 { let H2 { e, n } = h; return consume_e(e) + n; }
+fn p_let_r(h: Hr) -> R { let Hr { r, n } = h; return r; }
+fn p_match(h: H2) -> E { match h { H2 { e, n } => { return e; } } }
+fn p_tuple(t: (E, i64)) -> E { match t { (e, n) => { return e; } } }
+fn p_tuple_unused(t: (E, i64)) -> i64 { match t { (e, n) => { return n; } } }
+fn p_tuple_call(t: (E, i64)) -> i64 { match t { (e, n) => { return consume_e(e) + n; } } }
+fn p_tuple_r(t: (R, i64)) -> R { match t { (r, n) => { return r; } } }
+fn p_tuple_iflet(t: (E, i64)) -> E { if let (e, n) = t { return e; } else { return E.B; } }
+fn p_tuple_let(t: (E, i64)) -> E { let (e, n) = t; return e; }
+
+fn main() {
+    println("let/local"); let a1 = H2 { e: E.A(mk(1)), n: 10 }; let x1 = p_let(a1); println("  got"); let _ = x1;
+    println("let/temp"); let x2 = p_let(H2 { e: E.A(mk(2)), n: 10 }); println("  got"); let _ = x2;
+    println("let_unused/local"); let a3 = H2 { e: E.A(mk(3)), n: 10 }; let x3 = p_let_unused(a3); println(f"  got{x3}");
+    println("let_rebind/local"); let a4 = H2 { e: E.A(mk(4)), n: 10 }; let x4 = p_let_rebind(a4); println("  got"); let _ = x4;
+    println("let_call/local"); let a5 = H2 { e: E.A(mk(5)), n: 10 }; let x5 = p_let_call(a5); println(f"  got{x5}");
+    println("let_r/local"); let a6 = Hr { r: mk(6), n: 10 }; let x6 = p_let_r(a6); println(f"  got{x6.id}");
+    println("match/local"); let a7 = H2 { e: E.A(mk(7)), n: 10 }; let x7 = p_match(a7); println("  got"); let _ = x7;
+    println("tuple/local"); let b1 = (E.A(mk(11)), 10); let y1 = p_tuple(b1); println("  got"); let _ = y1;
+    println("tuple/temp"); let y2 = p_tuple((E.A(mk(12)), 10)); println("  got"); let _ = y2;
+    println("tuple_unused/local"); let b3 = (E.A(mk(13)), 10); let y3 = p_tuple_unused(b3); println(f"  got{y3}");
+    println("tuple_call/local"); let b4 = (E.A(mk(14)), 10); let y4 = p_tuple_call(b4); println(f"  got{y4}");
+    println("tuple_r/local"); let b5 = (mk(15), 10); let y5 = p_tuple_r(b5); println(f"  got{y5.id}");
+    println("tuple_iflet/local"); let b6 = (E.A(mk(16)), 10); let y6 = p_tuple_iflet(b6); println("  got"); let _ = y6;
+    println("tuple_let/local"); let b7 = (E.A(mk(17)), 10); let y7 = p_tuple_let(b7); println("  got"); let _ = y7;
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"let/local
+  got
+  dE
+  dR1
+let/temp
+  got
+  dE
+  dR2
+let_unused/local
+  dE
+  dR3
+  got10
+let_rebind/local
+  got
+  dE
+  dR4
+let_call/local
+  dE
+  dR5
+  got15
+let_r/local
+  got6
+  dR6
+match/local
+  got
+  dE
+  dR7
+tuple/local
+  got
+  dE
+  dR11
+tuple/temp
+  got
+  dE
+  dR12
+tuple_unused/local
+  dE
+  dR13
+  got10
+tuple_call/local
+  dE
+  dR14
+  got24
+tuple_r/local
+  got15
+  dR15
+tuple_iflet/local
+  got
+  dE
+  dR16
+tuple_let/local
+  got
+  dE
+  dR17
+end
+"#
+        );
+    }
+
     #[test]
     fn e2e_deep_projection_scrutinee_runs_one_payload_body() {
         let hdr = "struct R { id: i64 }\n\

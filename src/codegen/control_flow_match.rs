@@ -2541,6 +2541,26 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(tn) = self.var_types.var_type_names.get(name).cloned() else {
             return;
         };
+        // B-2026-09-06-32 — a non-shared user VALUE ENUM element (`(e, n)`
+        // with `e: E`, `E.A(R)`). This neutralizer recognised struct elements
+        // only, so an enum element handed out of the arm left its payload live
+        // in the source tuple, and the tuple drop at the merge freed what the
+        // returned value's owner freed again: glibc's `free(): double free
+        // detected in tcache 2` on the JIT and at -O0 (folded away at -O2),
+        // where the struct element `(r, n) => r` was clean. Same cap-zero the
+        // whole-enum move suppressor applies to a moved enum local
+        // (`zero_enum_payload_caps`); `Option` / `Result` keep their own
+        // machinery.
+        if !matches!(tn.as_str(), "Option" | "Result")
+            && !self.type_decls.struct_types.contains_key(&tn)
+        {
+            if let Some(layout) = self.type_decls.enum_layouts.get(&tn).cloned() {
+                if !layout.is_shared {
+                    self.zero_enum_payload_caps(elem_ptr, &layout);
+                }
+                return;
+            }
+        }
         if !self.type_decls.struct_types.contains_key(&tn)
             || self.type_decls.shared_types.contains_key(&tn)
         {

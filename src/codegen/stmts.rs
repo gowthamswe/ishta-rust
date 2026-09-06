@@ -14356,10 +14356,33 @@ impl<'ctx> super::Codegen<'ctx> {
                             TypeKind::Path(p) if p.segments.last().is_some_and(|s|
                                 self.type_decls.struct_types.contains_key(s.as_str())
                                     && !self.type_decls.shared_types.contains_key(s.as_str()))
-                        );
+                        )
+                        // B-2026-09-06-32 — and a non-shared user VALUE ENUM
+                        // field (`e: E` with `E.A(R)`). This list said "enum
+                        // fields stay on their existing source-owns path", and
+                        // the source's `StructDrop` did keep freeing the payload
+                        // -- but the leaf is a bit-copy the caller can be HANDED
+                        // (`let H2 { e, n } = h; return e;`), and the returned
+                        // value's owner freed the same payload again: glibc's
+                        // `free(): double free detected in tcache 2` on the JIT
+                        // and at -O0 (folded away at -O2), where the struct-leaf
+                        // twin `Hr { r, n } => r` and the `match h { H2 { e, n }
+                        // => e }` spelling were clean. Same transfer as its
+                        // neighbours: the leaf takes the enum's own
+                        // `EnumDrop` (below), and `zero_struct_field_move_cap`'s
+                        // enum arm zeroes the payload caps in the source so its
+                        // `StructDrop` skips the field. A hand-out then composes
+                        // through the whole-enum move suppressor exactly as a
+                        // `let`-bound enum local's does.
+                        || self.user_value_enum_leaf_name(&field_te).is_some();
                     if transferable {
                         if let Some(slot) = self.variables.get(&name).copied() {
-                            self.track_owned_destructure_field_cleanup(&name, slot.ptr, &field_te);
+                            match self.user_value_enum_leaf_name(&field_te) {
+                                Some(en) => self.track_enum_var(&en, slot.ptr),
+                                None => self.track_owned_destructure_field_cleanup(
+                                    &name, slot.ptr, &field_te,
+                                ),
+                            }
                             leaf_cleanup_registered = true;
                         }
                         self.zero_struct_field_move_cap_inst(
@@ -16720,6 +16743,26 @@ impl<'ctx> super::Codegen<'ctx> {
             }
         }
         None
+    }
+
+    /// B-2026-09-06-32 — the enum name when `te` is a bare, non-generic,
+    /// non-shared user VALUE enum (not `Option` / `Result`, whose leaves have
+    /// their own arms in the destructure ladder and their own trackers).
+    fn user_value_enum_leaf_name(&self, te: &TypeExpr) -> Option<String> {
+        let TypeKind::Path(p) = &te.kind else {
+            return None;
+        };
+        if p.generic_args.is_some() {
+            return None;
+        }
+        let n = p.segments.last()?;
+        if matches!(n.as_str(), "Option" | "Result")
+            || self.type_decls.struct_types.contains_key(n.as_str())
+        {
+            return None;
+        }
+        let layout = self.type_decls.enum_layouts.get(n.as_str())?;
+        (!layout.is_shared).then(|| n.clone())
     }
 
     /// Queue the right scope-exit `CleanupAction` for an owned destructured

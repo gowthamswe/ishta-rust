@@ -1509,6 +1509,121 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-32 — the MEMORY half, and the load-bearing pin, of
+    /// `e2e_enum_leaf_handed_back_out_of_a_destructure` (tests/codegen.rs): the
+    /// row is a double free (`free(): double free detected in tcache 2` on the
+    /// JIT and at -O0) of an enum leaf's payload, freed once by the source's
+    /// drop and once by the returned value's owner, on the `let`-destructure and
+    /// bare-tuple-arm hand-out paths. Both paths now transfer the leaf, and this
+    /// pins every cell of the fixture balanced under ASAN/LSan — the handed-out
+    /// leaf, the unconsumed one (which must now free itself exactly once), the
+    /// rebound and call-consumed ones, the struct-leaf twins, and the `if let` /
+    /// `let (e, n) = t` spellings. valgrind measured 0 errors at -O0 and -O2
+    /// before this landed as a test.
+    #[test]
+    fn asan_enum_leaf_handed_back_out_of_a_destructure_is_balanced() {
+        assert_clean_asan_run(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct H2 { e: E, n: i64 }
+struct Hr { r: R, n: i64 }
+fn consume_e(x: E) -> i64 { match x { E.A(r) => { return r.id; } E.B => { return 0; } } }
+
+fn p_let(h: H2) -> E { let H2 { e, n } = h; return e; }
+fn p_let_unused(h: H2) -> i64 { let H2 { e, n } = h; return n; }
+fn p_let_rebind(h: H2) -> E { let H2 { e, n } = h; let k = e; return k; }
+fn p_let_call(h: H2) -> i64 { let H2 { e, n } = h; return consume_e(e) + n; }
+fn p_let_r(h: Hr) -> R { let Hr { r, n } = h; return r; }
+fn p_match(h: H2) -> E { match h { H2 { e, n } => { return e; } } }
+fn p_tuple(t: (E, i64)) -> E { match t { (e, n) => { return e; } } }
+fn p_tuple_unused(t: (E, i64)) -> i64 { match t { (e, n) => { return n; } } }
+fn p_tuple_call(t: (E, i64)) -> i64 { match t { (e, n) => { return consume_e(e) + n; } } }
+fn p_tuple_r(t: (R, i64)) -> R { match t { (r, n) => { return r; } } }
+fn p_tuple_iflet(t: (E, i64)) -> E { if let (e, n) = t { return e; } else { return E.B; } }
+fn p_tuple_let(t: (E, i64)) -> E { let (e, n) = t; return e; }
+
+fn main() {
+    println("let/local"); let a1 = H2 { e: E.A(mk(1)), n: 10 }; let x1 = p_let(a1); println("  got"); let _ = x1;
+    println("let/temp"); let x2 = p_let(H2 { e: E.A(mk(2)), n: 10 }); println("  got"); let _ = x2;
+    println("let_unused/local"); let a3 = H2 { e: E.A(mk(3)), n: 10 }; let x3 = p_let_unused(a3); println(f"  got{x3}");
+    println("let_rebind/local"); let a4 = H2 { e: E.A(mk(4)), n: 10 }; let x4 = p_let_rebind(a4); println("  got"); let _ = x4;
+    println("let_call/local"); let a5 = H2 { e: E.A(mk(5)), n: 10 }; let x5 = p_let_call(a5); println(f"  got{x5}");
+    println("let_r/local"); let a6 = Hr { r: mk(6), n: 10 }; let x6 = p_let_r(a6); println(f"  got{x6.id}");
+    println("match/local"); let a7 = H2 { e: E.A(mk(7)), n: 10 }; let x7 = p_match(a7); println("  got"); let _ = x7;
+    println("tuple/local"); let b1 = (E.A(mk(11)), 10); let y1 = p_tuple(b1); println("  got"); let _ = y1;
+    println("tuple/temp"); let y2 = p_tuple((E.A(mk(12)), 10)); println("  got"); let _ = y2;
+    println("tuple_unused/local"); let b3 = (E.A(mk(13)), 10); let y3 = p_tuple_unused(b3); println(f"  got{y3}");
+    println("tuple_call/local"); let b4 = (E.A(mk(14)), 10); let y4 = p_tuple_call(b4); println(f"  got{y4}");
+    println("tuple_r/local"); let b5 = (mk(15), 10); let y5 = p_tuple_r(b5); println(f"  got{y5.id}");
+    println("tuple_iflet/local"); let b6 = (E.A(mk(16)), 10); let y6 = p_tuple_iflet(b6); println("  got"); let _ = y6;
+    println("tuple_let/local"); let b7 = (E.A(mk(17)), 10); let y7 = p_tuple_let(b7); println("  got"); let _ = y7;
+    println("end");
+}
+"#,
+            &[
+                "let/local",
+                "  got",
+                "  dE",
+                "  dR1",
+                "let/temp",
+                "  got",
+                "  dE",
+                "  dR2",
+                "let_unused/local",
+                "  dE",
+                "  dR3",
+                "  got10",
+                "let_rebind/local",
+                "  got",
+                "  dE",
+                "  dR4",
+                "let_call/local",
+                "  dE",
+                "  dR5",
+                "  got15",
+                "let_r/local",
+                "  got6",
+                "  dR6",
+                "match/local",
+                "  got",
+                "  dE",
+                "  dR7",
+                "tuple/local",
+                "  got",
+                "  dE",
+                "  dR11",
+                "tuple/temp",
+                "  got",
+                "  dE",
+                "  dR12",
+                "tuple_unused/local",
+                "  dE",
+                "  dR13",
+                "  got10",
+                "tuple_call/local",
+                "  dE",
+                "  dR14",
+                "  got24",
+                "tuple_r/local",
+                "  got15",
+                "  dR15",
+                "tuple_iflet/local",
+                "  got",
+                "  dE",
+                "  dR16",
+                "tuple_let/local",
+                "  got",
+                "  dE",
+                "  dR17",
+                "end",
+            ],
+            "asan_enum_leaf_handed_back_out_of_a_destructure_is_balanced",
+        );
+    }
+
     /// B-2026-09-04-29 — a by-value param destructure leaf REBOUND (`let c = b;`)
     /// runs the payload's body exactly once.
     ///
