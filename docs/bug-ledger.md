@@ -93,7 +93,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 383 |
-| run-vs-build | 345 |
+| run-vs-build | 346 |
 | leak | 273 |
 | missing-feature | 194 |
 | double-free | 189 |
@@ -111,7 +111,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | surface | total |
 |---|---|
 | codegen | 1500 |
-| interp | 372 |
+| interp | 373 |
 | typecheck | 294 |
 | ownership | 74 |
 | other | 73 |
@@ -132,7 +132,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 |---|---|---|---|---|---|
 | B-2026-08-28-76 | 2026-08-28 | autopar | high | AUTO-PAR RETURNS 1.08x FOR 15.7 CORES on the M5 (kata:288) and 3.09x (kata:282), against 3.06x/3.87x on 4 HOMOGENEOUS container cores -- the parallel lane burns 3.1-5.1x the sequential lane's USER CPU where the container burned 1.00x, and NO KARAC_PAR_WORKERS setting recovers it | kata:288-README |
 | B-2026-08-28-77 | 2026-08-28 | codegen | medium | kata:895 IS THE ONLY CORPUS ROW THAT GOT SLOWER ON THE FASTER HOST -- 26.50ms on 4 x86 container cores -> 29.63ms on the M5, while rust_ovf went 34.71 -> 16.49 (2.10x faster), go 1.68x and c 1.75x; kara falls from 1.31x AHEAD of checked Rust to 1.80x behind. Prime suspect: the map hash-tag probe is DISABLED on aarch64 for primitive keys | kata:895-README |
-| B-2026-08-31-50 | 2026-08-31 | interp+codegen | medium | AN ENUM-CONSTRUCTOR MIXED WRAP LOSES ITS SLOT MASK ACROSS A WHOLE-VALUE REBIND, AND CODEGEN CANNOT INHERIT IT BECAUSE IT STORES NOTHING PER VARIABLE -- `let w = W2.Two(r, mk(2)); let w2 = w;` prints `dR1 dR2 dR1` where `dR2 dR1` is due, on all three backends; the STRUCT and TUPLE spellings of the same rebind were fixed by B-2026-08-29-44 and this one could not be, because `enum_ctor_param_view_payload_slots` derives the masked slots from the ctor EXPRESSION at the `let` and keeps no per-var record for a rebind to copy | — |
 | B-2026-09-01-5 | 2026-09-01 | codegen | low | A DISCARDED BRANCH LITERAL WHOSE FIELD IS A PROJECTION OFF A NAMED LOCAL STILL STRANDS 38 B -- `P { a: t.a, b: 1 }` is the half of B-2026-08-29-32's guard that B-2026-08-31-44 could NOT admit, because the aggregate-literal move takeover does not extend to named locals and admitting it double-frees in a loop | — |
 | B-2026-09-01-17 | 2026-09-01 | interp+codegen | low | THE PROJECTED SPELLING OF B-2026-08-31-35 STILL RUNS THE LOCAL'S `Drop` BODY TWICE -- `let _ = if c { W { r: t.r, b: 1 } } else { .. };` over a local `W` doubles on all three backends because the aggregate-literal source walker resolves a bare NAME and not a field projection, so the disarm e49a85f wired up never names `t` | — |
 | B-2026-09-01-23 | 2026-09-01 | codegen | low | THE BRANCH ARM-OWNER SLOT IS ONE PER CONSTRUCT AND RESET EACH PASS, so a branch inside a loop whose owner frame lives OUTSIDE the loop frees only the LAST pass's escaping value -- `while i < 3 { let k = if i > 0 { mkA(n) } else { t }.contains("aaa"); }` strands `iterations - 1` of them (42 B in 2 blocks at 3 iterations, 72 B in 4 at 5); the same branch with the sibling binding declared INSIDE the loop body is clean, which isolates the frame CHOICE rather than the slot as the cause | — |
@@ -156,6 +155,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-15 | 2026-09-06 | interp+codegen | medium | A BARE `match self { H1 { e } => .. }` ON AN OWNED RECEIVER RUNS THE PAYLOAD'S `Drop` BODY TWICE FOR A NAMED-LOCAL RECEIVER AND LOSES THE ENUM SHELL'S BODY FOR A FRESH TEMP -- `dR31 dE dR31` / `dR32` on all four surfaces, the whole-`self` transfer path that B-2026-08-31-43's projection fix kept out on purpose | — |
 | B-2026-09-06-17 | 2026-09-06 | interp+codegen | medium | AN OWNED RECEIVER'S PAYLOAD HANDED OUT BY `return r` FROM `match self.e` RUNS ITS `Drop` BODY IN THE CALLER'S RETAINED WALK AS WELL -- `dE dR7 got7 dR7` on all four surfaces, the body before the read; `callee_returned_param_parts` indexes explicit parameters and `self` is not one at the AST level, so no caller-side mask is ever computed for a receiver | — |
 | B-2026-09-06-19 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM WRAPPED TWICE THROUGH A LOCAL ON SOME EXITS RUNS THE BODY TWICE ON THE HAND-BACK PATH -- `fn ftwo(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(82) }; } let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }` prints `d72 C72 B72 d72` for `k = false` on all four surfaces, while `k = true` is one body (`d71 C82 B82 d82`) | — |
+| B-2026-09-06-20 | 2026-09-06 | interp | medium | A `match` THAT DESTRUCTURES A MIXED WRAP'S VIEW SLOT RUNS THE VIEW'S `Drop` BODY TWICE IN THE INTERPRETER ALONE -- `fn m(r: R) -> i64 { let w = W2.Two(r, mk(2)); match w { W2.Two(a, b) => { return b.id; } W2.None2 => { return 0; } } }` prints `dR2 dR1 dR1` under `--interp` against `dR2 dR1` on jit / aot / `KARAC_AUTO_PAR=0`; the same with a rebind in between, with `a` read, and with both bindings unread; the slot mask guards the BINDING's walk and a match arm binds the payload out of it without consulting it | — |
 
 ### Relocated
 
@@ -2085,6 +2085,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-08-31-47 | interp | medium | THE INTERPRETER LOSES A `Drop` BODY THAT BOTH COMPILED BACKENDS RUN, IN TWO METHOD-ARG SHAPES -- a fresh enum temp whose payload an arm BINDS but doe… | 30e0e5d |
 | B-2026-08-31-48 | codegen | high | TWO INSTANTIATIONS OF ONE GENERIC FN AT DIFFERENT `Array`/`Slice`/`Vector` TYPE ARGS COLLIDE ON ONE MONO SYMBOL AND FAIL MODULE VERIFICATION -- `fn i… | 007c279 |
 | B-2026-08-31-49 | codegen | high | A GENERIC `Result[T, E]` RENDERS WITH THE `Option` VARIANT TABLE WHEN A GENERIC `Option[T]` DISPLAY IS EMITTED FIRST -- `Ok(7)` prints `Some(7)` and… | e5fd34f |
+| B-2026-08-31-50 | interp+codegen | medium | AN ENUM-CONSTRUCTOR MIXED WRAP LOSES ITS SLOT MASK ACROSS A WHOLE-VALUE REBIND, AND CODEGEN CANNOT INHERIT IT BECAUSE IT STORES NOTHING PER VARIABLE… | 24973b9 |
 | B-2026-09-01-1 | codegen | low | A SELF-ASSIGNMENT WHOSE RHS IS AN `if`/`match` LEAKS THE OVERWRITTEN VALUE -- `e = if c { pass(e) } else { pass(e) }` loses a block (12 allocs / 11 f… | 5b87599 |
 | B-2026-09-01-2 | interp | medium | THE INTERPRETER LOSES A MIXED WRAP'S FRESH FIELD BODY WHEN THE VIEW FIELD IS MOVED OUT -- `let s = S3 { a: r, b: mk(2) }; let x = s.a;` prints `dR1`… | 8a3f0a8 |
 | B-2026-09-01-3 | interp+codegen | medium | THE TUPLE SPELLING OF B-2026-08-29-47 STILL DOUBLES A PARAM VIEW'S `Drop` BODY -- `let t = (r, 5); let x = t.0;` prints `dR1 dR1` where one is due, a… | 39d41b6 |
