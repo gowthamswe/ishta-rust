@@ -5446,10 +5446,20 @@ impl<'a> super::Interpreter<'a> {
                     return false;
                 };
                 f.name == method
-                    && f.return_type.as_ref().is_some_and(|te| {
+                    && (f.return_type.as_ref().is_some_and(|te| {
                         matches!(&te.kind, crate::ast::TypeKind::Path(p)
                             if p.segments.last().is_some_and(|s| s == type_name))
                     })
+                        // B-2026-09-06-1 — or the method returns its OWN
+                        // generic parameter (`fn keep[T](ref self, x: T) -> T`):
+                        // the declared name is `T`, never the value's type, so
+                        // `let _ = h.keep(g)` and `h.keep(g);` were declined
+                        // here and ran NO body against the compiled surfaces'
+                        // one. The value in hand is a user struct/enum by the
+                        // caller's match, and a by-value `T` result is owned
+                        // by whoever received it, exactly as a concrete owned
+                        // return is.
+                        || Self::fn_returns_own_generic_param(f))
             })
         })
     }
@@ -7929,6 +7939,11 @@ impl<'a> super::Interpreter<'a> {
                                     }
                                 }
                             } else if let Some(tn) = self.user_fn_return_type_name(fn_name) {
+                                // B-2026-09-06-1 — a GENERIC callee's declared
+                                // return is its own parameter; the value says
+                                // which body is owed. See the helper.
+                                let tn =
+                                    self.discard_return_type_from_value(fn_name, tn, &discarded);
                                 if self.program.drop_method_keys.contains_key(&tn) {
                                     // B-2026-09-02-13 — the OWN body and, for an
                                     // enum, the live variant's PAYLOAD bodies.

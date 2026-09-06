@@ -62278,3 +62278,51 @@ fn main() {
         "got1\ndR1\none\ngot2\ndR2\ntwo\ngot3\ndR3\nthree\ngot4\ndR4\nfour\ngot5\ndR5\nfive\ngot6\ndR6\nsix\ngot7\ndR7\nk2\nseven\ngot8\ndR8\neight\ndR9\ngot10\ndR10\nnine\ndR11\ngot12\ndR12\nten\ndR13\nr13\neleven\ndR14\nr14\ntwelve\nend\n"
     );
 }
+
+/// B-2026-09-06-1 — a DISCARDED generic call's moved-in argument runs its
+/// `Drop` body on this backend. `let g = mk(1); passG(g);` over
+/// `fn passG[T](x: T) -> T` printed nothing here against `dR1` on all three
+/// compiled surfaces: the caller had stood down (the callee hands the
+/// argument back) and the discard site, reading the declared return `T`,
+/// found no type to run a body for. Same for a generic METHOD under both
+/// discard spellings. The discard arm now resolves the type from the VALUE
+/// when the callee returns its own generic parameter
+/// (`discard_return_type_from_value`), and the method gate admits such a
+/// method (`user_method_returns_owned_type`). Twin of `tests/codegen.rs`'s
+/// `e2e_discarded_generic_call_runs_the_moved_in_argument_body`, same
+/// program and string; that side was right throughout.
+///
+/// `one`/`four` the free-fn bare statement (named / temp), `two`/`five` its
+/// `let _ =` spelling (always right), `three` the concrete twin, `six`..`nine`
+/// the generic method under `let _ =` and bare, named and temp, `ten`/
+/// `eleven` its concrete twin, `twelve` the result bound (one body, at the
+/// binding's death).
+#[test]
+fn test_discarded_generic_call_runs_the_moved_in_argument_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, names: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, names: [f"a{i}", f"b{i}"] }; }
+fn passG[T](x: T) -> T { return x; }
+fn passN(x: R) -> R { return x; }
+struct H { n: i64 }
+impl H { fn keep[T](ref self, x: T) -> T { return x; } fn keepN(ref self, x: R) -> R { return x; } }
+fn main() {
+    { let g: R = mk(1); passG(g); println("one") }
+    { let g: R = mk(2); let _ = passG(g); println("two") }
+    { let g: R = mk(3); passN(g); println("three") }
+    { passG(mk(4)); println("four") }
+    { let _ = passG(mk(5)); println("five") }
+    { let h: H = H { n: 1 }; let g: R = mk(6); let _ = h.keep(g); println("six") }
+    { let h: H = H { n: 1 }; let g: R = mk(7); h.keep(g); println("seven") }
+    { let h: H = H { n: 1 }; let _ = h.keep(mk(8)); println("eight") }
+    { let h: H = H { n: 1 }; h.keep(mk(9)); println("nine") }
+    { let h: H = H { n: 1 }; let g: R = mk(10); let _ = h.keepN(g); println("ten") }
+    { let h: H = H { n: 1 }; h.keepN(mk(11)); println("eleven") }
+    { let g: R = mk(12); let w: R = passG(g); println(f"w{w.id}"); println("twelve") }
+    println("end")
+}
+"#),
+        "dR1\none\ndR2\ntwo\ndR3\nthree\ndR4\nfour\ndR5\nfive\ndR6\nsix\ndR7\nseven\ndR8\neight\ndR9\nnine\ndR10\nten\ndR11\neleven\nw12\ndR12\ntwelve\nend\n"
+    );
+}

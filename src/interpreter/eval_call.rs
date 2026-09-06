@@ -4296,6 +4296,56 @@ impl<'a> super::Interpreter<'a> {
     /// Declared return-type HEAD name of a user free function, for the
     /// fn-returned Drop temp classification (B-2026-07-01-7). `None` for
     /// unknown names, methods, and functions without a declared return.
+    /// B-2026-09-06-1 — does `f` declare its return type as one of its OWN
+    /// generic parameters (`fn passG[T](x: T) -> T`, `fn keep[T](ref self,
+    /// x: T) -> T`)? Such a return names no type the discard gates can look
+    /// up — `user_fn_return_type_name` answers the literal `T`, which is in
+    /// no `drop_method_keys` and matches no value's type — so the VALUE the
+    /// call produced is what says which body it owes.
+    pub(crate) fn fn_returns_own_generic_param(f: &crate::ast::Function) -> bool {
+        let Some(te) = f.return_type.as_ref() else {
+            return false;
+        };
+        let crate::ast::TypeKind::Path(p) = &te.kind else {
+            return false;
+        };
+        let [seg] = p.segments.as_slice() else {
+            return false;
+        };
+        f.generic_params
+            .as_ref()
+            .is_some_and(|g| g.params.iter().any(|gp| !gp.is_const && gp.name == *seg))
+    }
+
+    /// B-2026-09-06-1 — the type name a DISCARDED free-function result
+    /// should be walked as: the declared return name, unless the callee
+    /// returns its own generic parameter, in which case the value's own
+    /// type. `let g = mk(3); passG(g);` over `fn passG[T](x: T) -> T` ran
+    /// NO body here — the caller had stood down (the callee hands the
+    /// argument back) and the discard site, reading the declared `T`, found
+    /// nothing to run — where all three compiled surfaces printed `dR3`.
+    /// The concrete twin `fn passN(x: R) -> R` was right all along, which is
+    /// what says the declared name, not the discard, was the gap.
+    pub(crate) fn discard_return_type_from_value(
+        &self,
+        fn_name: &str,
+        declared: String,
+        v: &Value,
+    ) -> String {
+        let generic_ret = self.program.items.iter().any(|item| {
+            matches!(item, crate::ast::Item::Function(f)
+                if f.name == fn_name && Self::fn_returns_own_generic_param(f))
+        });
+        if !generic_ret {
+            return declared;
+        }
+        match v {
+            Value::Struct { name, .. } => name.clone(),
+            Value::EnumVariant { enum_name, .. } => enum_name.clone(),
+            _ => declared,
+        }
+    }
+
     pub(crate) fn user_fn_return_type_name(&self, fn_name: &str) -> Option<String> {
         self.program.items.iter().find_map(|item| match item {
             crate::ast::Item::Function(f) if f.name == fn_name => {
