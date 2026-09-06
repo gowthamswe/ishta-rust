@@ -5394,12 +5394,14 @@ fn main() {
     /// object, and admitting it would be a double free rather than a leak; and
     /// the LOOP, unbounded pre-fix.
     ///
-    /// THE INTERPRETER DISAGREES ON THE DISCARD CELLS AND THAT IS NOT THIS
-    /// TEST'S BUG. `karac run --interp` drops the body for a discarded generic
-    /// call outright (B-2026-09-06-1) — `a`, `c`, `g`, `h` and the loop are all
-    /// silent there — so this pins the COMPILED columns, which agree with each
-    /// other and with the concrete twins. Do not "fix" the expectation to match
-    /// the interpreter; the interpreter is the wrong column here.
+    /// THE INTERPRETER DISAGREED ON THE DISCARD CELLS WHEN THIS LANDED, and
+    /// no longer does. `karac run --interp` dropped the body for a discarded
+    /// generic call outright — `a`, `c`, `g`, `h` and the loop were all silent
+    /// there — so this was written to pin the COMPILED columns alone, which
+    /// agreed with each other and with the concrete twins. B-2026-09-06-1
+    /// (`3ef6220`) has since fixed the interpreter, and all five surfaces now
+    /// produce this string; the expectation is unchanged because the compiled
+    /// columns were the correct ones throughout.
     #[test]
     fn test_e2e_generic_method_whole_param_frees_the_entry_copy() {
         let out = run_program(
@@ -5439,6 +5441,72 @@ fn main() {
                 "a generic METHOD that hands its by-value param back owes one body \
                  per object and a free for its entry copy, on every compiled \
                  column; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// B-2026-09-05-37 — a whole rebind of a by-value `Drop` param NESTED in a
+    /// branch frees the callee's entry copy on the path that never rebound.
+    ///
+    /// `suppress_struct_cleanup_for_tail_identifier` is a compile-time frame
+    /// removal, so reaching it from inside a branch disarmed the source's
+    /// memory action on EVERY path: the destination covered the rebinding path
+    /// and nothing covered the rest. Measured before the fix at
+    /// `KARAC_OPT_LEVEL=0` as 3 B in 1 block per not-taken call — `brF`, `faF`,
+    /// `rdF` and the `tw` pair each leaking one `String` — and at the DEFAULT
+    /// `-O2` as well for `opt`, whose `println` between the branch and the
+    /// return stops LLVM deleting the dead copy.
+    ///
+    /// The BODIES were right throughout and stay so here; this asserts the
+    /// output, and `asan_branch_nested_param_rebind_frees_the_entry_copy`
+    /// asserts the freeing. `top` is the control the fix must not disturb: a
+    /// TOP-LEVEL rebind keeps the static removal B-2026-08-09-16 put there.
+    /// `rdT`/`rdF` are the second control — Kāra does not reject a read after a
+    /// move, so `n=h28` and `s=h27` pin that the guard leaves the source's
+    /// bytes intact where a cap-zero would not.
+    fn test_e2e_branch_nested_param_rebind_frees_the_entry_copy() {
+        let out = run_program(
+            r#"
+struct R { id: i64, name: String, xs: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", xs: [f"a{i}"] }; }
+fn br(r: R, keep: bool) -> i64 { if keep { let m = r; return m.id; } return 0; }
+fn fall(r: R, keep: bool) -> i64 { if keep { let m = r; println(f"in{m.id}"); } return 7; }
+fn els(r: R, keep: bool) -> i64 { if keep { return 4; } else { let m = r; return m.id; } }
+fn rd(r: R, keep: bool) -> i64 { if keep { let m = r; println(f"n={m.name}"); return 5; } println(f"s={r.name}"); return 6; }
+fn arm(r: R, k: i64) -> i64 { match k { 1 => { let m = r; return m.id; } _ => { return 0; } } }
+fn two(r: R, a: bool, b: bool) -> i64 { if a { if b { let m = r; return m.id; } return 2; } return 3; }
+fn top(r: R) -> i64 { let m = r; return m.id; }
+fn opt(r: R, keep: bool) -> Option[R] { if keep { let m = r; return Option.Some(m); } println("after"); return Option.None; }
+fn main() {
+  println(f"brF={br(mk(21), false)}");
+  println(f"brT={br(mk(22), true)}");
+  println(f"faF={fall(mk(23), false)}");
+  println(f"faT={fall(mk(24), true)}");
+  println(f"elF={els(mk(25), false)}");
+  println(f"elT={els(mk(26), true)}");
+  println(f"rdF={rd(mk(27), false)}");
+  println(f"rdT={rd(mk(28), true)}");
+  println(f"arF={arm(mk(29), 0)}");
+  println(f"arT={arm(mk(30), 1)}");
+  println(f"tw00={two(mk(31), false, false)}");
+  println(f"tw10={two(mk(32), true, false)}");
+  println(f"tw11={two(mk(33), true, true)}");
+  println(f"top={top(mk(34))}");
+  let _ = opt(mk(35), false);
+  let o = opt(mk(36), true);
+  match o { Option.Some(v) => { println(f"got{v.id}"); } _ => { println("none"); } }
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "dR21\nbrF=0\ndR22\nbrT=22\ndR23\nfaF=7\nin24\ndR24\nfaT=7\ndR25\nelF=25\ndR26\nelT=4\ns=h27\ndR27\nrdF=6\nn=h28\ndR28\nrdT=5\ndR29\narF=0\ndR30\narT=30\ndR31\ntw00=3\ndR32\ntw10=2\ndR33\ntw11=33\ndR34\ntop=34\nafter\ndR35\ngot36\ndR36\nend\n",
+                "a whole rebind of a by-value `Drop` param nested in a branch owes \
+                 one body per object on every path and a free for the entry copy \
+                 on the path that never rebound; got {out:?}"
             );
         }
     }

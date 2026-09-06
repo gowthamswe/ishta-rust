@@ -13118,12 +13118,70 @@ fn main() {
     /// object, and admitting it would be a double free rather than a leak; and
     /// the LOOP, unbounded pre-fix.
     ///
-    /// THE INTERPRETER DISAGREES ON THE DISCARD CELLS AND THAT IS NOT THIS
-    /// TEST'S BUG. `karac run --interp` drops the body for a discarded generic
-    /// call outright (B-2026-09-06-1) — `a`, `c`, `g`, `h` and the loop are all
-    /// silent there — so this pins the COMPILED columns, which agree with each
-    /// other and with the concrete twins. Do not "fix" the expectation to match
-    /// the interpreter; the interpreter is the wrong column here.
+    /// THE INTERPRETER DISAGREED ON THE DISCARD CELLS WHEN THIS LANDED, and
+    /// no longer does. `karac run --interp` dropped the body for a discarded
+    /// generic call outright — `a`, `c`, `g`, `h` and the loop were all silent
+    /// there — so this was written to pin the COMPILED columns alone, which
+    /// agreed with each other and with the concrete twins. B-2026-09-06-1
+    /// (`3ef6220`) has since fixed the interpreter, and all five surfaces now
+    /// produce this string; the expectation is unchanged because the compiled
+    /// columns were the correct ones throughout.
+    /// B-2026-09-05-37 — the AUTO-PAR twin of
+    /// `test_e2e_branch_nested_param_rebind_frees_the_entry_copy`.
+    ///
+    /// The defect was a compile-time cleanup-frame retraction reached from
+    /// inside a branch, so it is upstream of scheduling and the auto-par column
+    /// leaked exactly as the sequential one did (3 B in 1 block per not-taken
+    /// call at `KARAC_OPT_LEVEL=0`). The fix replaces the retraction with a
+    /// per-path runtime bit, and this pins that the default build — which
+    /// auto-parallelizes — agrees byte for byte with `KARAC_AUTO_PAR=0`, the
+    /// JIT and the interpreter.
+    #[test]
+    fn test_e2e_auto_par_branch_nested_param_rebind_frees_the_entry_copy() {
+        let out = run_program(
+            r#"
+struct R { id: i64, name: String, xs: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", xs: [f"a{i}"] }; }
+fn br(r: R, keep: bool) -> i64 { if keep { let m = r; return m.id; } return 0; }
+fn fall(r: R, keep: bool) -> i64 { if keep { let m = r; println(f"in{m.id}"); } return 7; }
+fn els(r: R, keep: bool) -> i64 { if keep { return 4; } else { let m = r; return m.id; } }
+fn rd(r: R, keep: bool) -> i64 { if keep { let m = r; println(f"n={m.name}"); return 5; } println(f"s={r.name}"); return 6; }
+fn arm(r: R, k: i64) -> i64 { match k { 1 => { let m = r; return m.id; } _ => { return 0; } } }
+fn two(r: R, a: bool, b: bool) -> i64 { if a { if b { let m = r; return m.id; } return 2; } return 3; }
+fn top(r: R) -> i64 { let m = r; return m.id; }
+fn opt(r: R, keep: bool) -> Option[R] { if keep { let m = r; return Option.Some(m); } println("after"); return Option.None; }
+fn main() {
+  println(f"brF={br(mk(21), false)}");
+  println(f"brT={br(mk(22), true)}");
+  println(f"faF={fall(mk(23), false)}");
+  println(f"faT={fall(mk(24), true)}");
+  println(f"elF={els(mk(25), false)}");
+  println(f"elT={els(mk(26), true)}");
+  println(f"rdF={rd(mk(27), false)}");
+  println(f"rdT={rd(mk(28), true)}");
+  println(f"arF={arm(mk(29), 0)}");
+  println(f"arT={arm(mk(30), 1)}");
+  println(f"tw00={two(mk(31), false, false)}");
+  println(f"tw10={two(mk(32), true, false)}");
+  println(f"tw11={two(mk(33), true, true)}");
+  println(f"top={top(mk(34))}");
+  let _ = opt(mk(35), false);
+  let o = opt(mk(36), true);
+  match o { Option.Some(v) => { println(f"got{v.id}"); } _ => { println("none"); } }
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "dR21\nbrF=0\ndR22\nbrT=22\ndR23\nfaF=7\nin24\ndR24\nfaT=7\ndR25\nelF=25\ndR26\nelT=4\ns=h27\ndR27\nrdF=6\nn=h28\ndR28\nrdT=5\ndR29\narF=0\ndR30\narT=30\ndR31\ntw00=3\ndR32\ntw10=2\ndR33\ntw11=33\ndR34\ntop=34\nafter\ndR35\ngot36\ndR36\nend\n",
+                "the auto-par column owes the same one body per object and the \
+                 same free for the entry copy as every other surface; got {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_e2e_auto_par_generic_method_whole_param_frees_the_entry_copy() {
         let out = run_program(

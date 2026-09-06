@@ -10439,6 +10439,40 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-05-37 — fire a `StructDrop`'s memory function, under the
+    /// slot's `cond_move_mem_drop_flags` bit when it has one.
+    ///
+    /// The unflagged path is byte-identical to the direct `build_call` this
+    /// replaced, so every slot that never met
+    /// [`Self::guard_struct_cleanup_for_nested_move`] emits exactly the IR it
+    /// did before.
+    fn emit_struct_drop_call_guarded(&self, drop_fn: FunctionValue<'ctx>, ptr: PointerValue<'ctx>) {
+        let flagged = self
+            .drop_rc
+            .cond_move_mem_drop_flags
+            .get(&ptr)
+            .copied()
+            .zip(self.current_fn);
+        let Some((flag, fn_val)) = flagged else {
+            self.builder.build_call(drop_fn, &[ptr.into()], "").unwrap();
+            return;
+        };
+        let live = self.context.append_basic_block(fn_val, "cmmem.live");
+        let cont = self.context.append_basic_block(fn_val, "cmmem.cont");
+        let armed = self
+            .builder
+            .build_load(self.context.bool_type(), flag, "cmmem.armed")
+            .unwrap()
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(armed, live, cont)
+            .unwrap();
+        self.builder.position_at_end(live);
+        self.builder.build_call(drop_fn, &[ptr.into()], "").unwrap();
+        self.builder.build_unconditional_branch(cont).unwrap();
+        self.builder.position_at_end(cont);
+    }
+
     pub(super) fn emit_user_drop_call_guarded(
         &self,
         binding_name: &str,
@@ -10713,6 +10747,72 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(flag) = self.cond_move_drop_flag_for(name) else {
             return false;
         };
+        let bool_t = self.context.bool_type();
+        let _ = self.builder.build_store(flag, bool_t.const_int(0, false));
+        true
+    }
+
+    /// B-2026-09-05-37 — the MEMORY sibling of
+    /// [`Self::guard_user_drop_for_nested_return`], for a whole rebind
+    /// (`let m = r;`) NESTED in a branch.
+    ///
+    /// [`Self::suppress_struct_cleanup_for_tail_identifier`] is a compile-time
+    /// frame removal, so reaching it from inside a branch disarms the source's
+    /// memory action on EVERY path. The destination's own memory drop covers
+    /// the rebinding path; the path that never rebound is left with nothing to
+    /// free the callee's ENTRY COPY of a by-value param — measured as 3 B in 1
+    /// block per call at `KARAC_OPT_LEVEL=0`, and at `-O2` as well once a
+    /// statement sits between the branch and the return (`-O2` deletes the dead
+    /// copy on the simplest shapes, which is what hid this).
+    ///
+    /// Same replacement the body half makes: keep the action armed and store
+    /// `false` into the binding's `cond_move_drop_flags` bit here, in the
+    /// branch's own block, and let the drain fire the memory drop only where
+    /// the bit still stands. The bit is shared with the body deliberately —
+    /// both answer "was the value in this slot moved out on this path?" — so a
+    /// flip-owned param whose body B-2026-09-05-13 already guarded disarms both
+    /// halves with one store, and `cond_move_drop_flag_for`'s entry-block
+    /// `true` (plus its per-iteration re-arm for a loop-declared binding) arms
+    /// them together.
+    ///
+    /// GATED on the action living in an ENCLOSING frame, exactly as the body
+    /// half is, and for the same reason: that is the test for "this `let` is
+    /// nested". A TOP-LEVEL `let k = r;` finds the action in the innermost
+    /// frame, takes no guard, and keeps today's static removal — so
+    /// B-2026-08-09-16's shape, which is what put that removal here, is
+    /// untouched. Returns `true` when the guard was installed, i.e. when the
+    /// caller must NOT also remove.
+    ///
+    /// NOT the cap-zeroing the sibling `else` arm uses for a non-`Drop` struct.
+    /// That is per path by construction too, and it would additionally paper
+    /// over the rebind-in-a-LOOP shape, which today aborts with `free(): double
+    /// free detected in tcache 2` under the JIT and at `-O0` (every iteration's
+    /// destination frees the one buffer). Zeroing would turn that loud abort
+    /// into a silent read of a freed buffer, which is strictly worse to find;
+    /// the flag leaves the loop exactly as it stands.
+    pub(super) fn guard_struct_cleanup_for_nested_move(&mut self, name: &str) -> bool {
+        let depth = self.drop_rc.scope_cleanup_actions.len();
+        if depth == 0 {
+            return false;
+        }
+        let Some(slot) = self.variables.get(name).map(|s| s.ptr) else {
+            return false;
+        };
+        let in_enclosing = self.drop_rc.scope_cleanup_actions[..depth - 1]
+            .iter()
+            .any(|frame| {
+                frame.iter().any(|a| {
+                    matches!(a, CleanupAction::StructDrop { struct_alloca, .. }
+                        if *struct_alloca == slot)
+                })
+            });
+        if !in_enclosing {
+            return false;
+        }
+        let Some(flag) = self.cond_move_drop_flag_for(name) else {
+            return false;
+        };
+        self.drop_rc.cond_move_mem_drop_flags.insert(slot, flag);
         let bool_t = self.context.bool_type();
         let _ = self.builder.build_store(flag, bool_t.const_int(0, false));
         true
@@ -13863,9 +13963,11 @@ impl<'ctx> super::Codegen<'ctx> {
                 struct_alloca,
                 drop_fn,
             } => {
-                self.builder
-                    .build_call(*drop_fn, &[(*struct_alloca).into()], "")
-                    .unwrap();
+                // B-2026-09-05-37 — guarded when a rebind nested in a branch
+                // handed this slot's value to a destination that registered its
+                // own memory drop; an ordinary unguarded call otherwise. See
+                // `Codegen::guard_struct_cleanup_for_nested_move`.
+                self.emit_struct_drop_call_guarded(*drop_fn, *struct_alloca);
             }
             // Phase 7 user-`impl Drop` dispatch Prereq.3 — invoke the
             // per-type wrapper `karac_drop_<Type>` on the binding. The

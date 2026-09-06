@@ -9696,7 +9696,25 @@ impl<'ctx> super::Codegen<'ctx> {
                                 // empty string. No-op when the wrapper carried the
                                 // memory, since then there is no `StructDrop` to
                                 // find.
-                                self.suppress_struct_cleanup_for_tail_identifier(source_name);
+                                //
+                                // B-2026-09-05-37 — PER PATH when the `let` is
+                                // itself nested, exactly as the body half above
+                                // is. This removal is all-paths; reached from
+                                // inside a branch it also disarms the path that
+                                // never rebound, which for a by-value param
+                                // leaves the callee's entry copy with no owner
+                                // (3 B in 1 block per call at
+                                // `KARAC_OPT_LEVEL=0`; at `-O2` too once a
+                                // statement sits between the branch and the
+                                // return). The guard keeps the action armed and
+                                // stores `false` in the branch's own block; a
+                                // TOP-LEVEL rebind finds the action in the
+                                // innermost frame, the guard declines, and the
+                                // static removal — B-2026-08-09-16's, above —
+                                // stands.
+                                if !self.guard_struct_cleanup_for_nested_move(source_name) {
+                                    self.suppress_struct_cleanup_for_tail_identifier(source_name);
+                                }
                             } else {
                                 // StructDrop move-suppression: `let g = f;`
                                 // where `f` is a tracked non-shared struct

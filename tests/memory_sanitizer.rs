@@ -6748,6 +6748,75 @@ fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); 
         );
     }
 
+    /// B-2026-09-05-37 — the LEAK gate for a whole rebind of a by-value `Drop`
+    /// param nested in a branch.
+    ///
+    /// Three rounds of fifteen calls; 443 allocations, 443 frees under valgrind
+    /// after the fix. Before it, every call whose branch did NOT rebind lost
+    /// one `String` — `brF`, `faF`, `rdF`, `arF`, `tw00`, `tw10` and `opt`'s
+    /// `None` leg — because the source's memory action was retracted from the
+    /// cleanup frame at COMPILE time, on every path, from inside the branch.
+    ///
+    /// THE `top` CELL IS THE CONTROL AND MUST STAY. A TOP-LEVEL `let m = r;`
+    /// keeps that static removal (B-2026-08-09-16 put it there to stop a double
+    /// free), so the guard has to decline for it; if a future change arms the
+    /// bit unconditionally this cell double-frees rather than leaks, which is
+    /// the failure worth catching first.
+    #[test]
+    fn asan_branch_nested_param_rebind_frees_the_entry_copy() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct R { id: i64, name: String, xs: Vec[String] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", xs: [f"a{i}"] }; }
+fn br(r: R, keep: bool) -> i64 { if keep { let m = r; return m.id; } return 0; }
+fn fall(r: R, keep: bool) -> i64 { if keep { let m = r; println(f"in{m.id}"); } return 7; }
+fn els(r: R, keep: bool) -> i64 { if keep { return 4; } else { let m = r; return m.id; } }
+fn rd(r: R, keep: bool) -> i64 { if keep { let m = r; println(f"n={m.name}"); return 5; } println(f"s={r.name}"); return 6; }
+fn arm(r: R, k: i64) -> i64 { match k { 1 => { let m = r; return m.id; } _ => { return 0; } } }
+fn two(r: R, a: bool, b: bool) -> i64 { if a { if b { let m = r; return m.id; } return 2; } return 3; }
+fn top(r: R) -> i64 { let m = r; return m.id; }
+fn opt(r: R, keep: bool) -> Option[R] { if keep { let m = r; return Option.Some(m); } println("after"); return Option.None; }
+fn round() {
+  println(f"brF={br(mk(21), false)}");
+  println(f"brT={br(mk(22), true)}");
+  println(f"faF={fall(mk(23), false)}");
+  println(f"faT={fall(mk(24), true)}");
+  println(f"elF={els(mk(25), false)}");
+  println(f"elT={els(mk(26), true)}");
+  println(f"rdF={rd(mk(27), false)}");
+  println(f"rdT={rd(mk(28), true)}");
+  println(f"arF={arm(mk(29), 0)}");
+  println(f"arT={arm(mk(30), 1)}");
+  println(f"tw00={two(mk(31), false, false)}");
+  println(f"tw10={two(mk(32), true, false)}");
+  println(f"tw11={two(mk(33), true, true)}");
+  println(f"top={top(mk(34))}");
+  let _ = opt(mk(35), false);
+  let o = opt(mk(36), true);
+  match o { Option.Some(v) => { println(f"got{v.id}"); } _ => { println("none"); } }
+}
+fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); }
+"#,
+            &[
+                "dR21", "brF=0", "dR22", "brT=22", "dR23", "faF=7", "in24", "dR24", "faT=7",
+                "dR25", "elF=25", "dR26", "elT=4", "s=h27", "dR27", "rdF=6", "n=h28", "dR28",
+                "rdT=5", "dR29", "arF=0", "dR30", "arT=30", "dR31", "tw00=3", "dR32", "tw10=2",
+                "dR33", "tw11=33", "dR34", "top=34", "after", "dR35", "got36", "dR36", "dR21",
+                "brF=0", "dR22", "brT=22", "dR23", "faF=7", "in24", "dR24", "faT=7", "dR25",
+                "elF=25", "dR26", "elT=4", "s=h27", "dR27", "rdF=6", "n=h28", "dR28", "rdT=5",
+                "dR29", "arF=0", "dR30", "arT=30", "dR31", "tw00=3", "dR32", "tw10=2", "dR33",
+                "tw11=33", "dR34", "top=34", "after", "dR35", "got36", "dR36", "dR21", "brF=0",
+                "dR22", "brT=22", "dR23", "faF=7", "in24", "dR24", "faT=7", "dR25", "elF=25",
+                "dR26", "elT=4", "s=h27", "dR27", "rdF=6", "n=h28", "dR28", "rdT=5", "dR29",
+                "arF=0", "dR30", "arT=30", "dR31", "tw00=3", "dR32", "tw10=2", "dR33", "tw11=33",
+                "dR34", "top=34", "after", "dR35", "got36", "dR36", "done",
+            ],
+            "b0905-37-branch-nested-param-rebind",
+            200,
+        );
+    }
+
     #[test]
     fn asan_place_struct_arg_escaping_field_frees_once() {
         assert_clean_asan_run_min_allocs(

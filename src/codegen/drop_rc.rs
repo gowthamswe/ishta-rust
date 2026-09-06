@@ -93,6 +93,27 @@ pub(crate) struct DropRc<'ctx> {
     /// exactly as they did before. That is what keeps this slice off the
     /// predicate question the row warns about.
     pub(crate) cond_move_drop_flags: HashMap<String, PointerValue<'ctx>>,
+    /// B-2026-09-05-37 — the MEMORY half of that same bit, keyed by the SLOT a
+    /// `CleanupAction::StructDrop` frees rather than by a binding name.
+    ///
+    /// `cond_move_drop_flags` made the BODY of a conditionally-moved binding
+    /// per path; the memory action beside it stayed on the compile-time
+    /// retraction ([`crate::codegen::CodeGen::suppress_struct_cleanup_for_tail_identifier`]),
+    /// which removes it on EVERY path. For a whole rebind nested in a branch
+    /// (`fn g(r: R, keep: bool) { if keep { let m = r; return 1; } return 0; }`)
+    /// that is one path too many: the destination's own memory drop covers the
+    /// rebinding path, and the path that never rebound is left with nothing to
+    /// free the callee's entry copy — 3 B per call at `KARAC_OPT_LEVEL=0`, and
+    /// at `-O2` too once anything sits between the branch and the return.
+    ///
+    /// SLOT-KEYED, not name-keyed, because the drain reads a `StructDrop` and a
+    /// `StructDrop` carries no binding name — the same reason
+    /// `param_view_mem_drops` carries the slot in its key. The VALUE is the
+    /// binding's entry in `cond_move_drop_flags`: one bit, one meaning ("the
+    /// value in this slot was moved out on this path"), so a shape that guards
+    /// both halves — a flip-owned param whose body B-2026-09-05-13 already
+    /// guarded — stores `false` once and disarms body and memory together.
+    pub(crate) cond_move_mem_drop_flags: HashMap<PointerValue<'ctx>, PointerValue<'ctx>>,
     /// B-2026-09-02-5 — for a binding whose `cond_move_drop_flags` bit was
     /// cleared by a PARAM-VIEW ASSIGNMENT (`h2 = h`), the memory-only
     /// `__karac_drop_struct_<T>` to run on the flag-`false` path.
