@@ -4594,16 +4594,32 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(program) = self.program_snapshot.as_deref() else {
             return Vec::new();
         };
-        program
-            .items
-            .iter()
-            .find_map(|item| match item {
-                crate::ast::Item::Function(f) if f.name == callee_name => {
-                    Some(crate::ast::fn_returns_param_part_paths(f, arg_index))
-                }
-                _ => None,
-            })
-            .unwrap_or_default()
+        // B-2026-09-05-33 — resolved through `find_function_ast` so a
+        // `Type.method` key answers too: the bare-name scan read
+        // `Item::Function` only, so the METHOD path's tuple argument had an
+        // empty skip list and `h.m_ret((mk(13), 0))` over `(r, k) => r` ran the
+        // handed-out element's body here and again at the result's owner.
+        let Some(f) = super::declarations::find_function_ast(program, callee_name) else {
+            return Vec::new();
+        };
+        let mut parts = crate::ast::fn_returns_param_part_paths(f, arg_index);
+        // B-2026-09-05-33 — the match-arm routes the part channel cannot see:
+        // an element forwarded through a call that returns it (`wrap(r)`),
+        // handed to a callee that stores it (`stash(r, v)`), stored under an
+        // outliving root (`v.push(r)`), or assigned into a place the function
+        // returns (`out = r`). `fn_returns_param_tuple_arm_elems` classifies
+        // all of them per element (program-aware for the two call routes),
+        // and reports as length-1 `TupleIndex` paths so every consumer of
+        // this list — the fresh-temp skip list, the place-argument disarm,
+        // the mono leg — picks them up unchanged. Interp twin:
+        // `callee_escaping_tuple_elems`.
+        for idx in crate::ast::fn_returns_param_tuple_arm_elems(program, f, arg_index) {
+            let path = vec![crate::ast::ParamPart::TupleIndex(idx)];
+            if !parts.contains(&path) {
+                parts.push(path);
+            }
+        }
+        parts
     }
 
     /// B-2026-09-05-6 — a place STRUCT argument (`cEsc(g)`) whose FIELD the
@@ -10916,6 +10932,17 @@ impl<'ctx> super::Codegen<'ctx> {
                     .map(|i| self.generic_struct_subst_from_inst(&type_name, i));
                 let vptr = self.move_suppression_value_ptr(var_name, slot.ptr);
                 self.zero_struct_move_caps_mono(vptr, &type_name, subst.as_ref());
+                // B-2026-09-05-33 — a bare-tuple ELEMENT binding moved by
+                // value (`v.push(r)`, `out = r`, a by-value call argument) is a
+                // bit-copy of the scrutinee's element: the zeroing above lands
+                // on the COPY, and the tuple's own drop at the merge still
+                // freed the buffers the moved value carries — `free(): double
+                // free detected` on every compiled backend. Same neutralization
+                // the arm-tail and `return` hooks apply (B-2026-09-05-27): zero
+                // the SOURCE element too. A no-op for a binding that is not a
+                // tuple element, or whose slot IS the element.
+                let var_name_owned = var_name.to_string();
+                self.zero_bare_tuple_elem_source_for_moved(&var_name_owned);
                 // B-2026-08-06-10, whole-payload sibling of the field move-out
                 // mirror above. `x` here is a deboxed COPY of a payload box the
                 // CALLER owns (`fn f(h: Option[H]) { match h { Some(x) => x } }`

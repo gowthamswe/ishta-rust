@@ -73586,4 +73586,72 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-05-33 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_match_arm_element_escaping_by_call_store_or_assignment_has_one_owner`:
+    /// a tuple element forwarded, stashed, pushed, assigned out, or handed out
+    /// of a method arm is freed exactly once and its body runs exactly once.
+    /// `three` and `four` were double frees before the source-element zeroing;
+    /// heap `R` (`String` + `Vec`) so a lost free is a leak LSan sees.
+    #[test]
+    fn asan_match_arm_element_escaping_by_call_store_or_assignment_clean() {
+        let label = "match_arm_element_escaping_by_call_store_or_assignment";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+fn wrap(x: R) -> R { return x }
+fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }
+struct H { n: i64 }
+impl H {
+    fn m_ret(ref self, t: (R, i64)) -> R { match t { (r, k) => { r } } }
+    fn m_two(ref self, t: (R, R)) -> R { match t { (a, b) => { b } } }
+}
+fn t_fwd(t: (R, i64)) -> R { match t { (r, k) => { wrap(r) } } }
+fn t_stash(t: (R, i64), v: mut ref Vec[R]) -> i64 { match t { (r, k) => { stash(r, v); k } } }
+fn t_push(t: (R, i64), v: mut ref Vec[R]) -> i64 { match t { (r, k) => { v.push(r); k } } }
+fn t_assign(t: (R, i64)) -> R { let mut out: R = mk(50); match t { (r, k) => { out = r; } } out }
+fn t_two_push(t: (R, R), v: mut ref Vec[R]) -> i64 { match t { (a, b) => { v.push(a); consume(b) } } }
+fn main() {
+    let h: H = H { n: 1 };
+    { let a: R = t_fwd((mk(1), 0)); println(f"r{a.id}"); println("one") }
+    { let mut v: Vec[R] = []; let d: i64 = t_stash((mk(2), 0), mut v); println(f"r{d} n{v.len()}"); println("two") }
+    { let mut v: Vec[R] = []; let d: i64 = t_push((mk(3), 0), mut v); println(f"r{d} n{v.len()}"); println("three") }
+    { let a: R = t_assign((mk(4), 0)); println(f"r{a.id}"); println("four") }
+    { let a: R = h.m_ret((mk(5), 0)); println(f"r{a.id}"); println("five") }
+    { let a: R = h.m_two((mk(6), mk(7))); println(f"r{a.id}"); println("six") }
+    { let mut v: Vec[R] = []; let d: i64 = t_two_push((mk(8), mk(9)), mut v); println(f"r{d} n{v.len()}"); println("eight") }
+    { let t: (R, i64) = (mk(10), 0); let a: R = t_fwd(t); println(f"r{a.id}"); println("ten") }
+    { let t: (R, i64) = (mk(11), 0); let mut v: Vec[R] = []; let d: i64 = t_push(t, mut v); println(f"r{d} n{v.len()}"); println("eleven") }
+    { let t: (R, i64) = (mk(12), 0); let a: R = h.m_ret(t); println(f"r{a.id}"); println("twelve") }
+    { let a: R = t_fwd((mk(13), 0)); let b: R = t_fwd((mk(14), 0)); println(f"r{a.id}{b.id}"); println("thirteen") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "r1", "dR1", "one", "r0 n1", "dR2", "two", "r0 n1", "dR3", "three", "dR50", "r4",
+                "dR4", "four", "r5", "dR5", "five", "dR6", "r7", "dR7", "six", "r9 n1", "dR8",
+                "eight", "r10", "dR10", "ten", "r0 n1", "dR11", "eleven", "r12", "dR12", "twelve",
+                "r1314", "dR14", "dR13", "thirteen", "end",
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

@@ -8000,7 +8000,24 @@ impl<'ctx> super::Codegen<'ctx> {
                     let escapes_frame = handed_off
                         || self.call_arg_moves_into_outliving_place(&qualified, i, false)
                         || self.callee_returns_enum_arg_payload(&qualified, pidx);
-                    self.track_inline_owned_aggregate_arg(val, &a.value, escapes_frame);
+                    // B-2026-09-05-33 — the per-ELEMENT escape set, exactly as
+                    // the free-fn leg carries it: a method whose arm hands one
+                    // element of a tuple argument out (`(r, k) => r`) must not
+                    // have that element's body registered caller-side, while
+                    // its siblings' bodies still are. The plain wrapper's empty
+                    // set ran `dR13 r13 dR13` for one object on every compiled
+                    // backend. The place-argument disarm is the named-local
+                    // spelling of the same rule (B-2026-08-28-16's helper).
+                    let escaping_parts = self.callee_returned_param_parts(&qualified, i);
+                    self.track_inline_owned_aggregate_arg_parts(
+                        val,
+                        &a.value,
+                        escapes_frame,
+                        &escaping_parts,
+                        None,
+                        false,
+                    );
+                    self.disarm_escaping_place_tuple_elem_bodies(&qualified, i, &a.value);
                     // Fresh-heap by-value arg materialization — the method-call
                     // sibling of the #20 arm in `compile_call` (call_dispatch.rs).
                     // A `String`/`Vec` produced by a Call/MethodCall (or a block /

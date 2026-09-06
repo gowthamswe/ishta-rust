@@ -3739,7 +3739,21 @@ impl<'a> super::Interpreter<'a> {
                 .callee_fn_for_ownership_guard_of(callee_name, method_owner)
                 .is_some_and(|f| {
                     let probe = &mut |n: &str| self.type_name_runs_user_drop(n, &mut Vec::new());
-                    !crate::ast::owned_self_return_is_opaque_to_receiver(f, probe)
+                    // B-2026-09-05-33 — not for a TUPLE parameter. Its
+                    // elements are classified one at a time by
+                    // `callee_escaping_tuple_elems` (a constructor wrap of an
+                    // element counts as an escape there too), so the
+                    // whole-argument stand-down this return-type test licenses
+                    // is strictly coarser: `fn m_two(ref self, t: (R, R)) -> R
+                    // { match t { (a, b) => b } }` stood the whole tuple down
+                    // and lost `a`'s body, and the `continue` it triggers
+                    // skipped the named-local mask below, so `h.m_ret(t)` ran
+                    // the handed-out element's body twice.
+                    let tuple_param = f
+                        .params
+                        .get(i)
+                        .is_some_and(|p| matches!(p.ty.kind, crate::ast::TypeKind::Tuple(_)));
+                    (!tuple_param && !crate::ast::owned_self_return_is_opaque_to_receiver(f, probe))
                         // The one shape the compiled backends keep INSIDE the
                         // callee: the parameter handed to a local aggregate,
                         // which owns it from there. Firing caller-side as well

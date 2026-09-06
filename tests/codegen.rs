@@ -144875,6 +144875,78 @@ fn main() {
         };
         assert_eq!(out, "dR1\nr1\none\ndR2\nr0\ntwo\nr3\ndR3\nthree\ndR4\nr4\nfour\ndR6\nr6\nsix\ndR7\nr0\nseven\ndR9\nr9\nnine\ndR10\nr10\nten\ndR11\nr0\neleven\ndR13\nr12\ndR12\ntwelve\ndR14\ndR15\nr14\nfourteen\ndR16\nr0\nsixteen\ndR17\nr117\nseventeen\ndR18\nr100\neighteen\ndR19\nr19\nnineteen\ndR20\nr0\ntwenty\ndR21\nr21\ntwentyone\ndR22\nr5\ntwentytwo\ndR23\nr23\ntwentythree\ndR24\nr3\ntwentyfour\ndR25\ndR26\nr25\ntwentysix\nend\n");
     }
+
+    /// B-2026-09-05-33 — a match arm over an owned tuple parameter whose
+    /// element leaves by a route other than a bare/alias return has ONE owner
+    /// on every compiled backend. Five routes, two channels:
+    ///
+    /// BODIES. The caller-side skip list for a tuple argument came from
+    /// `callee_returned_param_parts` alone, which classifies only a returned
+    /// expression that DENOTES the element and resolves free functions only.
+    /// It now unions `fn_returns_param_tuple_arm_elems` (the predicate
+    /// B-2026-09-05-28 built for the interpreter: forwarded through a call
+    /// that returns it, handed to a callee that stores it, stored under an
+    /// outliving root, assigned into a returned place) and resolves through
+    /// `find_function_ast`, so the METHOD path gets a skip list at all — it
+    /// carried the plain wrapper's empty set and ran `dR13 r13 dR13` for one
+    /// object (`five`, `twelve`).
+    ///
+    /// MEMORY. The shared move-suppressor (`suppress_source_vec_cleanup_for_
+    /// arg_ex`, reached by `v.push(r)`, `out = r` and a by-value argument
+    /// alike) zeroed the BINDING's caps, and a bare-tuple element binding is a
+    /// bit-copy of the scrutinee's element — so the tuple's own drop at the
+    /// merge freed the buffers the moved value carries: `free(): double free
+    /// detected in tcache 2` on `three` and `four`. It now also zeroes the
+    /// SOURCE element (`zero_bare_tuple_elem_source_for_moved`, the hook the
+    /// arm-tail and `return` sites already use since B-2026-09-05-27).
+    ///
+    /// `one`/`two`/`three`/`four` are the row's four free-function cells,
+    /// `five` the method-path bare return, `six` a two-`Drop` method tuple
+    /// whose unread sibling must still fire, `eight` push-one-consume-other,
+    /// `ten`..`twelve` the named-local argument spellings, `thirteen` two
+    /// forwarding calls in one block (the shared temp names composing). The
+    /// interpreter twin carries the same program; the ASAN twin runs it under
+    /// the sanitizer.
+    #[test]
+    fn e2e_match_arm_element_escaping_by_call_store_or_assignment_has_one_owner() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+fn wrap(x: R) -> R { return x }
+fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }
+struct H { n: i64 }
+impl H {
+    fn m_ret(ref self, t: (R, i64)) -> R { match t { (r, k) => { r } } }
+    fn m_two(ref self, t: (R, R)) -> R { match t { (a, b) => { b } } }
+}
+fn t_fwd(t: (R, i64)) -> R { match t { (r, k) => { wrap(r) } } }
+fn t_stash(t: (R, i64), v: mut ref Vec[R]) -> i64 { match t { (r, k) => { stash(r, v); k } } }
+fn t_push(t: (R, i64), v: mut ref Vec[R]) -> i64 { match t { (r, k) => { v.push(r); k } } }
+fn t_assign(t: (R, i64)) -> R { let mut out: R = mk(50); match t { (r, k) => { out = r; } } out }
+fn t_two_push(t: (R, R), v: mut ref Vec[R]) -> i64 { match t { (a, b) => { v.push(a); consume(b) } } }
+fn main() {
+    let h: H = H { n: 1 };
+    { let a: R = t_fwd((mk(1), 0)); println(f"r{a.id}"); println("one") }
+    { let mut v: Vec[R] = []; let d: i64 = t_stash((mk(2), 0), mut v); println(f"r{d} n{v.len()}"); println("two") }
+    { let mut v: Vec[R] = []; let d: i64 = t_push((mk(3), 0), mut v); println(f"r{d} n{v.len()}"); println("three") }
+    { let a: R = t_assign((mk(4), 0)); println(f"r{a.id}"); println("four") }
+    { let a: R = h.m_ret((mk(5), 0)); println(f"r{a.id}"); println("five") }
+    { let a: R = h.m_two((mk(6), mk(7))); println(f"r{a.id}"); println("six") }
+    { let mut v: Vec[R] = []; let d: i64 = t_two_push((mk(8), mk(9)), mut v); println(f"r{d} n{v.len()}"); println("eight") }
+    { let t: (R, i64) = (mk(10), 0); let a: R = t_fwd(t); println(f"r{a.id}"); println("ten") }
+    { let t: (R, i64) = (mk(11), 0); let mut v: Vec[R] = []; let d: i64 = t_push(t, mut v); println(f"r{d} n{v.len()}"); println("eleven") }
+    { let t: (R, i64) = (mk(12), 0); let a: R = h.m_ret(t); println(f"r{a.id}"); println("twelve") }
+    { let a: R = t_fwd((mk(13), 0)); let b: R = t_fwd((mk(14), 0)); println(f"r{a.id}{b.id}"); println("thirteen") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "r1\ndR1\none\nr0 n1\ndR2\ntwo\nr0 n1\ndR3\nthree\ndR50\nr4\ndR4\nfour\nr5\ndR5\nfive\ndR6\nr7\ndR7\nsix\nr9 n1\ndR8\neight\nr10\ndR10\nten\nr0 n1\ndR11\neleven\nr12\ndR12\ntwelve\nr1314\ndR14\ndR13\nthirteen\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]
