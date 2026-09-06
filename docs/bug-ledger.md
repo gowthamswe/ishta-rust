@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 381 |
+| miscompile | 383 |
 | run-vs-build | 345 |
 | leak | 273 |
 | missing-feature | 194 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1498 |
-| interp | 370 |
+| codegen | 1500 |
+| interp | 372 |
 | typecheck | 294 |
 | ownership | 74 |
 | other | 73 |
@@ -138,7 +138,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-01-23 | 2026-09-01 | codegen | low | THE BRANCH ARM-OWNER SLOT IS ONE PER CONSTRUCT AND RESET EACH PASS, so a branch inside a loop whose owner frame lives OUTSIDE the loop frees only the LAST pass's escaping value -- `while i < 3 { let k = if i > 0 { mkA(n) } else { t }.contains("aaa"); }` strands `iterations - 1` of them (42 B in 2 blocks at 3 iterations, 72 B in 4 at 5); the same branch with the sibling binding declared INSIDE the loop body is clean, which isolates the frame CHOICE rather than the slot as the cause | — |
 | B-2026-09-01-27 | 2026-09-01 | interp | low | A FRESH-TEMP owned argument DESTRUCTURED inside a method runs the right Drop bodies in the WRONG ORDER -- the payload's body fires before the enum shell's under `--interp` and after it on both compiled backends, so the counts agree and the sequence does not | — |
 | B-2026-09-01-39 | 2026-09-01 | interp+codegen | medium | A LIVE LOCAL HANDED OUT OF A DISCARDED BRANCH LOSES ITS PAYLOAD'S `Drop` BODY, and the `if` and `match` spellings disagree in OPPOSITE directions on the two backends -- `let _ = if c { E.A(mk(8)) } else { e };` with the `e` arm taken is interp `dE` / compiled `dE dR5`, while the `match` spelling of the same thing is interp `dE dR5` / compiled `dE` | — |
-| B-2026-09-02-4 | 2026-09-02 | interp+codegen | medium | AN ASSOCIATED fn returning an AGGREGATE THAT WRAPS a by-value param diverges in BOTH directions at once -- the compiled lanes run the wrapped param's `Drop` body TWICE and `--interp` loses it when the param dies -- while the FREE-function twin agrees on all four lanes and is wrong on one cell everywhere | — |
 | B-2026-09-02-9 | 2026-09-02 | runtime | low | OVER-ALIGNED ALLOCATION IS UNSUPPORTED ON WINDOWS -- `karac_alloc_aligned_or_panic` aborts there rather than honoring an alignment above `malloc`'s 16-byte guarantee, because the MSVC CRT has no `free`-compatible aligned allocator and every release path assumes plain `free`. | — |
 | B-2026-09-02-16 | 2026-09-02 | interp+codegen | low | A NEVER-READ SHADOWED NAME'S TWO GENERATIONS FIRE IN THE WRONG ORDER UNDER AUTO-PAR because each is branch-local and fires inside its own outlined branch at its own `let`, while the interpreter fires both at the single name-keyed endpoint in LIFO order -- `dR3 dR4 mid` vs `dR4 dR3 mid`; the position is now right on every surface and only the order between the two generations differs | — |
 | B-2026-09-02-22 | 2026-09-02 | codegen | low | A DOUBLY-NESTED `Option[Option[String]]` ARGUMENT LEAKS ITS INNER PAYLOAD -- 45 B in 3 blocks over a three-iteration loop, unmoved by all THREE of B-2026-09-01-29's fixes. The payload is 3 words, so `Option[Option[String]]` exceeds the 3-word boxing limit `optres_param_entry_copied_te` gates on: the param is never ADMITTED to the by-value copy convention, so neither the callee's entry copy nor any caller-side ownership predicate applies and no frame is ever offered the temp | — |
@@ -157,6 +156,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-15 | 2026-09-06 | interp+codegen | medium | A BARE `match self { H1 { e } => .. }` ON AN OWNED RECEIVER RUNS THE PAYLOAD'S `Drop` BODY TWICE FOR A NAMED-LOCAL RECEIVER AND LOSES THE ENUM SHELL'S BODY FOR A FRESH TEMP -- `dR31 dE dR31` / `dR32` on all four surfaces, the whole-`self` transfer path that B-2026-08-31-43's projection fix kept out on purpose | — |
 | B-2026-09-06-16 | 2026-09-06 | interp+codegen | medium | `let e = self.e` INSIDE AN OWNED RECEIVER RUNS BOTH THE FIELD'S AND ITS PAYLOAD'S `Drop` BODIES TWICE FOR A NAMED-LOCAL RECEIVER -- `dR51 dE dE dR51` on all four surfaces while the fresh-temp receiver is correct; a plain `let` binding a field out of `self` stays on the transfer path B-2026-08-31-43's fix did not touch | — |
 | B-2026-09-06-17 | 2026-09-06 | interp+codegen | medium | AN OWNED RECEIVER'S PAYLOAD HANDED OUT BY `return r` FROM `match self.e` RUNS ITS `Drop` BODY IN THE CALLER'S RETAINED WALK AS WELL -- `dE dR7 got7 dR7` on all four surfaces, the body before the read; `callee_returned_param_parts` indexes explicit parameters and `self` is not one at the AST level, so no caller-side mask is ever computed for a receiver | — |
+| B-2026-09-06-18 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM WRAPPED IN A USER ENUM VARIANT ON SOME EXITS RUNS THE BODY TWICE ON THE HAND-BACK PATH -- `fn fslot(r: R, k: bool) -> Slot { if k { return Slot.Empty; } return Slot.Held(r); }` prints `d65 C65 d65` for `let x = fslot(mr(65), false); match x { Slot.Held(v) => println(f"C{v.id}"), .. }` on all four surfaces, while the dies-inside path (`k = true`) is one body | — |
+| B-2026-09-06-19 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM WRAPPED TWICE THROUGH A LOCAL ON SOME EXITS RUNS THE BODY TWICE ON THE HAND-BACK PATH -- `fn ftwo(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(82) }; } let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }` prints `d72 C72 B72 d72` for `k = false` on all four surfaces, while `k = true` is one body (`d71 C82 B82 d82`) | — |
 
 ### Relocated
 
@@ -2131,6 +2132,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-02-1 | codegen | high | A `Vec`-OF-`Drop` BINDING FOLLOWED BY ANY LATER `let` INITIALIZED FROM A CALL RETURNING A CONTAINER RUNS THE ELEMENT `Drop` BODIES ON FREED MEMORY on… | 6486e68 |
 | B-2026-09-02-2 | interp | medium | THE INTERPRETER MIRROR OF B-2026-08-30-18: a STRUCT literal in RETURN POSITION whose field is a PLAIN `Drop` value moved in from a local runs that va… | 1836078 |
 | B-2026-09-02-3 | codegen | medium | A GENERIC function's conditionally-returned by-value param loses the DYING one's `Drop` body on ALL THREE COMPILED lanes while `--interp` runs it --… | 56cb337 |
+| B-2026-09-02-4 | interp+codegen | medium | AN ASSOCIATED fn returning an AGGREGATE THAT WRAPS a by-value param diverges in BOTH directions at once -- the compiled lanes run the wrapped param's… | 8740f8f |
 | B-2026-09-02-5 | codegen | low | A PARAM-VIEW ASSIGNMENT `h2 = h` OVER A `Drop`-BEARING STRUCT LEAKS THE MOVED-IN VALUE'S `String` AT `-O0` -- one block per assignment that actually… | b51e5982 |
 | B-2026-09-02-6 | codegen | medium | A `cond_move_drop_flags` PER-PATH DROP FLAG IS INITIALIZED IN THE ENTRY BLOCK, SO IT IS ARMED ONCE PER CALL AND NOT ONCE PER LOOP ITERATION -- an ass… | c2b8924 |
 | B-2026-09-02-7 | interp | medium | A `while let` ARM THAT BINDS ITS PAYLOAD RUNS THE PAYLOAD'S `Drop` BODY TWICE PER PASS UNDER `--interp` AND ONCE ON BOTH COMPILED BACKENDS -- the com… | 51491e9 |
