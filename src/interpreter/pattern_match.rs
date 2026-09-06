@@ -1107,20 +1107,39 @@ impl<'a> super::Interpreter<'a> {
     /// any other pattern or scrutinee shape. Shared by the `match`, `if let`
     /// and `while let` legs so the three spellings agree.
     pub(super) fn masked_payload_view_names(&self, pattern: &Pattern, place: &Expr) -> Vec<String> {
-        let (PatternKind::TupleVariant { patterns, .. }, ExprKind::Identifier(root)) =
-            (&pattern.kind, &place.kind)
-        else {
+        let ExprKind::Identifier(root) = &place.kind else {
             return Vec::new();
         };
-        patterns
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| {
-                self.moved_out_enum_payload_slots
-                    .contains(&(root.clone(), *i))
-            })
-            .flat_map(|(_, p)| p.binding_names())
-            .collect()
+        match &pattern.kind {
+            PatternKind::TupleVariant { patterns, .. } => patterns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    self.moved_out_enum_payload_slots
+                        .contains(&(root.clone(), *i))
+                })
+                .flat_map(|(_, p)| p.binding_names())
+                .collect(),
+            // B-2026-09-06-22 — the STRUCT-literal sibling: a mixed
+            // `S3 { a: r, b: mk(2) }` records its view FIELDS per binding
+            // (`param_view_struct_fields`), and a struct pattern over that
+            // binding binds them out on the same terms. This backend was
+            // right on the direct read (a named local's struct walk is its
+            // own single owner); the mark is what `let m = a;` in the arm
+            // needs, and it moves with codegen's in one commit.
+            PatternKind::Struct { fields, .. } => fields
+                .iter()
+                .filter(|f| {
+                    self.param_view_struct_fields
+                        .contains(&(root.clone(), f.name.clone()))
+                })
+                .flat_map(|f| match &f.pattern {
+                    Some(sub) => sub.binding_names(),
+                    None => vec![f.name.clone()],
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     fn match_disarms_payload_walk(&self, enum_name: &str, arms: &[MatchArm]) -> bool {

@@ -62980,3 +62980,51 @@ fn main() {
         "dR2\ndR1\nv=2\none\ndR4\ndR3\nv=4\ntwo\ndR6\ndR5\nv=5\nthree\ndR8\ndR7\nv=1\nfour\ndR10\ndR9\nv=10\nfive\ndR12\ndR11\nv=11\nsix\ndR14\ndR13\nv=14\nseven\ndR20\nv=21\nten\nend\n"
     );
 }
+
+/// B-2026-09-06-22 — a `match` (or `if let`) that destructures a mixed
+/// STRUCT literal's view field binds a view. The row is the compiled side's
+/// (`dR2 dR1 dR1` against this backend's `dR2 dR1`); this backend was right
+/// on the direct read — a named local's masked struct walk is its own single
+/// owner — but gave `let m = a;` inside the arm a body of its own, so the
+/// struct arm of `masked_payload_view_names` (reading
+/// `param_view_struct_fields`) puts the field binding into the view set.
+/// Twin of `tests/codegen.rs`'s
+/// `e2e_match_over_a_masked_struct_field_binds_a_view`, same program and
+/// string.
+///
+/// `one`..`three` direct / `a` read / unread, `four` rebound, `five` the
+/// `if let` spelling, `six` `let m = a` inside the arm, `seven` the view in
+/// the other field, `eight` a fresh literal (no view), `nine` a partial
+/// pattern (always right).
+#[test]
+fn test_match_over_a_masked_struct_field_binds_a_view() {
+    assert_eq!(
+        run(r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct S3 { a: R, b: R }
+fn s_direct(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(2) }; match s { S3 { a, b } => { return b.id; } } }
+fn s_direct_a(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(4) }; match s { S3 { a, b } => { return a.id; } } }
+fn s_unread(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(6) }; match s { S3 { a, b } => { return 1; } } }
+fn s_rebind(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(8) }; let s2: S3 = s; match s2 { S3 { a, b } => { return b.id; } } }
+fn s_iflet(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(10) }; if let S3 { a, b } = s { return b.id; } return 0; }
+fn s_rebind_in_arm(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(12) }; match s { S3 { a, b } => { let m: R = a; return m.id; } } }
+fn s_swap(r: R) -> i64 { let s: S3 = S3 { a: mk(14), b: r }; match s { S3 { a, b } => { return a.id; } } }
+fn s_fresh(r: R) -> i64 { let s: S3 = S3 { a: mk(16), b: mk(17) }; match s { S3 { a, b } => { return a.id; } } }
+fn s_partial(r: R) -> i64 { let s: S3 = S3 { a: r, b: mk(21) }; match s { S3 { b, .. } => { return b.id; } } }
+fn main() {
+    { let v: i64 = s_direct(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = s_direct_a(mk(3)); println(f"v={v}"); println("two") }
+    { let v: i64 = s_unread(mk(5)); println(f"v={v}"); println("three") }
+    { let v: i64 = s_rebind(mk(7)); println(f"v={v}"); println("four") }
+    { let v: i64 = s_iflet(mk(9)); println(f"v={v}"); println("five") }
+    { let v: i64 = s_rebind_in_arm(mk(11)); println(f"v={v}"); println("six") }
+    { let v: i64 = s_swap(mk(13)); println(f"v={v}"); println("seven") }
+    { let v: i64 = s_fresh(mk(15)); println(f"v={v}"); println("eight") }
+    { let v: i64 = s_partial(mk(20)); println(f"v={v}"); println("ten") }
+    println("end")
+}
+"#),
+        "dR2\ndR1\nv=2\none\ndR4\ndR3\nv=3\ntwo\ndR6\ndR5\nv=1\nthree\ndR8\ndR7\nv=8\nfour\ndR10\ndR9\nv=10\nfive\ndR12\ndR11\nv=11\nsix\ndR14\ndR13\nv=14\nseven\ndR17\ndR16\ndR15\nv=16\neight\ndR21\ndR20\nv=21\nten\nend\n"
+    );
+}

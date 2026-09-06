@@ -1518,25 +1518,62 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::Identifier(src) = &scrutinee.kind else {
             return out;
         };
-        let Some(slots) = self.enum_ctor_moved_payload_slots.get(src.as_str()) else {
-            return out;
-        };
-        for pat in patterns {
-            let PatternKind::TupleVariant {
-                path,
-                patterns: subs,
-                ..
-            } = &pat.kind
-            else {
-                continue;
-            };
-            let Some(variant) = path.last() else {
-                continue;
-            };
-            for (i, sub) in subs.iter().enumerate() {
-                if slots.contains(&(variant.clone(), i)) {
-                    out.extend(sub.binding_names());
+        // B-2026-09-06-22 — the STRUCT-literal sibling: a mixed
+        // `S3 { a: r, b: mk(2) }` records its view FIELDS per binding
+        // (`param_view_struct_fields` by name, `struct_moved_field_bodies` by
+        // index), and a struct pattern over that binding binds them out on
+        // the same terms as a masked enum slot.
+        let view_fields: std::collections::HashSet<String> = {
+            let mut v: std::collections::HashSet<String> = self
+                .payload_vars
+                .param_view_struct_fields
+                .get(src.as_str())
+                .cloned()
+                .unwrap_or_default();
+            if let (Some(idxs), Some(sname)) = (
+                self.type_decls.struct_moved_field_bodies.get(src.as_str()),
+                self.var_types.var_type_names.get(src.as_str()),
+            ) {
+                if let Some(names) = self.type_decls.struct_field_names.get(sname.as_str()) {
+                    v.extend(idxs.iter().filter_map(|i| names.get(*i).cloned()));
                 }
+            }
+            v
+        };
+        let slots = self.enum_ctor_moved_payload_slots.get(src.as_str());
+        for pat in patterns {
+            match &pat.kind {
+                PatternKind::TupleVariant {
+                    path,
+                    patterns: subs,
+                    ..
+                } => {
+                    let Some(slots) = slots else {
+                        continue;
+                    };
+                    let Some(variant) = path.last() else {
+                        continue;
+                    };
+                    for (i, sub) in subs.iter().enumerate() {
+                        if slots.contains(&(variant.clone(), i)) {
+                            out.extend(sub.binding_names());
+                        }
+                    }
+                }
+                PatternKind::Struct { fields, .. } => {
+                    for f in fields {
+                        if !view_fields.contains(&f.name) {
+                            continue;
+                        }
+                        match &f.pattern {
+                            Some(sub) => out.extend(sub.binding_names()),
+                            None => {
+                                out.insert(f.name.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         out
