@@ -94,9 +94,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 392 |
 | run-vs-build | 360 |
-| leak | 279 |
+| leak | 280 |
+| double-free | 197 |
 | missing-feature | 194 |
-| double-free | 194 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
 | false-positive | 106 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1532 |
+| codegen | 1536 |
 | interp | 394 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -157,11 +157,14 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-48 | 2026-09-06 | codegen | low | THE GENERIC HALF OF B-2026-09-04-12 STILL LOSES A BOXED TUPLE PAYLOAD'S INTERIOR -- `generic[T](x: Option[T])` leaks the same 54 B in 6 blocks the non-generic `plainT(x: Option[(String, String)])` did before its fix, and by a DIFFERENT owner, so the parent row's "identical on both paths, therefore not monomorph-specific" premise is refuted rather than confirmed | — |
 | B-2026-09-06-49 | 2026-09-06 | codegen | low | AN INLINE-BUILT `Array` PAYLOAD LOSES ITS INTERIOR EXACTLY AS THE TUPLE DID -- 54 B in 6 blocks for `f(Some([f"a{i}", f"b{i}"]))`, while the same array through a NAMED LOCAL is clean, because the array's interior is owned by a caller-side drop that a missing move-suppressor leaves armed | — |
 | B-2026-09-06-51 | 2026-09-06 | codegen | medium | THE -O0 ASAN RATCHET HAS BEEN RED ON `main` SINCE edb7236 -- six fixtures that commit ADDED fail `scripts/asan-o0-leg.sh` unquarantined, so the gate that is supposed to fail on any new -O0 regression now reports the same six to every session and can no longer distinguish a fresh one | — |
-| B-2026-09-06-52 | 2026-09-06 | codegen | high | A TOP-LEVEL WHOLE REBIND OF A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `shared` FIELD DOUBLE-FREES ON EVERY COMPILED SURFACE -- `fn topreb(r: R) -> i64 { let m = r; return m.inner.v; }` over `struct R { id: i64, name: String, inner: Inner }` with `shared struct Inner` aborts `free(): double free detected in tcache 2` under `karac run`, `karac build` at -O2 and at -O0 alike (3 valgrind errors from 3 contexts) while `--interp` prints `dR43 tp=43 end` correctly. The `shared` field makes the struct decline copy support, so the callee FORWARDS the caller's object instead of entry-copying it -- but `compile_let`'s param-view arm registers a memory-only `StructDrop` for the destination anyway, on the strength of a deep copy that was never made. Dropping the rebind makes the same program clean | — |
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-55 | 2026-09-06 | interp+codegen | low | A DEEP-CHAIN FIELD MOVE-OUT STILL LOSES THE MOVED HOP'S SIBLING ONE LEVEL DOWN, ON EVERY SURFACE -- `let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r;` prints `dR1 dR3` on `--interp` / jit / aot / `KARAC_AUTO_PAR=0` alike; `q`'s body (`dR2`) runs nowhere | — |
 | B-2026-09-06-56 | 2026-09-06 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-50 LEAKS ITS WHOLE BOXED STRUCT PAYLOAD -- 192 B in 3 blocks over three calls for `fn show(x: Result[P, i64])` matched `Ok(P { a, b, .. })`, because NEITHER frame owns the box: the caller-side arm is `Option`-only by construction and the callee's loop skips every non-`Option` enum | — |
 | B-2026-09-06-58 | 2026-09-06 | interp+codegen | medium | THE `String`-PARAMETER SIBLING OF B-2026-09-06-53 STILL LOSES THE RETURNED VALUE'S `Drop` BODY -- `fn mk2(i: i64, s: String) -> R { return R { id: i, name: s }; }` called as `let x = mk2(i, nm)` from a function holding `nm: String` prints `v=4` and never `dR4`, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; a `String` is not a scalar, so B-2026-09-06-53's test admits it, and it carries no user `Drop` body, so the view mark defers the `R`'s body to an owner that runs none | — |
+| B-2026-09-06-59 | 2026-09-06 | codegen | low | READING A DECLINED-COPY PARAM AFTER A WHOLE REBIND LEAVES ITS `String` UNOWNED -- `fn f(r: R) -> String { let m = r; return f"{r.name}"; }` over a struct with a `shared` field loses 3 B in 1 block at KARAC_OPT_LEVEL=0 (clean at -O2, correct output on every surface). INTRODUCED BY B-2026-09-06-52's fix, which correctly stopped the destination registering a second owner for buffers the caller still holds; on that fix's parent this same cell was a use-after-free of the `shared` handle's refcount block with no leak, so the trade is UAF -> 3-byte leak. The sibling that does NOT read the source after the rebind is fully clean on the fix and double-freed before it. The trigger is the read alone -- an i64 return, a non-heap field read and a named-binding argument all leak identically | — |
+| B-2026-09-06-60 | 2026-09-06 | codegen | high | A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `Map` FIELD DOUBLE-FREES WITH NO REBIND AT ALL -- `fn norebind(q: Q) -> i64 { return q.id; }` over `struct Q { id: i64, name: String, tbl: Map[i64, i64] }` aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (10 valgrind errors from 10 contexts) and SEGFAULTS at the default -O2 (9 errors from 9 contexts), while `--interp` prints `dQ43 nq=43 end` correctly. A `Map` field declines copy support but is NOT shared-owning, so the param is owned BY TRANSFER (B-2026-08-05-33) -- whose safety argument is a caller-side retraction held in lockstep. Passing the struct by value is the whole trigger; the same struct built and dropped in `main` is clean | — |
+| B-2026-09-06-61 | 2026-09-06 | codegen | high | RETURNING A WHOLE REBIND OF A DECLINED-COPY PARAM DOUBLE-FREES -- `fn rebret(r: R) -> R { let m = r; return m; }` over a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (3 valgrind errors from 3 contexts), and at the default -O2 survives as an invalid read of the freed 16-byte refcount block while printing the right answer; `--interp` is correct. The SAME function without the rebind (`return r;`) is clean on every surface, so one binding separates sound from unsound. B-2026-09-06-52's fix gives the frame-local answer (the destination takes the borrow-alias edge) and leaves the ESCAPING one unanswered: the caller then owns the returned value and its own argument temp | — |
+| B-2026-09-06-62 | 2026-09-06 | codegen | high | THE OWNED-`self` RECEIVER SPELLING OF B-2026-09-06-52 IS STILL RED -- `impl R { fn take(self) -> i64 { let m = self; return m.inner.v; } }` over a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (3 valgrind errors from 3 contexts) and survives at -O2 as an invalid read of the freed refcount block, while the byte-identical FREE FUNCTION `fn top(r: R) -> i64 { let m = r; return m.inner.v; }` is clean on all five surfaces after that fix. `fn_ctx.current_fn_param_names` is seeded from `func.params` only, so `self` is not a member and the caller-retains fact the prologue records is never consulted at the `let`. Not B-2026-09-06-45: the body count is correct here and the interpreter is right | — |
 
 ### Relocated
 
@@ -2324,6 +2327,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-46 | codegen | medium | A PARTIAL `let` DESTRUCTURE OF A LOCAL WHOSE OTHER FIELD WAS MOVED OUT EARLIER LOSES THE BOUND LEAF'S `Drop` BODY ON EVERY COMPILED BACKEND -- `let s… | 736a4fc |
 | B-2026-09-06-47 | interp | medium | THE `let`-DESTRUCTURE DISCARD RE-RUNS THE `Drop` BODY OF A FIELD ALREADY MOVED OUT OF THE SOURCE -- `let s = S3 { a: mk(8), b: mk(9) }; let x: R = s.… | 20e9ebc |
 | B-2026-09-06-50 | codegen | high | A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE PARAM ABORTS ON BOTH COMPILED BACKENDS -- `free(): double free detected in tcache 2`, exit 134,… | 7020445 |
+| B-2026-09-06-52 | codegen | high | A TOP-LEVEL WHOLE REBIND OF A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `shared` FIELD DOUBLE-FREES ON EVERY COMPILED SURFACE -- `fn topreb(r: R) -> i… | 0083494 |
 | B-2026-09-06-53 | interp+codegen | medium | A `Drop`-BEARING LOCAL BUILT FROM THE ENCLOSING FUNCTION'S PARAMETER RUNS NO `Drop` BODY AT ALL, ON EVERY SURFACE -- `fn a(i: i64) { let x = mkUses(i… | 35aff00 |
 | B-2026-09-06-57 | codegen | high | `main` IS RED: B-2026-09-06-45's OWN TWO REGRESSION TESTS FAIL ON A CLEAN CHECKOUT OF 6138e02 -- `asan_nested_self_rebind_keeps_one_owner` double-fre… | d3b39b8 |
 
