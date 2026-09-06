@@ -160,6 +160,37 @@ pub(crate) struct DropRc<'ctx> {
     ///
     /// Cleared per function alongside `param_view_locals`.
     pub(crate) param_view_callee_owned: HashSet<String>,
+    /// B-2026-09-06-52 — the bindings whose aggregate memory the CALLER
+    /// retains: a by-value param the prologue looked at and declined to own,
+    /// and every local a view of one has since been handed to.
+    ///
+    /// A struct that fails `aggregate_param_copy_supported_struct` cannot be
+    /// entry-copied, and `make_aggregate_param_callee_owned_transfer` then
+    /// takes ownership BY TRANSFER instead — except for the two classes it
+    /// deliberately refuses: a struct that owns a `shared` field
+    /// (B-2026-08-05-32 left the caller its drop, since owning here too would
+    /// rc-dec twice) and a self-referential one (B-2026-07-28-3). For those the
+    /// param is a pure VIEW: nothing was copied, nothing was transferred.
+    ///
+    /// Recorded rather than re-derived. The question "did the prologue take
+    /// ownership of this param" has exactly one authority — the prologue — and
+    /// [`Codegen::source_carries_callee_owned_param_memory`] answering it from
+    /// the param's SHAPE (owned, non-`ref`, not RC-promoted) is what made a
+    /// rebind of one of these double-free: that test says "an entry copy
+    /// happened" for a param whose type makes an entry copy impossible. Writing
+    /// the outcome down where it is decided keeps the two in step by
+    /// construction instead of by a predicate that has to enumerate every
+    /// refusal.
+    ///
+    /// The set is closed under the rebind, exactly as `param_view_callee_owned`
+    /// is: `let m = r; let n = m;` reaches the second `let` with a source that
+    /// is no longer a parameter, so without the step `n` registered the very
+    /// owner `m` had just been denied and the double free came back one rebind
+    /// later. Positive and negative halves of the same induction, and both are
+    /// needed because neither is derivable from the binding's type.
+    ///
+    /// Cleared per function alongside `param_view_callee_owned`.
+    pub(crate) caller_retained_aggregate_memory: HashSet<String>,
     /// B-2026-08-30-28 — the parameters whose user `Drop` BODY is owned by a
     /// per-path flag rather than by a static decision, so a later move site
     /// must NOT retract their action.

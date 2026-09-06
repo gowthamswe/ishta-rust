@@ -2820,6 +2820,8 @@ impl<'ctx> super::Codegen<'ctx> {
             let saved_param_view_locals = std::mem::take(&mut self.payload_vars.param_view_locals);
             let saved_param_view_callee_owned =
                 std::mem::take(&mut self.drop_rc.param_view_callee_owned);
+            let saved_caller_retained_memory =
+                std::mem::take(&mut self.drop_rc.caller_retained_aggregate_memory);
             // Slice 5: per-binding layout carrier — the mono body seeds its own
             // locals at their `let` sites; swap out the caller's map and restore
             // below, parallel to `variables` / `ref_params`.
@@ -2878,6 +2880,7 @@ impl<'ctx> super::Codegen<'ctx> {
             self.borrow_vars.owned_struct_params = saved_owned_struct_params;
             self.payload_vars.param_view_locals = saved_param_view_locals;
             self.drop_rc.param_view_callee_owned = saved_param_view_callee_owned;
+            self.drop_rc.caller_retained_aggregate_memory = saved_caller_retained_memory;
             self.borrow_vars.entry_slot_ref_vars = saved_entry_slot_ref_vars;
             self.mono_state.layout_subst = saved_layout_subst;
             self.mono_state.const_subst = saved_const_subst;
@@ -3630,6 +3633,8 @@ impl<'ctx> super::Codegen<'ctx> {
         let saved_param_view_locals = std::mem::take(&mut self.payload_vars.param_view_locals);
         let saved_param_view_callee_owned =
             std::mem::take(&mut self.drop_rc.param_view_callee_owned);
+        let saved_caller_retained_memory =
+            std::mem::take(&mut self.drop_rc.caller_retained_aggregate_memory);
         // Slice 5: the mono body seeds its own locals' layouts in
         // `binding_layouts` at their `let` sites. Take the caller's carrier for
         // the duration (the body starts empty, like `variables`) and restore it
@@ -3671,6 +3676,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.borrow_vars.owned_struct_params = saved_owned_struct_params;
         self.payload_vars.param_view_locals = saved_param_view_locals;
         self.drop_rc.param_view_callee_owned = saved_param_view_callee_owned;
+        self.drop_rc.caller_retained_aggregate_memory = saved_caller_retained_memory;
         self.borrow_vars.entry_slot_ref_vars = saved_entry_slot_ref_vars;
         self.return_layout = saved_return_layout;
         self.mono_state.layout_subst = saved_layout_subst;
@@ -3850,6 +3856,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.borrow_vars.owned_struct_params.clear();
         self.payload_vars.param_view_locals.clear();
         self.drop_rc.param_view_callee_owned.clear();
+        self.drop_rc.caller_retained_aggregate_memory.clear();
         // Per-binding layout carrier (slice 5): the caller's map was swapped out
         // (`mem::take`) at the mono entry point, so this fresh body starts empty
         // and seeds its own locals; `let`-site registrations land here.

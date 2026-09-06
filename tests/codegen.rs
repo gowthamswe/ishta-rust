@@ -5446,6 +5446,101 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-52 — a whole rebind of a by-value param whose struct the
+    /// PROLOGUE DECLINED TO OWN must not register a second owner for the
+    /// caller's buffers.
+    ///
+    /// A struct with a `shared` field (`inner`, direct in `R`, one level down in
+    /// `S`) or a self-referential one (`Node`) fails
+    /// `aggregate_param_copy_supported_struct`, so it is never entry-copied, and
+    /// `make_aggregate_param_callee_owned_transfer` then refuses the
+    /// own-by-transfer bargain as well — the param FORWARDS the caller's object.
+    /// `compile_let`'s param-view arm registered its memory-only `StructDrop`
+    /// anyway, on the strength of "the deep copy the rebind received", and there
+    /// was no deep copy: measured before the fix as `free(): double free
+    /// detected in tcache 2` under `karac run` and at `KARAC_OPT_LEVEL=0`, and
+    /// at the DEFAULT `-O2` as a surviving use-after-free of the `shared`
+    /// handle's 16-byte refcount block that still printed the right answer.
+    ///
+    /// Eight red spellings, one per cell: the plain `top`, the branch-nested
+    /// `br`, the chained `two` (whose second `let` sees a LOCAL, which is why
+    /// the caller-retains fact has to propagate), the call form `call`, the
+    /// second-param `pair`, the loop `loop`, the indirect-`shared` `deep`, the
+    /// no-`impl Drop` `nod` and the self-referential `self`. `ctl` is the
+    /// control the fix must not disturb — a copy-supported `P` IS entry-copied,
+    /// so its rebind keeps the owned drop it has always had. `rd` pins that the
+    /// source's bytes survive: Kara does not reject a read after a move, and
+    /// `h27/h27` would read empty if the decline had been spelled as a
+    /// cap-zeroing.
+    fn test_e2e_declined_copy_param_rebind_keeps_the_callers_ownership() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+
+shared struct Deep { v: i64 }
+struct Mid { d: Deep }
+struct S { id: i64, name: String, mid: Mid }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"h{i}", mid: Mid { d: Deep { v: i } } }; }
+
+struct N { id: i64, name: String, inner: Inner }
+fn mkn(i: i64) -> N { return N { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+
+struct Node { id: i64, name: String, kids: Vec[Node] }
+impl Drop for Node { fn drop(mut ref self) { println(f"dNd{self.id}") } }
+fn mknode(i: i64) -> Node { return Node { id: i, name: f"h{i}", kids: Vec[Node].new() }; }
+
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkp(i: i64) -> P { return P { id: i, name: f"h{i}" }; }
+
+fn top(r: R) -> i64 { let m = r; return m.inner.v; }
+fn br(r: R, keep: bool) -> i64 { if keep { let m = r; return m.inner.v; } return 0; }
+fn two(r: R) -> i64 { let m = r; let n = m; return n.inner.v; }
+fn keeps(x: R) -> R { return x; }
+fn call(r: R) -> i64 { let w = keeps(r); return w.inner.v; }
+fn pair(a: R, b: R) -> i64 { let m = b; return m.inner.v + a.id; }
+fn rdmove(r: R) -> String { let m = r; return f"{m.name}/{r.name}"; }
+fn loopreb(r: R, n: i64) -> i64 {
+    let mut t = 0;
+    for i in 0..n { if i == 0 { let m = r; t = t + m.inner.v; } }
+    return t;
+}
+fn deep(s: S) -> i64 { let m = s; return m.mid.d.v; }
+fn nodrop(n: N) -> i64 { let m = n; return m.inner.v; }
+fn selfref(nd: Node) -> i64 { let m = nd; return m.id; }
+fn ctl(p: P) -> i64 { let m = p; return m.id; }
+
+fn main() {
+    println(f"top={top(mk(21))}");
+    println(f"brT={br(mk(22), true)}");
+    println(f"brF={br(mk(23), false)}");
+    println(f"two={two(mk(24))}");
+    println(f"call={call(mk(25))}");
+    println(f"pair={pair(mk(1), mk(26))}");
+    println(f"rd={rdmove(mk(27))}");
+    println(f"loop={loopreb(mk(28), 3)}");
+    println(f"deep={deep(mks(29))}");
+    println(f"nod={nodrop(mkn(30))}");
+    println(f"self={selfref(mknode(31))}");
+    println(f"ctl={ctl(mkp(32))}");
+    println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "dR21\ntop=21\ndR22\nbrT=22\ndR23\nbrF=0\ndR24\ntwo=24\ndR25\ncall=25\ndR26\ndR1\npair=27\ndR27\nrd=h27/h27\ndR28\nloop=28\ndS29\ndeep=29\nnod=30\ndNd31\nself=31\ndP32\nctl=32\nend\n",
+                "a param the prologue declined to own is a VIEW: the rebind runs \
+                 one body and frees nothing the caller still owns; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-05-37 — a whole rebind of a by-value `Drop` param NESTED in a
     /// branch frees the callee's entry copy on the path that never rebound.
     ///

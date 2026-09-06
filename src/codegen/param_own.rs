@@ -365,6 +365,25 @@ impl<'ctx> super::Codegen<'ctx> {
                     );
                     return true;
                 }
+                // B-2026-09-06-52 — the prologue has just DECLINED to own this
+                // param: it cannot be entry-copied (the copy-support test above)
+                // and the two refusals right beside this line — a struct owning
+                // a `shared` field, and a self-referential one — rule out the
+                // own-by-transfer bargain as well. So the memory arrived as the
+                // caller's and stays the caller's, exactly like a `ref` param
+                // or an RC-promoted one.
+                //
+                // Write that outcome down. `source_carries_callee_owned_param_memory`
+                // otherwise answers "an entry copy happened" from the param's
+                // shape alone, which is true for every by-value aggregate param
+                // EXCEPT the ones this arm turns away — and a `let m = p;` over
+                // one of them then registers a second owner for buffers nobody
+                // duplicated (`free(): double free detected in tcache 2` under
+                // the JIT and at `-O0`; a use-after-free of the `shared` handle's
+                // refcount at `-O2`, where inlining hides the abort).
+                self.drop_rc
+                    .caller_retained_aggregate_memory
+                    .insert(param_name.to_string());
                 return false;
             }
             // B-2026-07-10-4: rc-inc buried bare-shared during entry-copy so it stays
@@ -865,6 +884,15 @@ impl<'ctx> super::Codegen<'ctx> {
     /// allocated and frees again. The shape that causes the promotion is a
     /// conditional param-view assignment to a LOOP-DECLARED local.
     ///
+    /// B-2026-09-06-52 — and RETAINED-BY-THE-CALLER ones, the third instance of
+    /// that same sentence and the one this enumeration was missing. A struct
+    /// that owns a `shared` field (or is self-referential) fails the copy
+    /// support test AND is refused the own-by-transfer bargain, so the prologue
+    /// takes no ownership at all; the param's SHAPE still looks like every
+    /// entry-copied aggregate, which is why the answer is read from the set the
+    /// prologue writes rather than re-derived here. Without it `let m = r;`
+    /// over such a param registered a second owner of the caller's buffers.
+    ///
     /// STEP: a local that took a qualifying view and registered its own
     /// memory ownership — through the assignment path (`a = h`) or through the
     /// `let` rebind (`let a = h`, whose site registers the memory-only
@@ -880,7 +908,11 @@ impl<'ctx> super::Codegen<'ctx> {
             && !self
                 .drop_rc
                 .rc_fallback_heap_types
-                .contains_key(source_name);
+                .contains_key(source_name)
+            && !self
+                .drop_rc
+                .caller_retained_aggregate_memory
+                .contains(source_name);
         is_entry_copied_param || self.drop_rc.param_view_callee_owned.contains(source_name)
     }
 

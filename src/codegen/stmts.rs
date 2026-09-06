@@ -9960,11 +9960,54 @@ impl<'ctx> super::Codegen<'ctx> {
                             if struct_borrow_elided {
                                 // Borrow alias: no owned drop (see comment above).
                             } else if rhs_is_param_view {
-                                // Memory only — the deep copy the rebind
-                                // received still frees at scope exit.
-                                let inst =
-                                    self.type_decls.enum_inst_var_types.get(var_name).cloned();
-                                self.track_struct_var_inst(&struct_name, alloca, inst);
+                                // B-2026-09-06-52 — ONLY when a copy actually
+                                // happened. The sentence below is true for
+                                // every by-value aggregate param the prologue
+                                // owns, and false for the ones it turned away:
+                                // a struct owning a `shared` field, or a
+                                // self-referential one, is neither entry-copied
+                                // nor taken by transfer, so `r` is a pure view
+                                // onto the CALLER's buffers and `let m = r;`
+                                // registering memory here made `m` a second
+                                // owner of them — `free(): double free detected
+                                // in tcache 2` under the JIT and at `-O0`, and
+                                // at `-O2` a use-after-free of the `shared`
+                                // handle's refcount that inlining leaves
+                                // printing the right answer.
+                                //
+                                // The prologue records its own refusals, so
+                                // this reads the decision rather than
+                                // re-deriving it; the call form (`let w =
+                                // keeps(r)`) asks about the argument it
+                                // forwarded, which is the param that was
+                                // declined. Declining here takes the same
+                                // borrow-alias edge as the arm above: no owned
+                                // drop, the caller's stands.
+                                let source_is_caller_retained = match &value.kind {
+                                    ExprKind::Identifier(src) => self
+                                        .drop_rc
+                                        .caller_retained_aggregate_memory
+                                        .contains(src.as_str()),
+                                    _ => call_src.as_deref().is_some_and(|s| {
+                                        self.drop_rc.caller_retained_aggregate_memory.contains(s)
+                                    }),
+                                };
+                                if source_is_caller_retained {
+                                    // The step: `m` is a view onto the caller's
+                                    // memory too, so `let n = m;` one line later
+                                    // must decline for the same reason `let m =
+                                    // r;` did. The source is a local by then and
+                                    // no longer answers to the param test.
+                                    self.drop_rc
+                                        .caller_retained_aggregate_memory
+                                        .insert(var_name.to_string());
+                                } else {
+                                    // Memory only — the deep copy the rebind
+                                    // received still frees at scope exit.
+                                    let inst =
+                                        self.type_decls.enum_inst_var_types.get(var_name).cloned();
+                                    self.track_struct_var_inst(&struct_name, alloca, inst);
+                                }
                                 // B-2026-09-02-5 — and that sentence is exactly
                                 // the induction step: this binding now carries
                                 // callee-owned memory, so a later `b = a` may

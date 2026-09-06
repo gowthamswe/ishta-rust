@@ -7001,6 +7001,85 @@ fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); 
     /// bit unconditionally this cell double-frees rather than leaks, which is
     /// the failure worth catching first.
     #[test]
+    /// B-2026-09-06-52 — the freeing half of
+    /// `test_e2e_declined_copy_param_rebind_keeps_the_callers_ownership`.
+    ///
+    /// Every cell rebinds a by-value param whose struct the prologue declined to
+    /// own, so nothing was entry-copied and the caller's buffers must be freed
+    /// exactly once, by the caller. Before the fix this aborted with a double
+    /// free under the JIT and at `-O0`; ASAN sees the `shared` handle's refcount
+    /// block read and written after its free even where the abort does not land.
+    ///
+    /// The E2E twin's `rd` cell is deliberately absent here: reading the source
+    /// after the move leaves its `String` unowned at `-O0` (3 B in 1 block),
+    /// which is B-2026-09-06-59's subject and not this row's.
+    fn asan_declined_copy_param_rebind_keeps_the_callers_ownership() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+
+shared struct Deep { v: i64 }
+struct Mid { d: Deep }
+struct S { id: i64, name: String, mid: Mid }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"h{i}", mid: Mid { d: Deep { v: i } } }; }
+
+struct N { id: i64, name: String, inner: Inner }
+fn mkn(i: i64) -> N { return N { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+
+struct Node { id: i64, name: String, kids: Vec[Node] }
+impl Drop for Node { fn drop(mut ref self) { println(f"dNd{self.id}") } }
+fn mknode(i: i64) -> Node { return Node { id: i, name: f"h{i}", kids: Vec[Node].new() }; }
+
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkp(i: i64) -> P { return P { id: i, name: f"h{i}" }; }
+
+fn top(r: R) -> i64 { let m = r; return m.inner.v; }
+fn br(r: R, keep: bool) -> i64 { if keep { let m = r; return m.inner.v; } return 0; }
+fn two(r: R) -> i64 { let m = r; let n = m; return n.inner.v; }
+fn keeps(x: R) -> R { return x; }
+fn call(r: R) -> i64 { let w = keeps(r); return w.inner.v; }
+fn pair(a: R, b: R) -> i64 { let m = b; return m.inner.v + a.id; }
+fn loopreb(r: R, n: i64) -> i64 {
+    let mut t = 0;
+    for i in 0..n { if i == 0 { let m = r; t = t + m.inner.v; } }
+    return t;
+}
+fn deep(s: S) -> i64 { let m = s; return m.mid.d.v; }
+fn nodrop(n: N) -> i64 { let m = n; return m.inner.v; }
+fn selfref(nd: Node) -> i64 { let m = nd; return m.id; }
+fn ctl(p: P) -> i64 { let m = p; return m.id; }
+
+fn main() {
+    println(f"top={top(mk(21))}");
+    println(f"brT={br(mk(22), true)}");
+    println(f"brF={br(mk(23), false)}");
+    println(f"two={two(mk(24))}");
+    println(f"call={call(mk(25))}");
+    println(f"pair={pair(mk(1), mk(26))}");
+    println(f"loop={loopreb(mk(28), 3)}");
+    println(f"deep={deep(mks(29))}");
+    println(f"nod={nodrop(mkn(30))}");
+    println(f"self={selfref(mknode(31))}");
+    println(f"ctl={ctl(mkp(32))}");
+    println("end");
+}
+"#,
+            &[
+                "dR21", "top=21", "dR22", "brT=22", "dR23", "brF=0", "dR24", "two=24", "dR25",
+                "call=25", "dR26", "dR1", "pair=27", "dR28", "loop=28", "dS29", "deep=29",
+                "nod=30", "dNd31", "self=31", "dP32", "ctl=32", "end",
+            ],
+            "b0906-52-declined-copy-param-rebind",
+            50,
+        );
+    }
+
+    #[test]
     fn asan_branch_nested_param_rebind_frees_the_entry_copy() {
         assert_clean_asan_run_min_allocs(
             r#"
