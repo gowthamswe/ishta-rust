@@ -93,7 +93,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 390 |
-| run-vs-build | 358 |
+| run-vs-build | 360 |
 | leak | 275 |
 | missing-feature | 194 |
 | double-free | 191 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1520 |
-| interp | 389 |
+| codegen | 1521 |
+| interp | 390 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -157,6 +157,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-39 | 2026-09-06 | interp+codegen | low | A READ-ONLY ARM OVER AN OWNED ENUM RECEIVER RUNS THE PAYLOAD'S `Drop` BODY BEFORE THE SHELL'S ON EVERY SURFACE -- `a.m_read()` prints `dR1 dE`, the reverse of the local-scrutinee order B-2026-08-28-67 established (`dE dR`, shell then fields per design.md § Part 8), so the same read-only arm orders its two bodies differently depending on whether the scrutinee is `self` or a local | — |
 | B-2026-09-06-40 | 2026-09-06 | interp+codegen | low | A REORDERED STRUCT `let` PATTERN DROPS ITS LEAVES IN REVERSE PATTERN ORDER ON THE INTERPRETER AND REVERSE DECLARATION ORDER ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(7), b: mk(8) }; let S3 { b, a } = s; return b.id * 100 + a.id;` prints `dR7 dR8 dR6 v=807` under `--interp` and `dR8 dR7 dR6 v=807` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs once, the sequence alone diverges | — |
 | B-2026-09-06-45 | 2026-09-06 | interp+codegen | low | A REBIND OF `self` NESTED IN A BRANCH OF AN OWNED-`self` METHOD RUNS THE RECEIVER'S OWN `Drop` BODY TWICE ON EVERY SURFACE -- `fn m_cond(self, c: bool) -> i64 { if c { let e = self; match e { .. } } else { match self { .. } } }` on a named-local enum receiver prints `dE dR11 dE x11` when `c` is true (the local `e`'s body, then the caller's retained walk) and the right `dR12 dE x112` when false; B-2026-09-06-42's top-level-only `fn_rebinds_self_whole` declines the nested spelling on purpose | — |
+| B-2026-09-06-46 | 2026-09-06 | codegen | medium | A PARTIAL `let` DESTRUCTURE OF A LOCAL WHOSE OTHER FIELD WAS MOVED OUT EARLIER LOSES THE BOUND LEAF'S `Drop` BODY ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(8), b: mk(9) }; let x: R = s.a; let S3 { b, .. } = s; return b.id + x.id;` prints `dR8 dR7` on jit / aot / `KARAC_AUTO_PAR=0` against the interpreter's `dR9 dR8 dR7`; `b`'s body (`dR9`) runs nowhere | — |
 
 ### Relocated
 
@@ -2313,6 +2314,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-42 | interp+codegen | high | `let e = self` INSIDE AN OWNED-`self` METHOD ON A VALUE ENUM WITH ITS OWN `Drop` DOUBLE-FREES THE PAYLOAD AT -O0 AND UNDER THE JIT -- `impl E { fn m_… | 21b6553 |
 | B-2026-09-06-43 | codegen | low | A DISCARDED BOXED `Result` PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Result[T, E]` with a heap-carrying payload past the 5-… | 4cec40c |
 | B-2026-09-06-44 | codegen | medium | A WHOLE-FIELD `let` PROJECTION OFF A BY-VALUE PARAM RUNS THE SIBLING FIELD'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn g(s: S3) -> i64 { let… | 3cc309f |
+| B-2026-09-06-47 | interp | medium | THE `let`-DESTRUCTURE DISCARD RE-RUNS THE `Drop` BODY OF A FIELD ALREADY MOVED OUT OF THE SOURCE -- `let s = S3 { a: mk(8), b: mk(9) }; let x: R = s.… | 20e9ebc |
 
 </details>
 
