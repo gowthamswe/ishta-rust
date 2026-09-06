@@ -3746,6 +3746,106 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-58 — the MEMORY half of `tests/codegen.rs`'s
+    /// `e2e_drop_free_argument_does_not_make_the_result_a_view` under ASAN +
+    /// LSan. Declining the view gives the result binding its own ownership, so
+    /// this pins that the argument's buffer still has exactly one owner: the
+    /// `String`, `Vec[String]` and `Drop`-free-struct arguments, the `Option`
+    /// return and the two-parameter call all keep one free per object.
+    #[test]
+    fn asan_drop_free_argument_result_keeps_one_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, name: String }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             struct H { r: R, n: i64 }\n\
+             impl Drop for H { fn drop(mut ref self) { println(f\"  dH{self.n}\") } }\n\
+             struct Q { s: String, n: i64 }\n\
+             struct W { r: R, n: i64 }\n\
+             struct N { r: R, n: i64 }\n\
+             \n\
+             fn from_string(i: i64, s: String) -> R { return R { id: i, name: s }; }\n\
+             fn from_vec(i: i64, v: Vec[String]) -> R { return R { id: i, name: v[0] }; }\n\
+             fn from_struct(q: Q) -> R { return R { id: q.n, name: q.s }; }\n\
+             fn from_two(a: String, b: String) -> R { return R { id: 30, name: a }; }\n\
+             fn into_option(s: String) -> Option[R] { return Option.Some(R { id: 40, name: s }); }\n\
+             fn into_bodyless(s: String) -> N { return N { r: R { id: 50, name: s }, n: 1 }; }\n\
+             fn hand_back(r: R) -> R { return r; }\n\
+             fn wrap_bodyless(r: R) -> W { return W { r: r, n: 2 }; }\n\
+             fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }\n\
+             fn from_scalar(i: i64) -> R { return R { id: i, name: f\"s{i}\" }; }\n\
+             fn no_store(i: i64, v: Vec[i64]) -> R { return R { id: i, name: f\"n{v.len()}\" }; }\n\
+             \n\
+             fn string_arg(i: i64, nm: String) { let x = from_string(i, nm); println(f\"  v={x.id}\"); }\n\
+             fn vec_arg(i: i64, v: Vec[String]) { let x = from_vec(i, v); println(f\"  v={x.id}\"); }\n\
+             fn struct_arg(q: Q) { let x = from_struct(q); println(f\"  v={x.id}\"); }\n\
+             fn two_string_args(a: String, b: String) { let x = from_two(a, b); println(f\"  v={x.id}\"); }\n\
+             fn option_return(s: String) { let o = into_option(s); match o { Option.Some(r) => { println(f\"  v={r.id}\"); } Option.None => { println(\"  v=none\"); } } }\n\
+             fn bodyless_return(s: String) { let n = into_bodyless(s); println(f\"  v={n.r.id}\"); }\n\
+             fn chained(s: String) { let x = from_string(60, s); let y = hand_back(x); println(f\"  v={y.id}\"); }\n\
+             fn same_type(r: R) { let y = hand_back(r); println(f\"  v={y.id}\"); }\n\
+             fn wrap_control(r: R) { let w = wrap_bodyless(r); println(f\"  v={w.r.id}\"); }\n\
+             fn wrap_bodied_control(r: R) { let h = wrap_bodied(r); println(f\"  v={h.r.id}\"); }\n\
+             fn scalar_control(i: i64) { let x = from_scalar(i); println(f\"  v={x.id}\"); }\n\
+             fn read_only_arg(i: i64, v: Vec[i64]) { let x = no_store(i, v); println(f\"  v={x.id}\"); }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"string_arg\"); string_arg(1, \"a\");\n\
+             \x20   println(\"vec_arg\"); vec_arg(2, [\"b\"]);\n\
+             \x20   println(\"struct_arg\"); struct_arg(Q { s: \"c\", n: 3 });\n\
+             \x20   println(\"two_string_args\"); two_string_args(\"d\", \"e\");\n\
+             \x20   println(\"option_return\"); option_return(\"f\");\n\
+             \x20   println(\"bodyless_return\"); bodyless_return(\"g\");\n\
+             \x20   println(\"chained\"); chained(\"h\");\n\
+             \x20   println(\"same_type\"); same_type(R { id: 7, name: \"i\" });\n\
+             \x20   println(\"wrap_control\"); wrap_control(R { id: 8, name: \"j\" });\n\
+             \x20   println(\"wrap_bodied_control\"); wrap_bodied_control(R { id: 9, name: \"k\" });\n\
+             \x20   println(\"scalar_control\"); scalar_control(10);\n\
+             \x20   println(\"read_only_arg\"); read_only_arg(11, [1, 2]);\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "string_arg",
+                "  v=1",
+                "  dR1",
+                "vec_arg",
+                "  v=2",
+                "  dR2",
+                "struct_arg",
+                "  v=3",
+                "  dR3",
+                "two_string_args",
+                "  v=30",
+                "  dR30",
+                "option_return",
+                "  v=40",
+                "  dR40",
+                "bodyless_return",
+                "  v=50",
+                "  dR50",
+                "chained",
+                "  v=60",
+                "  dR60",
+                "same_type",
+                "  v=7",
+                "  dR7",
+                "wrap_control",
+                "  v=8",
+                "  dR8",
+                "wrap_bodied_control",
+                "  v=9",
+                "  dR9",
+                "scalar_control",
+                "  v=10",
+                "  dR10",
+                "read_only_arg",
+                "  v=11",
+                "  dR11",
+                "end"
+            ],
+            "drop_free_argument_result_one_owner",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

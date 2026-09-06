@@ -34441,6 +34441,123 @@ end
         );
     }
 
+    /// B-2026-09-06-58 — the sibling of B-2026-09-06-53 one TYPE over: a call
+    /// whose result WRAPS a `Drop`-free argument in a `Drop`-bearing type ran
+    /// the result's own body nowhere. `fn from_string(i: i64, s: String) -> R`
+    /// hands the parameter back inside the `R` it returns, so the classifier
+    /// called the result a view of `s` — right about the memory, since the `R`
+    /// carries that buffer, and wrong about the body, since a `String` runs no
+    /// user `Drop` for the `R`'s to defer to. Five cells recovered a body that
+    /// ran on no surface before, with the pre-fix output byte-identical across
+    /// backends, so no A/B or memory gate saw it.
+    ///
+    /// The gate is narrow on purpose: it fires only when the parameter's type
+    /// carries no user `Drop` ANYWHERE inside it. A parameter that does carry
+    /// one keeps the view, because declining there gives the result binding a
+    /// full walk that runs the wrapped value's body beside the argument owner's
+    /// (measured `dH3 dR9 dR9` on `fn wrap_bodied(r: R) -> H`). That shape needs
+    /// an own-body-without-fields split and keeps today's behaviour here — its
+    /// `wrap_bodied_control` cell shows the `H`'s own body still missing.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_drop_free_argument_does_not_make_the_result_a_view`, pinned to the same string.
+    #[test]
+    fn e2e_drop_free_argument_does_not_make_the_result_a_view() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct H { r: R, n: i64 }
+impl Drop for H { fn drop(mut ref self) { println(f"  dH{self.n}") } }
+struct Q { s: String, n: i64 }
+struct W { r: R, n: i64 }
+struct N { r: R, n: i64 }
+
+fn from_string(i: i64, s: String) -> R { return R { id: i, name: s }; }
+fn from_vec(i: i64, v: Vec[String]) -> R { return R { id: i, name: v[0] }; }
+fn from_struct(q: Q) -> R { return R { id: q.n, name: q.s }; }
+fn from_two(a: String, b: String) -> R { return R { id: 30, name: a }; }
+fn into_option(s: String) -> Option[R] { return Option.Some(R { id: 40, name: s }); }
+fn into_bodyless(s: String) -> N { return N { r: R { id: 50, name: s }, n: 1 }; }
+fn hand_back(r: R) -> R { return r; }
+fn wrap_bodyless(r: R) -> W { return W { r: r, n: 2 }; }
+fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }
+fn from_scalar(i: i64) -> R { return R { id: i, name: f"s{i}" }; }
+fn no_store(i: i64, v: Vec[i64]) -> R { return R { id: i, name: f"n{v.len()}" }; }
+
+fn string_arg(i: i64, nm: String) { let x = from_string(i, nm); println(f"  v={x.id}"); }
+fn vec_arg(i: i64, v: Vec[String]) { let x = from_vec(i, v); println(f"  v={x.id}"); }
+fn struct_arg(q: Q) { let x = from_struct(q); println(f"  v={x.id}"); }
+fn two_string_args(a: String, b: String) { let x = from_two(a, b); println(f"  v={x.id}"); }
+fn option_return(s: String) { let o = into_option(s); match o { Option.Some(r) => { println(f"  v={r.id}"); } Option.None => { println("  v=none"); } } }
+fn bodyless_return(s: String) { let n = into_bodyless(s); println(f"  v={n.r.id}"); }
+fn chained(s: String) { let x = from_string(60, s); let y = hand_back(x); println(f"  v={y.id}"); }
+fn same_type(r: R) { let y = hand_back(r); println(f"  v={y.id}"); }
+fn wrap_control(r: R) { let w = wrap_bodyless(r); println(f"  v={w.r.id}"); }
+fn wrap_bodied_control(r: R) { let h = wrap_bodied(r); println(f"  v={h.r.id}"); }
+fn scalar_control(i: i64) { let x = from_scalar(i); println(f"  v={x.id}"); }
+fn read_only_arg(i: i64, v: Vec[i64]) { let x = no_store(i, v); println(f"  v={x.id}"); }
+
+fn main() {
+    println("string_arg"); string_arg(1, "a");
+    println("vec_arg"); vec_arg(2, ["b"]);
+    println("struct_arg"); struct_arg(Q { s: "c", n: 3 });
+    println("two_string_args"); two_string_args("d", "e");
+    println("option_return"); option_return("f");
+    println("bodyless_return"); bodyless_return("g");
+    println("chained"); chained("h");
+    println("same_type"); same_type(R { id: 7, name: "i" });
+    println("wrap_control"); wrap_control(R { id: 8, name: "j" });
+    println("wrap_bodied_control"); wrap_bodied_control(R { id: 9, name: "k" });
+    println("scalar_control"); scalar_control(10);
+    println("read_only_arg"); read_only_arg(11, [1, 2]);
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"string_arg
+  v=1
+  dR1
+vec_arg
+  v=2
+  dR2
+struct_arg
+  v=3
+  dR3
+two_string_args
+  v=30
+  dR30
+option_return
+  v=40
+  dR40
+bodyless_return
+  v=50
+  dR50
+chained
+  v=60
+  dR60
+same_type
+  v=7
+  dR7
+wrap_control
+  v=8
+  dR8
+wrap_bodied_control
+  v=9
+  dR9
+scalar_control
+  v=10
+  dR10
+read_only_arg
+  v=11
+  dR11
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value

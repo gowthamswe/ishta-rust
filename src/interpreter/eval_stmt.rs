@@ -2593,6 +2593,12 @@ impl<'a> super::Interpreter<'a> {
                         && !f.params.get(i).is_some_and(|p| {
                             crate::ast::type_expr_is_owned_scalar(&p.ty)
                         })
+                        // B-2026-09-06-58 — nor when the callee wraps the
+                        // argument in a `Drop`-bearing type of its own; codegen
+                        // asks the same question of the same declaration.
+                        && !crate::ast::fn_return_carries_own_drop_beyond_param(
+                            self.program, f, i,
+                        )
                         && crate::ast::fn_always_returns_param(Some(self.program), f, i) =>
                 {
                     Some(src.clone())

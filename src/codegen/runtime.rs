@@ -6884,6 +6884,15 @@ impl<'ctx> super::Codegen<'ctx> {
                         && !f.params.get(i).is_some_and(|p| {
                             crate::ast::type_expr_is_owned_scalar(&p.ty)
                         })
+                        // B-2026-09-06-58 — nor when the callee WRAPS the
+                        // argument in a type that carries its own `Drop` body.
+                        // The view mark defers the result's body to the
+                        // argument's owner, which runs the ARGUMENT's body; an
+                        // `R` built around a `String` parameter ran its own
+                        // nowhere.
+                        && !self.program_snapshot.as_deref().is_some_and(|p| {
+                            crate::ast::fn_return_carries_own_drop_beyond_param(p, f, i)
+                        })
                         && crate::ast::fn_always_returns_param(
                             self.program_snapshot.as_deref(),
                             f,

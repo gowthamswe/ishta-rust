@@ -2248,6 +2248,11 @@ pub fn param_whole_aliases(
                         .params
                         .get(*i)
                         .is_some_and(|p| type_expr_is_owned_scalar(&p.ty))
+                    // B-2026-09-06-58 — nor an alias THROUGH a callee that
+                    // wraps the value in a `Drop`-bearing type of its own: the
+                    // local holds a new object with a body of its own, not the
+                    // param under another name.
+                    && !fn_return_carries_own_drop_beyond_param(program, g, *i)
                     && fn_always_returns_param(None, g, *i)
             }) {
                 aliases.push(x.clone());
@@ -2487,6 +2492,137 @@ pub fn type_expr_is_owned_scalar(ty: &TypeExpr) -> bool {
             | "char"
             | "Unit"
     )
+}
+
+/// B-2026-09-06-58 — does the callee's RETURN type declare a user `Drop` of its
+/// own that parameter `arg_index`'s type does not carry for it?
+///
+/// The second question a call-result VIEW classifier has to ask, beside
+/// [`type_expr_is_owned_scalar`]. "The parameter is handed back" is also true
+/// of a callee that WRAPS it in a different type — `fn mk2(i: i64, s: String)
+/// -> R { return R { id: i, name: s }; }`, `fn wrapH(r: R) -> H { return H { r:
+/// r, .. }; }` — and the view mark then defers the RESULT's body to whoever
+/// owns the argument. That owner runs the argument's body, which is not the
+/// result's: an `R` built around a `String` parameter, and an `H` built around
+/// an `R` parameter, each ran their own `Drop` body NOWHERE, on every backend
+/// at both opt levels, with valgrind clean.
+///
+/// SAME-TYPE hand-backs keep the view, which is the case the classifier exists
+/// for: `fn keep(r: R) -> R { return r; }` returns the very value the argument
+/// owns, so its body belongs to the argument's owner and running it at the
+/// result binding as well would double it.
+///
+/// A return type with no user `Drop` of its own also keeps the view — `fn wrap(r:
+/// R) -> W { W { r: r } }` for a body-less `W` hands nothing new to run, and its
+/// field's body is the argument's.
+///
+/// Bare declared paths on both sides. A generic return (`Option[R]`) names
+/// `Option`, which declares no `Drop`, so those keep today's behaviour — the
+/// same per-monomorph coverage limit the neighbouring predicates carry.
+pub fn fn_return_carries_own_drop_beyond_param(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> bool {
+    let Some(ret) = f.return_type.as_ref() else {
+        return false;
+    };
+    let crate::ast::TypeKind::Path(rp) = &ret.kind else {
+        return false;
+    };
+    let [ret_name] = rp.segments.as_slice() else {
+        return false;
+    };
+    // The return type must carry a user `Drop` BODY — its own, or one reachable
+    // inside it. `Option[R]` is the second form and is the one a bare
+    // `drop_method_keys` lookup missed: `fn mkOptS(s: String) -> Option[R]` lost
+    // the payload's body exactly as the bare `R` return did.
+    if !type_carries_user_drop(program, ret, &mut Vec::new()) {
+        return false;
+    }
+    let Some(param) = f.params.get(arg_index) else {
+        return false;
+    };
+    let crate::ast::TypeKind::Path(pp) = &param.ty.kind else {
+        return false;
+    };
+    if pp.segments.last() == Some(ret_name) {
+        return false;
+    }
+    // The parameter must carry NO user `Drop` of its own, anywhere inside it.
+    // Firing on one that does trades the lost body for a DOUBLED one: declining
+    // the view gives the result binding full ownership, whose walk runs the
+    // wrapped field's body beside the argument owner's — measured on
+    // `fn wrapH(r: R) -> H`, where the `H`'s own body appeared (correctly) and
+    // the `R`'s ran twice (`dH2 dR43 dR43`). That shape needs an ownership
+    // split — the result's OWN body without its fields' — which is a wider
+    // change than this row's, so it keeps today's behaviour and is filed on its
+    // own.
+    !type_carries_user_drop(program, &param.ty, &mut Vec::new())
+}
+
+/// Does `ty`, or anything reachable from it BY VALUE, declare a user `Drop`?
+/// `visited` breaks recursive declarations; an unknown or non-path type answers
+/// `true`, the direction that leaves a shape on today's behaviour.
+fn type_carries_user_drop(
+    program: &crate::Program,
+    ty: &TypeExpr,
+    visited: &mut Vec<String>,
+) -> bool {
+    let crate::ast::TypeKind::Path(p) = &ty.kind else {
+        return true;
+    };
+    let Some(name) = p.segments.last() else {
+        return true;
+    };
+    if let Some(args) = p.generic_args.as_ref() {
+        if args.iter().any(|a| match a {
+            crate::ast::GenericArg::Type(t) => type_carries_user_drop(program, t, visited),
+            _ => false,
+        }) {
+            return true;
+        }
+    }
+    if program.drop_method_keys.contains_key(name) {
+        return true;
+    }
+    if type_expr_is_owned_scalar(ty)
+        || matches!(
+            name.as_str(),
+            "String" | "Vec" | "Map" | "Set" | "Option" | "Result"
+        )
+    {
+        // Builtin containers carry only what their arguments carry, which the
+        // generic-argument walk above already answered.
+        return false;
+    }
+    if visited.iter().any(|v| v == name) {
+        return false;
+    }
+    visited.push(name.clone());
+    for item in &program.items {
+        match item {
+            Item::StructDef(sd) if &sd.name == name => {
+                return sd
+                    .fields
+                    .iter()
+                    .any(|fl| type_carries_user_drop(program, &fl.ty, visited));
+            }
+            Item::EnumDef(ed) if &ed.name == name => {
+                return ed.variants.iter().any(|v| match &v.kind {
+                    VariantKind::Unit => false,
+                    VariantKind::Tuple(tys) => tys
+                        .iter()
+                        .any(|t| type_carries_user_drop(program, t, visited)),
+                    VariantKind::Struct(fs) => fs
+                        .iter()
+                        .any(|fl| type_carries_user_drop(program, &fl.ty, visited)),
+                });
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// B-2026-08-28-22 was filed for: measured on the method path, reusing it lost
