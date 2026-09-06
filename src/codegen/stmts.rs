@@ -9988,6 +9988,22 @@ impl<'ctx> super::Codegen<'ctx> {
                                         .drop_rc
                                         .caller_retained_aggregate_memory
                                         .contains(src.as_str()),
+                                    // B-2026-09-06-62 — the RECEIVER spelling of
+                                    // the same rebind. `impl R { fn take(self)
+                                    // { let m = self; .. } }` is the free
+                                    // function above one receiver-spelling
+                                    // over, and `self` parses as `SelfValue`,
+                                    // not `Identifier`, so this test missed the
+                                    // prologue's refusal and `m` registered the
+                                    // second owner the free-function twin no
+                                    // longer registers: `free(): double free
+                                    // detected in tcache 2` under the JIT and at
+                                    // -O0, an invalid read of the freed refcount
+                                    // block at -O2.
+                                    ExprKind::SelfValue => self
+                                        .drop_rc
+                                        .caller_retained_aggregate_memory
+                                        .contains("self"),
                                     _ => call_src.as_deref().is_some_and(|s| {
                                         self.drop_rc.caller_retained_aggregate_memory.contains(s)
                                     }),
@@ -10107,7 +10123,73 @@ impl<'ctx> super::Codegen<'ctx> {
                                 // per-monomorph `S.drop$<concrete>` emission and
                                 // is tracked separately — but nothing leaks, and
                                 // no body can double-run because none ran at all.
-                                if self
+                                // B-2026-09-06-62 — the RECEIVER spelling of
+                                // B-2026-09-06-52, which reaches this branch
+                                // instead of the param-view one above because
+                                // `rhs_is_param_view` reads an `Identifier` and
+                                // `self` parses as `SelfValue`.
+                                //
+                                // The prologue declined to own this receiver
+                                // (its struct owns a `shared` field, or is
+                                // self-referential, so it is neither
+                                // entry-copied nor taken by transfer), so its
+                                // buffers are the CALLER's. The wrapper below
+                                // frees as well as running the body, which made
+                                // `let m = self;` a second owner of them:
+                                // `free(): double free detected in tcache 2`
+                                // under the JIT and at -O0, and at -O2 an
+                                // invalid read of the freed refcount block. The
+                                // byte-identical free function one
+                                // receiver-spelling over is clean.
+                                //
+                                // BODIES ONLY here, where the free-function
+                                // path registers nothing at all: there the
+                                // caller's own walk over its named argument
+                                // runs the body, while an owned-`self`
+                                // receiver's temp registrar DECLINES once the
+                                // callee binds a part out (`fn_binds_self_part_out`,
+                                // and a whole rebind is a bind-out), so
+                                // registering nothing here loses the body
+                                // instead of doubling the free. One body, no
+                                // free, on every surface.
+                                //
+                                // The induction runs through LOCALS too: `let m
+                                // = self; let n = m;` reaches this branch a
+                                // second time with a bare identifier that is
+                                // neither a param nor a param-view local, so
+                                // without the second arm `n` registered the
+                                // owner `m` had just been denied and the
+                                // use-after-free came back one rebind later.
+                                let self_src_caller_retained = match &value.kind {
+                                    ExprKind::SelfValue => self
+                                        .drop_rc
+                                        .caller_retained_aggregate_memory
+                                        .contains("self"),
+                                    ExprKind::Identifier(src) => self
+                                        .drop_rc
+                                        .caller_retained_aggregate_memory
+                                        .contains(src.as_str()),
+                                    _ => false,
+                                };
+                                if self_src_caller_retained {
+                                    // The induction step the param leg makes
+                                    // too: `let n = m;` after this must decline
+                                    // for the same reason.
+                                    self.drop_rc
+                                        .caller_retained_aggregate_memory
+                                        .insert(var_name.to_string());
+                                    if let Some(bodies) =
+                                        self.emit_struct_user_drop_bodies_only_fn(&struct_name)
+                                    {
+                                        self.track_user_drop_var_with_fn(
+                                            "",
+                                            var_name,
+                                            alloca,
+                                            bodies,
+                                            crate::codegen::state::UserDropKind::StructFieldBodies,
+                                        );
+                                    }
+                                } else if self
                                     .drop_rc
                                     .user_drop_wrapper_fns
                                     .contains_key(&struct_name)

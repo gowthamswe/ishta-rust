@@ -3846,6 +3846,64 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-62 — the MEMORY half, and the half the row is about: the
+    /// same program under ASAN + LSan, where the pre-fix build aborted on a
+    /// double free. One owner and one free per object on the temp receiver, the
+    /// named receiver, the double rebind, the `ref self` control, a
+    /// copy-supported struct receiver and the free-function twin.
+    #[test]
+    fn asan_owned_self_rebind_of_a_shared_field_struct() {
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             struct P { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for P { fn drop(mut ref self) { println(f\"  dP{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn mkp(i: i64) -> P { return P { id: i, name: f\"p{i}\", xs: [i] }; }\n\
+             impl R {\n\
+             \x20   fn take(self) -> i64 { let m = self; return m.id; }\n\
+             \x20   fn twice(self) -> i64 { let m = self; let n = m; return n.id; }\n\
+             \x20   fn plain(self) -> i64 { return self.id; }\n\
+             \x20   fn borrowed(ref self) -> i64 { return self.id; }\n\
+             }\n\
+             impl P { fn take(self) -> i64 { let m = self; return m.id; } }\n\
+             fn top(r: R) -> i64 { let m = r; return m.id; }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"temp_receiver\"); println(f\"  v={mk(1).take()}\");\n\
+             \x20   println(\"named_receiver\"); let a = mk(2); println(f\"  v={a.take()}\");\n\
+             \x20   println(\"twice\"); println(f\"  v={mk(3).twice()}\");\n\
+             \x20   println(\"borrowed\"); let b = mk(5); println(f\"  v={b.borrowed()}\");\n\
+             \x20   println(\"copyable_struct\"); println(f\"  v={mkp(6).take()}\");\n\
+             \x20   println(\"free_function\"); println(f\"  v={top(mk(7))}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "temp_receiver",
+                "  dR1",
+                "  v=1",
+                "named_receiver",
+                "  dR2",
+                "  v=2",
+                "twice",
+                "  dR3",
+                "  v=3",
+                "borrowed",
+                "  v=5",
+                "  dR5",
+                "copyable_struct",
+                "  dP6",
+                "  v=6",
+                "free_function",
+                "  dR7",
+                "  v=7",
+                "end",
+            ],
+            "owned_self_rebind_shared_field",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

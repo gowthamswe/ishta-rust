@@ -11006,7 +11006,19 @@ impl<'ctx> super::Codegen<'ctx> {
             Option<FunctionValue<'ctx>>,
         )> = Vec::new();
         for (fi, ai, ptr, type_name) in hits {
-            let field_fn = self.emit_struct_drop_synthesis(&type_name);
+            // B-2026-09-06-62 — the replacement must free everything the
+            // WRAPPER freed, and `emit_struct_drop_synthesis` deliberately
+            // leaves a struct's DIRECT `shared` fields to the binding's own
+            // `let` cleanup (B-2026-06-14-28 #3) — which the wrapper WAS. So a
+            // receiver whose struct owns a `shared` field lost its rc-dec at
+            // this downgrade and the box leaked (16 B per call at -O0, hidden
+            // until the callee stopped double-freeing it). The composed
+            // element drop is the one that covers both halves without
+            // overlapping; it declines for a struct with no shared field, where
+            // the plain synthesis is already complete.
+            let field_fn = self
+                .emit_vec_elem_struct_with_shared_drop_fn(&type_name)
+                .or_else(|| self.emit_struct_drop_synthesis(&type_name));
             repl.push((fi, ai, ptr, field_fn));
         }
         // Highest index first, so a removal never shifts a position still to be

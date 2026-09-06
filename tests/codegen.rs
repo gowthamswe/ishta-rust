@@ -34558,6 +34558,87 @@ end
         );
     }
 
+    /// B-2026-09-06-62 — the RECEIVER spelling of B-2026-09-06-52. `impl R { fn
+    /// take(self) -> i64 { let m = self; .. } }` over a struct with a `shared`
+    /// field aborted `free(): double free detected in tcache 2` under the JIT
+    /// and at -O0, and survived -O2 as an invalid read of the freed refcount
+    /// block, while the byte-identical FREE FUNCTION one receiver-spelling over
+    /// was already clean: `self` parses as `SelfValue`, so neither the
+    /// param-view test nor the caller-retained test that row added ever saw it.
+    ///
+    /// Three parts, each measured: the retained test now reads a bare `self`;
+    /// the non-view registration declines the binding's own wrapper for a
+    /// receiver the prologue refused to own, registering bodies only (the
+    /// free-function path registers nothing there, but an owned-`self`
+    /// receiver's temp registrar declines once the callee binds a part out, so
+    /// nothing would run the body); and the induction runs through locals, so
+    /// `let m = self; let n = m;` declines twice rather than once.
+    ///
+    /// The keep-memory downgrade `suppress_user_drop_body_keeping_memory` makes
+    /// at the call site also had to learn the `shared` field: it replaced the
+    /// wrapper with the plain struct drop, which by design leaves a direct
+    /// `shared` field to the binding's own `let` cleanup — the wrapper it just
+    /// removed — so the box leaked 16 bytes per call once the callee stopped
+    /// double-freeing it.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_owned_self_rebind_of_a_shared_field_struct`, pinned to the same string.
+    #[test]
+    fn e2e_owned_self_rebind_of_a_shared_field_struct() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct P { id: i64, name: String, xs: Vec[i64] }
+impl Drop for P { fn drop(mut ref self) { println(f"  dP{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}", xs: [i] }; }
+impl R {
+    fn take(self) -> i64 { let m = self; return m.id; }
+    fn twice(self) -> i64 { let m = self; let n = m; return n.id; }
+    fn plain(self) -> i64 { return self.id; }
+    fn borrowed(ref self) -> i64 { return self.id; }
+}
+impl P { fn take(self) -> i64 { let m = self; return m.id; } }
+fn top(r: R) -> i64 { let m = r; return m.id; }
+
+fn main() {
+    println("temp_receiver"); println(f"  v={mk(1).take()}");
+    println("named_receiver"); let a = mk(2); println(f"  v={a.take()}");
+    println("twice"); println(f"  v={mk(3).twice()}");
+    println("borrowed"); let b = mk(5); println(f"  v={b.borrowed()}");
+    println("copyable_struct"); println(f"  v={mkp(6).take()}");
+    println("free_function"); println(f"  v={top(mk(7))}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"temp_receiver
+  dR1
+  v=1
+named_receiver
+  dR2
+  v=2
+twice
+  dR3
+  v=3
+borrowed
+  v=5
+  dR5
+copyable_struct
+  dP6
+  v=6
+free_function
+  dR7
+  v=7
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value
