@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 385 |
+| miscompile | 386 |
 | run-vs-build | 352 |
 | leak | 274 |
 | missing-feature | 194 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1507 |
-| interp | 379 |
+| codegen | 1508 |
+| interp | 380 |
 | typecheck | 294 |
 | ownership | 74 |
 | other | 73 |
@@ -152,7 +152,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-4 | 2026-09-06 | codegen | high | THE SELF-HOSTED RESOLVER ORACLE DOUBLE-FREES ON LINUX AND THE EMITTER ORACLE SEGFAULTS, AT THE IMPORT COMMIT AND ON CURRENT `main` ALIKE -- `tests/selfhost_resolver.rs`'s two tests abort `free(): double free detected in tcache 2` (SIGABRT, four per run) and `tests/selfhost_codegen.rs`'s `selfhost_codegen_matches_seed_run` dies SIGSEGV, identically at 51368a1 (the import that claims them green), e028255 and 822334c; the other six self-host oracles pass; CI's `codegen-e2e` job excludes both, so nothing has ever run them on glibc | — |
 | B-2026-09-06-19 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM WRAPPED TWICE THROUGH A LOCAL ON SOME EXITS RUNS THE BODY TWICE ON THE HAND-BACK PATH -- `fn ftwo(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(82) }; } let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }` prints `d72 C72 B72 d72` for `k = false` on all four surfaces, while `k = true` is one body (`d71 C82 B82 d82`) | — |
 | B-2026-09-06-21 | 2026-09-06 | interp+codegen | low | TWO FRESH PAYLOADS BOUND OUT OF A `match` ARM DIE IN OPPOSITE ORDERS ON THE TWO BACKENDS -- `let w = W2.Two(mk(16), mk(17)); match w { W2.Two(a, b) => { return a.id; } .. }` prints `dR16 dR17` on jit / aot / `KARAC_AUTO_PAR=0` (declaration order) and `dR17 dR16` under `--interp` (reverse); the body COUNT is right on both, only the arm-end sequence differs | — |
-| B-2026-09-06-22 | 2026-09-06 | codegen | medium | A `match` THAT DESTRUCTURES A MIXED STRUCT LITERAL'S VIEW FIELD RUNS THE VIEW'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `let s = S3 { a: r, b: mk(19) }; match s { S3 { a, b } => { return b.id; } }` prints `dR19 dR18 dR18` on jit / aot / `KARAC_AUTO_PAR=0` against the interpreter's `dR19 dR18`; the struct sibling of B-2026-09-06-20, with the backends swapped | — |
 | B-2026-09-06-23 | 2026-09-06 | interp+codegen | low | THE COPY A MATERIALIZING `match` ARM TAKES OFF A BORROW-PROJECTION SCRUTINEE NEVER RUNS THE ENUM SHELL'S OWN `Drop` BODY, ON EVERY BACKEND -- `match h.e { E.A(r) => { let m = r; return m.id; } .. }` through `mut ref h` prints `dR1 dE dR1` (the copy's payload body, then the original's shell and payload) where the `let e = h.e; match e { .. }` spelling of the same copy prints `dE dR1 dE dR1`; a fresh-temp or local scrutinee (`match mk(7) { .. }`, `let e = mk(8); match e { .. }`) does run its shell's `dE` after the payload moves out | — |
 | B-2026-09-06-24 | 2026-09-06 | codegen | medium | A READ-ONLY `if let` / `while let` OVER A BORROW-PROJECTION SCRUTINEE COPIES THE PAYLOAD OUT UNDER CODEGEN AND BINDS A VIEW IN THE INTERPRETER -- `if let E.A(r) = h.e { return r.id; }` through `ref h`, `mut ref h` or `ref self` prints `dR5 5 dE dR5` on jit / aot / `KARAC_AUTO_PAR=0` against `5 dE dR5` under `--interp`; the read-only `match h.e { E.A(r) => { return r.id; } .. }` binds a view on EVERY backend (`5 dE dR5`), so codegen's `if let` disagrees with its own `match` as well as with the interpreter | — |
 | B-2026-09-06-25 | 2026-09-06 | interp | medium | THE INTERPRETER TAKES NO COPY WHEN A VIEW BOUND OFF A BORROW-PROJECTION SCRUTINEE IS MATERIALIZED BY AN ARM VALUE OR A BY-VALUE CALL ARGUMENT -- `let r2 = match h.e { E.A(r) => r, .. }` through `ref h` / `mut ref h` MOVES the caller's payload out of the borrow (`dE 5 dR5`: the original struct drops with an empty shell) against `dE dR5 5 dR5` on jit / aot; `match self.e { E.A(r) => { return consume(r); } .. }` through `ref self` / `mut ref self` (and the `if let` spelling) runs ONE payload body (`3 dE dR3`) against two (`dR3 3 dE dR3`); the `let m = r` spelling copies correctly on every root | — |
@@ -160,6 +159,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-27 | 2026-09-06 | interp+codegen | medium | A READ-ONLY ARM ON AN OWNED ENUM RECEIVER LOSES THE PAYLOAD'S `Drop` BODY UNDER `--interp` -- `impl E { fn m_read(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } } }` prints `dE r63` for a named local (`dE r63 dR63` compiled) and `r64` for a fresh temp (`r64 dR64` compiled); the temp additionally loses the enum shell's `dE` on EVERY surface | — |
 | B-2026-09-06-28 | 2026-09-06 | codegen | low | A PLAIN-STRUCT PATTERN LEAF BOUND OUT OF A BY-VALUE PARAM AND NEVER CONSUMED LEAKS ITS HEAP AT -O0 -- `fn shell(h: H1) -> i64 { match h { H1 { e } => { return 9; } } }` with `e: E` carrying `R { tag: String, xs: Vec[i64] }` loses 3 B + 8 B per call (valgrind, `KARAC_OPT_LEVEL=0`), clean at -O2; the bare owned `self` spelling identically; stdout is correct on every surface | — |
 | B-2026-09-06-29 | 2026-09-06 | interp+codegen | medium | A PAYLOAD HANDED BACK OUT OF A TWO-LEVEL OWNED-PARAM DESTRUCTURE RUNS ITS `Drop` BODY TWICE ON EVERY SURFACE -- `fn p_h(h: H1) -> R { match h { H1 { e } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } }` prints `dE dR5 r5 dR5` for `let g = ..; let r5 = p_h(g); println(f"r{r5.id}")` on --interp / jit / -O0 / -O2, where the one-level `fn p_r(e: E) -> R { match e { E.A(r) => { return r; } .. } }` prints `dE r1 dR1`; the owned-`self` receiver spelling (`fn hand(self) -> R`) is identical | — |
+| B-2026-09-06-30 | 2026-09-06 | interp+codegen | medium | A `let` DESTRUCTURE OF A MIXED STRUCT LITERAL RUNS THE VIEW FIELD'S `Drop` BODY TWICE ON ALL FOUR SURFACES -- `let s = S3 { a: r, b: mk(19) }; let S3 { a, b } = s; return b.id;` prints `dR18 dR19 dR18` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike where `dR19 dR18` is due; the `match` spelling of the same destructure is one body on every surface since B-2026-09-06-22 | — |
 
 ### Relocated
 
@@ -2297,6 +2297,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-17 | interp+codegen | medium | AN OWNED RECEIVER'S PAYLOAD HANDED OUT BY `return r` FROM `match self.e` RUNS ITS `Drop` BODY IN THE CALLER'S RETAINED WALK AS WELL -- `dE dR7 got7 d… | 78ccf71 |
 | B-2026-09-06-18 | interp+codegen | medium | A BY-VALUE `Drop` PARAM WRAPPED IN A USER ENUM VARIANT ON SOME EXITS RUNS THE BODY TWICE ON THE HAND-BACK PATH -- `fn fslot(r: R, k: bool) -> Slot {… | 50c8f4a |
 | B-2026-09-06-20 | interp | medium | A `match` THAT DESTRUCTURES A MIXED WRAP'S VIEW SLOT RUNS THE VIEW'S `Drop` BODY TWICE IN THE INTERPRETER ALONE -- `fn m(r: R) -> i64 { let w = W2.Tw… | a5219e4 |
+| B-2026-09-06-22 | codegen | medium | A `match` THAT DESTRUCTURES A MIXED STRUCT LITERAL'S VIEW FIELD RUNS THE VIEW'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `let s = S3 { a: r, b:… | 94b4c94 |
 
 </details>
 
