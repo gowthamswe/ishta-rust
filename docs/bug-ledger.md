@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 389 |
 | run-vs-build | 357 |
-| leak | 274 |
+| leak | 275 |
 | missing-feature | 194 |
 | double-free | 191 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1517 |
+| codegen | 1518 |
 | interp | 388 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -148,7 +148,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-23 | 2026-09-05 | runtime | medium | kata:288's AUTO-PAR LANE GENERATES SYSTEM TIME LINEAR IN WORKER COUNT -- 1.11ms at N=1 rising to 1267.64ms at N=18 (~70ms of kernel time per added worker, 11.7 cores' worth against a 108.71ms wall), while kata:282 stays FLAT at 3.81 -> 9.41ms across the identical sweep | none |
 | B-2026-09-05-32 | 2026-09-05 | codegen | low | THE IDENTITY-ARM SPELLING OF B-2026-09-01-1 STILL LEAKS -- `e = if c { pass(e) } else { e }` loses a block (12 allocs / 11 frees at -O0) because the branch is DECLINED on purpose: an arm that hands the binding back unchanged yields the OLD value, so the overwrite cleanup would free the buffer about to be stored back; the one shape that genuinely needs a per-arm or aliasing-aware cleanup, and like its parent clean at -O2 | — |
 | B-2026-09-05-37 | 2026-09-05 | codegen | low | A WHOLE REBIND OF A BY-VALUE `Drop` PARAM NESTED IN A BRANCH LEAKS THE PARAM'S ENTRY COPY ON THE NOT-TAKEN PATH -- `fn g(r: R, keep: bool) -> i64 { if keep { let m = r; return 1; } return 0; }` over `struct R { id: i64, name: String }` with `impl Drop for R`, called with `keep = false`, leaks the `String` buffer (3 B per call at `KARAC_OPT_LEVEL=0`; masked at -O2 on the simplest shapes, still 3 B at -O2 once a `println` sits between the branch and the return). Bodies are correct on every surface; the `let`'s own-`Drop` source retraction (`suppress_struct_cleanup_for_tail_identifier`, B-2026-08-09-16's site in `compile_let`) is an ALL-PATHS static removal of `r`'s memory action, reached from inside the branch | — |
-| B-2026-09-06-3 | 2026-09-06 | codegen | low | A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Option[(R, i64)]` with a heap-carrying element (5+ words, boxed) leaks the whole box + interior; `try_track_discarded_boxed_option` frees a boxed STRUCT payload but declines a boxed TUPLE one. Split from B-2026-09-05-14 (the lost-BODY twin), which this leak is independent of -- identical with the body fix absent or present | — |
 | B-2026-09-06-4 | 2026-09-06 | codegen | high | THE SELF-HOSTED RESOLVER ORACLE DOUBLE-FREES ON LINUX AND THE EMITTER ORACLE SEGFAULTS, AT THE IMPORT COMMIT AND ON CURRENT `main` ALIKE -- `tests/selfhost_resolver.rs`'s two tests abort `free(): double free detected in tcache 2` (SIGABRT, four per run) and `tests/selfhost_codegen.rs`'s `selfhost_codegen_matches_seed_run` dies SIGSEGV, identically at 51368a1 (the import that claims them green), e028255 and 822334c; the other six self-host oracles pass; CI's `codegen-e2e` job excludes both, so nothing has ever run them on glibc | — |
 | B-2026-09-06-21 | 2026-09-06 | interp+codegen | low | TWO FRESH PAYLOADS BOUND OUT OF A `match` ARM DIE IN OPPOSITE ORDERS ON THE TWO BACKENDS -- `let w = W2.Two(mk(16), mk(17)); match w { W2.Two(a, b) => { return a.id; } .. }` prints `dR16 dR17` on jit / aot / `KARAC_AUTO_PAR=0` (declaration order) and `dR17 dR16` under `--interp` (reverse); the body COUNT is right on both, only the arm-end sequence differs | — |
 | B-2026-09-06-23 | 2026-09-06 | interp+codegen | low | THE COPY A MATERIALIZING `match` ARM TAKES OFF A BORROW-PROJECTION SCRUTINEE NEVER RUNS THE ENUM SHELL'S OWN `Drop` BODY, ON EVERY BACKEND -- `match h.e { E.A(r) => { let m = r; return m.id; } .. }` through `mut ref h` prints `dR1 dE dR1` (the copy's payload body, then the original's shell and payload) where the `let e = h.e; match e { .. }` spelling of the same copy prints `dE dR1 dE dR1`; a fresh-temp or local scrutinee (`match mk(7) { .. }`, `let e = mk(8); match e { .. }`) does run its shell's `dE` after the payload moves out | — |
@@ -159,6 +158,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-40 | 2026-09-06 | interp+codegen | low | A REORDERED STRUCT `let` PATTERN DROPS ITS LEAVES IN REVERSE PATTERN ORDER ON THE INTERPRETER AND REVERSE DECLARATION ORDER ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(7), b: mk(8) }; let S3 { b, a } = s; return b.id * 100 + a.id;` prints `dR7 dR8 dR6 v=807` under `--interp` and `dR8 dR7 dR6 v=807` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs once, the sequence alone diverges | — |
 | B-2026-09-06-41 | 2026-09-06 | interp | high | THE INTERPRETER PANICS WHEN A SCALAR FIELD IS READ OFF A LEAF DESTRUCTURED OUT OF A BY-VALUE PARAM WHOSE TYPE HAS ITS OWN `Drop` -- `fn g(s: S3) -> i64 { let S3 { a, b } = s; return a.id; }` (and `let x = a.id;`, and the `{ a, .. }` / `{ a, b: _ }` spellings) dies at the leaf's death with `internal error: entered unreachable code: field 'id' not found on struct 'R'` from inside `R`'s own `drop` body, after `mid dR6`; jit / aot print `mid dR6 dR5 v=5`; reading nothing off the leaf (`return 1`) runs clean | — |
 | B-2026-09-06-42 | 2026-09-06 | interp+codegen | high | `let e = self` INSIDE AN OWNED-`self` METHOD ON A VALUE ENUM WITH ITS OWN `Drop` DOUBLE-FREES THE PAYLOAD AT -O0 AND UNDER THE JIT -- `impl E { fn m_let(self) -> i64 { let e = self; match e { E.A(r) => { return r.id; } E.B => { return 0; } } } }` aborts with `free(): double free detected` for a named-local receiver AND a fresh temp, is clean at -O2, and at -O2 / --interp the named-local spelling runs the shell's body TWICE (`dE dR1 dE x1`); the no-shell enum, the struct twin and the by-value-param twin are clean everywhere | — |
+| B-2026-09-06-43 | 2026-09-06 | codegen | low | A DISCARDED BOXED `Result` PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Result[T, E]` with a heap-carrying payload past the 5-word inline area leaks the box + interior for a STRUCT payload (82 B, `Result[W, i64]`) as well as a tuple one (74 B, `Result[(R, String), i64]`); the discard battery has `try_track_discarded_inline_result` and `try_track_discarded_boxed_option` but NO boxed-`Result` member, so a boxed `Result` discard is tracked by nobody. Split from B-2026-09-06-3 (the boxed-Option-tuple twin), whose fix leaves both boxed `Result` shapes leaking | — |
 
 ### Relocated
 
@@ -2281,6 +2281,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-36 | interp+codegen | medium | A `let`-DESTRUCTURED TUPLE ELEMENT OR A BARE BY-VALUE PARAM HANDED TO A CALLEE THAT RETURNS OR STORES IT RUNS ITS `Drop` BODY TWICE ON ALL FOUR SURFA… | 2961e43 |
 | B-2026-09-06-1 | interp | medium | THE INTERPRETER LOSES A DISCARDED GENERIC CALL'S MOVED-IN ARGUMENT `Drop` BODY ENTIRELY -- `let g = mk(3); passG(g);` as a BARE STATEMENT over `fn pa… | 3ef6220 |
 | B-2026-09-06-2 | codegen | medium | A NAMED-LOCAL ARGUMENT TO A GENERIC *METHOD* THAT RETURNS ITS WHOLE BY-VALUE PARAM LEAKS THE CALLEE'S ENTRY COPY -- `let _ = h.keep(g)` over `impl H… | cb46fd0 |
+| B-2026-09-06-3 | codegen | low | A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Option[(R, i64)]` with a heap-carrying element (… | 192504e |
 | B-2026-09-06-5 | codegen | medium | A NESTED TUPLE ELEMENT HANDED BACK TWO TUPLE LEVELS DEEP RUNS ITS `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn v3_ret(h: H2) -> R { let (inner,… | dd4a63c |
 | B-2026-09-06-6 | codegen | medium | A WHOLE REBIND OF A TUPLE-TYPED PARAM VIEW RUNS THE ELEMENT'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn v3m(h: H2) { let (inner, y) = h.pe;… | 9290410 |
 | B-2026-09-06-7 | codegen | medium | THE TWO-STEP DESTRUCTURE OF A NESTED TUPLE FIELD OFF A LOCAL RUNS THE LEAF'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND, ONE OF THEM EARLY -- `let h… | aeaa806 |
