@@ -3163,6 +3163,18 @@ impl<'a> super::Interpreter<'a> {
                     cur = object;
                 }
                 ExprKind::Identifier(n) => break n.as_str(),
+                // B-2026-09-06-16 — a projection off an OWNED `self` receiver
+                // (`let e = self.e`) reads a field of a by-value parameter the
+                // CALLER retains, exactly as `let e = h.e` does; the walk
+                // stopped here and `e` took bodies of its own beside the
+                // caller's walk. The outer `matches!` guarantees at least one
+                // hop, so a bare `let x = self` keeps its transfer.
+                ExprKind::SelfValue => {
+                    return matches!(
+                        self.self_param_stack.last(),
+                        Some(crate::ast::SelfParam::Owned)
+                    );
+                }
                 _ => return false,
             }
         };

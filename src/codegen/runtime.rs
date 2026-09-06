@@ -7268,6 +7268,19 @@ impl<'ctx> super::Codegen<'ctx> {
                     cur = object;
                 }
                 ExprKind::Identifier(n) => break n.as_str(),
+                // B-2026-09-06-16 — an OWNED `self` receiver is a by-value
+                // parameter (`lower_method` inserts it into `params` under the
+                // name `self`, so it is in `current_fn_param_names`), and a
+                // field read off it (`let e = self.e`) is a VIEW of the
+                // caller-retained value exactly as `let e = h.e` is. This walk
+                // stopped at `SelfValue` with `false`, so the binding kept the
+                // bodies the enum-let gate had registered and ran them beside
+                // the caller's walk: `dR51 dE dE dR51`. A borrowed receiver
+                // stays `false` (a projection off a borrow is a copy).
+                ExprKind::SelfValue => {
+                    return self.fn_ctx.current_fn_param_names.contains("self")
+                        && !self.borrow_vars.ref_params.contains_key("self");
+                }
                 _ => return false,
             }
         };

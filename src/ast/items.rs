@@ -1536,15 +1536,6 @@ pub fn owned_self_return_is_opaque_to_receiver(
 /// leaves the field where it is, which is what keeps the plain receiver — the
 /// row's whole subject — admitted.
 pub fn fn_binds_self_part_out(f: &Function) -> bool {
-    /// Is `e` rooted at `self`? `self`, `self.a`, `self.inner.a`, `self[i]`.
-    fn self_rooted(e: &Expr) -> bool {
-        match &e.kind {
-            ExprKind::SelfValue => true,
-            ExprKind::FieldAccess { object, .. } => self_rooted(object),
-            ExprKind::Index { object, .. } => self_rooted(object),
-            _ => false,
-        }
-    }
     /// B-2026-08-31-43 — a `match` / `if let` / `while let` whose scrutinee
     /// is a PROJECTION off `self` (`self.e`, `self.s.e`) is no longer a
     /// bind-out: both backends now treat an owned receiver's projection like
@@ -1600,8 +1591,12 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
     }
     fn walk_block(b: &Block) -> bool {
         b.stmts.iter().any(|st| match &st.kind {
+            // B-2026-09-06-16 — a `let` from a PROJECTION off `self`
+            // (`let e = self.e`) binds a VIEW of the caller-retained value on
+            // both backends now, as `let e = h.e` always did, so it is no
+            // longer a bind-out; a bare `let x = self` (transfer) still is.
             StmtKind::Let { value, .. } | StmtKind::LetElse { value, .. } => {
-                self_rooted(value) || walk_expr(value)
+                scrutinee_binds_out(value) || walk_expr(value)
             }
             StmtKind::Expr(e) => walk_expr(e),
             _ => false,

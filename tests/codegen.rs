@@ -33031,6 +33031,116 @@ fn main() {
         }
     }
 
+    /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
+    /// field's and its payload's `Drop` bodies twice for a named-local receiver
+    /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value
+    /// PARAMETER (`p_fieldlet`) was one body each — the control. Both backends mark a
+    /// `let` from a projection off a by-value parameter as a VIEW of the
+    /// caller-retained value, and both walks stop at `ExprKind::Identifier`; `self`
+    /// is `ExprKind::SelfValue`. Codegen's is the let epilogue's
+    /// `field_move_out_source_is_param_view` (which cancels the bodies the enum-let
+    /// gate registers), the interpreter's is `let_reads_param_view_field`; each gained
+    /// the owned-`self` root, projections only.
+    ///
+    /// `justlet` (the field read and never used), `readlet` (a read-only arm), `deep`
+    /// (two hops), `mid` (a struct-typed field, then a match off it) are the other
+    /// spellings that doubled; `*/temp` are the fresh-temp receivers, whose bodies
+    /// the B-2026-09-04-30 gate now retains caller-side for a `let` from a projection
+    /// too; `borrowedlet` is `mut ref self`, where the second body is the documented
+    /// copy (design.md "A projection off a borrow is an implicit copy") and must stay
+    /// at two.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_owned_self_field_let_runs_one_body`, pinned to the same string.
+    #[test]
+    fn e2e_owned_self_field_let_runs_one_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct S { e: E }
+struct H1 { e: E }
+struct H2 { s: S }
+
+impl H1 {
+    fn fieldlet(self) -> i64 { let e = self.e; match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+    fn readlet(self) -> i64 { let e = self.e; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn justlet(self) -> i64 { let e = self.e; return 7; }
+    fn borrowedlet(mut ref self) -> i64 { let e = self.e; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+}
+impl H2 {
+    fn deep(self) -> i64 { let e = self.s.e; match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+    fn mid(self) -> i64 { let s = self.s; match s.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+}
+fn p_fieldlet(h: H1) -> i64 { let e = h.e; match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+
+fn main() {
+    println("fieldlet/local"); let a1 = H1 { e: E.A(mk(1)) }; let x1 = a1.fieldlet(); println(f"  r{x1}");
+    println("fieldlet/temp"); let x2 = H1 { e: E.A(mk(2)) }.fieldlet(); println(f"  r{x2}");
+    println("readlet/local"); let a3 = H1 { e: E.A(mk(3)) }; let x3 = a3.readlet(); println(f"  r{x3}");
+    println("justlet/local"); let a4 = H1 { e: E.A(mk(4)) }; let x4 = a4.justlet(); println(f"  r{x4}");
+    println("deep/local"); let a5 = H2 { s: S { e: E.A(mk(5)) } }; let x5 = a5.deep(); println(f"  r{x5}");
+    println("mid/local"); let a6 = H2 { s: S { e: E.A(mk(6)) } }; let x6 = a6.mid(); println(f"  r{x6}");
+    println("deep/temp"); let x7 = H2 { s: S { e: E.A(mk(7)) } }.deep(); println(f"  r{x7}");
+    println("borrowedlet/local"); let mut a8 = H1 { e: E.A(mk(8)) }; let x8 = a8.borrowedlet(); println(f"  r{x8}");
+    println("p_fieldlet/local"); let a9 = H1 { e: E.A(mk(9)) }; let x9 = p_fieldlet(a9); println(f"  r{x9}");
+    println("p_fieldlet/temp"); let x10 = p_fieldlet(H1 { e: E.A(mk(10)) }); println(f"  r{x10}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"fieldlet/local
+  dE
+  dR1
+  r1
+fieldlet/temp
+  dE
+  dR2
+  r2
+readlet/local
+  dE
+  dR3
+  r3
+justlet/local
+  dE
+  dR4
+  r7
+deep/local
+  dE
+  dR5
+  r5
+mid/local
+  dE
+  dR6
+  r6
+deep/temp
+  dE
+  dR7
+  r7
+borrowedlet/local
+  dE
+  dR8
+  dE
+  dR8
+  r8
+p_fieldlet/local
+  dE
+  dR9
+  r9
+p_fieldlet/temp
+  dE
+  dR10
+  r10
+end
+"#
+        );
+    }
+
     /// B-2026-08-31-43 — a `match` / `if let` / `let … else` / `while let` over a
     /// PROJECTION off an OWNED `self` receiver (`match self.e { E.A(r) => { let m = r;
     /// .. } }`, one and two hops) ran the payload's `Drop` body twice on every surface:

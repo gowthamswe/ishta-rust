@@ -1359,6 +1359,15 @@ fn main() {
     /// (`fn m(self) { .. }` on a temp runs no body on ANY surface) and has its own
     /// row, B-2026-09-04-30. Pinned so a change there shows up as a changed line,
     /// never as a silent double free.
+    ///
+    /// B-2026-09-06-16 — the `p_match` / `p_unused` cells (a destructure from
+    /// the PROJECTION `self.inner` on a fresh-temp receiver) now run each
+    /// field's body once (`dR104/t104 dR4/t4`, `dR105/t105 dR5/t5`): a `let`
+    /// from a self-rooted projection stopped counting as a bind-out in
+    /// `fn_binds_self_part_out`, so the temp receiver's bodies are retained
+    /// caller-side. The `s_*` cells (a bare `self` destructure, the transfer)
+    /// still print no field body on the compiled backends — B-2026-09-04-30's
+    /// remaining gap, pinned here as before.
     #[test]
     fn asan_self_receiver_destructure_frees_each_field_once() {
         assert_clean_asan_run(
@@ -1403,7 +1412,11 @@ fn main() {
                 "dR103/t103",
                 "  rd4",
                 "  okt104",
+                "dR104/t104",
+                "dR4/t4",
                 "  rd5",
+                "dR105/t105",
+                "dR5/t5",
                 "  rd11",
                 "  okt111",
                 "  rd12",
@@ -1411,7 +1424,11 @@ fn main() {
                 "dR113/t113",
                 "  rd14",
                 "  okt114",
+                "dR114/t114",
+                "dR14/t14",
                 "  rd15",
+                "dR115/t115",
+                "dR15/t15",
                 "  rd21",
                 "  okt121",
                 "  rd22",
@@ -1419,7 +1436,11 @@ fn main() {
                 "dR123/t123",
                 "  rd24",
                 "  okt124",
+                "dR124/t124",
+                "dR24/t24",
                 "  rd25",
+                "dR125/t125",
+                "dR25/t25",
             ],
             "asan_self_receiver_destructure_frees_each_field_once",
         );
@@ -1967,6 +1988,100 @@ fn main() {
                 "end",
             ],
             "b23-bare-tuple-element-single-owner",
+        );
+    }
+
+    /// B-2026-09-06-16 — the MEMORY half of
+    /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
+    /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the
+    /// caller-retained receiver on the compiled backends (its bodies cancelled
+    /// in the let epilogue, its memory the projection-view drop the by-value
+    /// parameter path already registers), so this pins that the field's
+    /// `String` / `Vec` buffers have exactly one owner on every spelling,
+    /// fresh-temp receivers included.
+    #[test]
+    fn asan_owned_self_field_let_is_a_view() {
+        assert_clean_asan_run(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] } }\n\
+             enum E { A(R), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"  dE\") } }\n\
+             struct S { e: E }\n\
+             struct H1 { e: E }\n\
+             struct H2 { s: S }\n\
+             \n\
+             impl H1 {\n\
+             \x20   fn fieldlet(self) -> i64 { let e = self.e; match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             \x20   fn readlet(self) -> i64 { let e = self.e; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             \x20   fn justlet(self) -> i64 { let e = self.e; return 7; }\n\
+             \x20   fn borrowedlet(mut ref self) -> i64 { let e = self.e; match e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             }\n\
+             impl H2 {\n\
+             \x20   fn deep(self) -> i64 { let e = self.s.e; match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             \x20   fn mid(self) -> i64 { let s = self.s; match s.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             }\n\
+             fn p_fieldlet(h: H1) -> i64 { let e = h.e; match e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"fieldlet/local\"); let a1 = H1 { e: E.A(mk(1)) }; let x1 = a1.fieldlet(); println(f\"  r{x1}\");\n\
+             \x20   println(\"fieldlet/temp\"); let x2 = H1 { e: E.A(mk(2)) }.fieldlet(); println(f\"  r{x2}\");\n\
+             \x20   println(\"readlet/local\"); let a3 = H1 { e: E.A(mk(3)) }; let x3 = a3.readlet(); println(f\"  r{x3}\");\n\
+             \x20   println(\"justlet/local\"); let a4 = H1 { e: E.A(mk(4)) }; let x4 = a4.justlet(); println(f\"  r{x4}\");\n\
+             \x20   println(\"deep/local\"); let a5 = H2 { s: S { e: E.A(mk(5)) } }; let x5 = a5.deep(); println(f\"  r{x5}\");\n\
+             \x20   println(\"mid/local\"); let a6 = H2 { s: S { e: E.A(mk(6)) } }; let x6 = a6.mid(); println(f\"  r{x6}\");\n\
+             \x20   println(\"deep/temp\"); let x7 = H2 { s: S { e: E.A(mk(7)) } }.deep(); println(f\"  r{x7}\");\n\
+             \x20   println(\"borrowedlet/local\"); let mut a8 = H1 { e: E.A(mk(8)) }; let x8 = a8.borrowedlet(); println(f\"  r{x8}\");\n\
+             \x20   println(\"p_fieldlet/local\"); let a9 = H1 { e: E.A(mk(9)) }; let x9 = p_fieldlet(a9); println(f\"  r{x9}\");\n\
+             \x20   println(\"p_fieldlet/temp\"); let x10 = p_fieldlet(H1 { e: E.A(mk(10)) }); println(f\"  r{x10}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "fieldlet/local",
+                "  dE",
+                "  dR1",
+                "  r1",
+                "fieldlet/temp",
+                "  dE",
+                "  dR2",
+                "  r2",
+                "readlet/local",
+                "  dE",
+                "  dR3",
+                "  r3",
+                "justlet/local",
+                "  dE",
+                "  dR4",
+                "  r7",
+                "deep/local",
+                "  dE",
+                "  dR5",
+                "  r5",
+                "mid/local",
+                "  dE",
+                "  dR6",
+                "  r6",
+                "deep/temp",
+                "  dE",
+                "  dR7",
+                "  r7",
+                "borrowedlet/local",
+                "  dE",
+                "  dR8",
+                "  dE",
+                "  dR8",
+                "  r8",
+                "p_fieldlet/local",
+                "  dE",
+                "  dR9",
+                "  r9",
+                "p_fieldlet/temp",
+                "  dE",
+                "  dR10",
+                "  r10",
+                "end",
+            ],
+            "b16-owned-self-field-let",
         );
     }
 
