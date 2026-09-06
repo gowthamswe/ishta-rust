@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 370 |
+| miscompile | 373 |
 | run-vs-build | 345 |
 | leak | 272 |
 | missing-feature | 194 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1486 |
+| codegen | 1489 |
 | interp | 362 |
 | typecheck | 293 |
 | ownership | 74 |
@@ -144,7 +144,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-02-16 | 2026-09-02 | interp+codegen | low | A NEVER-READ SHADOWED NAME'S TWO GENERATIONS FIRE IN THE WRONG ORDER UNDER AUTO-PAR because each is branch-local and fires inside its own outlined branch at its own `let`, while the interpreter fires both at the single name-keyed endpoint in LIFO order -- `dR3 dR4 mid` vs `dR4 dR3 mid`; the position is now right on every surface and only the order between the two generations differs | — |
 | B-2026-09-02-22 | 2026-09-02 | codegen | low | A DOUBLY-NESTED `Option[Option[String]]` ARGUMENT LEAKS ITS INNER PAYLOAD -- 45 B in 3 blocks over a three-iteration loop, unmoved by all THREE of B-2026-09-01-29's fixes. The payload is 3 words, so `Option[Option[String]]` exceeds the 3-word boxing limit `optres_param_entry_copied_te` gates on: the param is never ADMITTED to the by-value copy convention, so neither the callee's entry copy nor any caller-side ownership predicate applies and no frame is ever offered the temp | — |
 | B-2026-09-02-31 | 2026-09-02 | codegen | low | THE BARE-ARM SPELLING OF B-2026-09-01-26 STILL LEAKS -- `match mkVe(9) { Ve.A(s) => s, .. }` in a nested expression position loses 15 B per evaluation at both opt levels where the BRACED `=> { s }` spelling is now clean. Excluded by that fix's block-bodied-arm condition, which is load-bearing: dropping it fails BOTH `asan_generic_enum_heap_payload_bind_return_no_leak_or_double_free` and `selfhost_codegen_matches_seed_run`, because a bare-armed match is also how the generic-enum debox hands a value out of its frame | — |
-| B-2026-09-02-41 | 2026-09-02 | interp+codegen | medium | THE TWO-STEP DESTRUCTURE OF A NESTED TUPLE FIELD SPLITS THE BACKENDS -- `let (inner, y) = h.pe; let (r, x) = inner; let m = r;` runs ONE `Drop` body under `--interp` and TWO on `karac run` / `karac build` / `KARAC_AUTO_PAR=0`. The interpreter is right; the compiled side records nothing for the tuple-typed leaf under an owner-runs-bodies source | — |
 | B-2026-09-04-11 | 2026-09-04 | codegen | low | THE TWO `uam_*` SPAN SETS STILL LEAK FROM THE USER PROGRAM INTO THE BAKED-STDLIB BODY PASS -- `Span` carries no file identity, so `uam_consume_sites` (seeded from the USER program's ownership result and read during expression compilation) can mark a stdlib expression as a `UseAfterMove` consume site purely because their byte offsets coincide; B-2026-09-04-5 fixed the fourteen PROGRAM-DERIVED tables and its source-scan guard cannot see these two, because they are never on the install list it scans | — |
 | B-2026-09-04-12 | 2026-09-04 | codegen | low | A BOXED TWO-`String` TUPLE PAYLOAD LOSES ITS INTERIOR ON BOTH THE GENERIC AND NON-GENERIC PATHS -- 54 B in 6 blocks over three calls, IDENTICAL for `generic[T](x: Option[T])` and `plainT(x: Option[(String, String)])`, so this is the boxed-payload interior rather than anything monomorph-specific; the `Array[String, 2]` payload through the same generic fn is clean, and that asymmetry is the thing to explain | — |
 | B-2026-09-04-32 | 2026-09-04 | codegen+other | low | EVERY COMPILED BACKEND RELEASES AN AGGREGATE-HELD `shared` FIELD AT LEXICAL SCOPE EXIT while design.md pins RC decrements at the binding's LIVE-RANGE END -- one holder splits, `struct Mx { r: R, s: S }` giving `v2 dR1 post dS2`, so the plain field obeys the spec and the shared one does not; a BARE shared binding is unaffected | — |
@@ -157,6 +156,9 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-2 | 2026-09-06 | codegen | medium | A NAMED-LOCAL ARGUMENT TO A GENERIC *METHOD* THAT RETURNS ITS WHOLE BY-VALUE PARAM LEAKS THE CALLEE'S ENTRY COPY -- `let _ = h.keep(g)` over `impl H { fn keep[T](ref self, x: T) -> T }` orphans one object per call, 24,000 B in 500 blocks over a 500-iteration loop at the DEFAULT optimization level, while the CONCRETE method twin is 15 allocs / 15 frees clean; the FREE-FUNCTION twin was fixed by B-2026-09-05-31, which scoped itself out of the method path because that loop's argument index is receiver-inclusive and the discard registrar resolves `Item::Function` names only | — |
 | B-2026-09-06-3 | 2026-09-06 | codegen | low | A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Option[(R, i64)]` with a heap-carrying element (5+ words, boxed) leaks the whole box + interior; `try_track_discarded_boxed_option` frees a boxed STRUCT payload but declines a boxed TUPLE one. Split from B-2026-09-05-14 (the lost-BODY twin), which this leak is independent of -- identical with the body fix absent or present | — |
 | B-2026-09-06-4 | 2026-09-06 | codegen | high | THE SELF-HOSTED RESOLVER ORACLE DOUBLE-FREES ON LINUX AND THE EMITTER ORACLE SEGFAULTS, AT THE IMPORT COMMIT AND ON CURRENT `main` ALIKE -- `tests/selfhost_resolver.rs`'s two tests abort `free(): double free detected in tcache 2` (SIGABRT, four per run) and `tests/selfhost_codegen.rs`'s `selfhost_codegen_matches_seed_run` dies SIGSEGV, identically at 51368a1 (the import that claims them green), e028255 and 822334c; the other six self-host oracles pass; CI's `codegen-e2e` job excludes both, so nothing has ever run them on glibc | — |
+| B-2026-09-06-5 | 2026-09-06 | codegen | medium | A NESTED TUPLE ELEMENT HANDED BACK TWO TUPLE LEVELS DEEP RUNS ITS `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn v3_ret(h: H2) -> R { let (inner, y) = h.pe; let (r, x) = inner; return r; }` over `H2 { pe: ((R, i64), i64) }` prints `dR4 got4 dR4` on jit / aot / AUTO_PAR=0 against the interpreter's `got4 dR4`; the caller-side skip tree expresses a tuple index ONE level inside a field and this path (`pe.0.0`) needs two | — |
+| B-2026-09-06-6 | 2026-09-06 | codegen | medium | A WHOLE REBIND OF A TUPLE-TYPED PARAM VIEW RUNS THE ELEMENT'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn v3m(h: H2) { let (inner, y) = h.pe; let z: (R, i64) = inner; println(f"v3m {z.0.id}") }` prints `v3m 6 dR6 dR6` on jit / aot / AUTO_PAR=0 against the interpreter's `v3m 6 dR6`; the struct-typed view's rebind inherits view-ness (B-2026-08-31-7) and the tuple-typed view's does not | — |
+| B-2026-09-06-7 | 2026-09-06 | codegen | medium | THE TWO-STEP DESTRUCTURE OF A NESTED TUPLE FIELD OFF A LOCAL RUNS THE LEAF'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND, ONE OF THEM EARLY -- `let h = H2 { pe: ((mk(9), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f"l3 {m.id}")` prints `dR9 l3 9 dR9` on jit / aot / AUTO_PAR=0 against the interpreter's `l3 9 dR9`; the owned-PARAM source of the same shape is one body since B-2026-09-02-41 | — |
 
 ### Relocated
 
@@ -2162,6 +2164,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-02-38 | interp+codegen | medium | THE `let S { r, k } = s` SPELLING OF B-2026-09-02-25 STILL DOUBLES THE ELEMENT'S `Drop` BODY on all four surfaces -- `b9 dR9 dR9` where one is due, w… | 13e29320 |
 | B-2026-09-02-39 | codegen | medium | A TUPLE PARAM REGISTERS NO ELEMENT `TypeExpr`s AND A TUPLE WHOLE-REBIND CARRIES NONE, so any element a NAME cannot spell renders as an EMPTY path: `t… | b1ae9745 |
 | B-2026-09-02-40 | interp+codegen | medium | A PROJECTION SOURCE `let (r, k) = h.pe; let m = r;` STILL DOUBLES THE ELEMENT'S `Drop` BODY on all four surfaces -- `b12 dR12 dR12` where one is due,… | f9bf80d8 |
+| B-2026-09-02-41 | interp+codegen | medium | THE TWO-STEP DESTRUCTURE OF A NESTED TUPLE FIELD SPLITS THE BACKENDS -- `let (inner, y) = h.pe; let (r, x) = inner; let m = r;` runs ONE `Drop` body… | 47c566a |
 | B-2026-09-02-42 | typecheck | medium | A BODY TYPE ANNOTATION THAT NAMES A GENERIC PARAMETER POISONS EVERY LATER BOUNDED USE OF THAT VALUE: one `let w: T = v;` makes the next bounded call… | a7c8af7 |
 | B-2026-09-02-43 | codegen | medium | A LOCAL STRUCT'S PROJECTION DESTRUCTURE RUNS THE ELEMENT'S `Drop` BODY ON A CAP-ZEROED HUSK, BEFORE THE LIVE READ, and then again -- `let h = H { pe:… | 81c5100 |
 | B-2026-09-02-44 | interp+codegen | medium | A WHOLE-REBIND OF A STRUCT PARAM BEFORE PROJECTING STILL DOUBLES THE ELEMENT'S `Drop` BODY -- `let h2 = h; let (r, k) = h2.pe; let m = r;` runs TWO b… | 5cd4179 |
