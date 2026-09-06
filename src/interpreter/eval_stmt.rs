@@ -2119,8 +2119,26 @@ impl<'a> super::Interpreter<'a> {
             // and the passthrough disarm's `Some(v @ Value::Struct { .. })`
             // arm), and a rebind clears the record. Measured on an enum-valued
             // source either way.
-            if !middles.is_empty() {
-                self.moved_out_drop_field_bindings.insert(src.clone());
+            // B-2026-09-06-46 — and the deep chain's record is now PRECISE at
+            // the root's level too: the first hop, not the whole binding. The
+            // coarse record disarmed every field of the root, so a sibling of
+            // the moved hop that never moved (`k` in
+            // `Outer { h: Inner { r, q }, k }` after `let x = o.h.r`) lost its
+            // body outright. Codegen reached the same place from the other
+            // side — its whole-walker delete became a mask of the moved hop —
+            // and this keeps the two in step, which is what
+            // `moving_one_field_out_leaves_the_others_their_drop_bodies` and
+            // its compiled twin pin.
+            //
+            // Still ROOT-LEVEL, so `q` — the moved hop's sibling one level
+            // DOWN — is masked out with it and keeps losing its body on both
+            // backends. `moved_out_nested_field_bodies` is the record that
+            // could express that, and codegen has no twin for it at this site
+            // yet; closing it is one change on each backend, tracked as its
+            // own row rather than half-done here.
+            if let Some(first_hop) = middles.first() {
+                self.moved_out_struct_field_bodies
+                    .insert((src.clone(), (*first_hop).to_string()));
             }
         }
     }
@@ -7846,14 +7864,25 @@ impl<'a> super::Interpreter<'a> {
                         // many, against the compiled backends' (and the
                         // bare-identifier spelling's) `dR0 m1 m2 dR5 dE dR8 v5`.
                         //
-                        // Depth 1 only, because that is the key shape the set
-                        // has: a deep chain (`o.h.r = ..`) is keyed by the ROOT
-                        // and its own field name, which is not what a middle
-                        // segment's view would record.
-                        let field_is_view = chain_middles.is_empty()
-                            && self
-                                .moved_out_struct_field_bodies
-                                .contains(&(base.clone(), field.clone()));
+                        // B-2026-09-06-46 — and a DEEP chain is keyed by the
+                        // ROOT and its FIRST HOP now, because
+                        // `suppress_moved_out_drop_field` records that pair
+                        // instead of the whole binding. So the same gate
+                        // answers for `o.h.r = <new>` by asking about
+                        // `(o, h)`, where before it declined the shape and let
+                        // the base-coarse record below stand in. Dropping that
+                        // record without widening this ran the displaced
+                        // value's body over a husk `x` already owned:
+                        // `let x = o.h.r; o.h.r = mk(5);` printed
+                        // `drop 9 z9` twice under `--interp` against every
+                        // compiled backend's one (`test_deep_chain_field_move_then_reassign`).
+                        //
+                        // The hop, not the assigned field: `field` here is `r`,
+                        // one level below what the record keys.
+                        let gate_field = chain_middles.first().unwrap_or(field);
+                        let field_is_view = self
+                            .moved_out_struct_field_bodies
+                            .contains(&(base.clone(), gate_field.clone()));
                         if !field_is_view
                             && !self.moved_out_user_drop_bindings.contains(base.as_str())
                             && !self.moved_out_drop_field_bindings.contains(base.as_str())
@@ -7925,6 +7954,14 @@ impl<'a> super::Interpreter<'a> {
                         if simple_index
                             && !self.moved_out_user_drop_bindings.contains(base.as_str())
                             && !self.moved_out_drop_field_bindings.contains(base.as_str())
+                            // B-2026-09-06-46 — the per-field peer of the two
+                            // base-coarse gates above, for the same reason the
+                            // field-target site has one: a field moved out of
+                            // `base` is recorded per FIELD now, so a displaced
+                            // element of that field must not fire here either.
+                            && !self
+                                .moved_out_struct_field_bodies
+                                .contains(&(base.to_string(), fname.to_string()))
                             && !crate::deque_head::expr_mentions_name_deep(value, base)
                         {
                             let idx = match self.eval_expr_inner(index) {

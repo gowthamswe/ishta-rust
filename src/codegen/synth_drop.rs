@@ -7594,6 +7594,7 @@ impl<'ctx> super::Codegen<'ctx> {
 
     pub(super) fn disarm_user_drop_fields_for_moved_field(
         &mut self,
+        var_name: &str,
         base_ptr: PointerValue<'ctx>,
         struct_name: &str,
         field: &str,
@@ -7627,6 +7628,35 @@ impl<'ctx> super::Codegen<'ctx> {
         } else {
             None
         };
+        // B-2026-09-06-46 — a struct with NO `impl Drop` of its own carries a
+        // per-binding `StructFieldBodies` walker, and the retraction below is a
+        // whole-walker delete: moving ONE field out of `s` stopped `s` running
+        // the bodies of every OTHER field too. That is invisible while the
+        // survivors have no later owner — the fields die with the binding and
+        // something has to run them, so a second walk would double instead —
+        // and it is exactly wrong when a survivor is HANDED ON: a partial
+        // destructure (`let x = s.a; let S3 { b, .. } = s;`) asks
+        // `var_owns_struct_field_bodies` whether the source still holds the
+        // walk before transferring `b`'s body to the leaf, and the delete had
+        // already answered no, so `b`'s body ran NOWHERE on any compiled
+        // backend against the interpreter's one.
+        //
+        // Mask the moved field instead, through the same map / walker pair
+        // `disarm_struct_field_bodies_at` uses, and swap the walker IN PLACE so
+        // the action keeps the frame and position its let-site chose
+        // (`replace_user_drop_fn_for_var`'s rule — a re-register from an inner
+        // frame drains the owner's walk at the inner scope's end).
+        //
+        // FALLING BACK TO THE DELETE IS PART OF THE FIX, not a leftover. Two
+        // cases reach it and both need the old behaviour: a binding that holds
+        // no walk at all (a by-value param under caller-retains, a param VIEW —
+        // minting one there runs the caller's bodies inside the callee,
+        // B-2026-09-06-44), and a struct whose masked walker is EMPTY because
+        // the moved field was its only Drop-bearing one, which is the shape
+        // every pre-existing move-out test has.
+        if !owns_body && self.mask_moved_field_in_bodies_walk(var_name, struct_name, idx) {
+            return;
+        }
         for frame in self.drop_rc.scope_cleanup_actions.iter_mut().rev() {
             if owns_body {
                 let Some(replacement) = replacement else {
@@ -7654,6 +7684,57 @@ impl<'ctx> super::Codegen<'ctx> {
                     )
                 });
             }
+        }
+    }
+
+    /// B-2026-09-06-46 — mask ONE moved-out field in `var_name`'s live
+    /// `StructFieldBodies` walker, leaving every other field's body armed.
+    /// Returns whether a masked walker was installed; `false` means the caller
+    /// should fall back to retracting the walk outright.
+    ///
+    /// Declines a binding that holds no walk of its own, the rule
+    /// `disarm_struct_field_bodies_at` states at length: the field bodies of an
+    /// entry-copied param are the CALLER's, and minting a walker here would run
+    /// them a second time inside the callee.
+    fn mask_moved_field_in_bodies_walk(
+        &mut self,
+        var_name: &str,
+        struct_name: &str,
+        idx: usize,
+    ) -> bool {
+        if !self.var_owns_struct_field_bodies(var_name) {
+            return false;
+        }
+        self.type_decls
+            .struct_moved_field_bodies
+            .entry(var_name.to_string())
+            .or_default()
+            .insert(idx);
+        // Re-read from the map rather than masking `idx` alone, so repeated
+        // move-outs of the same binding accumulate and this composes with the
+        // payload / nested mask kinds — `field_skip_tree_for_var`'s contract.
+        let here: std::collections::BTreeSet<usize> = self
+            .type_decls
+            .struct_moved_field_bodies
+            .get(var_name)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let skip = self.field_skip_tree_for_var(var_name, here);
+        let subst = self
+            .type_decls
+            .enum_inst_var_types
+            .get(var_name)
+            .cloned()
+            .map(|i| self.generic_struct_subst_from_inst(struct_name, &i))
+            .unwrap_or_default();
+        match self.emit_user_drop_field_bodies_fn_skipping(struct_name, &subst, &skip) {
+            Some(bodies) => self.replace_user_drop_fn_for_var(
+                var_name,
+                super::state::UserDropKind::StructFieldBodies,
+                bodies,
+            ),
+            // Nothing survives the mask — let the caller retract the walk.
+            None => false,
         }
     }
 

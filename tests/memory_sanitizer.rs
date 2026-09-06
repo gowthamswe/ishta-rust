@@ -77068,4 +77068,57 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-46 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_partial_destructure_over_a_moved_out_source_runs_each_body_once`.
+    ///
+    /// The defect was a lost `Drop` BODY, not a memory error — the source's
+    /// whole field-bodies walk was deleted when one field moved out, so the
+    /// bound leaf's body ran nowhere while every buffer was still freed
+    /// exactly once. This pin exists for the direction the fix could have
+    /// gone wrong in: re-arming the walk masks one field and hands another
+    /// to the leaf, and getting that split wrong frees a field twice or not
+    /// at all. Asserts the body count as well, since ASAN alone would stay
+    /// green on the original defect.
+    #[test]
+    fn asan_partial_destructure_over_a_moved_out_source_runs_each_body_once() {
+        let label = "partial_destructure_over_a_moved_out_source";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct S3 { a: R, b: R }
+fn p_moved_rest(r: R) -> i64 { let s: S3 = S3 { a: mk(2), b: mk(3) }; let x: R = s.a; let S3 { b, .. } = s; println("mid"); return b.id + x.id; }
+fn p_moved_wild(r: R) -> i64 { let s: S3 = S3 { a: mk(5), b: mk(6) }; let x: R = s.a; let S3 { b, a: _ } = s; println("mid"); return b.id + x.id; }
+fn p_moved_unread(r: R) -> i64 { let s: S3 = S3 { a: mk(8), b: mk(9) }; let x: R = s.a; let S3 { b, .. } = s; println("mid"); return 1; }
+fn main() {
+    { let v: i64 = p_moved_rest(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = p_moved_wild(mk(4)); println(f"v={v}"); println("two") }
+    { let v: i64 = p_moved_unread(mk(7)); println(f"v={v}"); println("three") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "mid", "dR3", "dR2", "dR1", "v=5", "one", "mid", "dR6", "dR5", "dR4", "v=11",
+                "two", "dR8", "dR9", "mid", "dR7", "v=1", "three", "end"
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }

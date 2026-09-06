@@ -7202,7 +7202,7 @@ impl<'ctx> super::Codegen<'ctx> {
             ) else {
                 return;
             };
-            self.disarm_user_drop_fields_for_moved_field(slot.ptr, &struct_name, &fname);
+            self.disarm_user_drop_fields_for_moved_field(var_name, slot.ptr, &struct_name, &fname);
             return;
         }
         for idx in views {

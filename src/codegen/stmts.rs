@@ -9523,6 +9523,7 @@ impl<'ctx> super::Codegen<'ctx> {
                                         .unwrap_or(true);
                                     if leaf_moves {
                                         self.disarm_user_drop_fields_for_moved_field(
+                                            src,
                                             src_slot.ptr,
                                             &src_type,
                                             &disarm_field,

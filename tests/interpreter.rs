@@ -60417,11 +60417,15 @@ fn let_bound_scalar_field_read_runs_sibling_body_once() {
 /// was: moving the LAST field appears correct only because the surviving field
 /// there is the param view, whose body another owner already runs.
 ///
-/// `deep-chain` keeps the coarse record and must: the `let` arm's precise
-/// insert requires a bare identifier object, so a two-hop source has no precise
-/// mask and the root-coarse disarm is the only one it has. Both backends agree
-/// on `dR1` alone there -- they under-drop together, which is the documented
-/// trade and not this row.
+/// `deep-chain` narrowed with B-2026-09-06-46: the record is now the moved HOP
+/// (`h`), not the whole root, so `k` -- a top-level sibling that never moved --
+/// keeps its body and the row reads `dR1 dR3`. Codegen arrived at the same
+/// place from the other side, its whole-walker delete becoming a mask of the
+/// same hop, and the two moved together as this row requires. What is still
+/// under-dropped is `q`, the moved hop's sibling one level DOWN, which the
+/// root-level record masks out with `h`; both backends lose it together, which
+/// remains the documented trade and needs `moved_out_nested_field_bodies` plus
+/// a codegen twin it does not have yet.
 ///
 /// `enum-source` is the leg the row flagged as needing measurement before
 /// narrowing, because the enum branch of the walker sits behind the same early
@@ -60464,10 +60468,10 @@ fn moving_one_field_out_leaves_the_others_their_drop_bodies() {
             "dR4\ndR3\n7\n",
         ),
         (
-            "deep chain keeps the coarse disarm",
+            "deep chain masks the moved HOP, not the whole root",
             "fn f() -> i64 { let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r; return 7; }\n\
              fn main() { println(f()) }",
-            "dR1\n7\n",
+            "dR1\ndR3\n7\n",
         ),
         (
             "enum-valued source field",

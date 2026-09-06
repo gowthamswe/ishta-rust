@@ -110848,11 +110848,20 @@ fn main() {
     /// the surviving field's body to a coarse whole-walk disarm that shadowed
     /// the precise per-field mask.
     ///
-    /// `deep-chain` is the row that matters most here: both backends UNDER-DROP
-    /// it together (`dR1` alone, with `q` and `k` losing their bodies), which is
-    /// the coarse record's documented trade. It is pinned so that closing that
-    /// gap has to move both backends at once rather than reintroducing a
-    /// divergence on this one.
+    /// `deep-chain` is the row that matters most here, and B-2026-09-06-46 moved
+    /// it -- on both backends at once, which is what it was pinned to force.
+    /// Codegen's move-out disarm stopped DELETING the source's whole field-bodies
+    /// walker and started masking the moved hop, so `k` -- a top-level sibling
+    /// that never moved -- keeps its body; the interpreter's record narrowed from
+    /// the whole binding to that same hop in the same commit. The row reads
+    /// `dR1 dR3` now.
+    ///
+    /// What both backends still UNDER-DROP together is `q`, the moved hop's
+    /// sibling one level DOWN: a root-level mask takes it out along with `h`.
+    /// That is the remaining half of the coarse record's documented trade, and
+    /// it stays pinned here for the same reason the top level was -- closing it
+    /// needs a nested mask on each backend, and doing one alone reintroduces the
+    /// divergence this row exists to catch.
     #[test]
     fn test_e2e_moving_one_field_out_leaves_the_others_their_drop_bodies() {
         const H: &str = "struct R { id: i64 }\n\
@@ -110889,10 +110898,10 @@ fn main() {
                 "dR4\ndR3\n7\n",
             ),
             (
-                "deep chain keeps the coarse disarm",
+                "deep chain masks the moved HOP, not the whole root",
                 "fn f() -> i64 { let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r; return 7; }\n\
                  fn main() { println(f()) }",
-                "dR1\n7\n",
+                "dR1\ndR3\n7\n",
             ),
             (
                 "enum-valued source field",
@@ -149190,6 +149199,53 @@ fn main() {
             return;
         };
         assert_eq!(out, "dR2\ndR3\ndR1\nv=3\none\ndR8\ndR7\ndR6\nv=807\ntwo\ndR12\ndR13\ndR11\nv=13\nthree\nend\n");
+    }
+
+    /// B-2026-09-06-46 — the same partial destructure, over a source ONE of
+    /// whose fields was moved out first (`let x: R = s.a;`). Every compiled
+    /// backend lost the BOUND leaf's body outright: `mid dR2 dR1` for the
+    /// rest spelling where `mid dR3 dR2 dR1` is due, `b`'s body running
+    /// nowhere, on jit / aot / `KARAC_AUTO_PAR=0` alike.
+    ///
+    /// The move-out disarm was a whole-walker DELETE for a struct with no
+    /// `impl Drop` of its own, so `s` stopped running every field's body and
+    /// not just the moved one; the destructure then asked
+    /// `var_owns_struct_field_bodies` whether the source still held the walk
+    /// before handing `b`'s body to the leaf and got no. It masks the moved
+    /// field instead now.
+    ///
+    /// Only the BODY was lost — the memory half was balanced before the fix
+    /// and after it (valgrind: 20 allocs / 20 frees, 0 errors), which is why
+    /// no sanitizer caught this and the assert has to count bodies.
+    ///
+    /// Exact twin of `tests/interpreter.rs`'s
+    /// `test_let_destructure_discard_skips_a_moved_out_field` — same program,
+    /// same string, so the two backends are pinned to each other. ASAN twin:
+    /// `asan_partial_destructure_over_a_moved_out_source_runs_each_body_once`.
+    #[test]
+    fn e2e_partial_destructure_over_a_moved_out_source_runs_each_body_once() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct S3 { a: R, b: R }
+fn p_moved_rest(r: R) -> i64 { let s: S3 = S3 { a: mk(2), b: mk(3) }; let x: R = s.a; let S3 { b, .. } = s; println("mid"); return b.id + x.id; }
+fn p_moved_wild(r: R) -> i64 { let s: S3 = S3 { a: mk(5), b: mk(6) }; let x: R = s.a; let S3 { b, a: _ } = s; println("mid"); return b.id + x.id; }
+fn p_moved_unread(r: R) -> i64 { let s: S3 = S3 { a: mk(8), b: mk(9) }; let x: R = s.a; let S3 { b, .. } = s; println("mid"); return 1; }
+fn main() {
+    { let v: i64 = p_moved_rest(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = p_moved_wild(mk(4)); println(f"v={v}"); println("two") }
+    { let v: i64 = p_moved_unread(mk(7)); println(f"v={v}"); println("three") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "mid\ndR3\ndR2\ndR1\nv=5\none\nmid\ndR6\ndR5\ndR4\nv=11\ntwo\ndR8\ndR9\nmid\ndR7\nv=1\nthree\nend\n"
+        );
     }
 }
 
