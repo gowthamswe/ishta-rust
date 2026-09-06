@@ -2566,7 +2566,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     // only on the free-fn path; the monomorph path keeps its prior
                     // behaviour (the generic enum-payload-return shape is tracked
                     // separately under the B-2026-09-05-18 family).
-                    false,
+                    None,
                 );
             }
         }

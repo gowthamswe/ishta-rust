@@ -3085,15 +3085,139 @@ struct PartScanCx<'a> {
 /// on this channel — a missed body, never a double drop, and never a memory
 /// fault, since nothing here frees.
 pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
+    !escaping_param_payload_variants_impl(f, arg_index, CallYieldRule::Any).is_empty()
+}
+
+/// B-2026-09-05-35 — the PROGRAM-AWARE, per-VARIANT form of
+/// [`fn_returns_param_payload`]: which variants of by-value enum parameter
+/// `arg_index` have a payload that `f` hands out of its frame?
+///
+/// ```text
+/// fn e_call(b: E) -> i64   { match b { E.A(r) => consume(r), E.B(k) => k } }   // ["B"]
+/// fn e_ret(b: E) -> R      { match b { E.A(r) => r,          E.B(k) => mk(k) } } // ["A"]
+/// fn e_fwd(b: E) -> R      { match b { E.A(r) => wrap(r),    E.B(k) => mk(k) } } // ["A"]
+/// fn any(b: E) -> E        { match b { x => x } }                                 // ["*"]
+/// ```
+///
+/// Two over-approximations of the whole-param predicate are what this
+/// replaces for its caller-side consumers. Its `yields` counts a binding
+/// passed to ANY call as leaving (`consume(r)`, whose callee returns `x.id`),
+/// and a MIXED-arm callee answers for the whole parameter, so `E.B(k) => k`
+/// handing back an `i64` stood the caller's payload walk down for the `E.A`
+/// arm too. Both backends consult the same predicate for an enum argument, so
+/// both lost `r`'s body on both cells — agreed-and-wrong, invisible to A/B.
+/// Here a call is counted only when its callee takes the parameter over
+/// ([`callee_takes_param_over`]; an unknown callee still counts), and each
+/// arm reports under ITS variant: a `TupleVariant` / `Struct` pattern by its
+/// path's last segment, an `Or` by each alternative, and a whole-value
+/// `Binding` / `AtBinding` under `"*"`, which every consumer reads as "all".
+/// The interpreter asks with the argument's runtime variant; codegen masks
+/// the escaping variants out of the payload-bodies walker and lets the tag
+/// switch decide at run time. The whole-param form keeps the `Any` rule for
+/// the callee-side consumers it was measured on.
+pub fn fn_escaping_param_payload_variants(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> Vec<String> {
+    escaping_param_payload_variants_impl(f, arg_index, CallYieldRule::ReturnsIt(program))
+}
+
+/// [`fn_escaping_param_payload_variants`] asked of one variant (`Some`) or of
+/// any (`None`). `"*"` matches every variant.
+pub fn fn_returns_param_payload_of(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+    variant: Option<&str>,
+) -> bool {
+    let vs = fn_escaping_param_payload_variants(program, f, arg_index);
+    match variant {
+        None => !vs.is_empty(),
+        Some(v) => vs.iter().any(|x| x == "*" || x == v),
+    }
+}
+
+/// The variant names a pattern over an enum scrutinee commits to: a
+/// `TupleVariant` / `Struct` path's last segment, each alternative of an
+/// `Or`, `"*"` for a whole-value binding, nothing for a wildcard / literal
+/// (which bind no payload).
+fn pattern_variant_names(p: &Pattern) -> Vec<String> {
+    match &p.kind {
+        PatternKind::TupleVariant { path, .. } | PatternKind::Struct { path, .. } => {
+            path.last().cloned().into_iter().collect()
+        }
+        PatternKind::Binding(_) => vec!["*".to_string()],
+        PatternKind::AtBinding { pattern, .. } => {
+            let mut v = pattern_variant_names(pattern);
+            if v.is_empty() {
+                v.push("*".to_string());
+            }
+            v
+        }
+        PatternKind::Or(alts) => alts.iter().flat_map(pattern_variant_names).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn escaping_param_payload_variants_impl(
+    f: &Function,
+    arg_index: usize,
+    rule: CallYieldRule<'_>,
+) -> Vec<String> {
     let Some(param) = f.params.get(arg_index) else {
-        return false;
+        return Vec::new();
     };
     let PatternKind::Binding(param_name) = &param.pattern.kind else {
-        return false;
+        return Vec::new();
     };
-    let rule = CallYieldRule::Any;
+    fn note(out: &mut Vec<String>, pattern: &Pattern) {
+        for v in pattern_variant_names(pattern) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    // B-2026-09-05-35 — the STORE routes, as the tuple-arm predicate has
+    // them: a payload binding pushed under a borrowed `self` / `ref` param
+    // (`v.push(r)`) or handed to a callee that stores it (`stash(r, v)`,
+    // program-aware). The whole-param `Any` rule never saw either and was
+    // right on such arms only when a SIBLING arm's hand-back happened to
+    // stand the whole argument down; asked per variant, the store has to be
+    // seen on its own.
+    let mut roots: Vec<&str> = Vec::new();
+    if matches!(f.self_param, Some(SelfParam::Ref) | Some(SelfParam::MutRef)) {
+        roots.push("self");
+    }
+    for p in &f.params {
+        if !matches!(
+            p.ty.kind,
+            crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+        ) {
+            continue;
+        }
+        if let PatternKind::Binding(n) = &p.pattern.kind {
+            roots.push(n.as_str());
+        }
+    }
+    let program = match rule {
+        CallYieldRule::ReturnsIt(p) => Some(p),
+        CallYieldRule::Any => None,
+    };
+    let stored = |body: &Expr, names: &[String]| {
+        names.iter().any(|n| {
+            outliving_store::stores(body, n, &roots)
+                || program.is_some_and(|p| stored_via_call(body, n, p))
+        })
+    };
+    let stored_block = |body: &Block, names: &[String]| {
+        names.iter().any(|n| {
+            outliving_store::walk_block(body, n, &roots)
+                || program.is_some_and(|p| stored_via_call_block(body, n, p))
+        })
+    };
     /// Walk for a `match` / `if let` / `while let` whose SCRUTINEE is the param,
-    /// and ask whether the bindings it introduces leave the frame.
+    /// and record, per arm, the variants whose bindings leave the frame.
     ///
     /// B-2026-09-05-28 / -30 — a TUPLE pattern over the param is NOT this
     /// predicate's to answer, and is skipped here. Its bindings name ELEMENTS,
@@ -3105,21 +3229,35 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
     /// never ran `r`'s body. Codegen already asked this predicate only of a
     /// payload-carrying ENUM parameter (`callee_returns_enum_arg_payload`),
     /// which is why it was correct on the same cells.
-    fn walk(e: &Expr, param: &str, fn_body: &Block, rule: CallYieldRule<'_>) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        e: &Expr,
+        param: &str,
+        fn_body: &Block,
+        rule: CallYieldRule<'_>,
+        stored: &dyn Fn(&Expr, &[String]) -> bool,
+        stored_block: &dyn Fn(&Block, &[String]) -> bool,
+        out: &mut Vec<String>,
+    ) {
         let scrutinee_is_param =
             |s: &Expr| matches!(&s.kind, ExprKind::Identifier(n) if n == param);
         match &e.kind {
             ExprKind::Match { scrutinee, arms } if scrutinee_is_param(scrutinee) => {
-                arms.iter().any(|a| {
+                for a in arms {
                     if matches!(a.pattern.kind, PatternKind::Tuple(_)) {
-                        return walk(&a.body, param, fn_body, rule);
+                        walk(&a.body, param, fn_body, rule, stored, stored_block, out);
+                        continue;
                     }
                     let names: Vec<String> = a.pattern.binding_names();
-                    !names.is_empty()
+                    if !names.is_empty()
                         && (names.iter().any(|n| payload_yields(&a.body, n, rule))
                             || payload_returns_any(&a.body, &names, rule)
-                            || payload_escapes_by_assignment(&a.body, &names, fn_body, rule))
-                })
+                            || payload_escapes_by_assignment(&a.body, &names, fn_body, rule)
+                            || stored(&a.body, &names))
+                    {
+                        note(out, &a.pattern);
+                    }
+                }
             }
             ExprKind::IfLet {
                 pattern,
@@ -3128,9 +3266,13 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
                 ..
             } if scrutinee_is_param(value) && !matches!(pattern.kind, PatternKind::Tuple(_)) => {
                 let names: Vec<String> = pattern.binding_names();
-                !names.is_empty()
+                if !names.is_empty()
                     && (payload_returns_any_block(then_block, &names, rule)
-                        || payload_escapes_by_assignment_block(then_block, &names, fn_body, rule))
+                        || payload_escapes_by_assignment_block(then_block, &names, fn_body, rule)
+                        || stored_block(then_block, &names))
+                {
+                    note(out, pattern);
+                }
             }
             ExprKind::WhileLet {
                 pattern,
@@ -3139,30 +3281,40 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
                 ..
             } if scrutinee_is_param(value) && !matches!(pattern.kind, PatternKind::Tuple(_)) => {
                 let names: Vec<String> = pattern.binding_names();
-                !names.is_empty()
+                if !names.is_empty()
                     && (payload_returns_any_block(body, &names, rule)
-                        || payload_escapes_by_assignment_block(body, &names, fn_body, rule))
+                        || payload_escapes_by_assignment_block(body, &names, fn_body, rule)
+                        || stored_block(body, &names))
+                {
+                    note(out, pattern);
+                }
             }
             ExprKind::Match { scrutinee, arms } => {
-                walk(scrutinee, param, fn_body, rule)
-                    || arms.iter().any(|a| walk(&a.body, param, fn_body, rule))
+                walk(scrutinee, param, fn_body, rule, stored, stored_block, out);
+                for a in arms {
+                    walk(&a.body, param, fn_body, rule, stored, stored_block, out);
+                }
             }
             ExprKind::Block(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Try(b)
             | ExprKind::Seq(b)
-            | ExprKind::Par(b) => walk_block_for(b, param, fn_body, rule),
-            ExprKind::Return(Some(inner)) => walk(inner, param, fn_body, rule),
+            | ExprKind::Par(b) => {
+                walk_block_for(b, param, fn_body, rule, stored, stored_block, out)
+            }
+            ExprKind::Return(Some(inner)) => {
+                walk(inner, param, fn_body, rule, stored, stored_block, out)
+            }
             ExprKind::If {
                 condition,
                 then_block,
                 else_branch,
             } => {
-                walk(condition, param, fn_body, rule)
-                    || walk_block_for(then_block, param, fn_body, rule)
-                    || else_branch
-                        .as_deref()
-                        .is_some_and(|x| walk(x, param, fn_body, rule))
+                walk(condition, param, fn_body, rule, stored, stored_block, out);
+                walk_block_for(then_block, param, fn_body, rule, stored, stored_block, out);
+                if let Some(x) = else_branch.as_deref() {
+                    walk(x, param, fn_body, rule, stored, stored_block, out);
+                }
             }
             ExprKind::IfLet {
                 value,
@@ -3170,31 +3322,56 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
                 else_branch,
                 ..
             } => {
-                walk(value, param, fn_body, rule)
-                    || walk_block_for(then_block, param, fn_body, rule)
-                    || else_branch
-                        .as_deref()
-                        .is_some_and(|x| walk(x, param, fn_body, rule))
+                walk(value, param, fn_body, rule, stored, stored_block, out);
+                walk_block_for(then_block, param, fn_body, rule, stored, stored_block, out);
+                if let Some(x) = else_branch.as_deref() {
+                    walk(x, param, fn_body, rule, stored, stored_block, out);
+                }
             }
             ExprKind::While { body, .. }
             | ExprKind::WhileLet { body, .. }
             | ExprKind::For { body, .. }
             | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => walk_block_for(body, param, fn_body, rule),
-            _ => false,
+            | ExprKind::LabeledBlock { body, .. } => {
+                walk_block_for(body, param, fn_body, rule, stored, stored_block, out)
+            }
+            _ => {}
         }
     }
-    fn walk_block_for(b: &Block, param: &str, fn_body: &Block, rule: CallYieldRule<'_>) -> bool {
-        b.stmts.iter().any(|st| match &st.kind {
-            StmtKind::Expr(e) => walk(e, param, fn_body, rule),
-            StmtKind::Let { value, .. } => walk(value, param, fn_body, rule),
-            _ => false,
-        }) || b
-            .final_expr
-            .as_deref()
-            .is_some_and(|fe| walk(fe, param, fn_body, rule))
+    #[allow(clippy::too_many_arguments)]
+    fn walk_block_for(
+        b: &Block,
+        param: &str,
+        fn_body: &Block,
+        rule: CallYieldRule<'_>,
+        stored: &dyn Fn(&Expr, &[String]) -> bool,
+        stored_block: &dyn Fn(&Block, &[String]) -> bool,
+        out: &mut Vec<String>,
+    ) {
+        for st in &b.stmts {
+            match &st.kind {
+                StmtKind::Expr(e) => walk(e, param, fn_body, rule, stored, stored_block, out),
+                StmtKind::Let { value, .. } => {
+                    walk(value, param, fn_body, rule, stored, stored_block, out)
+                }
+                _ => {}
+            }
+        }
+        if let Some(fe) = b.final_expr.as_deref() {
+            walk(fe, param, fn_body, rule, stored, stored_block, out);
+        }
     }
-    walk_block_for(&f.body, param_name, &f.body, rule)
+    let mut out = Vec::new();
+    walk_block_for(
+        &f.body,
+        param_name,
+        &f.body,
+        rule,
+        &stored,
+        &stored_block,
+        &mut out,
+    );
+    out
 }
 
 /// B-2026-09-05-28 / -30 — the per-ELEMENT sibling of
@@ -3509,10 +3686,42 @@ fn stored_via_call_block(b: &Block, name: &str, program: &crate::Program) -> boo
 /// counted: only a copy of one field leaves, the value itself dies in the
 /// callee.
 fn callee_takes_param_over(program: &crate::Program, gf: &Function, j: usize) -> bool {
+    // B-2026-09-05-35 — CYCLE GUARD. Every interprocedural arm of this family
+    // routes through here, and a recursive callee (`fn len(l: L) -> i64 {
+    // match l { L.Cons(_, rest) => 1 + len(rest), .. } }`) asks this question
+    // of itself from inside its own answer: `fn_escaping_param_payload_variants
+    // (len)` reaches `len(rest)`, which asks `callee_takes_param_over(len, 0)`,
+    // which walks `len`'s arms again — measured as a stack overflow in
+    // `e2e_direct_recursive_shared_enum_single_field`. A question already in
+    // flight answers `true`, the conservative direction on both channels: the
+    // caller stands down and a body is at worst missed, never doubled. Mutual
+    // recursion (`g` → `h` → `g`) passes through here too, so one guard covers
+    // every route.
+    thread_local! {
+        static IN_FLIGHT: std::cell::RefCell<Vec<(String, usize)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (gf.name.clone(), j);
+    let re_entered = IN_FLIGHT.with(|f| f.borrow().contains(&key));
+    if re_entered {
+        return true;
+    }
+    IN_FLIGHT.with(|f| f.borrow_mut().push(key.clone()));
+    let answer = callee_takes_param_over_inner(program, gf, j);
+    IN_FLIGHT.with(|f| {
+        let mut v = f.borrow_mut();
+        if let Some(pos) = v.iter().rposition(|k| k == &key) {
+            v.remove(pos);
+        }
+    });
+    answer
+}
+
+fn callee_takes_param_over_inner(program: &crate::Program, gf: &Function, j: usize) -> bool {
     fn_returns_param(gf, j)
         || fn_always_returns_param(gf, j)
         || fn_conditionally_returns_param_bare(gf, j)
-        || fn_returns_param_payload(gf, j)
+        || fn_returns_param_payload_of(program, gf, j, None)
         || fn_returns_param_via_call(program, gf, j)
         || fn_moves_param_into_outliving_place(gf, j)
         || fn_moves_param_into_outliving_place_via_call(program, gf, j)

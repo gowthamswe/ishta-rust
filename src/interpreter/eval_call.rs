@@ -3037,8 +3037,19 @@ impl<'a> super::Interpreter<'a> {
                 // a constructor-wrapped conditional return is invisible to the
                 // three above, and the gate declined before the per-path owner
                 // below was consulted.
+                // B-2026-09-05-35 — the payload question asked of the
+                // binding's runtime variant, program-aware.
+                let variant = self.env.get(n).and_then(|v| match v {
+                    Value::EnumVariant { variant, .. } => Some(variant),
+                    _ => None,
+                });
                 let escapes = crate::ast::fn_returns_param(f, i)
-                    || crate::ast::fn_returns_param_payload(f, i)
+                    || crate::ast::fn_returns_param_payload_of(
+                        self.program,
+                        f,
+                        i,
+                        variant.as_deref(),
+                    )
                     || crate::ast::fn_moves_param_into_outliving_place(f, i)
                     || crate::ast::fn_moves_param_into_outliving_place_via_call(self.program, f, i)
                     || crate::ast::fn_conditionally_returns_param_bare(f, i);
@@ -3439,7 +3450,11 @@ impl<'a> super::Interpreter<'a> {
             // `self` or a `ref` param, the value is still travelling when this
             // walk would fire — the RESULT's consumer or the new home owns it.
             // B-2026-08-30-22's associated-callee resolution is inside.
-            if self.callee_owns_arg_beyond_call(callee_name, method_owner, i) {
+            let variant = match arg_vals.get(i) {
+                Some(Value::EnumVariant { variant, .. }) => Some(variant.as_str()),
+                _ => None,
+            };
+            if self.callee_owns_arg_beyond_call(callee_name, method_owner, i, variant) {
                 continue;
             }
             // B-2026-08-28-16 — a PLACE tuple argument (`take(q)`) whose
@@ -3732,7 +3747,7 @@ impl<'a> super::Interpreter<'a> {
         (matches!(&e.kind, ExprKind::Tuple(_))
             || self.fresh_temp_arg_type_name(e).is_some()
             || self.wrapper_tail_arg_type_name(e).is_some())
-            && !self.callee_owns_arg_beyond_call(callee_name, method_owner, i)
+            && !self.callee_owns_arg_beyond_call(callee_name, method_owner, i, None)
     }
 
     /// The two ownership guards the caller's fresh-temp walk applies, as ONE
@@ -3746,11 +3761,17 @@ impl<'a> super::Interpreter<'a> {
     /// `test_method_owned_param_user_drop_body_runs_once`'s `cond-return-dies`
     /// cell went from `drop 41 / 99 / drop 99` to `99 / drop 99`. Shape says
     /// "the caller COULD fire this"; this says "and nothing else claims it".
+    /// `variant` is the argument's RUNTIME enum variant when the caller has
+    /// the value in hand (B-2026-09-05-35): the payload-escape question is
+    /// then asked of that variant alone, so `E.B(k) => k` handing back an
+    /// `i64` no longer stands the walk down for an `E.A` argument. `None`
+    /// asks of any variant.
     fn callee_owns_arg_beyond_call(
         &self,
         callee_name: &str,
         method_owner: Option<&str>,
         i: usize,
+        variant: Option<&str>,
     ) -> bool {
         // B-2026-09-03-7 — on the METHOD path, also ask the question by RETURN
         // TYPE, exactly as B-2026-09-04-30's receiver gate does and through the
@@ -3809,7 +3830,12 @@ impl<'a> super::Interpreter<'a> {
                     // reaches its own stand-down through the same predicate.
                     || crate::ast::fn_always_returns_param(f, i)
                     || crate::ast::fn_returns_param_via_call(self.program, f, i)
-                    || crate::ast::fn_returns_param_payload(f, i)
+                    // B-2026-09-05-35 — program-aware and per-variant: a
+                    // payload binding handed to a callee that does NOT take
+                    // it over (`consume(r)`) dies inside, and a sibling
+                    // arm's hand-back (`E.B(k) => k`) is that variant's
+                    // business, not this argument's.
+                    || crate::ast::fn_returns_param_payload_of(self.program, f, i, variant)
                     || crate::ast::fn_moves_param_into_outliving_place(f, i)
                     || crate::ast::fn_moves_param_into_outliving_place_via_call(self.program, f, i)
                     // B-2026-08-31-46 — a conditional hand-back the callee

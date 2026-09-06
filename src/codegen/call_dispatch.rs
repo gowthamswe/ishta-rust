@@ -2186,14 +2186,14 @@ impl<'ctx> super::Codegen<'ctx> {
                 // for a fresh-temp enum arg whose payload a `match e { E.A(r) =>
                 // r }` callee hands back (see the fresh-temp enum arm in the
                 // registrar).
-                let payload_escapes = self.callee_returns_enum_arg_payload(&name, i);
+                let payload_skip = self.enum_arg_payload_skip(&name, i);
                 self.track_inline_owned_aggregate_arg_parts(
                     val,
                     &a.value,
                     escapes_frame,
                     &escaping_parts,
                     declared_tes.as_deref(),
-                    payload_escapes,
+                    payload_skip,
                 );
             }
             // B-2026-08-28-16 — a PLACE tuple argument (`take(q)`) whose
@@ -2299,18 +2299,29 @@ impl<'ctx> super::Codegen<'ctx> {
             // `take(mut sink, carg)` ran two, for the same callee compiled
             // once — the caller's binding fired at its NLL last use (the call)
             // and the container fired again at its drain.
-            if !borrow_skip
-                && (flows_into_return
-                    // B-2026-08-31-46 — the hand-off routes, so a NAMED
-                    // binding reaches `callee_takes_over_arg_drop_body` below
-                    // for a constructor-wrapped conditional return too.
-                    || self.callee_hands_arg_off(&name, i)
-                    || self.callee_returns_enum_arg_payload(&name, i)
-                    || self.call_arg_moves_into_outliving_place(&name, i, false))
-            {
+            // B-2026-09-05-35 — the payload route answers per VARIANT now: a
+            // whole hand-off still retracts the binding's walk outright, but a
+            // callee that hands out only SOME variants' payloads gets the
+            // binding's walker re-emitted with those variants masked, so an
+            // `E.A` local into `match b { E.A(r) => consume(r), E.B(k) => k }`
+            // keeps `r`'s body at the binding's own scope end.
+            let payload_escape = self.callee_enum_arg_payload_escape(&name, i);
+            let whole_escape = flows_into_return
+                // B-2026-08-31-46 — the hand-off routes, so a NAMED
+                // binding reaches `callee_takes_over_arg_drop_body` below
+                // for a constructor-wrapped conditional return too.
+                || self.callee_hands_arg_off(&name, i)
+                || self.call_arg_moves_into_outliving_place(&name, i, false);
+            if !borrow_skip && (whole_escape || payload_escape.is_some()) {
                 if let ExprKind::Identifier(var_name) = &a.value.kind {
                     let var_name = var_name.clone();
-                    self.suppress_container_elem_bodies_for_var(&var_name);
+                    match (&payload_escape, whole_escape) {
+                        (Some((en, vs)), false) => {
+                            let skip = self.enum_payload_skip_for_variants(en, vs);
+                            self.mask_enum_payload_bodies_for_var(&var_name, en, &skip);
+                        }
+                        _ => self.suppress_container_elem_bodies_for_var(&var_name),
+                    }
                     // B-2026-08-29-15 / -50 — and the binding's OWN body too,
                     // wherever some other frame is guaranteed to run it.
                     //
@@ -2615,7 +2626,20 @@ impl<'ctx> super::Codegen<'ctx> {
     ///
     /// Borrowed params are excluded outright: nothing transfers, so whatever the
     /// callee does with a borrow leaves the caller's walk its own.
-    pub(super) fn callee_returns_enum_arg_payload(&self, name: &str, i: usize) -> bool {
+    /// B-2026-09-05-35 — the per-VARIANT form of
+    /// [`Self::callee_returns_enum_arg_payload`]: the enum's name and the
+    /// variants whose payload the callee hands out of its frame (`"*"` for
+    /// all), or `None` when the parameter is not a payload-carrying enum or
+    /// nothing escapes. Program-aware through
+    /// `crate::ast::fn_escaping_param_payload_variants`, so a payload handed
+    /// to a callee that does not take it over (`consume(r)`) no longer counts,
+    /// and a sibling arm's hand-back (`E.B(k) => k`) is reported under ITS
+    /// variant rather than for the whole parameter.
+    pub(super) fn callee_enum_arg_payload_escape(
+        &self,
+        name: &str,
+        i: usize,
+    ) -> Option<(String, Vec<String>)> {
         let flagged = |table: &HashMap<String, Vec<bool>>| {
             table
                 .get(name)
@@ -2624,11 +2648,9 @@ impl<'ctx> super::Codegen<'ctx> {
                 .unwrap_or(false)
         };
         if flagged(&self.fn_sig.fn_param_ref) || flagged(&self.fn_sig.fn_param_mut_ref) {
-            return false;
+            return None;
         }
-        let Some(program) = self.program_snapshot.as_deref() else {
-            return false;
-        };
+        let program = self.program_snapshot.as_deref()?;
         // Free fns by bare name; impl methods by the `Type.method` key the
         // method path passes.
         let (recv_ty, bare) = match name.split_once('.') {
@@ -2653,7 +2675,7 @@ impl<'ctx> super::Codegen<'ctx> {
             }
             _ => Vec::new(),
         });
-        matching_fns.into_iter().any(|f| {
+        matching_fns.into_iter().find_map(|f| {
             // `fn_param_ref` counts the receiver as slot 0; the AST does NOT —
             // `Function::params` excludes it and `self_param` carries it. So the
             // caller's declared index has to shift back by one for a method, or
@@ -2663,14 +2685,12 @@ impl<'ctx> super::Codegen<'ctx> {
             let ast_i = if f.self_param.is_some() {
                 match i.checked_sub(1) {
                     Some(n) => n,
-                    None => return false,
+                    None => return None,
                 }
             } else {
                 i
             };
-            let Some(param) = f.params.get(ast_i) else {
-                return false;
-            };
+            let param = f.params.get(ast_i)?;
             // Bare `Path` naming a non-shared user enum, `Option`, or
             // `Result` — every tagged type whose payload bodies ride a
             // `ContainerElemBodies` walker (`__karac_dropelems_enum_<E>` for a
@@ -2687,7 +2707,7 @@ impl<'ctx> super::Codegen<'ctx> {
             // `suppress_container_elem_bodies_for_var`, which is keyed on the
             // BINDING, not on which walker the binding carries.
             let TypeKind::Path(path) = &param.ty.kind else {
-                return false;
+                return None;
             };
             let is_payload_carrying_enum = path.segments.first().is_some_and(|en| {
                 en == "Option"
@@ -2698,8 +2718,72 @@ impl<'ctx> super::Codegen<'ctx> {
                         .get(en.as_str())
                         .is_some_and(|l| !l.is_shared)
             });
-            is_payload_carrying_enum && crate::ast::fn_returns_param_payload(f, ast_i)
+            if !is_payload_carrying_enum {
+                return None;
+            }
+            let variants = crate::ast::fn_escaping_param_payload_variants(program, f, ast_i);
+            if variants.is_empty() {
+                return None;
+            }
+            let enum_name = path.segments.first().cloned()?;
+            Some((enum_name, variants))
         })
+    }
+
+    /// B-2026-09-05-35 — the `(variant, field)` pairs a fresh-temp enum
+    /// argument's payload-bodies walker must SKIP because the callee hands
+    /// those payloads out, or `None` when it hands none out. `"*"`, `Option`
+    /// and `Result` (whose walkers are not the per-variant kind) resolve to a
+    /// TOTAL set, which the registrar reads as "no walker at all" — the
+    /// whole-argument stand-down this used to be.
+    pub(super) fn enum_arg_payload_skip(
+        &self,
+        name: &str,
+        i: usize,
+    ) -> Option<std::collections::BTreeSet<(String, usize)>> {
+        let (enum_name, variants) = self.callee_enum_arg_payload_escape(name, i)?;
+        Some(self.enum_payload_skip_for_variants(&enum_name, &variants))
+    }
+
+    /// Every `(variant, field index)` of `enum_name` whose variant is in
+    /// `variants` — all of them for `"*"`, or for a built-in the per-variant
+    /// walker does not cover. A total set also carries the `("*", 0)` marker
+    /// so [`Self::enum_payload_skip_is_total`] needs no layout to say so.
+    pub(super) fn enum_payload_skip_for_variants(
+        &self,
+        enum_name: &str,
+        variants: &[String],
+    ) -> std::collections::BTreeSet<(String, usize)> {
+        let all =
+            variants.iter().any(|v| v == "*") || enum_name == "Option" || enum_name == "Result";
+        let mut skip = std::collections::BTreeSet::new();
+        if all {
+            skip.insert(("*".to_string(), 0));
+            return skip;
+        }
+        for (_, vname, tes) in self.enum_variant_field_type_exprs(enum_name) {
+            if variants.iter().any(|v| v == &vname) {
+                for fi in 0..tes.len() {
+                    skip.insert((vname.clone(), fi));
+                }
+            }
+        }
+        skip
+    }
+
+    /// Does `skip` cover every payload field of `enum_name`, so no walker is
+    /// worth emitting?
+    pub(super) fn enum_payload_skip_is_total(
+        &self,
+        enum_name: &str,
+        skip: &std::collections::BTreeSet<(String, usize)>,
+    ) -> bool {
+        if skip.contains(&("*".to_string(), 0)) {
+            return true;
+        }
+        self.enum_variant_field_type_exprs(enum_name)
+            .iter()
+            .all(|(_, vname, tes)| (0..tes.len()).all(|fi| skip.contains(&(vname.clone(), fi))))
     }
 
     /// Does parameter `i` of free function `name` take a by-value `Option[T]`
@@ -4563,7 +4647,7 @@ impl<'ctx> super::Codegen<'ctx> {
             false,
             &[],
             None,
-            false,
+            None,
         )
     }
 
@@ -4580,7 +4664,7 @@ impl<'ctx> super::Codegen<'ctx> {
         arg_escapes_frame: bool,
         escaping_paths: &[crate::ast::ParamPath],
         declared_elem_tes: Option<&[TypeExpr]>,
-        payload_escapes_frame: bool,
+        payload_skip: Option<std::collections::BTreeSet<(String, usize)>>,
     ) {
         self.track_inline_owned_aggregate_arg_inst(
             val,
@@ -4590,7 +4674,7 @@ impl<'ctx> super::Codegen<'ctx> {
             false,
             escaping_paths,
             declared_elem_tes,
-            payload_escapes_frame,
+            payload_skip,
         )
     }
 
@@ -4944,7 +5028,11 @@ impl<'ctx> super::Codegen<'ctx> {
         // it never enters `escaping_paths`; this bool carries it instead, and the
         // fresh-temp enum arm below skips the caller-side payload-bodies walker so
         // the result's consumer is the payload body's only owner.
-        payload_escapes_frame: bool,
+        // B-2026-09-05-35 — now the per-variant SKIP set (`enum_arg_payload_skip`)
+        // rather than a whole-argument bool: `None` walks every payload, a set
+        // masks the escaping variants' fields and lets the tag switch decide,
+        // and a TOTAL set is the old stand-down.
+        payload_skip: Option<std::collections::BTreeSet<(String, usize)>>,
     ) {
         let inkwell::types::BasicTypeEnum::StructType(agg_ty) = val.get_type() else {
             return;
@@ -4986,7 +5074,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 callee_entry_copies_mono,
                 escaping_paths,
                 declared_elem_tes,
-                payload_escapes_frame,
+                payload_skip.clone(),
             );
             return;
         }
@@ -5310,12 +5398,19 @@ impl<'ctx> super::Codegen<'ctx> {
             // the tuple-element skip a few arms down. Memory is untouched: a
             // heap payload's buffer left with the returned value, so there is
             // nothing here to free either.
-            let walker = if !payload_escapes_frame
-                && !shared
-                && enum_name != "Option"
-                && enum_name != "Result"
-            {
-                self.emit_enum_payload_user_drop_bodies_fn(&enum_name)
+            // B-2026-09-05-35 — per VARIANT: the escaping variants' fields are
+            // masked out of the walker and the runtime tag switch picks the
+            // arm, so `E.A(mk(1))` into `match b { E.A(r) => consume(r), E.B(k)
+            // => k }` still runs `r`'s body here while an `E.B` argument's
+            // hand-back stays with the result's owner.
+            let walker = if !shared && enum_name != "Option" && enum_name != "Result" {
+                match &payload_skip {
+                    None => self.emit_enum_payload_user_drop_bodies_fn(&enum_name),
+                    Some(skip) if self.enum_payload_skip_is_total(&enum_name, skip) => None,
+                    Some(skip) => {
+                        self.emit_enum_payload_user_drop_bodies_fn_skipping(&enum_name, skip)
+                    }
+                }
             } else {
                 None
             };

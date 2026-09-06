@@ -10881,6 +10881,46 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-05-35 — the per-VARIANT sibling of
+    /// [`Self::suppress_container_elem_bodies_for_var`]: instead of retracting
+    /// binding `name`'s payload-bodies walker, re-emit it with `skip`'s
+    /// `(variant, field)` pairs masked and swap it IN PLACE, so the walk keeps
+    /// its frame and position (the binding's own scope end) and only the
+    /// escaping variants' bodies are left to the value's new owner. A total
+    /// mask, or a binding whose walker cannot be re-emitted, falls back to
+    /// the retraction.
+    pub(super) fn mask_enum_payload_bodies_for_var(
+        &mut self,
+        name: &str,
+        enum_name: &str,
+        skip: &std::collections::BTreeSet<(String, usize)>,
+    ) {
+        if self.enum_payload_skip_is_total(enum_name, skip) {
+            self.suppress_container_elem_bodies_for_var(name);
+            return;
+        }
+        let Some(walker) = self.emit_enum_payload_user_drop_bodies_fn_skipping(enum_name, skip)
+        else {
+            self.suppress_container_elem_bodies_for_var(name);
+            return;
+        };
+        for frame in self.drop_rc.scope_cleanup_actions.iter_mut().rev() {
+            for action in frame.iter_mut() {
+                if let CleanupAction::UserDrop {
+                    binding_name,
+                    kind,
+                    drop_fn,
+                    ..
+                } = action
+                {
+                    if binding_name == name && *kind == UserDropKind::ContainerElemBodies {
+                        *drop_fn = walker;
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn suppress_container_elem_bodies_for_var(&mut self, name: &str) {
         for frame in self.drop_rc.scope_cleanup_actions.iter_mut().rev() {
             frame.retain(|action| match action {

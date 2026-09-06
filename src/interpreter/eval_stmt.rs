@@ -5831,9 +5831,20 @@ impl<'a> super::Interpreter<'a> {
                 // two bodies under `--interp` against one compiled — measured
                 // on `let b = mk(7); let _ = top(b);` before this row touched
                 // anything, a divergence the fresh-temp pin never saw.
+                // B-2026-09-05-35 — the payload question asked of the
+                // binding's runtime variant, program-aware.
+                let variant = self.env.get(n).and_then(|v| match v {
+                    Value::EnumVariant { variant, .. } => Some(variant),
+                    _ => None,
+                });
                 let is_passthrough = callee.is_some_and(|f| {
                     crate::ast::fn_returns_param(f, i)
-                        || crate::ast::fn_returns_param_payload(f, i)
+                        || crate::ast::fn_returns_param_payload_of(
+                            self.program,
+                            f,
+                            i,
+                            variant.as_deref(),
+                        )
                         || crate::ast::fn_always_returns_param(f, i)
                         || crate::ast::fn_conditionally_returns_param_bare(f, i)
                 });

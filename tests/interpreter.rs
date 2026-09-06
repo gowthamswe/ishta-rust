@@ -61479,3 +61479,67 @@ fn main() {
         "r1\ndR1\none\nr2\ndR2\ntwo\nr0 n1\ndR3\nthree\ndR4\nr4\nfour\nr5\ndR5\nfive\nr6\ndR6\nsix\nr1 n1\ndR7\nseven\nn1\ndR8\neight\nr7 n1\ndR9\nnine\nr10\ndR10\nten\ndR11\nr11\neleven\nr13\ndR13\nthirteen\nr0 n1\ndR14\nfourteen\nn1\ndR15\nfifteen\nr16\ndR16\nsixteen\nend\n"
     );
 }
+
+/// B-2026-09-05-35 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_enum_payload_consumed_or_unread_in_the_arm_runs_one_body`, same
+/// program and string. Both backends consult the same predicate for an enum
+/// argument, so every cell was agreed-and-wrong here exactly as compiled and
+/// the two move together; the interpreter asks with the argument's RUNTIME
+/// variant (`callee_owns_arg_beyond_call`'s new `variant` parameter, and the
+/// binding's value at the two identifier-argument gates).
+#[test]
+fn test_enum_payload_consumed_or_unread_in_the_arm_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+fn wrap(x: R) -> R { return x }
+fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }
+enum E { A(R), B(i64) }
+enum O { S(R), N }
+struct H { n: i64 }
+impl H {
+    fn m_call(ref self, b: E) -> i64 { match b { E.A(r) => { consume(r) + self.n }, E.B(k) => { k } } }
+    fn m_unread(ref self, b: E) -> i64 { match b { E.A(r) => { self.n }, E.B(k) => { k } } }
+}
+fn e_call(b: E) -> i64 { match b { E.A(r) => { consume(r) }, E.B(k) => { k } } }
+fn e_unread(b: E) -> i64 { match b { E.A(r) => { 5 }, E.B(k) => { k } } }
+fn e_read(b: E) -> i64 { match b { E.A(r) => { r.id }, E.B(k) => { k } } }
+fn e_ret(b: E) -> R { match b { E.A(r) => { r }, E.B(k) => { mk(k) } } }
+fn e_fwd(b: E) -> R { match b { E.A(r) => { wrap(r) }, E.B(k) => { mk(k) } } }
+fn e_stash(b: E, v: mut ref Vec[R]) -> i64 { match b { E.A(r) => { stash(r, v); 1 }, E.B(k) => { k } } }
+fn e_push(b: E, v: mut ref Vec[R]) -> i64 { match b { E.A(r) => { v.push(r); 1 }, E.B(k) => { k } } }
+fn e_call_stmt(b: E) -> i64 { match b { E.A(r) => { let d: i64 = consume(r); d + 1 }, E.B(k) => { k } } }
+fn o_call(b: O) -> i64 { match b { O.S(r) => { consume(r) }, O.N => { 0 } } }
+fn o_unread(b: O) -> i64 { match b { O.S(r) => { 5 }, O.N => { 0 } } }
+fn o_unread_single(b: O) -> i64 { if let O.S(r) = b { 5 } else { 0 } }
+fn o_call_single(b: O) -> i64 { if let O.S(r) = b { consume(r) } else { 0 } }
+fn o_wild(b: O) -> i64 { match b { O.S(_) => { 5 }, O.N => { 0 } } }
+fn main() {
+    let h: H = H { n: 100 };
+    { let d: i64 = e_call(E.A(mk(1))); println(f"r{d}"); println("one") }
+    { let d: i64 = e_unread(E.A(mk(2))); println(f"r{d}"); println("two") }
+    { let d: i64 = e_read(E.A(mk(3))); println(f"r{d}"); println("three") }
+    { let a: R = e_ret(E.A(mk(4))); println(f"r{a.id}"); println("four") }
+    { let a: R = e_fwd(E.A(mk(5))); println(f"r{a.id}"); println("five") }
+    { let mut v: Vec[R] = []; let d: i64 = e_stash(E.A(mk(6)), mut v); println(f"r{d} n{v.len()}"); println("six") }
+    { let mut v: Vec[R] = []; let d: i64 = e_push(E.A(mk(7)), mut v); println(f"r{d} n{v.len()}"); println("seven") }
+    { let d: i64 = e_call_stmt(E.A(mk(8))); println(f"r{d}"); println("eight") }
+    { let d: i64 = o_call(O.S(mk(9))); println(f"r{d}"); println("nine") }
+    { let d: i64 = o_unread(O.S(mk(10))); println(f"r{d}"); println("ten") }
+    { let d: i64 = o_unread_single(O.S(mk(11))); println(f"r{d}"); println("eleven") }
+    { let d: i64 = o_call_single(O.S(mk(12))); println(f"r{d}"); println("twelve") }
+    { let d: i64 = o_wild(O.S(mk(13))); println(f"r{d}"); println("thirteen") }
+    { let d: i64 = h.m_call(E.A(mk(14))); println(f"r{d}"); println("fourteen") }
+    { let d: i64 = h.m_unread(E.A(mk(15))); println(f"r{d}"); println("fifteen") }
+    { let e: E = E.A(mk(16)); let d: i64 = e_call(e); println(f"r{d}"); println("sixteen") }
+    { let e: E = E.A(mk(17)); let d: i64 = e_unread(e); println(f"r{d}"); println("seventeen") }
+    { let e: E = E.A(mk(18)); let a: R = e_ret(e); println(f"r{a.id}"); println("eighteen") }
+    { let d: i64 = e_call(E.B(19)); println(f"r{d}"); println("nineteen") }
+    println("end")
+}
+"#),
+        "dR1\nr1\none\ndR2\nr5\ntwo\ndR3\nr3\nthree\nr4\ndR4\nfour\nr5\ndR5\nfive\nr1 n1\ndR6\nsix\nr1 n1\ndR7\nseven\ndR8\nr9\neight\ndR9\nr9\nnine\ndR10\nr5\nten\ndR11\nr5\neleven\ndR12\nr12\ntwelve\ndR13\nr5\nthirteen\ndR14\nr114\nfourteen\ndR15\nr100\nfifteen\ndR16\nr16\nsixteen\ndR17\nr5\nseventeen\nr18\ndR18\neighteen\nr19\nnineteen\nend\n"
+    );
+}

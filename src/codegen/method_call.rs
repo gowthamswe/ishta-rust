@@ -7712,12 +7712,22 @@ impl<'ctx> super::Codegen<'ctx> {
                         // predicate is keyed on the raw AST method whose
                         // `params` exclude the receiver, the same index the
                         // `callee_takes_over_arg_drop_body` call below uses.
-                        if self.callee_returns_enum_arg_payload(&qualified, pidx)
-                            || self.call_arg_moves_into_outliving_place(&qualified, i, false)
-                        {
+                        // B-2026-09-05-35 — per variant, as the free-fn gate in
+                        // `compile_call`: a partial payload escape masks the
+                        // binding's walker instead of retracting it.
+                        let payload_escape = self.callee_enum_arg_payload_escape(&qualified, pidx);
+                        let whole_escape =
+                            self.call_arg_moves_into_outliving_place(&qualified, i, false);
+                        if whole_escape || payload_escape.is_some() {
                             if let ExprKind::Identifier(var_name) = &a.value.kind {
                                 let var_name = var_name.clone();
-                                self.suppress_container_elem_bodies_for_var(&var_name);
+                                match (&payload_escape, whole_escape) {
+                                    (Some((en, vs)), false) => {
+                                        let skip = self.enum_payload_skip_for_variants(en, vs);
+                                        self.mask_enum_payload_bodies_for_var(&var_name, en, &skip);
+                                    }
+                                    _ => self.suppress_container_elem_bodies_for_var(&var_name),
+                                }
                             }
                         }
                         // B-2026-08-29-15 — the method spelling of the
@@ -7997,9 +8007,17 @@ impl<'ctx> super::Codegen<'ctx> {
                     // Feeding the same predicate into `escapes_frame` reaches
                     // the temp, because the registrar is keyed on the VALUE
                     // rather than on a name.
+                    // B-2026-09-05-35 — the payload route no longer joins
+                    // `escapes_frame` here: that flag takes the registrar's
+                    // memory-only exit and skips the payload-bodies walker for
+                    // EVERY variant, which lost `r`'s body on `h.m_call(E.A(mk(1)))`
+                    // into `match b { E.A(r) => consume(r), E.B(k) => k }`. The
+                    // per-variant `payload_skip` below carries it now, exactly
+                    // as the free-fn path always has (B-2026-08-29-38's cell,
+                    // `t.take(Box2.Full(mk(7)))`, resolves to a TOTAL skip and
+                    // still emits no walker).
                     let escapes_frame = handed_off
-                        || self.call_arg_moves_into_outliving_place(&qualified, i, false)
-                        || self.callee_returns_enum_arg_payload(&qualified, pidx);
+                        || self.call_arg_moves_into_outliving_place(&qualified, i, false);
                     // B-2026-09-05-33 — the per-ELEMENT escape set, exactly as
                     // the free-fn leg carries it: a method whose arm hands one
                     // element of a tuple argument out (`(r, k) => r`) must not
@@ -8009,13 +8027,16 @@ impl<'ctx> super::Codegen<'ctx> {
                     // backend. The place-argument disarm is the named-local
                     // spelling of the same rule (B-2026-08-28-16's helper).
                     let escaping_parts = self.callee_returned_param_parts(&qualified, i);
+                    // B-2026-09-05-35 — the per-variant payload skip, as on the
+                    // free path.
+                    let payload_skip = self.enum_arg_payload_skip(&qualified, pidx);
                     self.track_inline_owned_aggregate_arg_parts(
                         val,
                         &a.value,
                         escapes_frame,
                         &escaping_parts,
                         None,
-                        false,
+                        payload_skip,
                     );
                     self.disarm_escaping_place_tuple_elem_bodies(&qualified, i, &a.value);
                     // Fresh-heap by-value arg materialization — the method-call

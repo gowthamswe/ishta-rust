@@ -73813,4 +73813,143 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-05-35 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_enum_payload_consumed_or_unread_in_the_arm_runs_one_body`: an enum
+    /// payload consumed, read, unread, handed out, stashed or pushed from a
+    /// match arm is freed exactly once and its body runs exactly once, with
+    /// the per-variant masked walker in play. Heap `R` (`String` + `Vec`) so
+    /// a lost free is a leak LSan sees.
+    #[test]
+    fn asan_enum_payload_consumed_or_unread_in_the_arm_clean() {
+        let label = "enum_payload_consumed_or_unread_in_the_arm";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+fn wrap(x: R) -> R { return x }
+fn stash(x: R, v: mut ref Vec[R]) { v.push(x) }
+enum E { A(R), B(i64) }
+enum O { S(R), N }
+struct H { n: i64 }
+impl H {
+    fn m_call(ref self, b: E) -> i64 { match b { E.A(r) => { consume(r) + self.n }, E.B(k) => { k } } }
+    fn m_unread(ref self, b: E) -> i64 { match b { E.A(r) => { self.n }, E.B(k) => { k } } }
+}
+fn e_call(b: E) -> i64 { match b { E.A(r) => { consume(r) }, E.B(k) => { k } } }
+fn e_unread(b: E) -> i64 { match b { E.A(r) => { 5 }, E.B(k) => { k } } }
+fn e_read(b: E) -> i64 { match b { E.A(r) => { r.id }, E.B(k) => { k } } }
+fn e_ret(b: E) -> R { match b { E.A(r) => { r }, E.B(k) => { mk(k) } } }
+fn e_fwd(b: E) -> R { match b { E.A(r) => { wrap(r) }, E.B(k) => { mk(k) } } }
+fn e_stash(b: E, v: mut ref Vec[R]) -> i64 { match b { E.A(r) => { stash(r, v); 1 }, E.B(k) => { k } } }
+fn e_push(b: E, v: mut ref Vec[R]) -> i64 { match b { E.A(r) => { v.push(r); 1 }, E.B(k) => { k } } }
+fn e_call_stmt(b: E) -> i64 { match b { E.A(r) => { let d: i64 = consume(r); d + 1 }, E.B(k) => { k } } }
+fn o_call(b: O) -> i64 { match b { O.S(r) => { consume(r) }, O.N => { 0 } } }
+fn o_unread(b: O) -> i64 { match b { O.S(r) => { 5 }, O.N => { 0 } } }
+fn o_unread_single(b: O) -> i64 { if let O.S(r) = b { 5 } else { 0 } }
+fn o_call_single(b: O) -> i64 { if let O.S(r) = b { consume(r) } else { 0 } }
+fn o_wild(b: O) -> i64 { match b { O.S(_) => { 5 }, O.N => { 0 } } }
+fn main() {
+    let h: H = H { n: 100 };
+    { let d: i64 = e_call(E.A(mk(1))); println(f"r{d}"); println("one") }
+    { let d: i64 = e_unread(E.A(mk(2))); println(f"r{d}"); println("two") }
+    { let d: i64 = e_read(E.A(mk(3))); println(f"r{d}"); println("three") }
+    { let a: R = e_ret(E.A(mk(4))); println(f"r{a.id}"); println("four") }
+    { let a: R = e_fwd(E.A(mk(5))); println(f"r{a.id}"); println("five") }
+    { let mut v: Vec[R] = []; let d: i64 = e_stash(E.A(mk(6)), mut v); println(f"r{d} n{v.len()}"); println("six") }
+    { let mut v: Vec[R] = []; let d: i64 = e_push(E.A(mk(7)), mut v); println(f"r{d} n{v.len()}"); println("seven") }
+    { let d: i64 = e_call_stmt(E.A(mk(8))); println(f"r{d}"); println("eight") }
+    { let d: i64 = o_call(O.S(mk(9))); println(f"r{d}"); println("nine") }
+    { let d: i64 = o_unread(O.S(mk(10))); println(f"r{d}"); println("ten") }
+    { let d: i64 = o_unread_single(O.S(mk(11))); println(f"r{d}"); println("eleven") }
+    { let d: i64 = o_call_single(O.S(mk(12))); println(f"r{d}"); println("twelve") }
+    { let d: i64 = o_wild(O.S(mk(13))); println(f"r{d}"); println("thirteen") }
+    { let d: i64 = h.m_call(E.A(mk(14))); println(f"r{d}"); println("fourteen") }
+    { let d: i64 = h.m_unread(E.A(mk(15))); println(f"r{d}"); println("fifteen") }
+    { let e: E = E.A(mk(16)); let d: i64 = e_call(e); println(f"r{d}"); println("sixteen") }
+    { let e: E = E.A(mk(17)); let d: i64 = e_unread(e); println(f"r{d}"); println("seventeen") }
+    { let e: E = E.A(mk(18)); let a: R = e_ret(e); println(f"r{a.id}"); println("eighteen") }
+    { let d: i64 = e_call(E.B(19)); println(f"r{d}"); println("nineteen") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "dR1",
+                "r1",
+                "one",
+                "dR2",
+                "r5",
+                "two",
+                "dR3",
+                "r3",
+                "three",
+                "r4",
+                "dR4",
+                "four",
+                "r5",
+                "dR5",
+                "five",
+                "r1 n1",
+                "dR6",
+                "six",
+                "r1 n1",
+                "dR7",
+                "seven",
+                "dR8",
+                "r9",
+                "eight",
+                "dR9",
+                "r9",
+                "nine",
+                "dR10",
+                "r5",
+                "ten",
+                "dR11",
+                "r5",
+                "eleven",
+                "dR12",
+                "r12",
+                "twelve",
+                "dR13",
+                "r5",
+                "thirteen",
+                "dR14",
+                "r114",
+                "fourteen",
+                "dR15",
+                "r100",
+                "fifteen",
+                "dR16",
+                "r16",
+                "sixteen",
+                "dR17",
+                "r5",
+                "seventeen",
+                "r18",
+                "dR18",
+                "eighteen",
+                "r19",
+                "nineteen",
+                "end",
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }
