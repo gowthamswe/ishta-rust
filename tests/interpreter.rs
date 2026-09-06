@@ -58346,6 +58346,116 @@ fn nll_drop_point_at_a_call_that_last_uses_the_binding() {
     );
 }
 
+/// B-2026-09-05-34 — AN `if let (r, k) = t` OVER AN OWNED TUPLE PARAM RAN THE
+/// ELEMENT'S `Drop` BODY ON THE WRONG OWNER (AND FREED ITS HEAP TWICE).
+///
+/// The row's cell — `fn t_iflet(t: (R, i64)) -> i64 { if let (r, k) = t { k }
+/// else { 0 } }` — aborted `free(): double free detected in tcache 2` on the
+/// JIT while `--interp` and `karac build` printed `dR9 r0`. The JIT executes
+/// raw IR and `karac build` runs `default<O2>` first, which folded one of the
+/// two frees away: `KARAC_OPT_LEVEL=0 karac build` aborted too. The memory
+/// half is pinned by `tests/memory_sanitizer.rs`'s
+/// `asan_iflet_bare_tuple_element_binding_is_not_a_second_owner`; THIS pin is
+/// the BODY-count half, which `-O2` did not mask on three cells:
+///
+/// - `p_rebind` / `l_rebind` / `l_two` — the element rebound inside the block
+///   ran `dR` twice (`dR8 dR8 r8` for the local spelling, on the interpreter
+///   as well: its single-pattern disarm had no tuple arm, where the `match`
+///   form's has had one since B-2026-09-02-26).
+/// - `p_out` — the element HANDED OUT of the then-block ran `dR3 r3 dR3` on
+///   every compiled backend against `r3 dR3`: the caller-side predicate
+///   `fn_returns_param_part_paths` aliased a `match` arm's pattern bindings
+///   (B-2026-09-02-24) and not an `if let`'s, so the returned element was
+///   never seen to escape and the caller ran its body a second time.
+///
+/// One mechanism throughout: the three single-pattern legs (`if let`,
+/// `while let`, `let … else`) never ran the bare-tuple staging the `match`
+/// arm loop runs (`stage_bare_tuple_bindings_for_bind`,
+/// `record_bare_tuple_elem_sources`, the bodies disarm, the tail hand-out
+/// hook), and the two AST predicates that feed both backends had `match`-only
+/// arms. Every cell here is identical on interpreter, JIT, `-O0`, `-O2` and
+/// `KARAC_AUTO_PAR=0`.
+///
+/// THE CONTROLS: `m_read` is the `match` spelling (correct before and after);
+/// `p_read` / `p_call` / `p_field` / `p_letelse` / `p_while` / `l_read` were
+/// memory-wrong but body-correct at `-O2` and must stay at one body each.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_iflet_bare_tuple_elem_runs_one_body`, pinned to the same string.
+#[test]
+fn test_iflet_bare_tuple_elem_runs_one_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+fn consume(x: R) -> i64 { return x.id }
+struct H { t: (R, i64) }
+
+fn p_read(t: (R, i64)) -> i64 { if let (r, k) = t { k } else { 0 } }
+fn p_call(t: (R, i64)) -> i64 { if let (r, k) = t { consume(r) } else { 0 } }
+fn p_rebind(t: (R, i64)) -> i64 { if let (r, k) = t { let m = r; m.id } else { 0 } }
+fn p_out(t: (R, i64)) -> R { if let (r, k) = t { r } else { mk(0) } }
+fn p_field(h: H) -> i64 { if let (r, k) = h.t { k } else { 0 } }
+fn p_letelse(t: (R, i64)) -> i64 { let (r, k) = t else { return 0 }; k }
+fn p_while(t: (R, i64)) -> i64 { while let (r, k) = t { return k }; 0 }
+fn l_read() -> i64 { let t = (mk(21), 0); if let (r, k) = t { k } else { 0 } }
+fn l_rebind() -> i64 { let t = (mk(22), 0); if let (r, k) = t { let m = r; m.id } else { 0 } }
+fn l_two() -> i64 { let t = (mk(23), mk(24)); if let (a, b) = t { let m = a; m.id } else { 0 } }
+fn m_read(t: (R, i64)) -> i64 { match t { (r, k) => { k } } }
+
+fn main() {
+    println("p_read"); let a = p_read((mk(1), 0)); println(f"  r{a}");
+    println("p_call"); let b = p_call((mk(2), 0)); println(f"  r{b}");
+    println("p_rebind"); let c = p_rebind((mk(3), 0)); println(f"  r{c}");
+    println("p_out"); let d = p_out((mk(4), 0)); println(f"  r{d.id}");
+    println("p_field"); let e = p_field(H { t: (mk(5), 0) }); println(f"  r{e}");
+    println("p_letelse"); let f = p_letelse((mk(6), 0)); println(f"  r{f}");
+    println("p_while"); let g = p_while((mk(7), 0)); println(f"  r{g}");
+    println("l_read"); let h = l_read(); println(f"  r{h}");
+    println("l_rebind"); let i = l_rebind(); println(f"  r{i}");
+    println("l_two"); let j = l_two(); println(f"  r{j}");
+    println("m_read"); let n = m_read((mk(8), 0)); println(f"  r{n}");
+    println("end");
+}
+"#),
+        r#"p_read
+dR1
+  r0
+p_call
+dR2
+  r2
+p_rebind
+dR3
+  r3
+p_out
+  r4
+dR4
+p_field
+dR5
+  r0
+p_letelse
+dR6
+  r0
+p_while
+dR7
+  r0
+l_read
+dR21
+  r0
+l_rebind
+dR22
+  r22
+l_two
+dR23
+dR24
+  r23
+m_read
+dR8
+  r0
+end
+"#
+    );
+}
+
 /// B-2026-09-02-26 — A LOCAL TUPLE SCRUTINEE'S ELEMENT REBIND DOUBLES THE
 /// `Drop` BODY, AND THE REPAIR IS THE OPPOSITE OF B-2026-08-31-7's.
 ///

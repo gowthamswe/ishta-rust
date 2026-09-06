@@ -668,43 +668,11 @@ impl<'ctx> super::Codegen<'ctx> {
                         .current_variant_payload_bindings
                         .extend(vp_names);
                 }
-                // B-2026-08-31-7 — and the complement, for VIEW-NESS rather
-                // than for the arm channel. A bare-tuple element bound out of
-                // an owned-param scrutinee (`match t { (r, k) => … }`, and the
-                // projected `match s.t { … }`) is a view of the callee's entry
-                // copy on exactly the terms the payload above is; the element
-                // walk stays the single body owner, and a REBIND of the
-                // element must inherit that rather than mint a second one.
-                // See `collect_bare_tuple_binding_names` for the measurements.
-                // Deliberately kept OUT of `current_variant_payload_bindings`:
-                // that set routes to the UserDrop channel, which is the one
-                // thing a tuple element must not do.
-                if self.pattern_state.pattern_binding_scrutinee_is_owned_param {
-                    let mut bt_names: Vec<String> = Vec::new();
-                    Self::collect_bare_tuple_binding_names(&arm.pattern, false, &mut bt_names);
-                    self.payload_vars.param_view_locals.extend(bt_names);
-                }
-                // B-2026-09-02-23 — and the MEMORY half, which is a different
-                // question from view-ness and is NOT restricted to an
-                // owned-param scrutinee. A bare-tuple element binding is a
-                // bit-copy of the tuple's element, and the tuple's own
-                // `__karac_drop_tuple_*` (emitted at the merge block) already
-                // frees that element's heap; registering the binding on the
-                // struct-drop channel too freed the same buffers twice.
-                // `-O2` hid almost every instance -- which is why this sat
-                // behind a `Vec`+`String` "trigger" that was really just the
-                // one shape the optimizer failed to fold -- and
-                // `KARAC_OPT_LEVEL=0` shows it on ALL of them, including a
-                // `match t { (r, k) => { println("hi") } }` that reads no
-                // field at all.
-                self.pattern_state.current_bare_tuple_bindings.clear();
-                {
-                    let mut bt_all: Vec<String> = Vec::new();
-                    Self::collect_bare_tuple_binding_names(&arm.pattern, false, &mut bt_all);
-                    self.pattern_state
-                        .current_bare_tuple_bindings
-                        .extend(bt_all);
-                }
+                // B-2026-08-31-7 / B-2026-09-02-23 — view-ness and the memory
+                // half for the arm's bare-tuple element bindings. Shared with
+                // the `if let` / `while let` / `let … else` legs since
+                // B-2026-09-05-34; the rationale lives on the helper.
+                self.stage_bare_tuple_bindings_for_bind(&arm.pattern);
                 // B-2026-08-12-2 — per-ARM, and saved/restored because a nested
                 // `match` inside this body binds through the same field.
                 let saved_arm_borrows = self.pattern_state.pattern_binding_arm_only_borrows;
@@ -2323,6 +2291,58 @@ impl<'ctx> super::Codegen<'ctx> {
     /// Stops at `TupleVariant` / `Struct`: bindings under those ARE payload
     /// positions and the sibling collector owns them, so the two sets stay
     /// disjoint by construction.
+    /// Stage the pattern's BARE-TUPLE element bindings for the
+    /// `bind_pattern_values` call that follows. Two halves, both keyed on the
+    /// names [`Self::collect_bare_tuple_binding_names`] reports:
+    ///
+    /// B-2026-08-31-7 — VIEW-NESS. A bare-tuple element bound out of an
+    /// owned-param scrutinee (`match t { (r, k) => … }`, and the projected
+    /// `match s.t { … }`) is a view of the callee's entry copy on exactly the
+    /// terms a variant payload is; the element walk stays the single body
+    /// owner, and a REBIND of the element must inherit that rather than mint a
+    /// second one. Deliberately kept OUT of `current_variant_payload_bindings`:
+    /// that set routes to the UserDrop channel, which is the one thing a tuple
+    /// element must not do. Reads `pattern_binding_scrutinee_is_owned_param`,
+    /// so the caller derives that flag first.
+    ///
+    /// B-2026-09-02-23 — the MEMORY half, which is a different question from
+    /// view-ness and is NOT restricted to an owned-param scrutinee. A
+    /// bare-tuple element binding is a bit-copy of the tuple's element, and
+    /// the tuple's own `__karac_drop_tuple_*` (emitted at the construct's
+    /// merge, or at the source binding's scope exit) already frees that
+    /// element's heap; registering the binding on the struct-drop channel too
+    /// freed the same buffers twice. `-O2` hid almost every instance -- which
+    /// is why this sat behind a `Vec`+`String` "trigger" that was really just
+    /// the one shape the optimizer failed to fold -- and `KARAC_OPT_LEVEL=0`
+    /// shows it on ALL of them, including a `match t { (r, k) => {
+    /// println("hi") } }` that reads no field at all.
+    ///
+    /// B-2026-09-05-34 — hoisted out of `compile_match`'s arm loop so the
+    /// `if let` / `while let` / `let … else` legs run the same staging. They
+    /// never did, so `if let (r, k) = t { k } else { 0 }` over an owned tuple
+    /// param registered `__karac_drop_struct_R` on `r` AND ran the tuple drop
+    /// on `t` at the merge: `free(): double free detected in tcache 2` on the
+    /// JIT (which executes raw IR) and under `KARAC_OPT_LEVEL=0 karac build`,
+    /// masked at `-O1`+ -- measured for a param, a local and a struct-field
+    /// tuple scrutinee on all three legs, against a clean `match` spelling of
+    /// every cell. The caller clears `current_bare_tuple_bindings` after the
+    /// bind, exactly as the arm loop does.
+    pub(super) fn stage_bare_tuple_bindings_for_bind(&mut self, pattern: &Pattern) {
+        if self.pattern_state.pattern_binding_scrutinee_is_owned_param {
+            let mut bt_names: Vec<String> = Vec::new();
+            Self::collect_bare_tuple_binding_names(pattern, false, &mut bt_names);
+            self.payload_vars.param_view_locals.extend(bt_names);
+        }
+        self.pattern_state.current_bare_tuple_bindings.clear();
+        {
+            let mut bt_all: Vec<String> = Vec::new();
+            Self::collect_bare_tuple_binding_names(pattern, false, &mut bt_all);
+            self.pattern_state
+                .current_bare_tuple_bindings
+                .extend(bt_all);
+        }
+    }
+
     pub(super) fn collect_bare_tuple_binding_names(
         pattern: &Pattern,
         in_bare_tuple: bool,
@@ -9910,6 +9930,102 @@ impl<'ctx> super::Codegen<'ctx> {
                 self.disarm_tuple_elem_bodies_at(&src, i as u32, tuple_ty);
             }
         }
+    }
+
+    /// B-2026-09-05-34 — the single-arm sibling of
+    /// [`Self::disarm_moved_bare_tuple_elem_bodies`] for the `if let` /
+    /// `while let` legs, whose one pattern binds against one `body` block and
+    /// carries no guard. Same classification per element (a binding the block
+    /// merely READS leaves the body with the tuple's walk; one it MOVES has
+    /// handed the body to the destination), same owned-param gate (the element
+    /// is a VIEW of a value the caller retains, so retracting there would hand
+    /// the body to nobody), same per-element mask.
+    ///
+    /// One difference in the write: the retract-and-re-register pair the arm
+    /// loop uses lands the owner's walk in the CURRENT frame, which for a
+    /// `match` arm is the arm's own — acceptable there because the arm frame
+    /// drains into the same merge the tuple drop sits at. A `while let` body
+    /// frame is per-ITERATION, so re-registering from inside it would fire the
+    /// owner's walk once per pass. The in-place swap
+    /// ([`Self::replace_user_drop_fn_for_var`], B-2026-08-29-33) keeps the
+    /// placement the let-site chose; the register path is only the fallback
+    /// for a source with no live walk to swap.
+    pub(super) fn disarm_moved_bare_tuple_elem_bodies_for_block(
+        &mut self,
+        pattern: &Pattern,
+        scrutinee: &Expr,
+        body: &Block,
+    ) {
+        if self.pattern_state.pattern_binding_scrutinee_is_owned_param {
+            return;
+        }
+        let PatternKind::Tuple(subs) = &pattern.kind else {
+            return;
+        };
+        let ExprKind::Identifier(src) = &scrutinee.kind else {
+            return;
+        };
+        let src = src.clone();
+        let Some(tuple_ty) = self.place_chain_aggregate_llvm_type(scrutinee) else {
+            return;
+        };
+        for (i, sub) in subs.iter().enumerate() {
+            let PatternKind::Binding(bname) = &sub.kind else {
+                continue;
+            };
+            if super::consume_class::binding_only_borrowed_block(bname, body) {
+                continue;
+            }
+            self.disarm_tuple_elem_bodies_in_place_at(&src, i as u32, tuple_ty);
+        }
+    }
+
+    /// The in-place twin of [`Self::disarm_tuple_elem_bodies_at`]: same skip
+    /// mask, same skipping walker, but the owner's live `ContainerElemBodies`
+    /// action is MUTATED where it sits rather than retracted and re-pushed
+    /// into the current (possibly inner, possibly per-iteration) frame. Falls
+    /// back to the register path when the source has no live walk.
+    fn disarm_tuple_elem_bodies_in_place_at(
+        &mut self,
+        var_name: &str,
+        index: u32,
+        tuple_ty: inkwell::types::StructType<'ctx>,
+    ) {
+        let Some(elem_tes) = self.var_types.tuple_var_elem_tes.get(var_name).cloned() else {
+            return;
+        };
+        let Some(slot) = self.variables.get(var_name).copied() else {
+            return;
+        };
+        let skip = self
+            .tuple_moved_elem_bodies
+            .entry(var_name.to_string())
+            .or_default();
+        skip.insert(index);
+        let skip = skip.clone();
+        // No element left to walk once this one is masked: the owner's walk
+        // is retracted outright, as `disarm_tuple_elem_bodies_at` does when
+        // the skipping emitter declines. Measured on
+        // `let t = (mk(8), 0); if let (r, k) = t { let m = r; m.id }`:
+        // returning here without the retraction left the original walk at
+        // the merge and ran `dR8` twice.
+        let Some(bodies) =
+            self.emit_tuple_elem_user_drop_bodies_fn_skipping(tuple_ty, &elem_tes, &skip)
+        else {
+            self.suppress_container_elem_bodies_for_var(var_name);
+            return;
+        };
+        if self.replace_user_drop_fn_for_var(var_name, UserDropKind::ContainerElemBodies, bodies) {
+            return;
+        }
+        self.suppress_container_elem_bodies_for_var(var_name);
+        self.track_user_drop_var_with_fn(
+            "",
+            var_name,
+            slot.ptr,
+            bodies,
+            UserDropKind::ContainerElemBodies,
+        );
     }
 
     pub(super) fn disarm_tuple_elem_bodies_at(

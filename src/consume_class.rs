@@ -51,11 +51,10 @@ pub(crate) fn binding_only_borrowed(name: &str, e: &Expr) -> bool {
 /// than a single arm expression. A block's value is its `final_expr`, so a
 /// `final_expr` that forwards `name` (the block result escapes) is a transfer,
 /// as is any consuming sink among its statements.
-// Codegen-only: this module was hoisted to crate level (B-2026-09-02-26) so the
-// INTERPRETER could share `binding_only_borrowed`; its remaining helpers still
-// have callers only under `#[cfg(feature = "llvm")]`, so they are dead in the
-// default build that CI lints.
-#[cfg(feature = "llvm")]
+// Shared by both backends since B-2026-09-05-34: the interpreter's
+// `bare_tuple_elems_block_move` (its `if let` / `while let` twin of the
+// match-arm classifier) asks this exact question, so the `#[cfg(feature =
+// "llvm")]` gate this carried while codegen was its only caller is gone.
 pub(crate) fn binding_only_borrowed_block(name: &str, b: &crate::ast::Block) -> bool {
     let consumed = b
         .final_expr

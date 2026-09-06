@@ -293,6 +293,11 @@ impl<'ctx> super::Codegen<'ctx> {
                 .filter(|n| super::consume_class::binding_only_borrowed_block(n, then_block))
                 .collect();
         }
+        // B-2026-08-31-7 / B-2026-09-02-23 / B-2026-09-05-34 — view-ness and
+        // the memory half for a bare-tuple element binding, staged exactly as
+        // `compile_match`'s arm loop stages them. Without this the element
+        // binding registered its own struct drop on top of the tuple's.
+        self.stage_bare_tuple_bindings_for_bind(pattern);
         let bind_res = self.bind_pattern_values(pattern, val);
         // B-2026-09-01-30 — the `match`-arm rule applies verbatim to a
         // whole-value `if let` / `while let` / `let ... else` binding: the value
@@ -304,6 +309,18 @@ impl<'ctx> super::Codegen<'ctx> {
         // happened to name would leave one convention with two answers again,
         // which is the defect itself rather than an instance of it.
         self.propagate_owned_param_to_whole_arm_binding(value, pattern);
+        self.pattern_state.current_bare_tuple_bindings.clear();
+        if bind_res.is_ok() {
+            // B-2026-09-02-27 / B-2026-09-02-26 (B-2026-09-05-34, `if let`
+            // leg) — the arm loop's two post-bind hooks for a bare-tuple
+            // pattern: record where each element binding's value REALLY lives
+            // (a later per-field move-out or hand-out has to neutralize both
+            // the view and the source), and retract the source's element body
+            // for an element the then-block MOVES. Before `restore_…` because
+            // both read the owned-param flag `set_…` derived.
+            self.record_bare_tuple_elem_sources(pattern, value);
+            self.disarm_moved_bare_tuple_elem_bodies_for_block(pattern, value, then_block);
+        }
         self.restore_scrutinee_shape_flags(saved_shape_flags);
         self.pattern_state.pattern_binding_arm_borrowed_only_names = saved_arm_borrowed_names;
         self.pattern_state.current_variant_payload_bindings.clear();
@@ -652,6 +669,15 @@ impl<'ctx> super::Codegen<'ctx> {
                     if owns_result {
                         self.suppress_user_drop_for_arm_tail_binding(pattern, &nm);
                     }
+                }
+                // B-2026-09-05-27 (B-2026-09-05-34, `if let` leg) — a
+                // bare-tuple element handed out as the then-block's value
+                // (`if let (r, k) = t { r } else { … }`) is a bit-copy of the
+                // scrutinee's element; cap-zero the SOURCE so the tuple drop
+                // at the merge skips it, as the match arm's tail does.
+                if let ExprKind::Identifier(nm) = &Self::block_tail_expr(fe).kind {
+                    let nm = nm.clone();
+                    self.zero_bare_tuple_elem_source_for_moved(&nm);
                 }
                 // B-2026-08-29-5 — the then-arm sibling of the fresh-tail
                 // owner in `compile_block_with_frame`. This arm hand-rolls
@@ -1047,6 +1073,11 @@ impl<'ctx> super::Codegen<'ctx> {
                 .filter(|n| super::consume_class::binding_only_borrowed_block(n, body))
                 .collect();
         }
+        // B-2026-08-31-7 / B-2026-09-02-23 / B-2026-09-05-34 — view-ness and
+        // the memory half for a bare-tuple element binding, staged exactly as
+        // `compile_match`'s arm loop stages them. Without this the element
+        // binding registered its own struct drop on top of the tuple's.
+        self.stage_bare_tuple_bindings_for_bind(pattern);
         let bind_res = self.bind_pattern_values(pattern, val);
         // B-2026-09-01-30 — the `match`-arm rule applies verbatim to a
         // whole-value `if let` / `while let` / `let ... else` binding: the value
@@ -1058,6 +1089,13 @@ impl<'ctx> super::Codegen<'ctx> {
         // happened to name would leave one convention with two answers again,
         // which is the defect itself rather than an instance of it.
         self.propagate_owned_param_to_whole_arm_binding(value, pattern);
+        self.pattern_state.current_bare_tuple_bindings.clear();
+        if bind_res.is_ok() {
+            // B-2026-09-02-27 / B-2026-09-02-26 (B-2026-09-05-34, `while let`
+            // leg) — see the `if let` site.
+            self.record_bare_tuple_elem_sources(pattern, value);
+            self.disarm_moved_bare_tuple_elem_bodies_for_block(pattern, value, body);
+        }
         self.restore_scrutinee_shape_flags(saved_shape_flags);
         self.pattern_state.pattern_binding_arm_borrowed_only_names = saved_arm_borrowed_names;
         self.pattern_state.current_variant_payload_bindings.clear();
@@ -1708,6 +1746,11 @@ impl<'ctx> super::Codegen<'ctx> {
         }
         let saved_shape_flags =
             self.set_scrutinee_shape_flags_for_pattern(pattern, value, freshtemp_boxed_slot);
+        // B-2026-08-31-7 / B-2026-09-02-23 / B-2026-09-05-34 — view-ness and
+        // the memory half for a bare-tuple element binding, staged exactly as
+        // `compile_match`'s arm loop stages them. Without this the element
+        // binding registered its own struct drop on top of the tuple's.
+        self.stage_bare_tuple_bindings_for_bind(pattern);
         let bind_res = self.bind_pattern_values(pattern, val);
         // B-2026-09-01-30 — the `match`-arm rule applies verbatim to a
         // whole-value `if let` / `while let` / `let ... else` binding: the value
@@ -1719,6 +1762,15 @@ impl<'ctx> super::Codegen<'ctx> {
         // happened to name would leave one convention with two answers again,
         // which is the defect itself rather than an instance of it.
         self.propagate_owned_param_to_whole_arm_binding(value, pattern);
+        self.pattern_state.current_bare_tuple_bindings.clear();
+        if bind_res.is_ok() {
+            // B-2026-09-02-27 (B-2026-09-05-34, `let … else` leg) — the
+            // source-slot record only. The bindings escape into the ENCLOSING
+            // block, whose continuation this site cannot see, so the
+            // per-element bodies classification the `if let` / `while let`
+            // legs run has nothing to classify against here.
+            self.record_bare_tuple_elem_sources(pattern, value);
+        }
         self.restore_scrutinee_shape_flags(saved_shape_flags);
         self.pattern_state.current_variant_payload_bindings.clear();
         bind_res?;

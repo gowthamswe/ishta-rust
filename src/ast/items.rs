@@ -2661,6 +2661,51 @@ pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamP
         aliases.retain(|(a, _)| a != name);
     }
 
+    /// A destructure of `base` (the param or one of its parts): each leaf
+    /// binding denotes the source's path extended by its own element / field.
+    /// Shared by the `let` / `let … else` statements and by every pattern
+    /// construct (`match`, `if let`, `while let`) — B-2026-09-02-24 taught the
+    /// `match` arm this, and B-2026-09-05-34 found `if let (r, k) = t { r }`
+    /// still opaque: `r` was an unknown name, the handed-back element never
+    /// registered as escaping, and the caller ran its `Drop` body a SECOND time
+    /// on top of the result's owner (`dR3 r3 dR3` against the interpreter's
+    /// `r3 dR3`). One walk for every destructuring position, so the `if let`
+    /// spelling cannot fall behind the `match` spelling again.
+    fn alias_destructure(
+        pattern: &Pattern,
+        base: &ParamPath,
+        aliases: &mut Vec<(String, ParamPath)>,
+    ) {
+        match &pattern.kind {
+            PatternKind::Tuple(pats) => {
+                for (i, p) in pats.iter().enumerate() {
+                    if let PatternKind::Binding(n) = &p.kind {
+                        let mut path = base.clone();
+                        path.push(ParamPart::TupleIndex(i));
+                        set_alias(aliases, n, path);
+                    }
+                }
+            }
+            PatternKind::Struct { fields, .. } => {
+                for fp in fields {
+                    let mut path = base.clone();
+                    path.push(ParamPart::Field(fp.name.clone()));
+                    match &fp.pattern {
+                        // `W { r, n }` — shorthand binds the field name itself.
+                        None => set_alias(aliases, &fp.name, path),
+                        // `W { r: inner, .. }` — renamed leaf.
+                        Some(p) => {
+                            if let PatternKind::Binding(n) = &p.kind {
+                                set_alias(aliases, n, path);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Record every name a `let` in this block makes denote the param or one
     /// of its parts, and un-record any alias the same `let` shadows.
     fn grow_block(b: &Block, aliases: &mut Vec<(String, ParamPath)>) {
@@ -2676,35 +2721,26 @@ pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamP
                         // by its own element / field (B-2026-08-28-23 — the
                         // whole-param gate here is what used to make a NESTED
                         // destructure unclassifiable).
-                        (PatternKind::Tuple(pats), Some(base)) => {
-                            for (i, p) in pats.iter().enumerate() {
-                                if let PatternKind::Binding(n) = &p.kind {
-                                    let mut path = base.clone();
-                                    path.push(ParamPart::TupleIndex(i));
-                                    set_alias(aliases, n, path);
-                                }
-                            }
-                        }
-                        (PatternKind::Struct { fields, .. }, Some(base)) => {
-                            for fp in fields {
-                                let mut path = base.clone();
-                                path.push(ParamPart::Field(fp.name.clone()));
-                                match &fp.pattern {
-                                    // `W { r, n }` — shorthand binds the field
-                                    // name itself.
-                                    None => set_alias(aliases, &fp.name, path),
-                                    // `W { r: inner, .. }` — renamed leaf.
-                                    Some(p) => {
-                                        if let PatternKind::Binding(n) = &p.kind {
-                                            set_alias(aliases, n, path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        (_, Some(base)) => alias_destructure(pattern, base, aliases),
                         _ => {}
                     }
                     grow_expr(value, aliases);
+                }
+                // B-2026-09-05-34 — `let PAT = SCRUT else { … }` destructures
+                // exactly as a `let` does; the else block diverges, so its
+                // aliases cannot reach a return of this frame, but it is
+                // walked for the same reason every other block is.
+                StmtKind::LetElse {
+                    pattern,
+                    value,
+                    else_block,
+                    ..
+                } => {
+                    if let Some(base) = denote(value, aliases) {
+                        alias_destructure(pattern, &base, aliases);
+                    }
+                    grow_expr(value, aliases);
+                    grow_block(else_block, aliases);
                 }
                 StmtKind::Expr(e) => grow_expr(e, aliases),
                 _ => {}
@@ -2733,10 +2769,19 @@ pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamP
                 }
             }
             ExprKind::IfLet {
+                pattern,
+                value,
                 then_block,
                 else_branch,
-                ..
             } => {
+                // B-2026-09-05-34 — the `if let` twin of the `match` arm
+                // below: the pattern destructures the scrutinee, so its leaf
+                // bindings denote the scrutinee's path extended by their
+                // position. See `alias_destructure`.
+                if let Some(base) = denote(value, aliases) {
+                    alias_destructure(pattern, &base, aliases);
+                }
+                grow_expr(value, aliases);
                 grow_block(then_block, aliases);
                 if let Some(x) = else_branch.as_deref() {
                     grow_expr(x, aliases);
@@ -2757,38 +2802,25 @@ pub fn fn_returns_param_part_paths(f: &Function, arg_index: usize) -> Vec<ParamP
                 let base = denote(scrutinee, aliases);
                 for a in arms {
                     if let Some(base) = &base {
-                        match &a.pattern.kind {
-                            PatternKind::Tuple(pats) => {
-                                for (i, p) in pats.iter().enumerate() {
-                                    if let PatternKind::Binding(n) = &p.kind {
-                                        let mut path = base.clone();
-                                        path.push(ParamPart::TupleIndex(i));
-                                        set_alias(aliases, n, path);
-                                    }
-                                }
-                            }
-                            PatternKind::Struct { fields, .. } => {
-                                for fp in fields {
-                                    let mut path = base.clone();
-                                    path.push(ParamPart::Field(fp.name.clone()));
-                                    match &fp.pattern {
-                                        None => set_alias(aliases, &fp.name, path),
-                                        Some(p) => {
-                                            if let PatternKind::Binding(n) = &p.kind {
-                                                set_alias(aliases, n, path);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                        alias_destructure(&a.pattern, base, aliases);
                     }
                     grow_expr(&a.body, aliases);
                 }
             }
+            ExprKind::WhileLet {
+                pattern,
+                value,
+                body,
+                ..
+            } => {
+                // B-2026-09-05-34 — the loop form, same destructure.
+                if let Some(base) = denote(value, aliases) {
+                    alias_destructure(pattern, &base, aliases);
+                }
+                grow_expr(value, aliases);
+                grow_block(body, aliases);
+            }
             ExprKind::While { body, .. }
-            | ExprKind::WhileLet { body, .. }
             | ExprKind::For { body, .. }
             | ExprKind::Loop { body, .. }
             | ExprKind::LabeledBlock { body, .. } => grow_block(body, aliases),

@@ -1970,6 +1970,91 @@ fn main() {
         );
     }
 
+    /// B-2026-09-05-34 — THE `if let` / `while let` / `let … else` LEGS MUST
+    /// STAGE A BARE-TUPLE ELEMENT BINDING EXACTLY AS THE `match` ARM DOES.
+    ///
+    /// `fn t(t: (R, i64)) -> i64 { if let (r, k) = t { k } else { 0 } }`
+    /// registered `__karac_drop_struct_R` on `r` — a bit-copy of `t.0` — AND ran
+    /// the tuple's own drop on `t` at the merge, so the element's `String` and
+    /// `Vec` buffers were freed twice. B-2026-09-02-23 had closed exactly this for
+    /// the `match` arm (`current_bare_tuple_bindings`, the memory half) and its
+    /// three single-pattern siblings never grew the staging.
+    ///
+    /// The row read "JIT-only" because the JIT executes RAW IR while `karac build`
+    /// runs `default<O2>` first, and the optimizer folded one of the two frees
+    /// away for every cell measured; `KARAC_OPT_LEVEL=0 karac build` aborted on
+    /// all of them. That is why this lives in the ASAN suite: the double free is
+    /// caught at any optimization level, and an `-O2` transcript pin would pass
+    /// vacuously. Measured before the fix: `free(): double free detected in
+    /// tcache 2` on the JIT and at `-O0` for a PARAM, a LOCAL and a STRUCT-FIELD
+    /// tuple scrutinee, on `if let`, `while let` and `let … else` alike; every
+    /// cell valgrind-clean after.
+    ///
+    /// THE CONTROLS ARE THE POINT, because the fix REMOVES an owner and the
+    /// failure mode of over-reaching is a leak (which LSan catches here):
+    /// - `m_read` — the `match` spelling, correct before and after.
+    /// - `letd` — the `let (r, k) = t` destructure, which goes through
+    ///   `finish_place_source_tuple_destructure` and must stay untouched.
+    /// - `p_out` — the element HANDED OUT of the then-block. The tuple drop must
+    ///   skip the source slot (`zero_bare_tuple_elem_source_for_moved`, the
+    ///   match arm's tail hook) while the caller's `d` frees the buffers once.
+    /// - `p_rebind` / `l_rebind` — the element REBOUND inside the block
+    ///   (`record_bare_tuple_elem_sources`, so the move-out neutralizes both
+    ///   the view and the source).
+    #[test]
+    fn asan_iflet_bare_tuple_element_binding_is_not_a_second_owner() {
+        assert_clean_asan_run(
+            "struct H { id: i64, xs: Vec[i64], name: String }\n\
+             fn mk(id: i64) -> H {\n\
+             \x20   let mut v: Vec[i64] = Vec.new();\n\
+             \x20   v.push(id);\n\
+             \x20   return H { id: id, xs: v, name: f\"n{id}\" }\n\
+             }\n\
+             struct W { t: (H, i64) }\n\
+             fn p_read(t: (H, i64)) -> i64 { if let (r, k) = t { k } else { 0 } }\n\
+             fn p_noread(t: (H, i64)) { if let (r, k) = t { println(\"  noread\") } else { println(\"  miss\") } }\n\
+             fn p_rebind(t: (H, i64)) -> i64 { if let (r, k) = t { let m = r; m.id } else { 0 } }\n\
+             fn p_out(t: (H, i64)) -> H { if let (r, k) = t { r } else { mk(0) } }\n\
+             fn p_field(w: W) -> i64 { if let (r, k) = w.t { r.xs.len() + k } else { 0 } }\n\
+             fn p_letelse(t: (H, i64)) -> i64 { let (r, k) = t else { return 0 }; r.id + k }\n\
+             fn p_while(t: (H, i64)) -> i64 { while let (r, k) = t { return r.id } 0 }\n\
+             fn l_read() -> i64 { let t = (mk(21), 0); if let (r, k) = t { r.id } else { 0 } }\n\
+             fn l_rebind() -> i64 { let t = (mk(22), 0); if let (r, k) = t { let m = r; m.id } else { 0 } }\n\
+             fn m_read(t: (H, i64)) -> i64 { match t { (r, k) => { r.id } } }\n\
+             fn letd(t: (H, i64)) -> i64 { let (r, k) = t; r.id }\n\
+             fn main() {\n\
+             \x20   println(f\"  a{p_read((mk(1), 0))}\");\n\
+             \x20   p_noread((mk(2), 0));\n\
+             \x20   println(f\"  c{p_rebind((mk(3), 0))}\");\n\
+             \x20   let d = p_out((mk(4), 0));\n\
+             \x20   println(f\"  d{d.name}\");\n\
+             \x20   println(f\"  e{p_field(W { t: (mk(5), 0) })}\");\n\
+             \x20   println(f\"  f{p_letelse((mk(6), 0))}\");\n\
+             \x20   println(f\"  g{p_while((mk(7), 0))}\");\n\
+             \x20   println(f\"  h{l_read()}\");\n\
+             \x20   println(f\"  i{l_rebind()}\");\n\
+             \x20   println(f\"  m{m_read((mk(8), 0))}\");\n\
+             \x20   println(f\"  l{letd((mk(9), 0))}\");\n\
+             \x20   println(\"end\")\n\
+             }\n",
+            &[
+                "a0",
+                "  noread",
+                "  c3",
+                "  dn4",
+                "  e1",
+                "  f6",
+                "  g7",
+                "  h21",
+                "  i22",
+                "  m8",
+                "  l9",
+                "end",
+            ],
+            "b34-iflet-bare-tuple-element-single-owner",
+        );
+    }
+
     /// B-2026-09-02-27 — MOVING A HEAP FIELD OUT OF A BARE-TUPLE ELEMENT
     /// BINDING MUST DISARM THAT FIELD IN THE TUPLE, NOT IN THE COPY.
     ///

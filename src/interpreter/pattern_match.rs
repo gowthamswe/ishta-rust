@@ -668,6 +668,30 @@ impl<'a> super::Interpreter<'a> {
             ExprKind::SelfValue => "self".to_string(),
             _ => return,
         };
+        // B-2026-09-02-26 (B-2026-09-05-34, `if let` / `while let` leg) — the
+        // bare-TUPLE arm the `match` form above has and this form never grew.
+        // `let t = (mk(8), 0); if let (r, k) = t { let m = r; m.id }` ran
+        // `dR8` twice here — once for `m`'s own slot, once for `t`'s element
+        // walk — while the `match` spelling of the same block ran it once, and
+        // every compiled backend ran it once through
+        // `disarm_moved_bare_tuple_elem_bodies_for_block`. Same gates as the
+        // `match` form: a LOCAL scrutinee only (an owned-param view's walk
+        // belongs to the caller), and per element, only one the block
+        // MATERIALIZES. `scope: None` (`let … else`) has no block to classify
+        // against and keeps the walk, which is what codegen does there too.
+        if let Value::Tuple(elems) = scrutinee {
+            if let Some(scope) = scope {
+                if self
+                    .tuple_scrutinee_walk_is_retractable(Some(scrutinee_place))
+                    .is_some()
+                {
+                    for i in self.bare_tuple_elems_block_move(pattern, elems, scope) {
+                        self.moved_out_tuple_elem_bodies.insert((name.clone(), i));
+                    }
+                }
+            }
+            return;
+        }
         let Value::EnumVariant { enum_name, .. } = scrutinee else {
             return;
         };
@@ -938,6 +962,35 @@ impl<'a> super::Interpreter<'a> {
         }
         (0..elems.len())
             .filter(|&i| binds_somewhere[i] && all_move[i])
+            .collect()
+    }
+
+    /// Single-pattern sibling of [`Self::bare_tuple_elems_all_arms_move`] for
+    /// the `if let` / `while let` forms: one pattern, one block, no guard.
+    /// Same per-element answer — a Drop-bearing element the block MOVES (rebinds,
+    /// hands out, passes to a sink) has its body handed to the destination, so
+    /// the tuple's walk must skip it; one the block only READS keeps it.
+    fn bare_tuple_elems_block_move(
+        &self,
+        pattern: &Pattern,
+        elems: &[Value],
+        scope: &Block,
+    ) -> Vec<usize> {
+        let PatternKind::Tuple(subs) = &pattern.kind else {
+            return Vec::new();
+        };
+        subs.iter()
+            .enumerate()
+            .filter_map(|(i, sub)| {
+                let PatternKind::Binding(bname) = &sub.kind else {
+                    return None;
+                };
+                let ev = elems.get(i)?;
+                if !self.value_runs_user_drop(ev) {
+                    return None;
+                }
+                (!crate::consume_class::binding_only_borrowed_block(bname, scope)).then_some(i)
+            })
             .collect()
     }
 
