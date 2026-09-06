@@ -15506,6 +15506,74 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-3 — A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMP NEVER
+    /// FREED ITS BOX OR THE TUPLE'S INTERIOR.
+    ///
+    /// `let _ = f();` where `f -> Option[(R, i64)]` boxes the payload (a
+    /// `(R, i64)` is 5 words, past the 3-word `Option` area). The body walker
+    /// (`track_discarded_optres_payload_bodies`, B-2026-09-05-14) ran the tuple
+    /// element's user `Drop` body — so the `dR` lines print on every surface and
+    /// a transcript-only pin sees nothing wrong — but the MEMORY battery's
+    /// `try_track_discarded_boxed_option` admitted only a struct payload and
+    /// declined a tuple one, which then fell through to `materialize_owned_temp`
+    /// (no Option arm) and freed nothing: the 40-byte box plus the tuple's
+    /// `String`/`Vec` interior leaked, once per call. The fix extends that
+    /// tracker with a tuple arm that frees the box and walks the tuple interior
+    /// through `synthesize_tuple_drop_fn_te` (memory only — its per-element walk
+    /// routes a struct leaf to `emit_struct_drop_synthesis`, not the user
+    /// wrapper, so the body does not double).
+    ///
+    /// A leak-only class the DEFAULT `-O2` optimizer folds away for the cells
+    /// measured; `KARAC_OPT_LEVEL=0` (the `asan-o0-leg.sh` leg) is what caught
+    /// it, and this fixture allocates for real there. Looped so any per-call
+    /// imbalance accumulates for LSan; ASan would flag a double-free if this
+    /// side and the body walker both freed the tuple interior.
+    ///
+    /// THE CELLS, in leak-shape then control order:
+    /// - `topagg(mk(n))` — the fn-return producer, the row's canonical shape.
+    /// - `Option.Some((mk(..), 9))` — the ctor producer of the same box.
+    /// - `fss(n)` — an `Option[(String, String)]` tuple with NO user `Drop`;
+    ///   the box + two `String` buffers still leaked pre-fix, and this cell
+    ///   isolates the interior walk from the body channel (no body to run).
+    /// - `Option.Some(mk(n + 200))` — the boxed STRUCT payload the tracker
+    ///   ALREADY freed; a control that must stay clean, proving the added tuple
+    ///   arm did not perturb the struct arm and that the source's own walk does
+    ///   not double-fire. Each body renders `s` and `xs.len()`, so a body run
+    ///   against a cap-zeroed husk would print `dR..::0` and fail the transcript
+    ///   rather than pass as a bare count.
+    #[test]
+    fn asan_discarded_boxed_option_tuple_payload_frees_box_and_interior() {
+        assert_clean_asan_run(
+            "struct R { id: i64, s: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}:{self.s}:{self.xs.len()}\") } }\n\
+             fn mk(n: i64) -> R { return R { id: n, s: f\"s{n}\", xs: [n, n] }; }\n\
+             fn topagg(r: R) -> Option[(R, i64)] { return Option.Some((r, 9)); }\n\
+             fn fss(n: i64) -> Option[(String, String)] { return Option.Some((f\"aa{n}\", f\"bb{n}\")); }\n\
+             fn main() {\n\
+             \x20   let mut n = 0;\n\
+             \x20   while n < 3 {\n\
+             \x20       let _ = topagg(mk(n));\n\
+             \x20       let _ = Option.Some((mk(n + 100), 9));\n\
+             \x20       let _ = fss(n);\n\
+             \x20       let _ = Option.Some(mk(n + 200));\n\
+             \x20       n = n + 1;\n\
+             \x20   }\n\
+             }\n",
+            &[
+                "dR0:s0:2",
+                "dR100:s100:2",
+                "dR200:s200:2",
+                "dR1:s1:2",
+                "dR101:s101:2",
+                "dR201:s201:2",
+                "dR2:s2:2",
+                "dR102:s102:2",
+                "dR202:s202:2",
+            ],
+            "asan_discarded_boxed_option_tuple_payload_frees_box_and_interior",
+        );
+    }
+
     #[test]
     fn asan_sorted_map_string_key_iter_no_leak() {
         // B-2026-07-09-17: `SortedMap[String, String]` ordered observation. The

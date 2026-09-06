@@ -7984,6 +7984,55 @@ impl<'ctx> super::Codegen<'ctx> {
         else {
             return false;
         };
+        // B-2026-09-06-3 — a boxed TUPLE payload (`Option[(R, i64)]`). The
+        // struct arm below frees the box + struct interior; a tuple payload
+        // fell through the `TypeKind::Path` gate to `materialize_owned_temp`
+        // (which has no Option/Result arm) and leaked the whole box + interior.
+        // The body walker (`track_discarded_optres_payload_bodies` ->
+        // `emit_optres_payload_user_drop_bodies_fn`'s tuple arm, B-2026-09-05-14)
+        // already runs the tuple elements' user `Drop` bodies on the
+        // `ContainerElemBodies` channel and frees nothing, so this MEMORY side
+        // owns the box and the interior. `synthesize_tuple_drop_fn_te` is
+        // memory-only — its per-element `emit_tuple_elem_drops` routes a struct
+        // leaf to `emit_struct_drop_synthesis`, not the user-drop wrapper — so no
+        // body doubles. Mirrors the `Vec[(R, i64)]` element split (bodies =
+        // `emit_tuple_elem_user_drop_bodies_fn`, memory = the tuple arm of
+        // `vec_elem_agg_drop_for_type_expr`). A wide POD tuple has no interior
+        // fn (`None`) but still needs its box freed, which `BoxedEnumDrop` does
+        // regardless — this path is only ever reached after the inline/shared
+        // trackers decline a wide payload, so nothing else claims the box.
+        if let TypeKind::Tuple(elem_tes) = &payload_te.kind {
+            let payload_ty = self.llvm_type_for_type_expr(&payload_te);
+            // Inline payloads (≤ 3 words) box nothing; the inline tracker frees
+            // them, exactly as the struct arm gates below.
+            if Self::llvm_type_word_count(payload_ty) <= 3 {
+                return false;
+            }
+            let elem_tes = elem_tes.clone();
+            let inner_drop_fn = match payload_ty {
+                inkwell::types::BasicTypeEnum::StructType(agg_ty) => {
+                    self.synthesize_tuple_drop_fn_te(agg_ty, &elem_tes)
+                }
+                _ => None,
+            };
+            let Some(cur_fn) = self
+                .builder
+                .get_insert_block()
+                .and_then(|bb| bb.get_parent())
+            else {
+                return false;
+            };
+            let slot = self.create_entry_alloca(cur_fn, "__owned_boxed_opt_tmp", val.get_type());
+            self.builder.build_store(slot, val).unwrap();
+            self.track_boxed_enum_var_with_inner_drop(
+                "__owned_boxed_opt_tmp",
+                slot,
+                "Option",
+                "Some",
+                inner_drop_fn,
+            );
+            return true;
+        }
         let TypeKind::Path(pp) = &payload_te.kind else {
             return false;
         };
