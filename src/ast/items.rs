@@ -1838,6 +1838,34 @@ pub fn fn_whole_param_aliases(
     out
 }
 
+/// A callee key as a call site spells it — a bare free-function name, or
+/// `Type.assoc` for an associated function — resolved to its AST. Instance
+/// methods are never returned: their receiver shifts the argument indices, and
+/// the method registrars own that leg.
+fn resolve_free_or_assoc_fn<'p>(program: &'p crate::Program, key: &str) -> Option<&'p Function> {
+    match key.split_once('.') {
+        None => program.items.iter().find_map(|item| match item {
+            Item::Function(g) if g.name == key => Some(g),
+            _ => None,
+        }),
+        Some((ty, m)) => program.items.iter().find_map(|item| match item {
+            Item::ImplBlock(b) => {
+                let crate::ast::TypeKind::Path(pth) = &b.target_type.kind else {
+                    return None;
+                };
+                if pth.segments.last().map(String::as_str) != Some(ty) {
+                    return None;
+                }
+                b.items.iter().find_map(|ii| match ii {
+                    ImplItem::Method(g) if g.name == m && g.self_param.is_none() => Some(&**g),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }),
+    }
+}
+
 /// B-2026-09-06-12 — [`param_rebind_aliases`] plus, when a `program` is given,
 /// the CALL spelling of the same rebind: `let x = g(.., a, ..)` where `a` is
 /// already an alias and `g` hands that parameter back on every exit. This is
@@ -1856,29 +1884,6 @@ pub fn param_whole_aliases(
     f: &Function,
     param_name: &str,
 ) -> Vec<String> {
-    fn resolve<'p>(program: &'p crate::Program, key: &str) -> Option<&'p Function> {
-        match key.split_once('.') {
-            None => program.items.iter().find_map(|item| match item {
-                Item::Function(g) if g.name == key => Some(g),
-                _ => None,
-            }),
-            Some((ty, m)) => program.items.iter().find_map(|item| match item {
-                Item::ImplBlock(b) => {
-                    let crate::ast::TypeKind::Path(pth) = &b.target_type.kind else {
-                        return None;
-                    };
-                    if pth.segments.last().map(String::as_str) != Some(ty) {
-                        return None;
-                    }
-                    b.items.iter().find_map(|ii| match ii {
-                        ImplItem::Method(g) if g.name == m && g.self_param.is_none() => Some(&**g),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            }),
-        }
-    }
     let w = rebind_walk(f);
     let mut aliases = close_rebind_aliases(&w, param_name);
     let Some(program) = program else {
@@ -1890,7 +1895,7 @@ pub fn param_whole_aliases(
             if aliases.iter().any(|a| a == x) || w.bound.get(x.as_str()) != Some(&1) {
                 continue;
             }
-            let Some(g) = resolve(program, key) else {
+            let Some(g) = resolve_free_or_assoc_fn(program, key) else {
                 continue;
             };
             if idents.iter().any(|(i, n)| {
@@ -4019,6 +4024,187 @@ fn callee_takes_param_over_inner(program: &crate::Program, gf: &Function, j: usi
         || !fn_returns_param_tuple_arm_elems(program, gf, j).is_empty()
 }
 
+/// B-2026-09-06-13 — is by-value parameter `arg_index` handed BARE, at a
+/// statement-level site both backends disarm, to a callee that returns THAT
+/// parameter on some exits and not others (`fn_conditionally_returns_param_bare`)
+/// — and moved nowhere else?
+///
+/// `fn s_cond(r: R, k: bool) { let w: R = keepc(r, k); println(..) }` over
+/// `fn keepc(r: R, k: bool) -> R { if k { return r; } return mk(99); }`:
+/// `keepc`'s frame owns `r`'s body per path (the return flip), so exactly one
+/// body is produced inside `s_cond`'s dynamic extent on every path — in `keepc`
+/// when the value dies there, in `w` when it is handed back — and the OUTER
+/// caller's fire after the call was the second one on every path (`sc 1 dR1
+/// dR1` / `dR2 sc 99 dR99 dR2`, all four surfaces). A hand-over to such a
+/// callee is a CONDITIONAL STORE in every respect that matters: the caller
+/// stands down ([`fn_moves_param_into_outliving_place_via_call`] reports it),
+/// and where the hand-over is itself nested in a branch the frame registers
+/// B-2026-08-30-28's bodies-only per-path drop, cleared at the handing
+/// statement by `arm_conditional_store_flag` /
+/// `disarm_cond_store_param_on_handover` — which is why the admitted sites are
+/// exactly the statement shapes those two recognize: a `let` / assignment RHS,
+/// a statement-position call, a `return` operand, at any block depth.
+///
+/// Deliberately NOT an always-returning callee (`keeps(r)`): there the result
+/// binding is a VIEW and the caller keeps firing (B-2026-09-06-9), the other
+/// convention, and admitting it here would stand the caller down beside a
+/// view — a lost body. Any OTHER move of the parameter (a bare `return r`, a
+/// store, a hand-over nested inside another expression) declines the whole
+/// function, the recoverable direction: today's double stays a double rather
+/// than becoming a silent loss.
+pub fn fn_conditionally_hands_param_to_flip_callee(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> bool {
+    let Some(param) = f.params.get(arg_index) else {
+        return false;
+    };
+    if matches!(
+        param.ty.kind,
+        crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+    ) {
+        return false;
+    }
+    let PatternKind::Binding(name) = &param.pattern.kind else {
+        return false;
+    };
+    struct Tally {
+        clearable: usize,
+        other: bool,
+    }
+    /// Is `e` a direct call handing `name` bare to a flip callee? The index
+    /// of that argument, if so.
+    fn flip_call(e: &Expr, name: &str, program: &crate::Program) -> Option<usize> {
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return None;
+        };
+        let key = match &callee.kind {
+            ExprKind::Identifier(g) => g.clone(),
+            ExprKind::Path { segments, .. } => segments.join("."),
+            _ => return None,
+        };
+        let gf = resolve_free_or_assoc_fn(program, &key)?;
+        args.iter().enumerate().find_map(|(j, a)| {
+            (matches!(&a.value.kind, ExprKind::Identifier(n) if n == name)
+                && fn_conditionally_returns_param_bare(Some(program), gf, j))
+            .then_some(j)
+        })
+    }
+    fn classify(e: &Expr, name: &str, program: &crate::Program, t: &mut Tally) {
+        if let Some(j) = flip_call(e, name, program) {
+            t.clearable += 1;
+            if let ExprKind::Call { args, .. } = &e.kind {
+                if args
+                    .iter()
+                    .enumerate()
+                    .any(|(k, a)| k != j && outliving_store::moves(&a.value, name))
+                {
+                    t.other = true;
+                }
+            }
+            return;
+        }
+        match &e.kind {
+            ExprKind::Block(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Try(b)
+            | ExprKind::Seq(b)
+            | ExprKind::Par(b) => walk_block(b, name, program, t),
+            ExprKind::If {
+                condition,
+                then_block,
+                else_branch,
+            } => {
+                if outliving_store::moves(condition, name) {
+                    t.other = true;
+                }
+                walk_block(then_block, name, program, t);
+                if let Some(x) = else_branch.as_deref() {
+                    classify(x, name, program, t);
+                }
+            }
+            ExprKind::IfLet {
+                value,
+                then_block,
+                else_branch,
+                ..
+            } => {
+                if outliving_store::moves(value, name) {
+                    t.other = true;
+                }
+                walk_block(then_block, name, program, t);
+                if let Some(x) = else_branch.as_deref() {
+                    classify(x, name, program, t);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                if outliving_store::moves(scrutinee, name) {
+                    t.other = true;
+                }
+                for a in arms {
+                    classify(&a.body, name, program, t);
+                }
+            }
+            ExprKind::While {
+                condition, body, ..
+            } => {
+                if outliving_store::moves(condition, name) {
+                    t.other = true;
+                }
+                walk_block(body, name, program, t);
+            }
+            ExprKind::WhileLet { value, body, .. } => {
+                if outliving_store::moves(value, name) {
+                    t.other = true;
+                }
+                walk_block(body, name, program, t);
+            }
+            ExprKind::For { iterable, body, .. } => {
+                if outliving_store::moves(iterable, name) {
+                    t.other = true;
+                }
+                walk_block(body, name, program, t);
+            }
+            ExprKind::Loop { body, .. } | ExprKind::LabeledBlock { body, .. } => {
+                walk_block(body, name, program, t)
+            }
+            ExprKind::Return(Some(inner)) => classify(inner, name, program, t),
+            _ => {
+                if outliving_store::moves(e, name) {
+                    t.other = true;
+                }
+            }
+        }
+    }
+    fn walk_block(b: &Block, name: &str, program: &crate::Program, t: &mut Tally) {
+        for st in &b.stmts {
+            match &st.kind {
+                StmtKind::Let { value, .. } | StmtKind::Assign { value, .. } => {
+                    classify(value, name, program, t)
+                }
+                StmtKind::LetElse {
+                    value, else_block, ..
+                } => {
+                    classify(value, name, program, t);
+                    walk_block(else_block, name, program, t);
+                }
+                StmtKind::Expr(e) => classify(e, name, program, t),
+                _ => {}
+            }
+        }
+        if let Some(fe) = b.final_expr.as_deref() {
+            classify(fe, name, program, t);
+        }
+    }
+    let mut t = Tally {
+        clearable: 0,
+        other: false,
+    };
+    walk_block(&f.body, name, program, &mut t);
+    t.clearable > 0 && !t.other
+}
+
 /// B-2026-09-05-36 — the program-aware sibling of
 /// [`fn_moves_param_into_outliving_place`]: is by-value parameter `arg_index`
 /// handed BARE to a free function that moves that parameter into a place
@@ -4054,6 +4240,10 @@ pub fn fn_moves_param_into_outliving_place_via_call(
         return false;
     };
     stored_via_call_block(&f.body, param_name, program)
+        // B-2026-09-06-13 — or handed to a callee that returns it on some
+        // exits: that frame owns the body per path, so the caller stands down
+        // exactly as for a store.
+        || fn_conditionally_hands_param_to_flip_callee(program, f, arg_index)
 }
 
 /// How the payload-escape walks below treat a CALL that takes the tracked

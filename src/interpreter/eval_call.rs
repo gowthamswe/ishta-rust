@@ -2608,7 +2608,10 @@ impl<'a> super::Interpreter<'a> {
             let cond_returned =
                 crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i)
                     && !crate::ast::fn_moves_param_into_outliving_place(f, i);
-            let cond_stored = crate::ast::fn_conditionally_moves_param_into_outliving_place(f, i);
+            // B-2026-09-06-13 — and the hand-over to a callee that returns it
+            // on some exits, the conditional store's twin; see the predicate.
+            let cond_stored = crate::ast::fn_conditionally_moves_param_into_outliving_place(f, i)
+                || crate::ast::fn_conditionally_hands_param_to_flip_callee(self.program, f, i);
             if !cond_returned && !cond_stored {
                 continue;
             }

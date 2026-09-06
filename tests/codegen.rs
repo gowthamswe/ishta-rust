@@ -32145,6 +32145,77 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-13 — a by-value `Drop` param handed BARE to a callee that
+    /// returns it on SOME exits (`let w: R = keepc(r, k)` over `fn keepc(r: R,
+    /// k: bool) -> R { if k { return r; } return mk(99); }`) runs its body ONCE
+    /// on each path: in `keepc` when the value dies there, in `w` when it is
+    /// handed back — never a second time from the OUTER caller. The hand-over
+    /// is a conditional store in the passthrough family's terms
+    /// (`fn_conditionally_hands_param_to_flip_callee`): the caller stands down
+    /// through the via-call channel, and the frame registers the per-path
+    /// bodies-only drop cleared at the handing statement, so the NESTED
+    /// spelling keeps the body on the path that never reaches the call. Cells:
+    /// read / unread / discarded / statement-position / returned (`return w`
+    /// and the direct `return keepc(r, k)` control) / an `Option` ctor flip /
+    /// nested in a branch on all three path combinations / a local source
+    /// control / a method frame / named arguments, each on both `k` values.
+    /// Interpreter twin:
+    /// `test_param_handed_to_conditionally_returning_callee_runs_one_body`.
+    #[test]
+    fn e2e_param_handed_to_conditionally_returning_callee_runs_one_body() {
+        assert_eq!(
+            run_program(
+                r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] }; }
+fn keepc(r: R, k: bool) -> R { if k { return r; } return mk(99); }
+fn keepo(r: R, k: bool) -> Option[R] { if k { return Option.Some(r); } return Option.None; }
+fn s_cond(r: R, k: bool) { let w: R = keepc(r, k); println(f"sc {w.id}") }
+fn s_cond_unread(r: R, k: bool) { let w: R = keepc(r, k); println("scu") }
+fn s_cond_disc(r: R, k: bool) { let _ = keepc(r, k); println("scd") }
+fn s_cond_stmt(r: R, k: bool) { keepc(r, k); println("scs") }
+fn s_cond_ret(r: R, k: bool) -> R { let w: R = keepc(r, k); return w; }
+fn s_cond_direct(r: R, k: bool) -> R { return keepc(r, k); }
+fn s_cond_opt(r: R, k: bool) { let o: Option[R] = keepo(r, k); match o { Option.Some(x) => println(f"so {x.id}"), Option.None => println("so none") } }
+fn s_cond_nested(r: R, k: bool, j: bool) { if j { let w: R = keepc(r, k); println(f"scn {w.id}"); } println("scn-out") }
+fn s_local(k: bool) { let l = mk(50); let w: R = keepc(l, k); println(f"sl {w.id}") }
+struct K { n: i64 }
+impl K {
+    fn m_cond(ref self, r: R, k: bool) { let w: R = keepc(r, k); println(f"mc {w.id}") }
+}
+fn main() {
+    let k = K { n: 0 };
+    println("one-t"); s_cond(mk(1), true);
+    println("two-f"); s_cond(mk(2), false);
+    println("three-t"); s_cond_unread(mk(3), true);
+    println("four-f"); s_cond_unread(mk(4), false);
+    println("five-t"); s_cond_disc(mk(5), true);
+    println("six-f"); s_cond_disc(mk(6), false);
+    println("seven-t"); s_cond_stmt(mk(7), true);
+    println("eight-f"); s_cond_stmt(mk(8), false);
+    println("nine-t"); let a = s_cond_ret(mk(9), true); println(f"got {a.id}");
+    println("ten-f"); let b = s_cond_ret(mk(10), false); println(f"got {b.id}");
+    println("eleven-t"); let c = s_cond_direct(mk(11), true); println(f"got {c.id}");
+    println("twelve-f"); let d = s_cond_direct(mk(12), false); println(f"got {d.id}");
+    println("thirteen-t"); s_cond_opt(mk(13), true);
+    println("fourteen-f"); s_cond_opt(mk(14), false);
+    println("fifteen-tt"); s_cond_nested(mk(15), true, true);
+    println("sixteen-ft"); s_cond_nested(mk(16), false, true);
+    println("seventeen-tf"); s_cond_nested(mk(17), true, false);
+    println("eighteen-lt"); s_local(true);
+    println("nineteen-lf"); s_local(false);
+    println("twenty-mt"); k.m_cond(mk(20), true);
+    println("twentyone-mf"); k.m_cond(mk(21), false);
+    println("twentytwo-nt"); let e = mk(22); s_cond(e, true);
+    println("twentythree-nf"); let f = mk(23); s_cond(f, false);
+    println("end");
+}"#
+            ),
+            Some("one-t\nsc 1\ndR1\ntwo-f\ndR2\nsc 99\ndR99\nthree-t\ndR3\nscu\nfour-f\ndR4\ndR99\nscu\nfive-t\ndR5\nscd\nsix-f\ndR6\ndR99\nscd\nseven-t\ndR7\nscs\neight-f\ndR8\ndR99\nscs\nnine-t\ngot 9\ndR9\nten-f\ndR10\ngot 99\ndR99\neleven-t\ngot 11\ndR11\ntwelve-f\ndR12\ngot 99\ndR99\nthirteen-t\nso 13\ndR13\nfourteen-f\ndR14\nso none\nfifteen-tt\nscn 15\ndR15\nscn-out\nsixteen-ft\ndR16\nscn 99\ndR99\nscn-out\nseventeen-tf\nscn-out\ndR17\neighteen-lt\nsl 50\ndR50\nnineteen-lf\ndR50\nsl 99\ndR99\ntwenty-mt\nmc 20\ndR20\ntwentyone-mf\ndR21\nmc 99\ndR99\ntwentytwo-nt\nsc 22\ndR22\ntwentythree-nf\ndR23\nsc 99\ndR99\nend\n".to_string()),
+            "a param handed to a conditionally-returning callee has one owner per path"
+        );
+    }
+
     /// B-2026-08-29-31 — the `let _ =` spelling of a discarded branch now owns
     /// whatever its arm hands out, on all three backends.
     ///

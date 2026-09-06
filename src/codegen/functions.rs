@@ -3015,9 +3015,18 @@ impl<'ctx> super::Codegen<'ctx> {
                 // `fn take(sink: mut ref Vec[R], r: R) { sink.push(r); }` keeps
                 // today's path — no registration, container owns it — so the
                 // only behaviour that changes is the shape that had no owner.
+                // B-2026-09-06-13 — or handed, on some path, to a callee that
+                // returns it on some exits (`if j { let w = keepc(r, k); }`):
+                // the caller stands down for it through the via-call channel,
+                // so on the path that never reaches the hand-over this frame
+                // is the only owner left. Same registration, same flag, same
+                // clearing statement.
                 if func.generic_params.is_none()
                     && !self.is_coroutine_compiled(&func.name)
-                    && crate::ast::fn_conditionally_moves_param_into_outliving_place(func, i)
+                    && (crate::ast::fn_conditionally_moves_param_into_outliving_place(func, i)
+                        || self.program_snapshot.as_deref().is_some_and(|p| {
+                            crate::ast::fn_conditionally_hands_param_to_flip_callee(p, func, i)
+                        }))
                 {
                     if let TypeKind::Path(path) = &param.ty.kind {
                         if let Some(struct_name) = path.segments.first() {
