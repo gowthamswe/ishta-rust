@@ -92,11 +92,11 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 390 |
+| miscompile | 391 |
 | run-vs-build | 360 |
 | leak | 278 |
 | missing-feature | 194 |
-| double-free | 192 |
+| double-free | 193 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
 | false-positive | 106 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1525 |
-| interp | 390 |
+| codegen | 1527 |
+| interp | 391 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -146,7 +146,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-22 | 2026-09-05 | runtime | medium | THE AUTO-PAR WORKER POOL AT N=2 IS SLOWER THAN AT N=1 AND BURNS 3.6x THE CPU -- kata:282 under HOMOGENEOUS all-E placement: N=1 4329.73ms/4272ms user, N=2 7710.74ms/15191ms user, sd 38% of mean; N=4 recovers, so the N>=2 general dispatch path has a degenerate TWO-WORKER case | docs/investigations/autopar-alloc-scaling.md |
 | B-2026-09-05-23 | 2026-09-05 | runtime | medium | kata:288's AUTO-PAR LANE GENERATES SYSTEM TIME LINEAR IN WORKER COUNT -- 1.11ms at N=1 rising to 1267.64ms at N=18 (~70ms of kernel time per added worker, 11.7 cores' worth against a 108.71ms wall), while kata:282 stays FLAT at 3.81 -> 9.41ms across the identical sweep | docs/investigations/autopar-alloc-scaling.md |
 | B-2026-09-05-32 | 2026-09-05 | codegen | low | THE IDENTITY-ARM SPELLING OF B-2026-09-01-1 STILL LEAKS -- `e = if c { pass(e) } else { e }` loses a block (12 allocs / 11 frees at -O0) because the branch is DECLINED on purpose: an arm that hands the binding back unchanged yields the OLD value, so the overwrite cleanup would free the buffer about to be stored back; the one shape that genuinely needs a per-arm or aliasing-aware cleanup, and like its parent clean at -O2 | — |
-| B-2026-09-05-37 | 2026-09-05 | codegen | low | A WHOLE REBIND OF A BY-VALUE `Drop` PARAM NESTED IN A BRANCH LEAKS THE PARAM'S ENTRY COPY ON THE NOT-TAKEN PATH -- `fn g(r: R, keep: bool) -> i64 { if keep { let m = r; return 1; } return 0; }` over `struct R { id: i64, name: String }` with `impl Drop for R`, called with `keep = false`, leaks the `String` buffer (3 B per call at `KARAC_OPT_LEVEL=0`; masked at -O2 on the simplest shapes, still 3 B at -O2 once a `println` sits between the branch and the return). Bodies are correct on every surface; the `let`'s own-`Drop` source retraction (`suppress_struct_cleanup_for_tail_identifier`, B-2026-08-09-16's site in `compile_let`) is an ALL-PATHS static removal of `r`'s memory action, reached from inside the branch | — |
 | B-2026-09-06-4 | 2026-09-06 | codegen | high | THE SELF-HOSTED RESOLVER ORACLE DOUBLE-FREES ON LINUX AND THE EMITTER ORACLE SEGFAULTS, AT THE IMPORT COMMIT AND ON CURRENT `main` ALIKE -- `tests/selfhost_resolver.rs`'s two tests abort `free(): double free detected in tcache 2` (SIGABRT, four per run) and `tests/selfhost_codegen.rs`'s `selfhost_codegen_matches_seed_run` dies SIGSEGV, identically at 51368a1 (the import that claims them green), e028255 and 822334c; the other six self-host oracles pass; CI's `codegen-e2e` job excludes both, so nothing has ever run them on glibc | — |
 | B-2026-09-06-21 | 2026-09-06 | interp+codegen | low | TWO FRESH PAYLOADS BOUND OUT OF A `match` ARM DIE IN OPPOSITE ORDERS ON THE TWO BACKENDS -- `let w = W2.Two(mk(16), mk(17)); match w { W2.Two(a, b) => { return a.id; } .. }` prints `dR16 dR17` on jit / aot / `KARAC_AUTO_PAR=0` (declaration order) and `dR17 dR16` under `--interp` (reverse); the body COUNT is right on both, only the arm-end sequence differs | — |
 | B-2026-09-06-23 | 2026-09-06 | interp+codegen | low | THE COPY A MATERIALIZING `match` ARM TAKES OFF A BORROW-PROJECTION SCRUTINEE NEVER RUNS THE ENUM SHELL'S OWN `Drop` BODY, ON EVERY BACKEND -- `match h.e { E.A(r) => { let m = r; return m.id; } .. }` through `mut ref h` prints `dR1 dE dR1` (the copy's payload body, then the original's shell and payload) where the `let e = h.e; match e { .. }` spelling of the same copy prints `dE dR1 dE dR1`; a fresh-temp or local scrutinee (`match mk(7) { .. }`, `let e = mk(8); match e { .. }`) does run its shell's `dE` after the payload moves out | — |
@@ -161,6 +160,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-49 | 2026-09-06 | codegen | low | AN INLINE-BUILT `Array` PAYLOAD LOSES ITS INTERIOR EXACTLY AS THE TUPLE DID -- 54 B in 6 blocks for `f(Some([f"a{i}", f"b{i}"]))`, while the same array through a NAMED LOCAL is clean, because the array's interior is owned by a caller-side drop that a missing move-suppressor leaves armed | — |
 | B-2026-09-06-50 | 2026-09-06 | codegen | high | A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE PARAM ABORTS ON BOTH COMPILED BACKENDS -- `free(): double free detected in tcache 2`, exit 134, at -O0 and -O2 alike, for `match x { Some(P { a, b, .. }) => ... }` over `x: Option[P]`, while the interpreter prints the right answer | — |
 | B-2026-09-06-51 | 2026-09-06 | codegen | medium | THE -O0 ASAN RATCHET HAS BEEN RED ON `main` SINCE edb7236 -- six fixtures that commit ADDED fail `scripts/asan-o0-leg.sh` unquarantined, so the gate that is supposed to fail on any new -O0 regression now reports the same six to every session and can no longer distinguish a fresh one | — |
+| B-2026-09-06-52 | 2026-09-06 | codegen | high | A TOP-LEVEL WHOLE REBIND OF A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `shared` FIELD DOUBLE-FREES ON EVERY COMPILED SURFACE -- `fn topreb(r: R) -> i64 { let m = r; return m.inner.v; }` over `struct R { id: i64, name: String, inner: Inner }` with `shared struct Inner` aborts `free(): double free detected in tcache 2` under `karac run`, `karac build` at -O2 and at -O0 alike (3 valgrind errors from 3 contexts) while `--interp` prints `dR43 tp=43 end` correctly. The `shared` field makes the struct decline copy support, so the callee FORWARDS the caller's object instead of entry-copying it -- but `compile_let`'s param-view arm registers a memory-only `StructDrop` for the destination anyway, on the strength of a deep copy that was never made. Dropping the rebind makes the same program clean | — |
+| B-2026-09-06-53 | 2026-09-06 | interp+codegen | medium | A `Drop`-BEARING LOCAL BUILT FROM THE ENCLOSING FUNCTION'S PARAMETER RUNS NO `Drop` BODY AT ALL, ON EVERY SURFACE -- `fn a(i: i64) { let x = mkUses(i); .. }` over `fn mkUses(i: i64) -> R { return R { id: i, name: f"h{i}" }; }` prints `A1` and never `dR1`, identically under `--interp`, `karac run` and `karac build` at both opt levels, so NO A/B gate sees it; valgrind is clean, so the MEMORY is freed and only the user body is lost. Four cells isolate it to the callee storing the BARE param into the returned aggregate while the call site passes a bare identifier naming the caller's own param: `mkIgnores(i)`, `mkName(i)` (f-string, not stored bare), `mkUses(9)` and `mk(i + 0)` all run the body. The CALL-SITE sibling of B-2026-09-06-26 / B-2026-09-06-41's scalar false positive -- an `i64` argument owns nothing, so making the result its view leaves the body with no owner | — |
 
 ### Relocated
 
@@ -2282,6 +2283,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-34 | codegen | high | AN `if let (r, k) = t` OVER AN OWNED BY-VALUE TUPLE PARAM DOUBLE-FREES UNDER `karac run` (JIT) ONLY -- `fn t_iflet(t: (R, i64)) -> i64 { if let (r, k… | cd96ef9 |
 | B-2026-09-05-35 | interp+codegen | medium | A MATCH ARM OVER AN OWNED BY-VALUE ENUM PARAM WHOSE PAYLOAD BINDING IS CONSUMED BY A BY-VALUE CALLEE OR NEVER USED LOSES THE PAYLOAD'S `Drop` BODY ON… | 5b19120 |
 | B-2026-09-05-36 | interp+codegen | medium | A `let`-DESTRUCTURED TUPLE ELEMENT OR A BARE BY-VALUE PARAM HANDED TO A CALLEE THAT RETURNS OR STORES IT RUNS ITS `Drop` BODY TWICE ON ALL FOUR SURFA… | 2961e43 |
+| B-2026-09-05-37 | codegen | low | A WHOLE REBIND OF A BY-VALUE `Drop` PARAM NESTED IN A BRANCH LEAKS THE PARAM'S ENTRY COPY ON THE NOT-TAKEN PATH -- `fn g(r: R, keep: bool) -> i64 { i… | a707930 |
 | B-2026-09-06-1 | interp | medium | THE INTERPRETER LOSES A DISCARDED GENERIC CALL'S MOVED-IN ARGUMENT `Drop` BODY ENTIRELY -- `let g = mk(3); passG(g);` as a BARE STATEMENT over `fn pa… | 3ef6220 |
 | B-2026-09-06-2 | codegen | medium | A NAMED-LOCAL ARGUMENT TO A GENERIC *METHOD* THAT RETURNS ITS WHOLE BY-VALUE PARAM LEAKS THE CALLEE'S ENTRY COPY -- `let _ = h.keep(g)` over `impl H… | cb46fd0 |
 | B-2026-09-06-3 | codegen | low | A DISCARDED BOXED `Option` TUPLE-PAYLOAD TEMPORARY NEVER FREES ITS BOX -- `let _ = f();` where `f -> Option[(R, i64)]` with a heap-carrying element (… | 192504e |
