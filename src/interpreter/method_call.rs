@@ -503,6 +503,16 @@ impl<'a> super::Interpreter<'a> {
                         // walk fire is the established in-parity convention.
                         if matches!(sp, crate::ast::SelfParam::Owned) {
                             if let ExprKind::Identifier(recv_name) = &object.kind {
+                                // B-2026-09-06-17 — mask the payload the method
+                                // hands out of `self.<path>` in the named
+                                // receiver's retained walk.
+                                for path in
+                                    self.receiver_escaping_field_payload_parts(&type_name, method)
+                                {
+                                    let names = Self::param_path_names(&path);
+                                    self.moved_out_struct_field_payload_bodies
+                                        .insert((recv_name.clone(), names));
+                                }
                                 if matches!(obj, Value::EnumVariant { .. }) {
                                     self.moved_out_container_bodies_bindings
                                         .insert(recv_name.clone());

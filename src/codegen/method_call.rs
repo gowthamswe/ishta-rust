@@ -7550,6 +7550,22 @@ impl<'ctx> super::Codegen<'ctx> {
                 // struct receiver's single walk fire is the established
                 // in-parity convention (probe b159_ownstruct).
                 if let ExprKind::Identifier(recv_name) = &object.kind {
+                    // B-2026-09-06-17 — an owned-`self` method that hands a
+                    // payload out of `self.<path>`: mask it in the named
+                    // receiver's retained walk, as the argument path does.
+                    if matches!(
+                        self.impl_method_self_and_borrow_return(&receiver_type, method),
+                        Some((crate::ast::SelfParam::Owned, _))
+                    ) {
+                        let recv_name = recv_name.clone();
+                        self.disarm_escaping_receiver_field_payload_bodies(
+                            &receiver_type,
+                            method,
+                            &recv_name,
+                        );
+                    }
+                }
+                if let ExprKind::Identifier(recv_name) = &object.kind {
                     if matches!(
                         self.impl_method_self_and_borrow_return(&receiver_type, method),
                         Some((crate::ast::SelfParam::Owned, _))
@@ -8037,11 +8053,14 @@ impl<'ctx> super::Codegen<'ctx> {
                     // B-2026-09-05-35 — the per-variant payload skip, as on the
                     // free path.
                     let payload_skip = self.enum_arg_payload_skip(&qualified, pidx);
+                    let field_payload_paths =
+                        self.callee_escaping_field_payload_paths(&qualified, i);
                     self.track_inline_owned_aggregate_arg_parts(
                         val,
                         &a.value,
                         escapes_frame,
                         &escaping_parts,
+                        &field_payload_paths,
                         None,
                         payload_skip,
                     );
@@ -8051,6 +8070,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     // g: Cd) -> R { return cEsc(g); }` ran `g.r`'s body at `g`'s
                     // scope end and again at the result's.
                     self.disarm_escaping_place_struct_field_bodies(&qualified, i, &a.value);
+                    self.disarm_escaping_place_struct_field_payload_bodies(&qualified, i, &a.value);
                     // Fresh-heap by-value arg materialization — the method-call
                     // sibling of the #20 arm in `compile_call` (call_dispatch.rs).
                     // A `String`/`Vec` produced by a Call/MethodCall (or a block /

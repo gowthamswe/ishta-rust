@@ -3460,6 +3460,378 @@ pub fn fn_returns_param_payload(f: &Function, arg_index: usize) -> bool {
 /// the escaping variants out of the payload-bodies walker and lets the tag
 /// switch decide at run time. The whole-param form keeps the `Any` rule for
 /// the callee-side consumers it was measured on.
+/// B-2026-09-06-17 — the PROJECTION-ROOTED sibling of
+/// [`fn_escaping_param_payload_variants`]: which enum-typed PARTS of by-value
+/// parameter `arg_index` (`h.e`, `h.s.e`, `t.0`) have a payload that `f` hands
+/// out of its frame?
+///
+/// ```text
+/// fn out(h: H1) -> R   { match h.e { E.A(r) => return r, E.B => mk(0) } }   // [["e"]]
+/// fn out2(h: H2) -> R  { match h.s.e { E.A(r) => return r, .. } }           // [["s","e"]]
+/// fn read(h: H1) -> i64 { match h.e { E.A(r) => r.id, .. } }               // []
+/// ```
+///
+/// The whole-param scanner keys its scrutinee on the bare parameter name, and
+/// the part-path scanner denotes returned PLACES, so a payload bound out of a
+/// projected enum by a `match` / `if let` / `while let` arm and handed back
+/// reached neither: the caller's retained walk over the argument ran that
+/// payload's body a second time, for a named local and a fresh temp alike, on
+/// every surface. Conservative-any-variant, like [`fn_returns_param_payload`]:
+/// a path is reported when ANY arm hands its payload out, and the consumer
+/// masks the whole field's payload bodies — a missed body on a run that takes
+/// another arm, never a double.
+pub fn fn_escaping_param_field_payload_paths(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> Vec<ParamPath> {
+    let Some(param) = f.params.get(arg_index) else {
+        return Vec::new();
+    };
+    let PatternKind::Binding(param_name) = &param.pattern.kind else {
+        return Vec::new();
+    };
+    escaping_field_payload_paths_impl(f, param_name, false, CallYieldRule::ReturnsIt(program))
+}
+
+/// [`fn_escaping_param_field_payload_paths`] for an OWNED `self` receiver
+/// (`fn out(self) -> R { match self.e { E.A(r) => return r, .. } }`), which
+/// has no index in `f.params` at the AST level. Empty for a borrowed receiver:
+/// a projection off a borrow is a copy, and the copy's binding is its own owner.
+pub fn fn_escaping_self_field_payload_paths(
+    program: &crate::Program,
+    f: &Function,
+) -> Vec<ParamPath> {
+    if !matches!(f.self_param, Some(SelfParam::Owned)) {
+        return Vec::new();
+    }
+    escaping_field_payload_paths_impl(f, "self", true, CallYieldRule::ReturnsIt(program))
+}
+
+fn escaping_field_payload_paths_impl(
+    f: &Function,
+    root: &str,
+    root_is_self: bool,
+    rule: CallYieldRule<'_>,
+) -> Vec<ParamPath> {
+    let mut roots: Vec<&str> = Vec::new();
+    if matches!(f.self_param, Some(SelfParam::Ref) | Some(SelfParam::MutRef)) {
+        roots.push("self");
+    }
+    for p in &f.params {
+        if !matches!(
+            p.ty.kind,
+            crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+        ) {
+            continue;
+        }
+        if let PatternKind::Binding(n) = &p.pattern.kind {
+            roots.push(n.as_str());
+        }
+    }
+    let program = match rule {
+        CallYieldRule::ReturnsIt(p) => Some(p),
+        CallYieldRule::Any => None,
+    };
+    let stored = |body: &Expr, names: &[String]| {
+        names.iter().any(|n| {
+            outliving_store::stores(body, n, &roots)
+                || program.is_some_and(|p| stored_via_call(body, n, p))
+        })
+    };
+    let stored_block = |body: &Block, names: &[String]| {
+        names.iter().any(|n| {
+            outliving_store::walk_block(body, n, &roots)
+                || program.is_some_and(|p| stored_via_call_block(body, n, p))
+        })
+    };
+    /// The path a scrutinee denotes off `root`: at least one `FieldAccess` /
+    /// `TupleIndex` hop down to the root identifier (or `self`).
+    fn denote(e: &Expr, root: &str, root_is_self: bool) -> Option<ParamPath> {
+        let mut path: Vec<ParamPart> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::FieldAccess { object, field } => {
+                    path.push(ParamPart::Field(field.clone()));
+                    cur = object;
+                }
+                ExprKind::TupleIndex { object, index } => {
+                    path.push(ParamPart::TupleIndex(*index as usize));
+                    cur = object;
+                }
+                ExprKind::Identifier(n) if !root_is_self && n == root && !path.is_empty() => {
+                    path.reverse();
+                    return Some(path);
+                }
+                ExprKind::SelfValue if root_is_self && !path.is_empty() => {
+                    path.reverse();
+                    return Some(path);
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn push(out: &mut Vec<ParamPath>, path: ParamPath) {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        e: &Expr,
+        root: &str,
+        root_is_self: bool,
+        fn_body: &Block,
+        rule: CallYieldRule<'_>,
+        stored: &dyn Fn(&Expr, &[String]) -> bool,
+        stored_block: &dyn Fn(&Block, &[String]) -> bool,
+        out: &mut Vec<ParamPath>,
+    ) {
+        match &e.kind {
+            ExprKind::Match { scrutinee, arms } => {
+                if let Some(path) = denote(scrutinee, root, root_is_self) {
+                    for a in arms {
+                        if matches!(a.pattern.kind, PatternKind::Tuple(_)) {
+                            continue;
+                        }
+                        let names: Vec<String> = a.pattern.binding_names();
+                        if !names.is_empty()
+                            && (names.iter().any(|n| payload_yields(&a.body, n, rule))
+                                || payload_returns_any(&a.body, &names, rule)
+                                || payload_escapes_by_assignment(&a.body, &names, fn_body, rule)
+                                || stored(&a.body, &names))
+                        {
+                            push(out, path.clone());
+                        }
+                    }
+                }
+                for a in arms {
+                    walk(
+                        &a.body,
+                        root,
+                        root_is_self,
+                        fn_body,
+                        rule,
+                        stored,
+                        stored_block,
+                        out,
+                    );
+                }
+            }
+            ExprKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_branch,
+            } => {
+                if let Some(path) = denote(value, root, root_is_self) {
+                    if !matches!(pattern.kind, PatternKind::Tuple(_)) {
+                        let names: Vec<String> = pattern.binding_names();
+                        if !names.is_empty()
+                            && (payload_returns_any_block(then_block, &names, rule)
+                                || payload_escapes_by_assignment_block(
+                                    then_block, &names, fn_body, rule,
+                                )
+                                || stored_block(then_block, &names))
+                        {
+                            push(out, path);
+                        }
+                    }
+                }
+                walk_block_for(
+                    then_block,
+                    root,
+                    root_is_self,
+                    fn_body,
+                    rule,
+                    stored,
+                    stored_block,
+                    out,
+                );
+                if let Some(x) = else_branch.as_deref() {
+                    walk(
+                        x,
+                        root,
+                        root_is_self,
+                        fn_body,
+                        rule,
+                        stored,
+                        stored_block,
+                        out,
+                    );
+                }
+            }
+            ExprKind::WhileLet {
+                pattern,
+                value,
+                body,
+                ..
+            } => {
+                if let Some(path) = denote(value, root, root_is_self) {
+                    if !matches!(pattern.kind, PatternKind::Tuple(_)) {
+                        let names: Vec<String> = pattern.binding_names();
+                        if !names.is_empty()
+                            && (payload_returns_any_block(body, &names, rule)
+                                || payload_escapes_by_assignment_block(body, &names, fn_body, rule)
+                                || stored_block(body, &names))
+                        {
+                            push(out, path);
+                        }
+                    }
+                }
+                walk_block_for(
+                    body,
+                    root,
+                    root_is_self,
+                    fn_body,
+                    rule,
+                    stored,
+                    stored_block,
+                    out,
+                );
+            }
+            ExprKind::Block(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Try(b)
+            | ExprKind::Seq(b)
+            | ExprKind::Par(b) => walk_block_for(
+                b,
+                root,
+                root_is_self,
+                fn_body,
+                rule,
+                stored,
+                stored_block,
+                out,
+            ),
+            ExprKind::Return(Some(inner)) => walk(
+                inner,
+                root,
+                root_is_self,
+                fn_body,
+                rule,
+                stored,
+                stored_block,
+                out,
+            ),
+            ExprKind::If {
+                condition,
+                then_block,
+                else_branch,
+            } => {
+                walk(
+                    condition,
+                    root,
+                    root_is_self,
+                    fn_body,
+                    rule,
+                    stored,
+                    stored_block,
+                    out,
+                );
+                walk_block_for(
+                    then_block,
+                    root,
+                    root_is_self,
+                    fn_body,
+                    rule,
+                    stored,
+                    stored_block,
+                    out,
+                );
+                if let Some(x) = else_branch.as_deref() {
+                    walk(
+                        x,
+                        root,
+                        root_is_self,
+                        fn_body,
+                        rule,
+                        stored,
+                        stored_block,
+                        out,
+                    );
+                }
+            }
+            ExprKind::While { body, .. }
+            | ExprKind::For { body, .. }
+            | ExprKind::Loop { body, .. }
+            | ExprKind::LabeledBlock { body, .. } => walk_block_for(
+                body,
+                root,
+                root_is_self,
+                fn_body,
+                rule,
+                stored,
+                stored_block,
+                out,
+            ),
+            _ => {}
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn walk_block_for(
+        b: &Block,
+        root: &str,
+        root_is_self: bool,
+        fn_body: &Block,
+        rule: CallYieldRule<'_>,
+        stored: &dyn Fn(&Expr, &[String]) -> bool,
+        stored_block: &dyn Fn(&Block, &[String]) -> bool,
+        out: &mut Vec<ParamPath>,
+    ) {
+        for st in &b.stmts {
+            match &st.kind {
+                StmtKind::Expr(e) => walk(
+                    e,
+                    root,
+                    root_is_self,
+                    fn_body,
+                    rule,
+                    stored,
+                    stored_block,
+                    out,
+                ),
+                StmtKind::Let { value, .. } | StmtKind::LetElse { value, .. } => walk(
+                    value,
+                    root,
+                    root_is_self,
+                    fn_body,
+                    rule,
+                    stored,
+                    stored_block,
+                    out,
+                ),
+                _ => {}
+            }
+        }
+        if let Some(fe) = b.final_expr.as_deref() {
+            walk(
+                fe,
+                root,
+                root_is_self,
+                fn_body,
+                rule,
+                stored,
+                stored_block,
+                out,
+            );
+        }
+    }
+    let mut out = Vec::new();
+    walk_block_for(
+        &f.body,
+        root,
+        root_is_self,
+        &f.body,
+        rule,
+        &stored,
+        &stored_block,
+        &mut out,
+    );
+    out
+}
+
 pub fn fn_escaping_param_payload_variants(
     program: &crate::Program,
     f: &Function,

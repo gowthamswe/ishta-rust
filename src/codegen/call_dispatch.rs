@@ -2195,11 +2195,13 @@ impl<'ctx> super::Codegen<'ctx> {
                 // r }` callee hands back (see the fresh-temp enum arm in the
                 // registrar).
                 let payload_skip = self.enum_arg_payload_skip(&name, i);
+                let field_payload_paths = self.callee_escaping_field_payload_paths(&name, i);
                 self.track_inline_owned_aggregate_arg_parts(
                     val,
                     &a.value,
                     escapes_frame,
                     &escaping_parts,
+                    &field_payload_paths,
                     declared_tes.as_deref(),
                     payload_skip,
                 );
@@ -2250,6 +2252,7 @@ impl<'ctx> super::Codegen<'ctx> {
             // twin: `struct_moved_field_bodies` is keyed by field INDEX, so a
             // deeper path has no key here (B-2026-08-28-23).
             self.disarm_escaping_place_struct_field_bodies(&name, i, &a.value);
+            self.disarm_escaping_place_struct_field_payload_bodies(&name, i, &a.value);
             // B-2026-07-10-4 residual — an inline-heap `Option[String]`/
             // `Option[Vec]` binding MOVED by value into a user function that
             // OWNS + frees it (`consume(sv)` where `sv: Option[String]` is a
@@ -4750,6 +4753,7 @@ impl<'ctx> super::Codegen<'ctx> {
             None,
             false,
             &[],
+            &[],
             None,
             None,
         )
@@ -4761,12 +4765,14 @@ impl<'ctx> super::Codegen<'ctx> {
     /// returns must not have its body registered caller-side. Every other site
     /// keeps the plain wrapper and its empty set. Interp twin: the tuple arm of
     /// `run_fresh_temp_arg_drops`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn track_inline_owned_aggregate_arg_parts(
         &mut self,
         val: BasicValueEnum<'ctx>,
         arg: &Expr,
         arg_escapes_frame: bool,
         escaping_paths: &[crate::ast::ParamPath],
+        field_payload_paths: &[crate::ast::ParamPath],
         declared_elem_tes: Option<&[TypeExpr]>,
         payload_skip: Option<std::collections::BTreeSet<(String, usize)>>,
     ) {
@@ -4777,6 +4783,7 @@ impl<'ctx> super::Codegen<'ctx> {
             None,
             false,
             escaping_paths,
+            field_payload_paths,
             declared_elem_tes,
             payload_skip,
         )
@@ -4952,6 +4959,164 @@ impl<'ctx> super::Codegen<'ctx> {
                 continue;
             };
             self.disarm_tuple_elem_bodies_at_path(&src, prefix, *last, tuple_ty);
+        }
+    }
+
+    /// B-2026-09-06-17 — the PAYLOAD sibling of
+    /// [`Self::disarm_escaping_place_struct_field_bodies`]: the callee hands
+    /// out the payload of an enum-typed PART of a by-value struct argument
+    /// (`fn out(h: H1) -> R { match h.e { E.A(r) => return r, .. } }`), so
+    /// the caller's walk over the named argument must stop running that
+    /// payload's body. Same shape as the `match s.e { .. }` mask a local gets
+    /// at its own scrutinee (B-2026-09-02-43): the whole field's payload
+    /// bodies, masked in place.
+    /// B-2026-09-06-17 — [`crate::ast::fn_escaping_param_field_payload_paths`]
+    /// for the named callee's slot `arg_index`; empty for an unknown name.
+    pub(super) fn callee_escaping_field_payload_paths(
+        &self,
+        callee_name: &str,
+        arg_index: usize,
+    ) -> Vec<crate::ast::ParamPath> {
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return Vec::new();
+        };
+        let Some(f) = super::declarations::find_function_ast(program, callee_name) else {
+            return Vec::new();
+        };
+        crate::ast::fn_escaping_param_field_payload_paths(program, f, arg_index)
+    }
+
+    /// B-2026-09-06-17 — merge PAYLOAD-only masks into a fresh temp's field
+    /// skip tree: each path is resolved to index hops and lands as
+    /// `payload_here` on the walker of the struct that owns the enum, so the
+    /// enum's own `Drop` body still runs while the payload the callee handed
+    /// out does not.
+    pub(super) fn insert_payload_skip_paths(
+        &self,
+        tree: &mut super::synth_drop::FieldSkipTree,
+        struct_name: &str,
+        paths: &[crate::ast::ParamPath],
+    ) {
+        for path in paths {
+            if !matches!(path.first(), Some(crate::ast::ParamPart::Field(_))) {
+                continue;
+            }
+            let Some((hops, leaf_te)) = self.param_path_index_hops(struct_name, path) else {
+                continue;
+            };
+            let TypeKind::Path(p) = &leaf_te.kind else {
+                continue;
+            };
+            let Some(en) = p.segments.first() else {
+                continue;
+            };
+            let payload_enum = en == "Option"
+                || en == "Result"
+                || self
+                    .type_decls
+                    .enum_layouts
+                    .get(en.as_str())
+                    .is_some_and(|l| !l.is_shared);
+            if !payload_enum {
+                continue;
+            }
+            let Some((last, prefix)) = hops.split_last() else {
+                continue;
+            };
+            let mut cur = &mut *tree;
+            let mut blocked = false;
+            for idx in prefix {
+                if cur.here.contains(idx) {
+                    blocked = true;
+                    break;
+                }
+                cur = cur.nested.entry(*idx).or_default();
+            }
+            if blocked || cur.here.contains(last) {
+                continue;
+            }
+            cur.payload_here.insert(*last);
+        }
+    }
+
+    pub(super) fn disarm_escaping_place_struct_field_payload_bodies(
+        &mut self,
+        callee_name: &str,
+        arg_index: usize,
+        arg: &Expr,
+    ) {
+        let ExprKind::Identifier(src) = &arg.kind else {
+            return;
+        };
+        let src = src.clone();
+        if self.borrow_vars.owned_struct_params.contains(src.as_str()) {
+            return;
+        }
+        let Some(program) = self.program_snapshot.clone() else {
+            return;
+        };
+        let Some(f) = super::declarations::find_function_ast(&program, callee_name) else {
+            return;
+        };
+        let paths = crate::ast::fn_escaping_param_field_payload_paths(&program, f, arg_index);
+        self.disarm_place_field_payload_paths(&src, &paths);
+    }
+
+    /// The receiver form of
+    /// [`Self::disarm_escaping_place_struct_field_payload_bodies`]: an OWNED
+    /// `self` method whose arm hands a payload out of `self.<path>`
+    /// (B-2026-09-06-17), consulted for a NAMED-LOCAL receiver whose walk the
+    /// caller retains.
+    pub(super) fn disarm_escaping_receiver_field_payload_bodies(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        recv: &str,
+    ) {
+        if self.borrow_vars.owned_struct_params.contains(recv) {
+            return;
+        }
+        let Some(program) = self.program_snapshot.clone() else {
+            return;
+        };
+        let Some(f) = self.find_impl_method_ast(type_name, method) else {
+            return;
+        };
+        let paths = crate::ast::fn_escaping_self_field_payload_paths(&program, f);
+        self.disarm_place_field_payload_paths(recv, &paths);
+    }
+
+    fn disarm_place_field_payload_paths(&mut self, src: &str, paths: &[crate::ast::ParamPath]) {
+        if paths.is_empty() {
+            return;
+        }
+        let Some(struct_name) = self.var_types.var_type_names.get(src).cloned() else {
+            return;
+        };
+        for path in paths {
+            if !matches!(path.first(), Some(crate::ast::ParamPart::Field(_))) {
+                continue;
+            }
+            let Some((hops, leaf_te)) = self.param_path_index_hops(&struct_name, path) else {
+                continue;
+            };
+            let TypeKind::Path(p) = &leaf_te.kind else {
+                continue;
+            };
+            let Some(en) = p.segments.first() else {
+                continue;
+            };
+            let payload_enum = en == "Option"
+                || en == "Result"
+                || self
+                    .type_decls
+                    .enum_layouts
+                    .get(en.as_str())
+                    .is_some_and(|l| !l.is_shared);
+            if !payload_enum {
+                continue;
+            }
+            self.disarm_struct_field_enum_payload_bodies_at(src, &hops);
         }
     }
 
@@ -5340,6 +5505,11 @@ impl<'ctx> super::Codegen<'ctx> {
         mono_inst: Option<TypeExpr>,
         callee_entry_copies_mono: bool,
         escaping_paths: &[crate::ast::ParamPath],
+        // B-2026-09-06-17 — enum-typed PARTS whose payload the callee hands
+        // out (`match h.e { E.A(r) => return r, .. }`): masked payload-only in
+        // the temp's field walk, so `E.drop` still runs and `r`'s consumer is
+        // the payload body's only owner.
+        field_payload_paths: &[crate::ast::ParamPath],
         declared_elem_tes: Option<&[TypeExpr]>,
         // B-2026-09-02-24 — the enum sibling of `escaping_paths`: the named
         // callee returns THIS fresh-temp enum arg's PAYLOAD (a `match e { E.A(r)
@@ -5392,6 +5562,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 mono_inst,
                 callee_entry_copies_mono,
                 escaping_paths,
+                field_payload_paths,
                 declared_elem_tes,
                 payload_skip.clone(),
             );
@@ -5979,7 +6150,8 @@ impl<'ctx> super::Codegen<'ctx> {
                         // field's MEMORY is still this buffer's to release, so a
                         // mask reaching the frees would trade the double body for
                         // a leak.
-                        let skip = self.escaping_field_skip_tree(&name, escaping_paths);
+                        let mut skip = self.escaping_field_skip_tree(&name, escaping_paths);
+                        self.insert_payload_skip_paths(&mut skip, &name, field_payload_paths);
                         // B-2026-09-05-4 — the temp's INSTANTIATION, taken from
                         // the same `mono_inst` the SHAPE-2 arm below already
                         // uses for its own bodies half (B-2026-09-04-24). Keyed
@@ -6056,7 +6228,8 @@ impl<'ctx> super::Codegen<'ctx> {
                     // measured on `struct W { a: R, b: R }` returning `a`, which
                     // needs `b`'s body and not `a`'s. Interp twin:
                     // `run_fresh_temp_arg_drops`' masked-value call.
-                    let skip = self.escaping_field_skip_tree(&name, escaping_paths);
+                    let mut skip = self.escaping_field_skip_tree(&name, escaping_paths);
+                    self.insert_payload_skip_paths(&mut skip, &name, field_payload_paths);
                     // B-2026-09-04-24 — resolve the walk through the temp's
                     // INSTANTIATION when the call path handed one down.
                     //

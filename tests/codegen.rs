@@ -33100,6 +33100,127 @@ fn main() {
         }
     }
 
+    /// B-2026-09-06-17 — a payload bound out of a PROJECTED enum and handed back
+    /// (`fn out(self) -> R { match self.e { E.A(r) => return r, .. } }`, and the
+    /// free-function twin `fn p_out(h: H1) -> R { match h.e { .. } }`) ran its `Drop`
+    /// body in the caller's walk over the argument as well as at the result's own
+    /// death, on a named local and a fresh temp alike, agreed on every surface. The
+    /// whole-param scanner keys on the bare parameter (`e_out`, one body throughout)
+    /// and the part-path scanner denotes returned PLACES; neither covered a projected
+    /// enum's payload. `fn_escaping_param_field_payload_paths` (and its owned-`self`
+    /// form) now reports the field path, and the callers mask that field's payload
+    /// bodies — in place on a named binding, payload-only in a fresh temp's walker.
+    ///
+    /// `read` / `p_read` are the read-only arms (unchanged, one body); `out_some/not`
+    /// is the conservative-any-variant trade, where the un-taken hand-out path still
+    /// runs the payload's body once at the caller (`dR6` before `got1`); `out/temp`
+    /// is the fresh-temp RECEIVER, whose payload is one body but whose enum shell's
+    /// `dE` is B-2026-09-04-30's pre-existing loss, pinned as it stands.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_projected_enum_payload_handed_out_runs_one_body`, pinned to the same string.
+    #[test]
+    fn e2e_projected_enum_payload_handed_out_runs_one_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct S { e: E }
+struct H1 { e: E }
+struct H2 { s: S }
+
+impl H1 {
+    fn out(self) -> R { match self.e { E.A(r) => { return r; } E.B => { return mk(0); } } }
+    fn out_iflet(self) -> R { if let E.A(r) = self.e { return r; } else { return mk(0); } }
+    fn out_tail(self) -> R { match self.e { E.A(r) => r, E.B => mk(0) } }
+    fn out_some(self, k: bool) -> R { match self.e { E.A(r) => { if k { return r; } return mk(1); } E.B => { return mk(0); } } }
+    fn read(self) -> i64 { match self.e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+}
+impl H2 { fn out2(self) -> R { match self.s.e { E.A(r) => { return r; } E.B => { return mk(0); } } } }
+fn p_out(h: H1) -> R { match h.e { E.A(r) => { return r; } E.B => { return mk(0); } } }
+fn p_out2(h: H2) -> R { match h.s.e { E.A(r) => { return r; } E.B => { return mk(0); } } }
+fn p_read(h: H1) -> i64 { match h.e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+fn e_out(b: E) -> R { match b { E.A(r) => { return r; } E.B => { return mk(0); } } }
+
+fn main() {
+    println("out/local"); let a1 = H1 { e: E.A(mk(1)) }; let r1 = a1.out(); println(f"  got{r1.id}");
+    println("out/temp"); let r2 = H1 { e: E.A(mk(2)) }.out(); println(f"  got{r2.id}");
+    println("out_iflet/local"); let a3 = H1 { e: E.A(mk(3)) }; let r3 = a3.out_iflet(); println(f"  got{r3.id}");
+    println("out_tail/local"); let a4 = H1 { e: E.A(mk(4)) }; let r4 = a4.out_tail(); println(f"  got{r4.id}");
+    println("out_some/taken"); let a5 = H1 { e: E.A(mk(5)) }; let r5 = a5.out_some(true); println(f"  got{r5.id}");
+    println("out_some/not"); let a6 = H1 { e: E.A(mk(6)) }; let r6 = a6.out_some(false); println(f"  got{r6.id}");
+    println("read/local"); let a7 = H1 { e: E.A(mk(7)) }; let x7 = a7.read(); println(f"  r{x7}");
+    println("out2/local"); let a8 = H2 { s: S { e: E.A(mk(8)) } }; let r8 = a8.out2(); println(f"  got{r8.id}");
+    println("p_out/local"); let a9 = H1 { e: E.A(mk(9)) }; let r9 = p_out(a9); println(f"  got{r9.id}");
+    println("p_out/temp"); let r10 = p_out(H1 { e: E.A(mk(10)) }); println(f"  got{r10.id}");
+    println("p_out2/local"); let a11 = H2 { s: S { e: E.A(mk(11)) } }; let r11 = p_out2(a11); println(f"  got{r11.id}");
+    println("p_read/local"); let a12 = H1 { e: E.A(mk(12)) }; let x12 = p_read(a12); println(f"  r{x12}");
+    println("e_out/local"); let a13 = E.A(mk(13)); let r13 = e_out(a13); println(f"  got{r13.id}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"out/local
+  dE
+  got1
+  dR1
+out/temp
+  got2
+  dR2
+out_iflet/local
+  dE
+  got3
+  dR3
+out_tail/local
+  dE
+  got4
+  dR4
+out_some/taken
+  dE
+  got5
+  dR5
+out_some/not
+  dE
+  got1
+  dR1
+read/local
+  dE
+  dR7
+  r7
+out2/local
+  dE
+  got8
+  dR8
+p_out/local
+  dE
+  got9
+  dR9
+p_out/temp
+  dE
+  got10
+  dR10
+p_out2/local
+  dE
+  got11
+  dR11
+p_read/local
+  dE
+  dR12
+  r12
+e_out/local
+  dE
+  got13
+  dR13
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value

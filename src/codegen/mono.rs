@@ -2552,6 +2552,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 || self.arg_is_entry_copied_heap_tuple(&a.value, name, i)
             {
                 let escaping_parts = self.callee_returned_param_parts(name, i);
+                let field_payload_paths = self.callee_escaping_field_payload_paths(name, i);
                 // B-2026-09-04-26 — the monomorph path reads the same declared
                 // param types as the free-fn loop. The caller's inferred view
                 // stays authoritative wherever it resolves, which matters most
@@ -2565,6 +2566,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     mono_agg[i].1.clone(),
                     mono_agg[i].0,
                     &escaping_parts,
+                    &field_payload_paths,
                     declared_tes.as_deref(),
                     // The enum-payload escape skip (B-2026-09-02-24) is threaded
                     // only on the free-fn path; the monomorph path keeps its prior
@@ -2683,6 +2685,7 @@ impl<'ctx> super::Codegen<'ctx> {
             // reason stated at its head: this edits CALLER-scope cleanup frames
             // and so must run with the caller's substitution restored.
             self.disarm_escaping_place_struct_field_bodies(name, i, &a.value);
+            self.disarm_escaping_place_struct_field_payload_bodies(name, i, &a.value);
             // B-2026-09-05-18 — the TUPLE sibling of the line above, and the
             // half that row opened on. `kEsc[T](p: (T, i64)) -> T` handed
             // element 0 back to a place argument and the caller's element walk

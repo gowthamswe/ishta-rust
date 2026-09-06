@@ -3168,6 +3168,48 @@ impl<'a> super::Interpreter<'a> {
     /// name, a method, or any shape that analysis declines to classify (it
     /// under-approximates on purpose — see its doc). Codegen twin:
     /// `callee_returned_param_parts` in `call_dispatch.rs`.
+    /// B-2026-09-06-17 — [`crate::ast::fn_escaping_param_field_payload_paths`]
+    /// for the callee `arg_index` reaches, resolved like
+    /// [`Self::callee_returned_param_parts`].
+    fn callee_escaping_field_payload_parts(
+        &self,
+        callee_name: &str,
+        method_owner: Option<&str>,
+        arg_index: usize,
+    ) -> Vec<crate::ast::ParamPath> {
+        if let Some(ty) = method_owner {
+            return self
+                .impl_method_ast(ty, callee_name)
+                .map(|f| {
+                    crate::ast::fn_escaping_param_field_payload_paths(self.program, f, arg_index)
+                })
+                .unwrap_or_default();
+        }
+        self.program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::ast::Item::Function(f) if f.name == callee_name => Some(
+                    crate::ast::fn_escaping_param_field_payload_paths(self.program, f, arg_index),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The receiver form of [`Self::callee_escaping_field_payload_parts`]
+    /// (B-2026-09-06-17): an owned-`self` method handing a payload out of
+    /// `self.<path>`.
+    pub(crate) fn receiver_escaping_field_payload_parts(
+        &self,
+        type_name: &str,
+        method: &str,
+    ) -> Vec<crate::ast::ParamPath> {
+        self.impl_method_ast(type_name, method)
+            .map(|f| crate::ast::fn_escaping_self_field_payload_paths(self.program, f))
+            .unwrap_or_default()
+    }
+
     fn callee_returned_param_parts(
         &self,
         callee_name: &str,
@@ -3269,7 +3311,7 @@ impl<'a> super::Interpreter<'a> {
 
     /// B-2026-09-06-10 / -11 — a part path as the NAME path the value-side
     /// masks speak: a field by name, a tuple hop as `#<i>`.
-    fn param_path_names(path: &[crate::ast::ParamPart]) -> Vec<String> {
+    pub(super) fn param_path_names(path: &[crate::ast::ParamPart]) -> Vec<String> {
         path.iter()
             .map(|p| match p {
                 crate::ast::ParamPart::Field(n) => n.clone(),
@@ -3328,6 +3370,104 @@ impl<'a> super::Interpreter<'a> {
     /// is the whole difference between masking `w.inner.r` and masking
     /// `w.inner`, and the codegen twin's `FieldSkipTree` has the same two arms
     /// for the same reason.
+    /// B-2026-09-06-17 — the PAYLOAD-only sibling of [`Self::mask_struct_fields`]:
+    /// at each path's leaf, an enum value keeps its variant (so `E.drop`'s own
+    /// body still runs) and has its payload blanked to `Unit` (so the payload
+    /// the callee handed out runs no body here). Intermediate hops walk
+    /// struct fields and `#i` tuple elements like the whole-field masker.
+    fn mask_struct_field_payloads(
+        value: &super::value::Value,
+        paths: &[Vec<String>],
+    ) -> super::value::Value {
+        if paths.is_empty() {
+            return value.clone();
+        }
+        fn blank_payload(v: &super::value::Value) -> super::value::Value {
+            match v {
+                super::value::Value::EnumVariant {
+                    enum_name,
+                    variant,
+                    data,
+                } => {
+                    let data = match data {
+                        super::value::EnumData::Unit => super::value::EnumData::Unit,
+                        super::value::EnumData::Tuple(items) => super::value::EnumData::Tuple(
+                            items.iter().map(|_| super::value::Value::Unit).collect(),
+                        ),
+                        super::value::EnumData::Struct(fields) => super::value::EnumData::Struct(
+                            fields
+                                .keys()
+                                .map(|k| (k.clone(), super::value::Value::Unit))
+                                .collect(),
+                        ),
+                    };
+                    super::value::Value::EnumVariant {
+                        enum_name: enum_name.clone(),
+                        variant: variant.clone(),
+                        data,
+                    }
+                }
+                other => other.clone(),
+            }
+        }
+        if let super::value::Value::Tuple(items) = value {
+            let mut items = items.clone();
+            for path in paths {
+                let Some((head, rest)) = path.split_first() else {
+                    continue;
+                };
+                let Some(idx) = head.strip_prefix('#').and_then(|d| d.parse::<usize>().ok()) else {
+                    continue;
+                };
+                if idx >= items.len() {
+                    continue;
+                }
+                items[idx] = if rest.is_empty() {
+                    blank_payload(&items[idx])
+                } else {
+                    Self::mask_struct_field_payloads(&items[idx], &[rest.to_vec()])
+                };
+            }
+            return super::value::Value::Tuple(items);
+        }
+        let super::value::Value::Struct { name, fields } = value else {
+            return value.clone();
+        };
+        let mut fields = fields.clone();
+        for path in paths {
+            let Some((head, rest)) = path.split_first() else {
+                continue;
+            };
+            let Some(inner) = fields.get(head).cloned() else {
+                continue;
+            };
+            let masked = if rest.is_empty() {
+                blank_payload(&inner)
+            } else {
+                Self::mask_struct_field_payloads(&inner, &[rest.to_vec()])
+            };
+            fields.insert(head.clone(), masked);
+        }
+        super::value::Value::Struct {
+            name: name.clone(),
+            fields,
+        }
+    }
+
+    /// B-2026-09-06-17 — [`Self::escaping_field_paths`]' payload sibling, as
+    /// name paths for [`Self::mask_struct_field_payloads`].
+    fn escaping_field_payload_paths(
+        &self,
+        callee_name: &str,
+        method_owner: Option<&str>,
+        i: usize,
+    ) -> Vec<Vec<String>> {
+        self.callee_escaping_field_payload_parts(callee_name, method_owner, i)
+            .iter()
+            .map(|path| Self::param_path_names(path))
+            .collect()
+    }
+
     fn mask_struct_fields(
         value: &super::value::Value,
         escaping: &[Vec<String>],
@@ -3628,6 +3768,18 @@ impl<'a> super::Interpreter<'a> {
                 // `moved_out_nested_field_bodies` is where that case would go;
                 // no measurement asks for it yet (B-2026-08-28-23's rule).
                 if let Some(Value::Struct { .. }) = arg_vals.get(i) {
+                    // B-2026-09-06-17 — the callee hands out the PAYLOAD of an
+                    // enum-typed part (`match h.e { E.A(r) => return r, .. }`):
+                    // mask that field's payload bodies in the caller's walk
+                    // over the named argument, the mask `match s.e` over a
+                    // local records for itself.
+                    for path in
+                        self.callee_escaping_field_payload_parts(callee_name, method_owner, i)
+                    {
+                        let names = Self::param_path_names(&path);
+                        self.moved_out_struct_field_payload_bodies
+                            .insert((src.clone(), names));
+                    }
                     for path in self.callee_returned_param_parts(callee_name, method_owner, i) {
                         if let [crate::ast::ParamPart::Field(f)] = path.as_slice() {
                             self.moved_out_struct_field_bodies
@@ -3776,7 +3928,11 @@ impl<'a> super::Interpreter<'a> {
                 // rather than masking its input.
                 let escaping = self.escaping_field_paths(callee_name, method_owner, i);
                 self.run_user_drop_body_only(&tn, v.clone());
-                self.drop_user_drop_fields_of_value(&Self::mask_struct_fields(v, &escaping));
+                let payloads = self.escaping_field_payload_paths(callee_name, method_owner, i);
+                let masked = Self::mask_struct_fields(v, &escaping);
+                self.drop_user_drop_fields_of_value(&Self::mask_struct_field_payloads(
+                    &masked, &payloads,
+                ));
             }
             if is_user_enum_value {
                 let v = v.clone();
@@ -3812,7 +3968,11 @@ impl<'a> super::Interpreter<'a> {
                 // `track_inline_owned_aggregate_arg_inst` re-emits the walker
                 // with the same field indices masked.
                 let escaping = self.escaping_field_paths(callee_name, method_owner, i);
-                self.drop_user_drop_fields_of_value(&Self::mask_struct_fields(v, &escaping));
+                let payloads = self.escaping_field_payload_paths(callee_name, method_owner, i);
+                let masked = Self::mask_struct_fields(v, &escaping);
+                self.drop_user_drop_fields_of_value(&Self::mask_struct_field_payloads(
+                    &masked, &payloads,
+                ));
             }
         }
     }

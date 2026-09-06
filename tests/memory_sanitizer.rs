@@ -1991,6 +1991,112 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-17 — the MEMORY half of
+    /// `tests/codegen.rs`'s `e2e_projected_enum_payload_handed_out_runs_one_body`:
+    /// the same program under ASAN + LSan. The payload handed out of a
+    /// projected enum now has one body owner; this pins that masking it in the
+    /// caller's walk — in place on a named binding, payload-only in a fresh
+    /// temp's walker — left exactly one owner of its `String` / `Vec` buffers
+    /// and freed nothing twice, on every spelling and both receiver kinds.
+    #[test]
+    fn asan_projected_enum_payload_handed_out_is_single_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] } }\n\
+             enum E { A(R), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"  dE\") } }\n\
+             struct S { e: E }\n\
+             struct H1 { e: E }\n\
+             struct H2 { s: S }\n\
+             \n\
+             impl H1 {\n\
+             \x20   fn out(self) -> R { match self.e { E.A(r) => { return r; } E.B => { return mk(0); } } }\n\
+             \x20   fn out_iflet(self) -> R { if let E.A(r) = self.e { return r; } else { return mk(0); } }\n\
+             \x20   fn out_tail(self) -> R { match self.e { E.A(r) => r, E.B => mk(0) } }\n\
+             \x20   fn out_some(self, k: bool) -> R { match self.e { E.A(r) => { if k { return r; } return mk(1); } E.B => { return mk(0); } } }\n\
+             \x20   fn read(self) -> i64 { match self.e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             }\n\
+             impl H2 { fn out2(self) -> R { match self.s.e { E.A(r) => { return r; } E.B => { return mk(0); } } } }\n\
+             fn p_out(h: H1) -> R { match h.e { E.A(r) => { return r; } E.B => { return mk(0); } } }\n\
+             fn p_out2(h: H2) -> R { match h.s.e { E.A(r) => { return r; } E.B => { return mk(0); } } }\n\
+             fn p_read(h: H1) -> i64 { match h.e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             fn e_out(b: E) -> R { match b { E.A(r) => { return r; } E.B => { return mk(0); } } }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"out/local\"); let a1 = H1 { e: E.A(mk(1)) }; let r1 = a1.out(); println(f\"  got{r1.id}\");\n\
+             \x20   println(\"out/temp\"); let r2 = H1 { e: E.A(mk(2)) }.out(); println(f\"  got{r2.id}\");\n\
+             \x20   println(\"out_iflet/local\"); let a3 = H1 { e: E.A(mk(3)) }; let r3 = a3.out_iflet(); println(f\"  got{r3.id}\");\n\
+             \x20   println(\"out_tail/local\"); let a4 = H1 { e: E.A(mk(4)) }; let r4 = a4.out_tail(); println(f\"  got{r4.id}\");\n\
+             \x20   println(\"out_some/taken\"); let a5 = H1 { e: E.A(mk(5)) }; let r5 = a5.out_some(true); println(f\"  got{r5.id}\");\n\
+             \x20   println(\"out_some/not\"); let a6 = H1 { e: E.A(mk(6)) }; let r6 = a6.out_some(false); println(f\"  got{r6.id}\");\n\
+             \x20   println(\"read/local\"); let a7 = H1 { e: E.A(mk(7)) }; let x7 = a7.read(); println(f\"  r{x7}\");\n\
+             \x20   println(\"out2/local\"); let a8 = H2 { s: S { e: E.A(mk(8)) } }; let r8 = a8.out2(); println(f\"  got{r8.id}\");\n\
+             \x20   println(\"p_out/local\"); let a9 = H1 { e: E.A(mk(9)) }; let r9 = p_out(a9); println(f\"  got{r9.id}\");\n\
+             \x20   println(\"p_out/temp\"); let r10 = p_out(H1 { e: E.A(mk(10)) }); println(f\"  got{r10.id}\");\n\
+             \x20   println(\"p_out2/local\"); let a11 = H2 { s: S { e: E.A(mk(11)) } }; let r11 = p_out2(a11); println(f\"  got{r11.id}\");\n\
+             \x20   println(\"p_read/local\"); let a12 = H1 { e: E.A(mk(12)) }; let x12 = p_read(a12); println(f\"  r{x12}\");\n\
+             \x20   println(\"e_out/local\"); let a13 = E.A(mk(13)); let r13 = e_out(a13); println(f\"  got{r13.id}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "out/local",
+                "  dE",
+                "  got1",
+                "  dR1",
+                "out/temp",
+                "  got2",
+                "  dR2",
+                "out_iflet/local",
+                "  dE",
+                "  got3",
+                "  dR3",
+                "out_tail/local",
+                "  dE",
+                "  got4",
+                "  dR4",
+                "out_some/taken",
+                "  dE",
+                "  got5",
+                "  dR5",
+                "out_some/not",
+                "  dE",
+                "  got1",
+                "  dR1",
+                "read/local",
+                "  dE",
+                "  dR7",
+                "  r7",
+                "out2/local",
+                "  dE",
+                "  got8",
+                "  dR8",
+                "p_out/local",
+                "  dE",
+                "  got9",
+                "  dR9",
+                "p_out/temp",
+                "  dE",
+                "  got10",
+                "  dR10",
+                "p_out2/local",
+                "  dE",
+                "  got11",
+                "  dR11",
+                "p_read/local",
+                "  dE",
+                "  dR12",
+                "  r12",
+                "e_out/local",
+                "  dE",
+                "  got13",
+                "  dR13",
+                "end",
+            ],
+            "b17-projected-enum-payload-handed-out",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the
