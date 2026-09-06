@@ -1545,10 +1545,21 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
             _ => false,
         }
     }
+    /// B-2026-08-31-43 — a `match` / `if let` / `while let` whose scrutinee
+    /// is a PROJECTION off `self` (`self.e`, `self.s.e`) is no longer a
+    /// bind-out: both backends now treat an owned receiver's projection like
+    /// any by-value parameter's, so its arms bind VIEWS of the caller-retained
+    /// value and run no body of their own. Declining those here left a
+    /// fresh-temp receiver (`H1 { .. }.take()`) with nobody running its bodies
+    /// at all. A bare `self` scrutinee stays a bind-out: that receiver reaches
+    /// the callee by transfer (B-2026-09-04-29) and its arms own their parts.
+    fn scrutinee_binds_out(e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::SelfValue)
+    }
     fn walk_expr(e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Match { scrutinee, arms } => {
-                self_rooted(scrutinee)
+                scrutinee_binds_out(scrutinee)
                     || walk_expr(scrutinee)
                     || arms.iter().any(|a| walk_expr(&a.body))
             }
@@ -1558,13 +1569,13 @@ pub fn fn_binds_self_part_out(f: &Function) -> bool {
                 else_branch,
                 ..
             } => {
-                self_rooted(value)
+                scrutinee_binds_out(value)
                     || walk_expr(value)
                     || walk_block(then_block)
                     || else_branch.as_deref().is_some_and(walk_expr)
             }
             ExprKind::WhileLet { value, body, .. } => {
-                self_rooted(value) || walk_expr(value) || walk_block(body)
+                scrutinee_binds_out(value) || walk_expr(value) || walk_block(body)
             }
             ExprKind::Block(b)
             | ExprKind::Unsafe(b)

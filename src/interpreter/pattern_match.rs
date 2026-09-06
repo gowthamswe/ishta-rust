@@ -749,18 +749,43 @@ impl<'a> super::Interpreter<'a> {
     /// the by-value parameter names AND every local that inherited view-ness
     /// from one, where codegen splits those across `current_fn_param_names` and
     /// `param_view_locals`. So a single containment test answers both halves.
-    fn place_root_is_owned_param(&self, e: &Expr) -> bool {
+    pub(super) fn place_root_is_owned_param(&self, e: &Expr) -> bool {
         let mut cur = e;
+        let mut hops = 0usize;
         loop {
             match &cur.kind {
                 ExprKind::FieldAccess { object, .. } | ExprKind::TupleIndex { object, .. } => {
-                    cur = object
+                    cur = object;
+                    hops += 1;
                 }
                 ExprKind::Identifier(n) => {
                     return self
                         .owned_param_names_stack
                         .last()
                         .is_some_and(|params| params.contains(n.as_str()));
+                }
+                // B-2026-08-31-43 — an OWNED `self` receiver is a by-value
+                // parameter whose bodies the caller retains, exactly like a
+                // named by-value param; it is simply not in
+                // `owned_param_names_stack` (`method_owned_param_names` lists
+                // the explicit params) and parses as `SelfValue`, so this walk
+                // stopped at it with `false`. The arm's payload binding then
+                // took a body of its own beside the caller's walk over the
+                // receiver: `match self.e { E.A(r) => { let m = r; .. } }`
+                // ran `dR` twice. A borrowed receiver stays `false` — a
+                // projection off a borrow is an implicit COPY (design.md
+                // "A projection off a borrow is an implicit copy"), and the
+                // copy's binding is its own owner.
+                // A PROJECTION only: a bare `match self { .. }` keeps its
+                // transfer semantics (the `SelfValue` arm of
+                // `scrutinee_expr_is_consuming`), where the arms own what
+                // they bind.
+                ExprKind::SelfValue => {
+                    return hops > 0
+                        && matches!(
+                            self.self_param_stack.last(),
+                            Some(crate::ast::SelfParam::Owned)
+                        );
                 }
                 _ => return false,
             }

@@ -3042,15 +3042,22 @@ impl<'a> super::Interpreter<'a> {
         // a second owner — `b12 dR12 dR12` against a due `b12 dR12`, agreed on
         // all four surfaces because codegen's own marking was gated to
         // identifiers purely to match this bail.
-        let Some(n) = self.destructure_source_param_root(value) else {
-            return false;
+        let root_is_owned = match self.destructure_source_param_root(value) {
+            Some(n) => self
+                .owned_param_names_stack
+                .last()
+                .is_some_and(|params| params.contains(n)),
+            // B-2026-08-31-43 — a projection off an owned `self` receiver
+            // (`let E.A(r) = self.e else { .. }`): the root walk above stops
+            // at an identifier and `self` is its own expression kind. Same
+            // gate as the `match` leg's `place_root_is_owned_param` — a
+            // PROJECTION only, so a bare `let x = self` keeps its transfer.
+            None => {
+                matches!(&value.kind, ExprKind::FieldAccess { .. })
+                    && self.place_root_is_owned_param(value)
+            }
         };
-        let n = n.to_string();
-        if !self
-            .owned_param_names_stack
-            .last()
-            .is_some_and(|params| params.contains(n.as_str()))
-        {
+        if !root_is_owned {
             return false;
         }
         // B-2026-09-02-25 — retracting this destructure's OWN slots is only

@@ -1116,7 +1116,23 @@ impl<'a> super::Interpreter<'a> {
                     // body while the `match` spelling of the same program was
                     // correct — the spelling-dependent split B-2026-08-28-63
                     // already had to close once for this family.
-                    if matches!(&value.kind, ExprKind::Identifier(n)
+                    // B-2026-08-31-43 — a PROJECTION off an owned param or an
+                    // owned `self` receiver (`if let E.A(r) = h.e` / `self.e`)
+                    // binds VIEWS of the caller-retained value, exactly as the
+                    // `match` leg's `scrutinee_projects_owned_param` decides;
+                    // this leg admitted only the bare identifier and gave `r`
+                    // (then `let m = r`) a body beside the caller's walk.
+                    let projects_owned_param = matches!(
+                        pattern.kind,
+                        PatternKind::TupleVariant { .. }
+                            | PatternKind::Struct { .. }
+                            | PatternKind::Tuple(..)
+                    ) && matches!(
+                        &value.kind,
+                        ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. }
+                    ) && self.place_root_is_owned_param(value);
+                    if projects_owned_param
+                        || matches!(&value.kind, ExprKind::Identifier(n)
                         if self.owned_param_names_stack
                             .last()
                             .is_some_and(|params| params.contains(n.as_str())))
@@ -1430,7 +1446,23 @@ impl<'a> super::Interpreter<'a> {
                     // body while the `match` spelling of the same program was
                     // correct — the spelling-dependent split B-2026-08-28-63
                     // already had to close once for this family.
-                    if matches!(&value.kind, ExprKind::Identifier(n)
+                    // B-2026-08-31-43 — a PROJECTION off an owned param or an
+                    // owned `self` receiver (`if let E.A(r) = h.e` / `self.e`)
+                    // binds VIEWS of the caller-retained value, exactly as the
+                    // `match` leg's `scrutinee_projects_owned_param` decides;
+                    // this leg admitted only the bare identifier and gave `r`
+                    // (then `let m = r`) a body beside the caller's walk.
+                    let projects_owned_param = matches!(
+                        pattern.kind,
+                        PatternKind::TupleVariant { .. }
+                            | PatternKind::Struct { .. }
+                            | PatternKind::Tuple(..)
+                    ) && matches!(
+                        &value.kind,
+                        ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. }
+                    ) && self.place_root_is_owned_param(value);
+                    if projects_owned_param
+                        || matches!(&value.kind, ExprKind::Identifier(n)
                         if self.owned_param_names_stack
                             .last()
                             .is_some_and(|params| params.contains(n.as_str())))

@@ -1970,6 +1970,124 @@ fn main() {
         );
     }
 
+    /// B-2026-08-31-43 — the MEMORY half of
+    /// `tests/codegen.rs`'s `e2e_owned_self_projection_scrutinee_runs_one_payload_body`:
+    /// the same program with a heap-carrying payload under ASAN + LSan. The
+    /// arm's binding over an owned `self` projection is now a VIEW of the
+    /// caller-retained receiver (memory only), so this pins that handing its
+    /// body back to the caller's walk left exactly one owner of the payload's
+    /// `String` / `Vec` buffers — and that a fresh-temp receiver's bodies,
+    /// newly retained caller-side, free nothing twice.
+    #[test]
+    fn asan_owned_self_projection_scrutinee_leaf_is_a_view() {
+        assert_clean_asan_run(
+            "struct R { id: i64, tag: String, xs: Vec[i64] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, tag: f\"t{i}\", xs: [i] } }\n\
+             enum E { A(R), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"  dE\") } }\n\
+             struct S { e: E }\n\
+             struct H1 { e: E }\n\
+             struct H2 { s: S }\n\
+             fn consume(x: R) -> i64 { return x.id }\n\
+             \n\
+             impl H1 {\n\
+             \x20   fn take(self) -> i64 { match self.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             \x20   fn read(self) -> i64 { match self.e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             \x20   fn viacall(self) -> i64 { match self.e { E.A(r) => { return consume(r); } E.B => { return 0; } } }\n\
+             \x20   fn iflet(self) -> i64 { if let E.A(r) = self.e { let m = r; return m.id; } else { return 0; } }\n\
+             \x20   fn letelse(self) -> i64 { let E.A(r) = self.e else { return 0; }; let m = r; return m.id; }\n\
+             \x20   fn whilelet(self) -> i64 { while let E.A(r) = self.e { let m = r; return m.id; } return 0; }\n\
+             \x20   fn borrowed(mut ref self) -> i64 { match self.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             }\n\
+             impl H2 {\n\
+             \x20   fn take2(self) -> i64 { match self.s.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             \x20   fn read2(self) -> i64 { match self.s.e { E.A(r) => { return r.id; } E.B => { return 0; } } }\n\
+             }\n\
+             fn p_take(h: H1) -> i64 { match h.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }\n\
+             fn p_iflet(h: H1) -> i64 { if let E.A(r) = h.e { let m = r; return m.id; } else { return 0; } }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"take/local\"); let a1 = H1 { e: E.A(mk(1)) }; let x1 = a1.take(); println(f\"  r{x1}\");\n\
+             \x20   println(\"take/temp\"); let x2 = H1 { e: E.A(mk(2)) }.take(); println(f\"  r{x2}\");\n\
+             \x20   println(\"take2/local\"); let a3 = H2 { s: S { e: E.A(mk(3)) } }; let x3 = a3.take2(); println(f\"  r{x3}\");\n\
+             \x20   println(\"read/local\"); let a4 = H1 { e: E.A(mk(4)) }; let x4 = a4.read(); println(f\"  r{x4}\");\n\
+             \x20   println(\"read2/local\"); let a5 = H2 { s: S { e: E.A(mk(5)) } }; let x5 = a5.read2(); println(f\"  r{x5}\");\n\
+             \x20   println(\"viacall/local\"); let a6 = H1 { e: E.A(mk(6)) }; let x6 = a6.viacall(); println(f\"  r{x6}\");\n\
+             \x20   println(\"viacall/temp\"); let x7 = H1 { e: E.A(mk(7)) }.viacall(); println(f\"  r{x7}\");\n\
+             \x20   println(\"iflet/local\"); let a8 = H1 { e: E.A(mk(8)) }; let x8 = a8.iflet(); println(f\"  r{x8}\");\n\
+             \x20   println(\"iflet/temp\"); let x9 = H1 { e: E.A(mk(9)) }.iflet(); println(f\"  r{x9}\");\n\
+             \x20   println(\"letelse/local\"); let a10 = H1 { e: E.A(mk(10)) }; let x10 = a10.letelse(); println(f\"  r{x10}\");\n\
+             \x20   println(\"whilelet/local\"); let a11 = H1 { e: E.A(mk(11)) }; let x11 = a11.whilelet(); println(f\"  r{x11}\");\n\
+             \x20   println(\"borrowed/local\"); let mut a12 = H1 { e: E.A(mk(12)) }; let x12 = a12.borrowed(); println(f\"  r{x12}\");\n\
+             \x20   println(\"p_take/local\"); let a13 = H1 { e: E.A(mk(13)) }; let x13 = p_take(a13); println(f\"  r{x13}\");\n\
+             \x20   println(\"p_iflet/local\"); let a14 = H1 { e: E.A(mk(14)) }; let x14 = p_iflet(a14); println(f\"  r{x14}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "take/local",
+                "  dE",
+                "  dR1",
+                "  r1",
+                "take/temp",
+                "  dE",
+                "  dR2",
+                "  r2",
+                "take2/local",
+                "  dE",
+                "  dR3",
+                "  r3",
+                "read/local",
+                "  dE",
+                "  dR4",
+                "  r4",
+                "read2/local",
+                "  dE",
+                "  dR5",
+                "  r5",
+                "viacall/local",
+                "  dE",
+                "  dR6",
+                "  r6",
+                "viacall/temp",
+                "  dE",
+                "  dR7",
+                "  r7",
+                "iflet/local",
+                "  dE",
+                "  dR8",
+                "  r8",
+                "iflet/temp",
+                "  dE",
+                "  dR9",
+                "  r9",
+                "letelse/local",
+                "  dE",
+                "  dR10",
+                "  r10",
+                "whilelet/local",
+                "  dE",
+                "  dR11",
+                "  r11",
+                "borrowed/local",
+                "  dR12",
+                "  dE",
+                "  dR12",
+                "  r12",
+                "p_take/local",
+                "  dE",
+                "  dR13",
+                "  r13",
+                "p_iflet/local",
+                "  dE",
+                "  dR14",
+                "  r14",
+                "end",
+            ],
+            "b43-owned-self-projection-scrutinee",
+        );
+    }
+
     /// B-2026-09-05-34 — THE `if let` / `while let` / `let … else` LEGS MUST
     /// STAGE A BARE-TUPLE ELEMENT BINDING EXACTLY AS THE `match` ARM DOES.
     ///

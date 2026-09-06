@@ -1495,17 +1495,41 @@ impl<'ctx> super::Codegen<'ctx> {
     /// only widening: an index or call in the chain is not a plain view.
     pub(super) fn scrutinee_is_owned_param_binding(&self, e: &Expr) -> bool {
         let mut cur = e;
+        let mut hops = 0usize;
         loop {
-            match &cur.kind {
-                ExprKind::FieldAccess { object, .. } => cur = object,
-                ExprKind::TupleIndex { object, .. } => cur = object,
-                ExprKind::Identifier(n) => {
-                    return (self.fn_ctx.current_fn_param_names.contains(n.as_str())
-                        && !self.borrow_vars.ref_params.contains_key(n.as_str()))
-                        || self.payload_vars.param_view_locals.contains(n.as_str());
+            let name: &str = match &cur.kind {
+                ExprKind::FieldAccess { object, .. } => {
+                    cur = object;
+                    hops += 1;
+                    continue;
                 }
+                ExprKind::TupleIndex { object, .. } => {
+                    cur = object;
+                    hops += 1;
+                    continue;
+                }
+                ExprKind::Identifier(n) => n.as_str(),
+                // B-2026-08-31-43 — an OWNED `self` receiver is a by-value
+                // parameter like any other: `lower_method` inserts it into
+                // `params` at index 0 under the name `self`, so it is in
+                // `current_fn_param_names` (and in `ref_params` when the
+                // receiver is borrowed). Only the EXPRESSION differs — `self`
+                // parses as `SelfValue`, not `Identifier` — and this walk
+                // stopped at it with `false`, so `match self.e { E.A(r) => ..
+                // }` bound `r` as an owner beside the caller-retained walk
+                // over the receiver and ran the payload's body twice.
+                //
+                // A PROJECTION only (`self.e`, `self.s.e`, `self.t.0`). A bare
+                // `match self { .. }` stays where it was: that receiver reaches
+                // the callee by TRANSFER (B-2026-09-04-29) and its arms own
+                // what they bind, so admitting it here would hand those
+                // bodies to a caller walk that does not exist.
+                ExprKind::SelfValue if hops > 0 => "self",
                 _ => return false,
-            }
+            };
+            return (self.fn_ctx.current_fn_param_names.contains(name)
+                && !self.borrow_vars.ref_params.contains_key(name))
+                || self.payload_vars.param_view_locals.contains(name);
         }
     }
 

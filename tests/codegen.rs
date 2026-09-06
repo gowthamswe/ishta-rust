@@ -32886,6 +32886,140 @@ fn main() {
         }
     }
 
+    /// B-2026-08-31-43 — a `match` / `if let` / `let … else` / `while let` over a
+    /// PROJECTION off an OWNED `self` receiver (`match self.e { E.A(r) => { let m = r;
+    /// .. } }`, one and two hops) ran the payload's `Drop` body twice on every surface:
+    /// the owned-param-root walk in each backend (codegen's
+    /// `scrutinee_is_owned_param_binding`, the interpreter's `place_root_is_owned_param`)
+    /// stopped at `ExprKind::Identifier`, `self` is `ExprKind::SelfValue`, so the arm's
+    /// binding was never a view of the caller-retained value and took a body beside the
+    /// caller's walk. A named by-value param in the same position (`p_take`, `p_iflet`)
+    /// was one body throughout — the control.
+    ///
+    /// The fresh-temp receiver (`take/temp`, `viacall/temp`, `iflet/temp`) had been
+    /// losing the enum shell's `dE` all along, because the B-2026-09-04-30 gate
+    /// declined to retain a temp receiver's bodies caller-side for any method that
+    /// binds a part of `self` out; a projection scrutinee no longer counts as one. The
+    /// `read` cells are the read-only arms (`read2/local` was a compiled-only double at
+    /// two hops); `borrowed/local` is `mut ref self`, where the second body is the
+    /// documented copy (design.md "A projection off a borrow is an implicit copy") and
+    /// must stay at two.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_owned_self_projection_scrutinee_runs_one_payload_body`, pinned to the same string.
+    #[test]
+    fn e2e_owned_self_projection_scrutinee_runs_one_payload_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct S { e: E }
+struct H1 { e: E }
+struct H2 { s: S }
+fn consume(x: R) -> i64 { return x.id }
+
+impl H1 {
+    fn take(self) -> i64 { match self.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+    fn read(self) -> i64 { match self.e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn viacall(self) -> i64 { match self.e { E.A(r) => { return consume(r); } E.B => { return 0; } } }
+    fn iflet(self) -> i64 { if let E.A(r) = self.e { let m = r; return m.id; } else { return 0; } }
+    fn letelse(self) -> i64 { let E.A(r) = self.e else { return 0; }; let m = r; return m.id; }
+    fn whilelet(self) -> i64 { while let E.A(r) = self.e { let m = r; return m.id; } return 0; }
+    fn borrowed(mut ref self) -> i64 { match self.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+}
+impl H2 {
+    fn take2(self) -> i64 { match self.s.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+    fn read2(self) -> i64 { match self.s.e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+}
+fn p_take(h: H1) -> i64 { match h.e { E.A(r) => { let m = r; return m.id; } E.B => { return 0; } } }
+fn p_iflet(h: H1) -> i64 { if let E.A(r) = h.e { let m = r; return m.id; } else { return 0; } }
+
+fn main() {
+    println("take/local"); let a1 = H1 { e: E.A(mk(1)) }; let x1 = a1.take(); println(f"  r{x1}");
+    println("take/temp"); let x2 = H1 { e: E.A(mk(2)) }.take(); println(f"  r{x2}");
+    println("take2/local"); let a3 = H2 { s: S { e: E.A(mk(3)) } }; let x3 = a3.take2(); println(f"  r{x3}");
+    println("read/local"); let a4 = H1 { e: E.A(mk(4)) }; let x4 = a4.read(); println(f"  r{x4}");
+    println("read2/local"); let a5 = H2 { s: S { e: E.A(mk(5)) } }; let x5 = a5.read2(); println(f"  r{x5}");
+    println("viacall/local"); let a6 = H1 { e: E.A(mk(6)) }; let x6 = a6.viacall(); println(f"  r{x6}");
+    println("viacall/temp"); let x7 = H1 { e: E.A(mk(7)) }.viacall(); println(f"  r{x7}");
+    println("iflet/local"); let a8 = H1 { e: E.A(mk(8)) }; let x8 = a8.iflet(); println(f"  r{x8}");
+    println("iflet/temp"); let x9 = H1 { e: E.A(mk(9)) }.iflet(); println(f"  r{x9}");
+    println("letelse/local"); let a10 = H1 { e: E.A(mk(10)) }; let x10 = a10.letelse(); println(f"  r{x10}");
+    println("whilelet/local"); let a11 = H1 { e: E.A(mk(11)) }; let x11 = a11.whilelet(); println(f"  r{x11}");
+    println("borrowed/local"); let mut a12 = H1 { e: E.A(mk(12)) }; let x12 = a12.borrowed(); println(f"  r{x12}");
+    println("p_take/local"); let a13 = H1 { e: E.A(mk(13)) }; let x13 = p_take(a13); println(f"  r{x13}");
+    println("p_iflet/local"); let a14 = H1 { e: E.A(mk(14)) }; let x14 = p_iflet(a14); println(f"  r{x14}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"take/local
+  dE
+  dR1
+  r1
+take/temp
+  dE
+  dR2
+  r2
+take2/local
+  dE
+  dR3
+  r3
+read/local
+  dE
+  dR4
+  r4
+read2/local
+  dE
+  dR5
+  r5
+viacall/local
+  dE
+  dR6
+  r6
+viacall/temp
+  dE
+  dR7
+  r7
+iflet/local
+  dE
+  dR8
+  r8
+iflet/temp
+  dE
+  dR9
+  r9
+letelse/local
+  dE
+  dR10
+  r10
+whilelet/local
+  dE
+  dR11
+  r11
+borrowed/local
+  dR12
+  dE
+  dR12
+  r12
+p_take/local
+  dE
+  dR13
+  r13
+p_iflet/local
+  dE
+  dR14
+  r14
+end
+"#
+        );
+    }
+
     #[test]
     fn e2e_deep_projection_scrutinee_runs_one_payload_body() {
         let hdr = "struct R { id: i64 }\n\
@@ -33000,14 +33134,19 @@ fn main() {
             let src = format!("{hdr}fn main() {{\n{body}\n}}\n");
             assert_eq!(run_program(&src).as_deref(), Some(want), "[{label}]");
         }
-        // PINNED AT A KNOWN GAP, not asserted as correct. A `self`-ROOTED
-        // projection scrutinee is not masked at ANY depth — the resolver needs
-        // an identifier root and `self` is its own expression kind — so the
-        // payload body runs twice. Both backends agree, so it is an agreed gap
-        // rather than a divergence, and it is a different axis from this row:
-        // the ONE-hop `self.e` doubles identically, which is what shows this is
-        // about the root kind and not the depth this row fixed. Filed
-        // separately.
+        // A `self`-ROOTED projection scrutinee through a BORROWED receiver
+        // (`mut ref self`) runs the payload's body twice, and that is the
+        // documented copy, not a gap: design.md "A projection off a borrow is
+        // an implicit copy, and that is a stopgap" -- the match copies
+        // `E.A(R)` out of the borrow, `m` owns the copy and runs its body, and
+        // the caller's receiver still owns the original and runs its own. The
+        // explicit spelling `let e = h.e` through `ref h` prints `dE dR dE dR`
+        // on every surface (valgrind-clean with a heap-carrying payload) and
+        // carries W0299 `borrow_projection_copy` saying so. B-2026-08-31-43
+        // first pinned this as a KNOWN GAP; its fix covers the OWNED receiver
+        // (`fn take(self)`), whose payload was a genuine double -- see
+        // `e2e_owned_self_projection_scrutinee_runs_one_payload_body`. Kept at
+        // the copy's transcript so a change in that stopgap fails loudly here.
         let selfrooted = "struct R { id: i64 }\n\
              impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
              enum E { A(R), B }\n\
@@ -33026,7 +33165,7 @@ fn main() {
         assert_eq!(
             run_program(selfrooted).as_deref(),
             Some("dR1\n1\ndE\ndR1\ndR2\n2\ndE\ndR2\n"),
-            "[pinned GAP: `self`-rooted projection, one hop and two]"
+            "[borrowed receiver: the projection copies, one hop and two]"
         );
     }
 
