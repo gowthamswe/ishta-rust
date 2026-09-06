@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 375 |
+| miscompile | 376 |
 | run-vs-build | 345 |
 | leak | 273 |
 | missing-feature | 194 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1492 |
-| interp | 364 |
+| codegen | 1493 |
+| interp | 365 |
 | typecheck | 293 |
 | ownership | 74 |
 | other | 73 |
@@ -159,7 +159,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-7 | 2026-09-06 | codegen | medium | THE TWO-STEP DESTRUCTURE OF A NESTED TUPLE FIELD OFF A LOCAL RUNS THE LEAF'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND, ONE OF THEM EARLY -- `let h = H2 { pe: ((mk(9), 1), 2) }; let (inner, y) = h.pe; let (r, x) = inner; let m: R = r; println(f"l3 {m.id}")` prints `dR9 l3 9 dR9` on jit / aot / AUTO_PAR=0 against the interpreter's `l3 9 dR9`; the owned-PARAM source of the same shape is one body since B-2026-09-02-41 | — |
 | B-2026-09-06-8 | 2026-09-06 | codegen | medium | PROJECTING THE `Drop` ELEMENT OUT OF A TUPLE PARAM (`let x: R = t.0`) LEAKS `x`'S INTERIOR AT -O0 ON EVERY COMPILED BACKEND -- 10 B in 2 blocks per call (`R`'s `String` tag and `Vec` buffer, `definitely lost`), body count right (one), identical for the bare param, the destructure-leaf view and the struct-field place; -O2 reads clean only because LLVM elides the never-read, never-freed allocations | — |
 | B-2026-09-06-9 | 2026-09-06 | interp+codegen | medium | A BY-VALUE `Drop` PARAM HANDED TO A CALLEE THAT RETURNS IT, WITH THE RESULT BOUND TO A LOCAL, RUNS THE BODY TWICE ON ALL FOUR SURFACES -- `fn s_keep(r: R) { let w: R = keeps(r); println(f"skd {w.id}") }` over `fn keeps(r: R) -> R { return r }` prints `skd 3 dR3 dR3` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike; the tuple-param spelling (`let w: (R, i64) = keep(t)`) and the rebind spelling (`let z = t; let w = keep(z)`) match; valgrind-clean at both opt levels | — |
-| B-2026-09-06-10 | 2026-09-06 | interp+codegen | medium | A NAMED LOCAL HANDED TO A CALLEE THAT RETURNS A PART NESTED BELOW ONE OF ITS FIELDS RUNS THAT PART'S `Drop` BODY TWICE ON ALL FOUR SURFACES -- `let h: H1 = H1 { pe: (mk(1), 1) }; let a: R = flat_ret(h);` over `fn flat_ret(h: H1) -> R { let (r, k) = h.pe; return r; }` prints `dR1 got1 dR1` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike, where the FRESH-TEMP spelling `flat_ret(H1 { pe: (mk(4), 1) })` prints `got4 dR4`; same for a struct path (`g.s.r`) and for two tuple levels (`h.pe.0.0`) | — |
+| B-2026-09-06-11 | 2026-09-06 | interp+codegen | medium | A TUPLE ARGUMENT WHOSE CALLEE HANDS BACK A PART BELOW ITS TOP-LEVEL ELEMENTS RUNS THAT PART'S `Drop` BODY TWICE ON ALL FOUR SURFACES, NAMED LOCAL AND FRESH TEMP ALIKE -- `fn tv_ret(t: ((R, i64), i64)) -> R { let (inner, y) = t; let (r, x) = inner; return r; }` prints `dR1 got1 dR1` for `let t = ((mk(1), 1), 2); tv_ret(t)` AND for `tv_ret(((mk(4), 1), 2))` under `--interp`, jit, aot and `KARAC_AUTO_PAR=0` alike; a struct under a tuple (`fn ts_ret(t: (S, i64)) -> R { let (s, k) = t; return s.r; }`) matches; the one-level `flat_t(t)` is right | — |
 
 ### Relocated
 
@@ -2278,6 +2278,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-05-36 | interp+codegen | medium | A `let`-DESTRUCTURED TUPLE ELEMENT OR A BARE BY-VALUE PARAM HANDED TO A CALLEE THAT RETURNS OR STORES IT RUNS ITS `Drop` BODY TWICE ON ALL FOUR SURFA… | 2961e43 |
 | B-2026-09-06-5 | codegen | medium | A NESTED TUPLE ELEMENT HANDED BACK TWO TUPLE LEVELS DEEP RUNS ITS `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn v3_ret(h: H2) -> R { let (inner,… | dd4a63c |
 | B-2026-09-06-6 | codegen | medium | A WHOLE REBIND OF A TUPLE-TYPED PARAM VIEW RUNS THE ELEMENT'S `Drop` BODY TWICE ON EVERY COMPILED BACKEND -- `fn v3m(h: H2) { let (inner, y) = h.pe;… | 9290410 |
+| B-2026-09-06-10 | interp+codegen | medium | A NAMED LOCAL HANDED TO A CALLEE THAT RETURNS A PART NESTED BELOW ONE OF ITS FIELDS RUNS THAT PART'S `Drop` BODY TWICE ON ALL FOUR SURFACES -- `let h… | 8667916 |
 
 </details>
 
