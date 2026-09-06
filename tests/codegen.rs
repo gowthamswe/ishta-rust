@@ -31089,10 +31089,14 @@ fn main() {
     /// B-2026-08-01-6 — codegen parity pin for `tests/interpreter.rs`'s
     /// `test_ref_self_match_borrowed_payload_silent` (same source and
     /// expected string): a `ref self` method matching on `self` binds
-    /// borrowed views, so no payload body fires inside the method — the
-    /// fresh-receiver shape stays silent and the named-binding shape fires
-    /// exactly once via the binding's own walk. This side was already
-    /// correct; the interpreter's stash was the diverging half.
+    /// borrowed views, so no payload body fires INSIDE the method — the
+    /// named-binding shape fires exactly once via the binding's own walk.
+    /// This side was already correct; the interpreter's stash was the
+    /// diverging half. The fresh-receiver shape was silent on every surface
+    /// when this landed (the borrowed temp's body had no owner at all);
+    /// since B-2026-09-06-38 the caller's receiver-temp registrar runs it
+    /// once at the statement's end (`drop 5 e5` before `t=1`), still
+    /// outside the arm.
     #[test]
     fn e2e_ref_self_match_borrowed_payload_silent() {
         let Some(out) = run_program(
@@ -31129,7 +31133,7 @@ fn main() {
         };
         assert_eq!(
             out,
-            "a: ref-self match on fresh receiver\nt=1\n\
+            "a: ref-self match on fresh receiver\ndrop 5 e5\nt=1\n\
              b: ref-self match on named binding\ndrop 8 e8\nu=1\nend\n"
         );
     }
@@ -34066,7 +34070,8 @@ end
     /// shell's body ran nowhere. Bare owned struct `self` now takes the owned-param VIEW
     /// walks on both backends (codegen `bare_self_is_owned_struct_receiver`, the
     /// interpreter twin) and a `match self` scrutinee is no longer a bind-out; an owned
-    /// ENUM receiver keeps the transfer (`enum_recv/*` guard cells, unchanged).
+    /// ENUM receiver keeps the transfer (`enum_recv/*` guard cells; since
+    /// B-2026-09-06-38 the temp cell also carries the shell's `dE`).
     ///
     /// The free-function twin was the oracle and had a compiled-only defect of its own
     /// in the same shape: codegen never marked a plain-STRUCT pattern's leaves as param
@@ -34227,6 +34232,7 @@ enum_recv/local
   r61
   dR61
 enum_recv/temp
+  dE
   r62
   dR62
 end
@@ -34553,9 +34559,10 @@ end
     /// free-function twin (`free`) agree. The WILDCARD arm (`E.A(_)`, `none/*`) ran
     /// the payload body on no surface when this row closed; B-2026-09-06-37's lowering
     /// rewrite now binds that position to a never-read name, so `none/*` fire `dR5` /
-    /// `dR6` at the arm's end like the bound cells. One AGREED gap stays pinned as it
-    /// stands and filed on its own row: a TEMP enum receiver loses the shell's own `dE`
-    /// on every surface (B-2026-09-04-30's registrar declines enum receiver bodies).
+    /// `dR6` at the arm's end like the bound cells. The other agreed gap this row
+    /// pinned as it stood — a TEMP enum receiver losing the shell's own `dE` on every
+    /// surface (B-2026-09-04-30's registrar declined enum receiver bodies) — closed as
+    /// B-2026-09-06-38: the temp cells now carry their `dE` at the statement's end.
     ///
     /// Twin of `tests/interpreter.rs`'s `test_read_only_arm_on_owned_enum_receiver_runs_payload_body`, pinned to the same string.
     #[test]
@@ -34611,12 +34618,14 @@ fn main() {
   x1
 read/temp
   dR2
+  dE
   x2
 r/local
   dE
   y3
   dR3
 r/temp
+  dE
   y4
   dR4
 none/local
@@ -34625,6 +34634,7 @@ none/local
   z1
 none/temp
   dR6
+  dE
   z1
 print/local
   p7
@@ -34633,6 +34643,7 @@ print/local
 print/temp
   p8
   dR8
+  dE
 noshell/local
   dR9
   w9
@@ -34653,6 +34664,7 @@ iflet/local
   q21
 iflet/temp
   dR22
+  dE
   q22
 whilelet/local
   dR23
@@ -34799,9 +34811,11 @@ end
     /// own `Drop`), `half` (one wildcard beside a bound payload), `both` (two
     /// wildcards), against the controls `bound` (arm binds the payload), `free` (the
     /// by-value param twin, whose caller walk was always right) and `localmatch` (a
-    /// local scrutinee, untouched by the rewrite). The temp cells keep losing the
-    /// shell's `dE` (B-2026-09-06-38) and the arm channel keeps firing the payload
-    /// before the shell (B-2026-09-06-39); both are pinned as they stand.
+    /// local scrutinee, untouched by the rewrite). The temp cells lost the shell's
+    /// `dE` when this landed; B-2026-09-06-38 gave a temp enum receiver its shell body
+    /// at the statement's end, so `wild/temp` / `ifwild/temp` now carry it. The arm
+    /// channel still fires the payload before the shell (B-2026-09-06-39), pinned as
+    /// it stands.
     ///
     /// Twin of `tests/interpreter.rs`'s `test_wildcard_arm_over_owned_enum_receiver_runs_payload_body`, pinned to the same string.
     #[test]
@@ -34853,6 +34867,7 @@ fn main() {
   x1
 wild/temp
   dR2
+  dE
   x1
 bound/local
   dR3
@@ -34864,6 +34879,7 @@ ifwild/local
   z1
 ifwild/temp
   dR5
+  dE
   z1
 noshell/local
   dR6
@@ -34893,6 +34909,162 @@ localmatch
   arm
   dE
   dR12
+end
+"#
+        );
+    }
+
+    /// B-2026-09-06-38 — a FRESH-TEMP owned ENUM receiver lost the enum SHELL's own
+    /// `Drop` body on every surface: `E.A(mk(2)).m_read()` printed `dR2 x2` and never
+    /// `dE`, where the named local `let a = E.A(mk(1)); a.m_read()` printed `dR1 dE x1`.
+    /// B-2026-09-04-30's receiver-temp registrar kept the value-enum arm memory-only
+    /// (B-2026-08-01-5's reasoning: a ref-self method binding the payload fired the
+    /// interpreter's arm channel, so a walk here would double it). That covered the
+    /// PAYLOAD; the shell's own body has no arm to fire from and had no owner for a
+    /// temp. Measured wider, a `ref self` temp (`E.A(mk(6)).m_ref()`) fired NOTHING —
+    /// neither payload nor shell — on all four surfaces, the arm channel having stood
+    /// down on a borrowed receiver since B-2026-08-28-67's read-through gate.
+    ///
+    /// Both registrars now give an enum receiver temp its bodies at the statement's
+    /// end, in two shapes: a `ref self` / `mut ref self` method BORROWED the temp, so
+    /// the caller owns the whole value — shell body, then the payload walk (`ref/temp`
+    /// `dE dR6 x6`, the order `ref/local` prints; `refnoshell/temp` `dR13`); an owned
+    /// `self` CONSUMED it and the arm channel runs the payload (B-2026-09-06-27, -37),
+    /// so the caller registers the shell's body ALONE (`read/temp` `dR2 dE x2`,
+    /// `print/temp` `p5 dR5 dE`, `iflet/temp` `dR7 dE x7`). The owned gate is
+    /// `owned_self_return_cannot_carry_receiver`, the enum-specific form of the struct
+    /// arm's opacity gate: it declines only a return that can carry the WHOLE receiver
+    /// (`-> E`, `-> Self`, `-> W { e: E }`, `-> Option[E]`), the one shape whose result
+    /// binding would run the shell body a second time — `me/temp`, `wrap/temp`,
+    /// `optself/temp` keep their single `dE` — and admits a payload hand-back (`-> R`,
+    /// `-> Option[R]`), which doubles nothing: `r/temp` `dE y4 dR4` now matches
+    /// `r/local` `dE y3 dR3`. Memory is untouched (the new registrations are
+    /// bodies-only fns behind the unchanged `track_enum_var` free). The chain link
+    /// (`E.A(mk(11)).me().m_read()`, `chain/temp`) stays shell-less, the struct side's
+    /// recorded residual; `unit/temp` (`E.B.m_read()`) was already right.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_fresh_temp_owned_enum_receiver_runs_the_shell_body`, pinned to the same string.
+    #[test]
+    fn e2e_fresh_temp_owned_enum_receiver_runs_the_shell_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct W { e: E }
+enum F { A(R), B }
+impl E {
+    fn m_read(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_r(self) -> R { match self { E.A(r) => { return r; } E.B => { return mk(0); } } }
+    fn m_print(self) { match self { E.A(r) => { println(f"  p{r.id}"); } E.B => { println("  pB"); } } }
+    fn m_ref(ref self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_iflet(self) -> i64 { if let E.A(r) = self { return r.id; } else { return 0; } }
+    fn me(self) -> E { return self; }
+    fn wrap(self) -> W { return W { e: self }; }
+    fn m_opt(self) -> Option[R] { match self { E.A(r) => { return Some(r); } E.B => { return None; } } }
+    fn m_optself(self) -> Option[E] { return Some(self); }
+    fn m_mut(mut ref self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+}
+impl F {
+    fn m_read(self) -> i64 { match self { F.A(r) => { return r.id; } F.B => { return 0; } } }
+    fn m_ref(ref self) -> i64 { match self { F.A(r) => { return r.id; } F.B => { return 0; } } }
+}
+fn main() {
+    println("read/local"); let a = E.A(mk(1)); let x = a.m_read(); println(f"  x{x}");
+    println("read/temp"); let x2 = E.A(mk(2)).m_read(); println(f"  x{x2}");
+    println("r/local"); let b = E.A(mk(3)); let y = b.m_r(); println(f"  y{y.id}");
+    println("r/temp"); let y2 = E.A(mk(4)).m_r(); println(f"  y{y2.id}");
+    println("print/temp"); E.A(mk(5)).m_print(); println("  after");
+    println("ref/temp"); let x6 = E.A(mk(6)).m_ref(); println(f"  x{x6}");
+    println("iflet/temp"); let x7 = E.A(mk(7)).m_iflet(); println(f"  x{x7}");
+    println("unit/temp"); let x8 = E.B.m_read(); println(f"  x{x8}");
+    println("noshell/temp"); let x9 = F.A(mk(8)).m_read(); println(f"  x{x9}");
+    println("me/temp"); let e = E.A(mk(9)).me(); println("  held");
+    println("wrap/temp"); let w = E.A(mk(10)).wrap(); println("  held");
+    println("chain/temp"); let x11 = E.A(mk(11)).me().m_read(); println(f"  x{x11}");
+    println("ref/local"); let c = E.A(mk(12)); let x12 = c.m_ref(); println(f"  x{x12}");
+    println("refnoshell/temp"); let x13 = F.A(mk(13)).m_ref(); println(f"  x{x13}");
+    println("refnoshell/local"); let d = F.A(mk(14)); let x14 = d.m_ref(); println(f"  x{x14}");
+    println("opt/temp"); let o16 = E.A(mk(16)).m_opt(); println("  held");
+    println("optself/temp"); let o17 = E.A(mk(17)).m_optself(); println("  held");
+    println("mut/temp"); let x18 = E.A(mk(18)).m_mut(); println(f"  x{x18}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"read/local
+  dR1
+  dE
+  x1
+read/temp
+  dR2
+  dE
+  x2
+r/local
+  dE
+  y3
+  dR3
+r/temp
+  dE
+  y4
+  dR4
+print/temp
+  p5
+  dR5
+  dE
+  after
+ref/temp
+  dE
+  dR6
+  x6
+iflet/temp
+  dR7
+  dE
+  x7
+unit/temp
+  dE
+  x0
+noshell/temp
+  dR8
+  x8
+me/temp
+  dE
+  dR9
+  held
+wrap/temp
+  dE
+  dR10
+  held
+chain/temp
+  dR11
+  x11
+ref/local
+  dE
+  dR12
+  x12
+refnoshell/temp
+  dR13
+  x13
+refnoshell/local
+  dR14
+  x14
+opt/temp
+  dE
+  dR16
+  held
+optself/temp
+  dE
+  dR17
+  held
+mut/temp
+  dE
+  dR18
+  x18
 end
 "#
         );

@@ -10737,14 +10737,95 @@ impl<'ctx> super::Codegen<'ctx> {
                     .map(|p| p.drop_method_keys.contains_key(&type_name))
                     .unwrap_or(false);
                 if is_value_enum {
-                    // Memory only. ENUM receiver bodies are deliberately NOT
-                    // registered: a ref-self method that matches on `self`
-                    // and binds the payload fires the interpreter's arm
-                    // channel (a pre-existing interp-only fire on borrowed
-                    // self, B-2026-08-01-6) — registering a walker here
-                    // would stack a second fire on one side or the other.
-                    // Struct receivers below carry the body work.
+                    // Memory FIRST (the struct arm's load-bearing order: the
+                    // frame drains LIFO, so the bodies registered below run
+                    // before this free). Unchanged from the memory-only arm
+                    // this was until B-2026-09-06-38.
                     self.track_enum_var(&type_name, slot);
+                    // B-2026-09-06-38 — an ENUM receiver temp's BODIES. This
+                    // arm was memory-only (B-2026-08-01-5) on the reasoning
+                    // that a ref-self method matching on `self` fires the
+                    // interpreter's arm channel for the payload, so a walker
+                    // here would double it. That covered the PAYLOAD and only
+                    // for a bound arm; the shell's OWN body has no arm to fire
+                    // from and so had no owner for a temp on any surface:
+                    // `E.A(mk(2)).m_read()` printed `dR2 x2` and never `dE`,
+                    // where `let a = E.A(mk(1)); a.m_read()` printed
+                    // `dR1 dE x1`. Measured wider: a `ref self` temp
+                    // (`E.A(mk(6)).m_ref()`) fired NOTHING — neither payload
+                    // nor shell — on all four surfaces, the arm channel
+                    // standing down on a borrowed receiver since
+                    // B-2026-08-28-67's read-through gate.
+                    //
+                    // Two shapes, two registrations, both `__urecv_drop_tmp`
+                    // so they drain at the statement's end like the struct
+                    // arm's:
+                    //  * `ref self` / `mut ref self` BORROWED the temp, so the
+                    //    caller owns the whole value: shell body, then the
+                    //    payload-bodies walk (`__karac_dropelems_enum_<E>`,
+                    //    bodies only), then the memory above — the order a
+                    //    named local prints (`dE dR12` for `ref/local`).
+                    //  * owned `self` CONSUMED it, and the arm channel runs the
+                    //    payload's body (B-2026-09-06-27, -37): the caller
+                    //    registers the shell's own body ALONE, gated on
+                    //    `owned_self_return_cannot_carry_receiver` — the
+                    //    enum-specific form of the struct arm's opacity gate,
+                    //    declining only a return that can carry the WHOLE
+                    //    receiver (`-> E`, `-> Self`, `-> W { e: E }`, any
+                    //    generic), since that is the one shape whose result
+                    //    binding would run the shell body a second time. A
+                    //    payload hand-back (`-> R`) is admitted: it doubles
+                    //    nothing, and declining it kept `r/temp` shell-less.
+                    // Registered LAST so it drains FIRST: the own body, then the
+                    // payload walk, then the free.
+                    let ref_self_borrows = shape_ok
+                        && !self.user_ref_method_names.contains(method)
+                        && matches!(
+                            self_mode,
+                            Some((
+                                crate::ast::SelfParam::Ref | crate::ast::SelfParam::MutRef,
+                                false
+                            ))
+                        );
+                    let owned_self_shell = shape_ok
+                        && !self.user_ref_method_names.contains(method)
+                        && matches!(self_mode, Some((crate::ast::SelfParam::Owned, false)))
+                        && self
+                            .find_impl_method_ast(&type_name, method)
+                            .is_some_and(|f| {
+                                let items = self
+                                    .program_snapshot
+                                    .as_deref()
+                                    .map(|p| p.items.as_slice())
+                                    .unwrap_or(&[]);
+                                crate::ast::owned_self_return_cannot_carry_receiver(
+                                    f, &type_name, items,
+                                ) && !crate::ast::fn_binds_self_part_out(f)
+                            });
+                    if ref_self_borrows {
+                        if let Some(walk) = self.emit_enum_payload_user_drop_bodies_fn(&type_name) {
+                            self.track_user_drop_var_with_fn(
+                                &type_name,
+                                "__urecv_drop_tmp",
+                                slot,
+                                walk,
+                                UserDropKind::ContainerElemBodies,
+                            );
+                        }
+                    }
+                    if (ref_self_borrows || owned_self_shell) && has_user_drop {
+                        if let Some(body) = self
+                            .user_drop_body_fn_mono(&type_name, &std::collections::HashMap::new())
+                        {
+                            self.track_user_drop_var_with_fn(
+                                &type_name,
+                                "__urecv_drop_tmp",
+                                slot,
+                                body,
+                                UserDropKind::OwnWrapper,
+                            );
+                        }
+                    }
                 } else if bodies_eligible && has_user_drop {
                     self.track_user_drop_var(&type_name, "__urecv_drop_tmp", slot);
                 } else if bodies_eligible && self.type_runs_user_drop_mono(&type_name, &recv_subst)

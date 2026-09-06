@@ -1395,6 +1395,7 @@ fn main() {
                 "  r61",
                 "  dR61",
                 "enum_recv/temp",
+                "  dE",
                 "  r62",
                 "  dR62",
                 "end",
@@ -1681,6 +1682,7 @@ fn main() {
                 "  x1",
                 "wild/temp",
                 "  dR2",
+                "  dE",
                 "  x1",
                 "bound/local",
                 "  dR3",
@@ -1692,6 +1694,7 @@ fn main() {
                 "  z1",
                 "ifwild/temp",
                 "  dR5",
+                "  dE",
                 "  z1",
                 "noshell/local",
                 "  dR6",
@@ -1724,6 +1727,137 @@ fn main() {
                 "end",
             ],
             "asan_wildcard_arm_over_owned_enum_receiver_is_balanced",
+        );
+    }
+
+    /// B-2026-09-06-38 — the fresh-temp ENUM receiver's bodies are new
+    /// registrations on the same frame as its `track_enum_var` free: the
+    /// shell's own `E.drop` for an owned `self`, and shell + payload-bodies walk
+    /// for a `ref self`. Both are bodies-only fns registered AFTER the free so
+    /// they drain BEFORE it (LIFO), the struct arm's load-bearing order; this
+    /// pins that every body reads live storage and nothing frees twice across
+    /// the whole cell battery of `e2e_fresh_temp_owned_enum_receiver_runs_the_shell_body`.
+    /// valgrind measured 0 errors at -O0 and -O2 before this landed as a test.
+    #[test]
+    fn asan_fresh_temp_owned_enum_receiver_runs_the_shell_body_balanced() {
+        assert_clean_asan_run(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct W { e: E }
+enum F { A(R), B }
+impl E {
+    fn m_read(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_r(self) -> R { match self { E.A(r) => { return r; } E.B => { return mk(0); } } }
+    fn m_print(self) { match self { E.A(r) => { println(f"  p{r.id}"); } E.B => { println("  pB"); } } }
+    fn m_ref(ref self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_iflet(self) -> i64 { if let E.A(r) = self { return r.id; } else { return 0; } }
+    fn me(self) -> E { return self; }
+    fn wrap(self) -> W { return W { e: self }; }
+    fn m_opt(self) -> Option[R] { match self { E.A(r) => { return Some(r); } E.B => { return None; } } }
+    fn m_optself(self) -> Option[E] { return Some(self); }
+    fn m_mut(mut ref self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+}
+impl F {
+    fn m_read(self) -> i64 { match self { F.A(r) => { return r.id; } F.B => { return 0; } } }
+    fn m_ref(ref self) -> i64 { match self { F.A(r) => { return r.id; } F.B => { return 0; } } }
+}
+fn main() {
+    println("read/local"); let a = E.A(mk(1)); let x = a.m_read(); println(f"  x{x}");
+    println("read/temp"); let x2 = E.A(mk(2)).m_read(); println(f"  x{x2}");
+    println("r/local"); let b = E.A(mk(3)); let y = b.m_r(); println(f"  y{y.id}");
+    println("r/temp"); let y2 = E.A(mk(4)).m_r(); println(f"  y{y2.id}");
+    println("print/temp"); E.A(mk(5)).m_print(); println("  after");
+    println("ref/temp"); let x6 = E.A(mk(6)).m_ref(); println(f"  x{x6}");
+    println("iflet/temp"); let x7 = E.A(mk(7)).m_iflet(); println(f"  x{x7}");
+    println("unit/temp"); let x8 = E.B.m_read(); println(f"  x{x8}");
+    println("noshell/temp"); let x9 = F.A(mk(8)).m_read(); println(f"  x{x9}");
+    println("me/temp"); let e = E.A(mk(9)).me(); println("  held");
+    println("wrap/temp"); let w = E.A(mk(10)).wrap(); println("  held");
+    println("chain/temp"); let x11 = E.A(mk(11)).me().m_read(); println(f"  x{x11}");
+    println("ref/local"); let c = E.A(mk(12)); let x12 = c.m_ref(); println(f"  x{x12}");
+    println("refnoshell/temp"); let x13 = F.A(mk(13)).m_ref(); println(f"  x{x13}");
+    println("refnoshell/local"); let d = F.A(mk(14)); let x14 = d.m_ref(); println(f"  x{x14}");
+    println("opt/temp"); let o16 = E.A(mk(16)).m_opt(); println("  held");
+    println("optself/temp"); let o17 = E.A(mk(17)).m_optself(); println("  held");
+    println("mut/temp"); let x18 = E.A(mk(18)).m_mut(); println(f"  x{x18}");
+    println("end");
+}
+"#,
+            &[
+                "read/local",
+                "  dR1",
+                "  dE",
+                "  x1",
+                "read/temp",
+                "  dR2",
+                "  dE",
+                "  x2",
+                "r/local",
+                "  dE",
+                "  y3",
+                "  dR3",
+                "r/temp",
+                "  dE",
+                "  y4",
+                "  dR4",
+                "print/temp",
+                "  p5",
+                "  dR5",
+                "  dE",
+                "  after",
+                "ref/temp",
+                "  dE",
+                "  dR6",
+                "  x6",
+                "iflet/temp",
+                "  dR7",
+                "  dE",
+                "  x7",
+                "unit/temp",
+                "  dE",
+                "  x0",
+                "noshell/temp",
+                "  dR8",
+                "  x8",
+                "me/temp",
+                "  dE",
+                "  dR9",
+                "  held",
+                "wrap/temp",
+                "  dE",
+                "  dR10",
+                "  held",
+                "chain/temp",
+                "  dR11",
+                "  x11",
+                "ref/local",
+                "  dE",
+                "  dR12",
+                "  x12",
+                "refnoshell/temp",
+                "  dR13",
+                "  x13",
+                "refnoshell/local",
+                "  dR14",
+                "  x14",
+                "opt/temp",
+                "  dE",
+                "  dR16",
+                "  held",
+                "optself/temp",
+                "  dE",
+                "  dR17",
+                "  held",
+                "mut/temp",
+                "  dE",
+                "  dR18",
+                "  x18",
+                "end",
+            ],
+            "asan_fresh_temp_owned_enum_receiver_runs_the_shell_body_balanced",
         );
     }
 

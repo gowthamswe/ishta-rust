@@ -970,28 +970,75 @@ impl<'a> super::Interpreter<'a> {
                     crate::ast::owned_self_return_is_opaque_to_receiver(f, drop_probe)
                         && !crate::ast::fn_binds_self_part_out(f)
                 });
-        if !matches!(
+        let ref_self = matches!(
             self_param,
             Some(crate::ast::SelfParam::Ref | crate::ast::SelfParam::MutRef)
-        ) && !owned_self_consumes
-        {
+        );
+        // B-2026-09-06-38 — the ENUM receiver's gate for an owned `self`:
+        // only the shell's own body is registered here (the arm channel owns
+        // the payload), so the question is not the struct arm's "can the
+        // return carry any Drop-bearing part" but "can it carry the WHOLE
+        // receiver" — the one shape whose result binding would run the shell
+        // body a second time. Same shared predicate as the codegen registrar.
+        let owned_self_enum_shell = matches!(obj, Value::EnumVariant { .. })
+            && matches!(self_param, Some(crate::ast::SelfParam::Owned))
+            && self
+                .find_impl_method_ast(type_name, method)
+                .is_some_and(|f| {
+                    crate::ast::owned_self_return_cannot_carry_receiver(
+                        f,
+                        type_name,
+                        &self.program.items,
+                    ) && !crate::ast::fn_binds_self_part_out(f)
+                });
+        if !ref_self && !owned_self_consumes && !owned_self_enum_shell {
             return;
         }
         if self.method_returns_borrow(type_name, method) {
             return;
         }
-        // STRUCT receivers only — an ENUM receiver whose ref-self method
-        // matches on `self` and binds the payload already fires the
-        // match-arm channel (a pre-existing interp-only fire on borrowed
-        // self, B-2026-08-01-6); adding the walk here double-fired. The
-        // codegen twin skips enum receiver bodies identically.
-        if let Value::Struct { name, .. } = obj {
-            let tn = name.clone();
-            if self.program.drop_method_keys.contains_key(&tn) {
-                self.run_user_drop_body_on_value(&tn, obj.clone());
-            } else if self.value_runs_user_drop(obj) {
-                self.drop_user_drop_fields_of_value(obj);
+        match obj {
+            Value::Struct { name, .. } => {
+                let tn = name.clone();
+                if self.program.drop_method_keys.contains_key(&tn) {
+                    self.run_user_drop_body_on_value(&tn, obj.clone());
+                } else if self.value_runs_user_drop(obj) {
+                    self.drop_user_drop_fields_of_value(obj);
+                }
             }
+            // B-2026-09-06-38 — a value ENUM receiver temp. This arm was
+            // struct-only (B-2026-08-01-5): a ref-self method that matched on
+            // `self` and bound the payload fired the arm channel, so a walk
+            // here double-fired the payload. That reasoning covered the
+            // PAYLOAD; the shell's OWN body has no arm to fire from and had no
+            // owner for a temp on any surface (`E.A(mk(2)).m_read()` → `dR2 x2`,
+            // never `dE`). And the arm channel has since stood down on a
+            // borrowed receiver (B-2026-08-28-67's read-through gate), so a
+            // `ref self` temp fired NOTHING — measured `x6` alone for
+            // `E.A(mk(6)).m_ref()` on all four surfaces.
+            //
+            //  * `ref self`: the caller owns the whole borrowed temp — shell
+            //    body, then the payload walk, the order a named local prints.
+            //  * owned `self`: the arm channel runs the payload's body
+            //    (B-2026-09-06-27, -37); the caller runs the shell's alone.
+            // Option/Result never carry a user body of their own and shared
+            // enums are refcount-driven; both stay out, as in the codegen twin.
+            Value::EnumVariant { enum_name, .. }
+                if enum_name != "Option"
+                    && enum_name != "Result"
+                    && self.program.items.iter().any(
+                        |it| matches!(it, Item::EnumDef(e) if &e.name == enum_name && !e.is_shared),
+                    ) =>
+            {
+                let tn = enum_name.clone();
+                if self.program.drop_method_keys.contains_key(&tn) {
+                    self.run_user_drop_body_only(&tn, obj.clone());
+                }
+                if ref_self {
+                    self.run_enum_payload_user_drops_value(obj);
+                }
+            }
+            _ => {}
         }
     }
 

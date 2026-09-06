@@ -1521,6 +1521,125 @@ pub fn owned_self_return_is_opaque_to_receiver(
     }
 }
 
+/// B-2026-09-06-38 — can `f`'s RETURN value carry its owned `self` receiver,
+/// of type `receiver`, back to the caller WHOLE?
+///
+/// The ENUM-receiver sibling of [`owned_self_return_is_opaque_to_receiver`].
+/// That gate asks whether the return could carry ANY Drop-bearing part of the
+/// receiver, because a struct temp's caller-side registration is a walk over
+/// its fields, and a field handed back would fire twice. An owned ENUM temp's
+/// caller-side registration is the shell's OWN body alone — the match-arm
+/// channel owns the payload (B-2026-08-01-6, B-2026-09-06-27) — so a payload
+/// handed back (`fn m_r(self) -> R`) doubles nothing, and declining it under
+/// the struct gate left the shell body with no owner on every surface. What
+/// doubles the shell body is the WHOLE receiver riding out: the caller's
+/// result binding then runs it too (`fn me(self) -> E`, `fn wrap(self) -> W`
+/// with `struct W { e: E }`).
+///
+/// So this declines exactly the returns that can CONTAIN the receiver's type:
+/// `Self`, the type itself, any generic path (`Option[E]`, `Vec[E]`), any
+/// tuple / array / pointer / ref / fn return, and any declared type whose
+/// fields or payloads reach the receiver's type transitively. A name this
+/// pass cannot resolve to a declaration declines too — the conservative
+/// direction of the whole family (a body nobody runs, never a double fire).
+pub fn owned_self_return_cannot_carry_receiver(
+    f: &Function,
+    receiver: &str,
+    items: &[Item],
+) -> bool {
+    let Some(rt) = f.return_type.as_ref() else {
+        // Unit return: there is no value to carry anything back in.
+        return true;
+    };
+    !type_expr_can_contain(rt, receiver, items, &mut Vec::new())
+}
+
+fn type_expr_can_contain(
+    te: &TypeExpr,
+    target: &str,
+    items: &[Item],
+    visited: &mut Vec<String>,
+) -> bool {
+    match &te.kind {
+        crate::ast::TypeKind::Unit => false,
+        crate::ast::TypeKind::Tuple(elems) => elems
+            .iter()
+            .any(|e| type_expr_can_contain(e, target, items, visited)),
+        crate::ast::TypeKind::Path(p) => {
+            let [name] = p.segments.as_slice() else {
+                return true;
+            };
+            if name == target || name == "Self" {
+                return true;
+            }
+            if let Some(args) = p.generic_args.as_ref() {
+                // A generic path contains `target` when one of its ARGUMENTS
+                // does (`Option[E]`, `Map[String, E]`, `Vec[W]` with
+                // `W { e: E }`) — or, for a user-declared generic head, when
+                // the declaration's own fields reach it (`S[T] { e: E, t: T }`;
+                // the bare `T` field resolves to no declaration and so counts
+                // as "can", the conservative direction). A builtin head
+                // (`Vec[i64]`, `Option[String]`) has no declaration here and
+                // carries nothing but its arguments — which is what keeps a
+                // payload like `R { xs: Vec[i64] }` from reading as able to
+                // hold the enum that carries it.
+                let arg_can = args.iter().any(|a| match a {
+                    GenericArg::Type(t) => type_expr_can_contain(t, target, items, visited),
+                    GenericArg::Const(_) | GenericArg::Shape(_) => false,
+                });
+                let declared_here = items.iter().any(|it| {
+                    matches!(it, Item::StructDef(s) if &s.name == name)
+                        || matches!(it, Item::EnumDef(e) if &e.name == name)
+                });
+                return arg_can
+                    || (declared_here && type_name_can_contain(name, target, items, visited));
+            }
+            if type_expr_cannot_carry_drop_body(te) {
+                return false;
+            }
+            type_name_can_contain(name, target, items, visited)
+        }
+        _ => true,
+    }
+}
+
+/// Does the declared struct or enum `name` reach `target` by value through
+/// its fields / payloads? `visited` breaks recursive declarations.
+fn type_name_can_contain(
+    name: &str,
+    target: &str,
+    items: &[Item],
+    visited: &mut Vec<String>,
+) -> bool {
+    if visited.iter().any(|v| v == name) {
+        return false;
+    }
+    visited.push(name.to_string());
+    for it in items {
+        match it {
+            Item::StructDef(s) if s.name == name => {
+                return s
+                    .fields
+                    .iter()
+                    .any(|f| type_expr_can_contain(&f.ty, target, items, visited));
+            }
+            Item::EnumDef(e) if e.name == name => {
+                return e.variants.iter().any(|v| match &v.kind {
+                    VariantKind::Unit => false,
+                    VariantKind::Tuple(tys) => tys
+                        .iter()
+                        .any(|t| type_expr_can_contain(t, target, items, visited)),
+                    VariantKind::Struct(fs) => fs
+                        .iter()
+                        .any(|f| type_expr_can_contain(&f.ty, target, items, visited)),
+                });
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// B-2026-09-04-30 — does `f`'s body BIND A PART OF `self` OUT: a `let` (or
 /// `let…else`) initialized from `self` or a `self`-rooted place, or a
 /// `match` / `if let` / `while let` whose scrutinee is one?
