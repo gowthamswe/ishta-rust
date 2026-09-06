@@ -8039,6 +8039,11 @@ impl<'ctx> super::Codegen<'ctx> {
                         payload_skip,
                     );
                     self.disarm_escaping_place_tuple_elem_bodies(&qualified, i, &a.value);
+                    // B-2026-09-05-17 — and the STRUCT sibling, which the method
+                    // path never called: `h.m_fwd(g)` over `fn m_fwd(ref self,
+                    // g: Cd) -> R { return cEsc(g); }` ran `g.r`'s body at `g`'s
+                    // scope end and again at the result's.
+                    self.disarm_escaping_place_struct_field_bodies(&qualified, i, &a.value);
                     // Fresh-heap by-value arg materialization — the method-call
                     // sibling of the #20 arm in `compile_call` (call_dispatch.rs).
                     // A `String`/`Vec` produced by a Call/MethodCall (or a block /

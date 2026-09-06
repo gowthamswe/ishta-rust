@@ -3450,13 +3450,14 @@ impl<'a> super::Interpreter<'a> {
             // `self` or a `ref` param, the value is still travelling when this
             // walk would fire — the RESULT's consumer or the new home owns it.
             // B-2026-08-30-22's associated-callee resolution is inside.
-            let variant = match arg_vals.get(i) {
-                Some(Value::EnumVariant { variant, .. }) => Some(variant.as_str()),
-                _ => None,
-            };
-            if self.callee_owns_arg_beyond_call(callee_name, method_owner, i, variant) {
-                continue;
-            }
+            // B-2026-09-05-17 — the place-argument masks run BEFORE the
+            // whole-argument stand-down below, not after it: on the method
+            // path a Drop-returning callee stands the whole argument down by
+            // return type and `continue`d past them, so `h.m_fwd(g)` never
+            // masked `g.r` and the binding's own field walk fired beside the
+            // result's owner. Masking a subset of a walk that a later
+            // passthrough disarms outright changes nothing, so the order is
+            // safe in the other direction.
             // B-2026-08-28-16 — a PLACE tuple argument (`take(q)`) whose
             // ELEMENT escapes through the callee's return. The fresh-temp walk
             // below is gated on `ExprKind::Tuple`, so a bare identifier never
@@ -3517,6 +3518,13 @@ impl<'a> super::Interpreter<'a> {
                         }
                     }
                 }
+            }
+            let variant = match arg_vals.get(i) {
+                Some(Value::EnumVariant { variant, .. }) => Some(variant.as_str()),
+                _ => None,
+            };
+            if self.callee_owns_arg_beyond_call(callee_name, method_owner, i, variant) {
+                continue;
             }
             // B-2026-07-30-11 (param-tuple leg, the A shape): a tuple
             // LITERAL arg (`take_tuple((Res { id: 41 }, 10))`) moved into

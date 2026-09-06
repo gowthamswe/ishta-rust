@@ -145399,6 +145399,73 @@ fn main() {
         };
         assert_eq!(out, "dR1\nr1\none\ndR2\nr5\ntwo\ndR3\nr3\nthree\nr4\ndR4\nfour\nr5\ndR5\nfive\nr1 n1\ndR6\nsix\nr1 n1\ndR7\nseven\ndR8\nr9\neight\ndR9\nr9\nnine\ndR10\nr5\nten\ndR11\nr5\neleven\ndR12\nr12\ntwelve\ndR13\nr5\nthirteen\ndR14\nr114\nfourteen\ndR15\nr100\nfifteen\ndR16\nr16\nsixteen\ndR17\nr5\nseventeen\nr18\ndR18\neighteen\nr19\nnineteen\nend\n");
     }
+
+    /// B-2026-09-05-17 — a place struct (or tuple) argument whose part is
+    /// handed back THROUGH a forwarding call runs that part's `Drop` body
+    /// once. `fn fwd(g: Cd) -> R { return cEsc(g); }` over `fn cEsc(h: Cd) -> R
+    /// { let Cd { r, z } = h; r }` printed `in dR61 got61 dR61` on every
+    /// surface: the part channel classified only a return site that DENOTES
+    /// the part, so a forwarded call reported nothing and `g`'s own field walk
+    /// fired beside the result's owner. The program-aware part scan
+    /// (`fn_escaping_param_part_paths`) now composes the callee's own answer
+    /// under the argument's prefix — the shape `fn_returns_param_via_call`
+    /// gives the whole-param channel — for a call on the body's TOP LEVEL
+    /// (tail, `return`, `let`, inside a returned aggregate literal), with a
+    /// cycle guard for a recursive forward. A CONDITIONAL forward is left
+    /// unreported on purpose: reporting it would trade this double for a lost
+    /// body on the path that does not forward.
+    ///
+    /// `one` is the row's cell, `two` the direct call, `three`/`four` the tail
+    /// and projection spellings, `five` a two-hop forward, `six` the tuple
+    /// sibling, `seven` a forward inside a returned struct literal, `eight`
+    /// the conditional forward's NOT-taken path (one body, unchanged), `nine`/
+    /// `ten` `let`-bound forwards (`ten` dies inside the frame), `eleven` a
+    /// fresh-temp argument, `twelve` the METHOD path, which also needed the
+    /// struct sibling of the place-argument disarm on the method arg loop.
+    #[test]
+    fn e2e_forwarded_place_struct_arg_field_handed_back_has_one_owner() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct Cd { r: R, z: i64 }
+struct W { r: R, n: i64 }
+fn cEsc(h: Cd) -> R { let Cd { r, z } = h; println("in"); return r; }
+fn cProj(h: Cd) -> R { return h.r; }
+fn tEsc(t: (R, i64)) -> R { let (r, k) = t; return r; }
+fn fwd(g: Cd) -> R { return cEsc(g); }
+fn fwd_tail(g: Cd) -> R { cEsc(g) }
+fn fwd_proj(g: Cd) -> R { return cProj(g); }
+fn fwd2(g: Cd) -> R { return fwd(g); }
+fn fwd_t(t: (R, i64)) -> R { return tEsc(t); }
+fn fwd_wrap(g: Cd) -> W { return W { r: cEsc(g), n: 1 }; }
+fn fwd_cond(g: Cd, c: bool) -> R { if c { return cEsc(g); } return mk(99); }
+fn fwd_let(g: Cd) -> R { let x: R = cEsc(g); return x; }
+fn fwd_i(g: Cd) -> i64 { let x: R = cEsc(g); return x.id; }
+struct H { n: i64 }
+impl H { fn m_fwd(ref self, g: Cd) -> R { return cEsc(g); } }
+fn main() {
+    let h: H = H { n: 1 };
+    { let g: Cd = Cd { r: mk(61), z: 9 }; let out: R = fwd(g); println(f"got{out.id}"); println("one") }
+    { let g: Cd = Cd { r: mk(62), z: 9 }; let out: R = cEsc(g); println(f"got{out.id}"); println("two") }
+    { let g: Cd = Cd { r: mk(63), z: 9 }; let out: R = fwd_tail(g); println(f"got{out.id}"); println("three") }
+    { let g: Cd = Cd { r: mk(64), z: 9 }; let out: R = fwd_proj(g); println(f"got{out.id}"); println("four") }
+    { let g: Cd = Cd { r: mk(65), z: 9 }; let out: R = fwd2(g); println(f"got{out.id}"); println("five") }
+    { let t: (R, i64) = (mk(66), 0); let out: R = fwd_t(t); println(f"got{out.id}"); println("six") }
+    { let g: Cd = Cd { r: mk(67), z: 9 }; let out: W = fwd_wrap(g); println(f"got{out.r.id}"); println("seven") }
+    { let g: Cd = Cd { r: mk(69), z: 9 }; let out: R = fwd_cond(g, false); println(f"got{out.id}"); println("nine") }
+    { let g: Cd = Cd { r: mk(70), z: 9 }; let out: R = fwd_let(g); println(f"got{out.id}"); println("ten") }
+    { let g: Cd = Cd { r: mk(71), z: 9 }; let d: i64 = fwd_i(g); println(f"got{d}"); println("eleven") }
+    { let out: R = fwd(Cd { r: mk(72), z: 9 }); println(f"got{out.id}"); println("twelve") }
+    { let g: Cd = Cd { r: mk(73), z: 9 }; let out: R = h.m_fwd(g); println(f"got{out.id}"); println("thirteen") }
+    println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "in\ngot61\ndR61\none\nin\ngot62\ndR62\ntwo\nin\ngot63\ndR63\nthree\ngot64\ndR64\nfour\nin\ngot65\ndR65\nfive\ngot66\ndR66\nsix\nin\ngot67\ndR67\nseven\ndR69\ngot99\ndR99\nnine\nin\ngot70\ndR70\nten\nin\ndR71\ngot71\neleven\nin\ngot72\ndR72\ntwelve\nin\ngot73\ndR73\nthirteen\nend\n");
+    }
 }
 
 #[cfg(feature = "llvm")]

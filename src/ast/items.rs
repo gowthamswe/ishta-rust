@@ -2675,7 +2675,22 @@ fn returned_param_part_paths_impl(
     let cx = PartScanCx {
         program,
         roots: &roots,
+        top_level: true,
     };
+    // B-2026-09-05-17 — cycle guard for the forwarding route, which asks
+    // this same question of the callee: a recursive forward answers empty,
+    // the channel's under-approximating direction.
+    thread_local! {
+        static PART_PATHS_IN_FLIGHT: std::cell::RefCell<Vec<(String, usize)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (f.name.clone(), arg_index);
+    if program.is_some() && PART_PATHS_IN_FLIGHT.with(|v| v.borrow().contains(&key)) {
+        return Vec::new();
+    }
+    if program.is_some() {
+        PART_PATHS_IN_FLIGHT.with(|v| v.borrow_mut().push(key.clone()));
+    }
     let PatternKind::Binding(param_name) = &param.pattern.kind else {
         return Vec::new();
     };
@@ -2919,11 +2934,14 @@ fn returned_param_part_paths_impl(
         cx: PartScanCx<'_>,
         out: &mut Vec<ParamPath>,
     ) {
-        let mut note = |a: &Expr| {
+        fn push_part(out: &mut Vec<ParamPath>, path: ParamPath) {
+            if !path.is_empty() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+        let note = |a: &Expr, out: &mut Vec<ParamPath>| {
             if let Some(path) = denote(a, aliases) {
-                if !path.is_empty() && !out.contains(&path) {
-                    out.push(path);
-                }
+                push_part(out, path);
             }
         };
         match &e.kind {
@@ -2939,10 +2957,29 @@ fn returned_param_part_paths_impl(
                     return;
                 };
                 for (j, a) in args.iter().enumerate() {
-                    if matches!(&a.value.kind, ExprKind::Identifier(_))
-                        && callee_takes_param_over(program, gf, j)
-                    {
-                        note(&a.value);
+                    if !matches!(&a.value.kind, ExprKind::Identifier(_)) {
+                        continue;
+                    }
+                    if callee_takes_param_over(program, gf, j) {
+                        note(&a.value, out);
+                        continue;
+                    }
+                    // B-2026-09-05-17 — the FORWARDING route: the callee hands
+                    // back not the value but a PART of it (`fn fwd(g: Cd) -> R
+                    // { return cEsc(g); }` over `fn cEsc(h: Cd) -> R { let Cd
+                    // { r, z } = h; r }`), so `fwd` hands back the same part
+                    // under this argument's prefix. Composed from the callee's
+                    // own answer, which is what the whole-param channel's
+                    // `fn_returns_param_via_call` does one level up, and gated
+                    // to the body's top level (see `PartScanCx::top_level`).
+                    if cx.top_level {
+                        if let Some(prefix) = denote(&a.value, aliases) {
+                            for q in fn_escaping_param_part_paths(program, gf, j) {
+                                let mut path = prefix.clone();
+                                path.extend(q);
+                                push_part(out, path);
+                            }
+                        }
                     }
                 }
             }
@@ -2950,7 +2987,7 @@ fn returned_param_part_paths_impl(
                 if cx.program.is_some() && outliving_store::place_root_outlives(object, cx.roots) {
                     for a in args {
                         if matches!(&a.value.kind, ExprKind::Identifier(_)) {
-                            note(&a.value);
+                            note(&a.value, out);
                         }
                     }
                 }
@@ -2976,6 +3013,18 @@ fn returned_param_part_paths_impl(
                     scan_expr(&a.value, aliases, cx, out);
                 }
             }
+            // B-2026-09-05-17 — a call nested in a returned aggregate literal
+            // (`return W { r: cEsc(g), n: 1 }`) forwards exactly as a bare one.
+            ExprKind::StructLiteral { fields, .. } => {
+                for fi in fields {
+                    scan_expr(&fi.value, aliases, cx, out);
+                }
+            }
+            ExprKind::Tuple(elems) => {
+                for el in elems {
+                    scan_expr(el, aliases, cx, out);
+                }
+            }
             ExprKind::MethodCall { object, args, .. } => {
                 taken_over(e, aliases, cx, out);
                 scan_expr(object, aliases, cx, out);
@@ -2993,6 +3042,10 @@ fn returned_param_part_paths_impl(
                 else_branch,
                 ..
             } => {
+                let cx = PartScanCx {
+                    top_level: false,
+                    ..cx
+                };
                 scan_block(then_block, aliases, cx, out);
                 if let Some(x) = else_branch.as_deref() {
                     scan_expr(x, aliases, cx, out);
@@ -3003,12 +3056,20 @@ fn returned_param_part_paths_impl(
                 else_branch,
                 ..
             } => {
+                let cx = PartScanCx {
+                    top_level: false,
+                    ..cx
+                };
                 scan_block(then_block, aliases, cx, out);
                 if let Some(x) = else_branch.as_deref() {
                     scan_expr(x, aliases, cx, out);
                 }
             }
             ExprKind::Match { arms, .. } => {
+                let cx = PartScanCx {
+                    top_level: false,
+                    ..cx
+                };
                 for a in arms {
                     yielded(&a.body, aliases, out);
                     scan_expr(&a.body, aliases, cx, out);
@@ -3018,7 +3079,15 @@ fn returned_param_part_paths_impl(
             | ExprKind::WhileLet { body, .. }
             | ExprKind::For { body, .. }
             | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => scan_block(body, aliases, cx, out),
+            | ExprKind::LabeledBlock { body, .. } => scan_block(
+                body,
+                aliases,
+                PartScanCx {
+                    top_level: false,
+                    ..cx
+                },
+                out,
+            ),
             _ => {}
         }
     }
@@ -3046,6 +3115,14 @@ fn returned_param_part_paths_impl(
     grow_block(&f.body, &mut aliases);
     let mut out = Vec::new();
     scan_block(&f.body, &aliases, cx, &mut out);
+    if program.is_some() {
+        PART_PATHS_IN_FLIGHT.with(|v| {
+            let mut v = v.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|k| k == &key) {
+                v.remove(pos);
+            }
+        });
+    }
     out
 }
 
@@ -3054,6 +3131,13 @@ fn returned_param_part_paths_impl(
 struct PartScanCx<'a> {
     program: Option<&'a crate::Program>,
     roots: &'a [&'a str],
+    /// B-2026-09-05-17 — still on the function body's own statement list,
+    /// i.e. not inside an `if` / `match` / loop. The forwarding route below
+    /// is admitted only here, so a CONDITIONAL forward keeps the channel's
+    /// under-approximating answer (`fn f(g: Cd, c: bool) -> R { if c { return
+    /// cEsc(g); } mk(99) }` reports nothing and the not-forwarded path keeps
+    /// its body) rather than trading this row's double for a lost body.
+    top_level: bool,
 }
 
 /// B-2026-08-09-15 — the PAYLOAD sibling of [`fn_returns_param`]: does `f`

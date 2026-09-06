@@ -73952,4 +73952,75 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-05-17 — ASAN twin of `tests/codegen.rs`'s
+    /// `e2e_forwarded_place_struct_arg_field_handed_back_has_one_owner`: a part
+    /// handed back through a forwarding call is freed once and its body runs
+    /// once. Heap `R` (`String` + `Vec`) so a lost free is a leak LSan sees.
+    #[test]
+    fn asan_forwarded_place_struct_arg_field_handed_back_clean() {
+        let label = "forwarded_place_struct_arg_field_handed_back";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+struct Cd { r: R, z: i64 }
+struct W { r: R, n: i64 }
+fn cEsc(h: Cd) -> R { let Cd { r, z } = h; println("in"); return r; }
+fn cProj(h: Cd) -> R { return h.r; }
+fn tEsc(t: (R, i64)) -> R { let (r, k) = t; return r; }
+fn fwd(g: Cd) -> R { return cEsc(g); }
+fn fwd_tail(g: Cd) -> R { cEsc(g) }
+fn fwd_proj(g: Cd) -> R { return cProj(g); }
+fn fwd2(g: Cd) -> R { return fwd(g); }
+fn fwd_t(t: (R, i64)) -> R { return tEsc(t); }
+fn fwd_wrap(g: Cd) -> W { return W { r: cEsc(g), n: 1 }; }
+fn fwd_cond(g: Cd, c: bool) -> R { if c { return cEsc(g); } return mk(99); }
+fn fwd_let(g: Cd) -> R { let x: R = cEsc(g); return x; }
+fn fwd_i(g: Cd) -> i64 { let x: R = cEsc(g); return x.id; }
+struct H { n: i64 }
+impl H { fn m_fwd(ref self, g: Cd) -> R { return cEsc(g); } }
+fn main() {
+    let h: H = H { n: 1 };
+    { let g: Cd = Cd { r: mk(61), z: 9 }; let out: R = fwd(g); println(f"got{out.id}"); println("one") }
+    { let g: Cd = Cd { r: mk(62), z: 9 }; let out: R = cEsc(g); println(f"got{out.id}"); println("two") }
+    { let g: Cd = Cd { r: mk(63), z: 9 }; let out: R = fwd_tail(g); println(f"got{out.id}"); println("three") }
+    { let g: Cd = Cd { r: mk(64), z: 9 }; let out: R = fwd_proj(g); println(f"got{out.id}"); println("four") }
+    { let g: Cd = Cd { r: mk(65), z: 9 }; let out: R = fwd2(g); println(f"got{out.id}"); println("five") }
+    { let t: (R, i64) = (mk(66), 0); let out: R = fwd_t(t); println(f"got{out.id}"); println("six") }
+    { let g: Cd = Cd { r: mk(67), z: 9 }; let out: W = fwd_wrap(g); println(f"got{out.r.id}"); println("seven") }
+    { let g: Cd = Cd { r: mk(69), z: 9 }; let out: R = fwd_cond(g, false); println(f"got{out.id}"); println("nine") }
+    { let g: Cd = Cd { r: mk(70), z: 9 }; let out: R = fwd_let(g); println(f"got{out.id}"); println("ten") }
+    { let g: Cd = Cd { r: mk(71), z: 9 }; let d: i64 = fwd_i(g); println(f"got{d}"); println("eleven") }
+    { let out: R = fwd(Cd { r: mk(72), z: 9 }); println(f"got{out.id}"); println("twelve") }
+    { let g: Cd = Cd { r: mk(73), z: 9 }; let out: R = h.m_fwd(g); println(f"got{out.id}"); println("thirteen") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "in", "got61", "dR61", "one", "in", "got62", "dR62", "two", "in", "got63", "dR63",
+                "three", "got64", "dR64", "four", "in", "got65", "dR65", "five", "got66", "dR66",
+                "six", "in", "got67", "dR67", "seven", "dR69", "got99", "dR99", "nine", "in",
+                "got70", "dR70", "ten", "in", "dR71", "got71", "eleven", "in", "got72", "dR72",
+                "twelve", "in", "got73", "dR73", "thirteen", "end",
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }
