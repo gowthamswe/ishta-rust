@@ -3499,6 +3499,22 @@ pub fn fn_escaping_param_field_payload_paths(
     let PatternKind::Binding(param_name) = &param.pattern.kind else {
         return Vec::new();
     };
+    // B-2026-09-06-25 — a BORROWED param hands nothing out of the caller's
+    // value: a payload the body forwards from `h.e` under `h: ref H` /
+    // `mut ref H` is the stopgap COPY (design.md § "A projection off a borrow
+    // is an implicit copy"), and the caller's own field walk still owns the
+    // original's body. Without this gate the interpreter's named-arg consumer
+    // disarmed the CALLER's payload walk for a `ref` argument, so
+    // `let r2 = match h.e { E.A(r) => r, .. }` through `ref h` printed
+    // `dE 5 dR5` — the caller's struct dying with an empty shell — against
+    // `dE dR5 5 dR5` on every compiled backend. The owned-`self` sibling below
+    // already carries the same mode gate.
+    if matches!(
+        param.ty.kind,
+        crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+    ) {
+        return Vec::new();
+    }
     escaping_field_payload_paths_impl(f, param_name, false, CallYieldRule::ReturnsIt(program))
 }
 

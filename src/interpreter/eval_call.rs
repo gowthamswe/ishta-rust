@@ -3171,12 +3171,47 @@ impl<'a> super::Interpreter<'a> {
     /// B-2026-09-06-17 — [`crate::ast::fn_escaping_param_field_payload_paths`]
     /// for the callee `arg_index` reaches, resolved like
     /// [`Self::callee_returned_param_parts`].
+    /// B-2026-09-06-25 — is the callee's parameter at `arg_index` a `ref` /
+    /// `mut ref` borrow? Every caller-side mask below asks "what does the
+    /// callee hand out of THIS argument", and for a borrow the answer is
+    /// nothing of the caller's: a payload the body forwards out of `h.e`
+    /// under `h: ref H` is the stopgap COPY (design.md § "A projection off a
+    /// borrow is an implicit copy"), and the caller's own walk still owns the
+    /// original. Without this gate `let r2 = match h.e { E.A(r) => r, .. }`
+    /// and `return h.r` through a `ref` argument masked the CALLER's field
+    /// walk, so its struct died with an empty shell (`dE 5 dR5`) against
+    /// `dE dR5 5 dR5` on every compiled backend.
+    fn callee_param_is_borrow(
+        &self,
+        callee_name: &str,
+        method_owner: Option<&str>,
+        arg_index: usize,
+    ) -> bool {
+        let f = if let Some(ty) = method_owner {
+            self.impl_method_ast(ty, callee_name)
+        } else {
+            self.program.items.iter().find_map(|item| match item {
+                crate::ast::Item::Function(f) if f.name == callee_name => Some(f),
+                _ => None,
+            })
+        };
+        f.and_then(|f| f.params.get(arg_index)).is_some_and(|p| {
+            matches!(
+                p.ty.kind,
+                crate::ast::TypeKind::Ref(_) | crate::ast::TypeKind::MutRef(_)
+            )
+        })
+    }
+
     fn callee_escaping_field_payload_parts(
         &self,
         callee_name: &str,
         method_owner: Option<&str>,
         arg_index: usize,
     ) -> Vec<crate::ast::ParamPath> {
+        if self.callee_param_is_borrow(callee_name, method_owner, arg_index) {
+            return Vec::new();
+        }
         if let Some(ty) = method_owner {
             return self
                 .impl_method_ast(ty, callee_name)
@@ -3216,6 +3251,10 @@ impl<'a> super::Interpreter<'a> {
         method_owner: Option<&str>,
         arg_index: usize,
     ) -> Vec<crate::ast::ParamPath> {
+        // B-2026-09-06-25 — see `callee_param_is_borrow`.
+        if self.callee_param_is_borrow(callee_name, method_owner, arg_index) {
+            return Vec::new();
+        }
         // B-2026-09-03-7 — an INSTANCE method resolves by (type, name), not by
         // the bare-name scan below: that scan reads `Item::Function` only, so
         // for a method it answered "nothing escapes" for every argument. The

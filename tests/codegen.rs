@@ -33297,6 +33297,136 @@ end
         );
     }
 
+    /// B-2026-09-06-25 — the interpreter took NO copy for two materializations
+    /// of a view bound off a BORROW-projection scrutinee: an arm value / a
+    /// `return` forwarding the binding (and a whole `return h.r`) through a
+    /// named `ref` / `mut ref` param let the caller-side escape masks fire on
+    /// a borrowed argument, so the CALLER's struct died with an empty shell;
+    /// and a by-value call argument under `ref self` / `mut ref self` bound
+    /// `r` with no slot (the `self.e` root had no disarm-and-stash lockstep),
+    /// so the copy's body ran nowhere. Codegen was right on every cell; this
+    /// pins it against the interpreter twin, byte for byte. `p_read` /
+    /// `m_read` are the read-only controls (one body); `m_mixed/read` is the
+    /// user-enum whole-match trade (B-2026-09-02-14): the guard arm's hand-out
+    /// makes the untaken path pay for the copy too, on every backend.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_borrow_projection_view_materialized_by_arm_value_or_call_arg_copies`, pinned to the same string.
+    #[test]
+    fn e2e_borrow_projection_view_materialized_by_arm_value_or_call_arg_copies() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct H { e: E }
+struct W { r: R }
+fn consume(x: R) -> i64 { return x.id }
+
+fn p_out(h: ref H) -> R { let r2 = match h.e { E.A(r) => r, E.B => mk(0) }; return r2; }
+fn p_out_mut(h: mut ref H) -> R { match h.e { E.A(r) => { return r; } E.B => { return mk(0); } } }
+fn p_field(w: ref W) -> R { return w.r; }
+fn p_consume(h: ref H) -> i64 { match h.e { E.A(r) => { return consume(r); } E.B => { return 0; } } }
+fn p_read(h: ref H) -> i64 { match h.e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+impl H {
+    fn m_consume(ref self) -> i64 { match self.e { E.A(r) => { return consume(r); } E.B => { return 0; } } }
+    fn m_consume_mut(mut ref self) -> i64 { match self.e { E.A(r) => { return consume(r); } E.B => { return 0; } } }
+    fn m_consume_iflet(ref self) -> i64 { if let E.A(r) = self.e { return consume(r); } return 0; }
+    fn m_let(ref self) -> i64 { match self.e { E.A(r) => { let m = r; return consume(m); } E.B => { return 0; } } }
+    fn m_out(ref self) -> R { let r2 = match self.e { E.A(r) => r, E.B => mk(0) }; return r2; }
+    fn m_read(ref self) -> i64 { match self.e { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_mixed(ref self, k: bool) -> i64 { match self.e { E.A(r) if k => { return consume(r); } E.A(r) => { return r.id; } E.B => { return 0; } } }
+}
+
+fn main() {
+    println("p_out"); let a1 = H { e: E.A(mk(1)) }; let r1 = p_out(a1); println(f"  got{r1.id}");
+    println("p_out_mut"); let mut a2 = H { e: E.A(mk(2)) }; let r2 = p_out_mut(mut a2); println(f"  got{r2.id}");
+    println("p_field"); let w3 = W { r: mk(3) }; let r3 = p_field(w3); println(f"  got{r3.id}");
+    println("p_consume"); let a4 = H { e: E.A(mk(4)) }; let x4 = p_consume(a4); println(f"  got{x4}");
+    println("p_read"); let a5 = H { e: E.A(mk(5)) }; let x5 = p_read(a5); println(f"  got{x5}");
+    println("m_consume"); let a6 = H { e: E.A(mk(6)) }; let x6 = a6.m_consume(); println(f"  got{x6}");
+    println("m_consume_mut"); let mut a7 = H { e: E.A(mk(7)) }; let x7 = a7.m_consume_mut(); println(f"  got{x7}");
+    println("m_consume_iflet"); let a8 = H { e: E.A(mk(8)) }; let x8 = a8.m_consume_iflet(); println(f"  got{x8}");
+    println("m_let"); let a9 = H { e: E.A(mk(9)) }; let x9 = a9.m_let(); println(f"  got{x9}");
+    println("m_out"); let a10 = H { e: E.A(mk(10)) }; let r10 = a10.m_out(); println(f"  got{r10.id}");
+    println("m_read"); let a11 = H { e: E.A(mk(11)) }; let x11 = a11.m_read(); println(f"  got{x11}");
+    println("m_mixed/taken"); let a12 = H { e: E.A(mk(12)) }; let x12 = a12.m_mixed(true); println(f"  got{x12}");
+    println("m_mixed/read"); let a13 = H { e: E.A(mk(13)) }; let x13 = a13.m_mixed(false); println(f"  got{x13}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"p_out
+  dE
+  dR1
+  got1
+  dR1
+p_out_mut
+  dE
+  dR2
+  got2
+  dR2
+p_field
+  dR3
+  got3
+  dR3
+p_consume
+  dR4
+  dE
+  dR4
+  got4
+p_read
+  dE
+  dR5
+  got5
+m_consume
+  dR6
+  dE
+  dR6
+  got6
+m_consume_mut
+  dR7
+  dE
+  dR7
+  got7
+m_consume_iflet
+  dR8
+  dE
+  dR8
+  got8
+m_let
+  dR9
+  dE
+  dR9
+  got9
+m_out
+  dE
+  dR10
+  got10
+  dR10
+m_read
+  dE
+  dR11
+  got11
+m_mixed/taken
+  dR12
+  dE
+  dR12
+  got12
+m_mixed/read
+  dR13
+  dE
+  dR13
+  got13
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value

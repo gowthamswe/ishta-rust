@@ -620,6 +620,14 @@ impl<'a> super::Interpreter<'a> {
         };
         let (root, mut path) = match &object.kind {
             ExprKind::Identifier(root) => (root.clone(), Vec::new()),
+            // B-2026-09-06-25 — `self` is its own expression kind, and it is
+            // the name the receiver is bound under, so `self.e` resolves to
+            // the same `(root, path)` a named param's `h.e` does. Under a
+            // BORROWED receiver this is what gives a consuming arm's payload
+            // binding its arm-end slot (see `scrutinee_expr_is_consuming`);
+            // under an OWNED receiver the record only masks the callee's
+            // memory-only view walk, which runs no body either way.
+            ExprKind::SelfValue => ("self".to_string(), Vec::new()),
             ExprKind::FieldAccess { .. } => Self::projection_field_name_path(object)?,
             _ => return None,
         };
@@ -956,6 +964,26 @@ impl<'a> super::Interpreter<'a> {
                             .moved_out_struct_field_payload_bodies
                             .contains(&(n.clone(), vec![field.clone()]))
                 }
+                // B-2026-09-06-25 — `self.e` under a `ref self` / `mut ref self`
+                // receiver, on the named-param arm's exact terms: the
+                // projection off a borrow is the stopgap COPY, the arm's
+                // binding owns it, and the disarm above recorded the retraction
+                // (the lockstep the Identifier arm keys on). An OWNED receiver
+                // is the caller-retains case and stays a view, exactly as an
+                // owned named param does. Without this arm `match self.e {
+                // E.A(r) => { return consume(r); } .. }` under `ref self` bound
+                // `r` with no slot, the by-value callee ran no body (caller
+                // retains), and the copy's body ran nowhere: `3 dE dR3` against
+                // `dR3 3 dE dR3` on every compiled backend and on this backend's
+                // own `fn take(h: ref H1)` twin.
+                ExprKind::SelfValue => {
+                    !matches!(
+                        self.self_param_stack.last(),
+                        Some(crate::ast::SelfParam::Owned)
+                    ) && self
+                        .moved_out_struct_field_payload_bodies
+                        .contains(&("self".to_string(), vec![field.clone()]))
+                }
                 _ => false,
             },
             _ => false,
@@ -1229,7 +1257,10 @@ impl<'a> super::Interpreter<'a> {
             // reason a fresh temp does — standing the stash down there would
             // hand the payload to nobody.
             ExprKind::TupleIndex { object, .. } | ExprKind::FieldAccess { object, .. } => {
-                matches!(object.kind, ExprKind::Identifier(_))
+                // B-2026-09-06-25 — `self.e` joins `h.e`: the read-through
+                // gate has to be able to stand the stash down per arm there
+                // too, now that a borrowed receiver's projection is consuming.
+                matches!(object.kind, ExprKind::Identifier(_) | ExprKind::SelfValue)
             }
             _ => false,
         }
