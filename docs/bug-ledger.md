@@ -94,9 +94,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 390 |
 | run-vs-build | 360 |
-| leak | 275 |
+| leak | 278 |
 | missing-feature | 194 |
-| double-free | 191 |
+| double-free | 192 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
 | false-positive | 106 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1521 |
+| codegen | 1525 |
 | interp | 390 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -141,7 +141,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-02-22 | 2026-09-02 | codegen | low | A DOUBLY-NESTED `Option[Option[String]]` ARGUMENT LEAKS ITS INNER PAYLOAD -- 45 B in 3 blocks over a three-iteration loop, unmoved by all THREE of B-2026-09-01-29's fixes. The payload is 3 words, so `Option[Option[String]]` exceeds the 3-word boxing limit `optres_param_entry_copied_te` gates on: the param is never ADMITTED to the by-value copy convention, so neither the callee's entry copy nor any caller-side ownership predicate applies and no frame is ever offered the temp | — |
 | B-2026-09-02-31 | 2026-09-02 | codegen | low | THE BARE-ARM SPELLING OF B-2026-09-01-26 STILL LEAKS -- `match mkVe(9) { Ve.A(s) => s, .. }` in a nested expression position loses 15 B per evaluation at both opt levels where the BRACED `=> { s }` spelling is now clean. Excluded by that fix's block-bodied-arm condition, which is load-bearing: dropping it fails BOTH `asan_generic_enum_heap_payload_bind_return_no_leak_or_double_free` and `selfhost_codegen_matches_seed_run`, because a bare-armed match is also how the generic-enum debox hands a value out of its frame | — |
 | B-2026-09-04-11 | 2026-09-04 | codegen | low | THE TWO `uam_*` SPAN SETS STILL LEAK FROM THE USER PROGRAM INTO THE BAKED-STDLIB BODY PASS -- `Span` carries no file identity, so `uam_consume_sites` (seeded from the USER program's ownership result and read during expression compilation) can mark a stdlib expression as a `UseAfterMove` consume site purely because their byte offsets coincide; B-2026-09-04-5 fixed the fourteen PROGRAM-DERIVED tables and its source-scan guard cannot see these two, because they are never on the install list it scans | — |
-| B-2026-09-04-12 | 2026-09-04 | codegen | low | A BOXED TWO-`String` TUPLE PAYLOAD LOSES ITS INTERIOR ON BOTH THE GENERIC AND NON-GENERIC PATHS -- 54 B in 6 blocks over three calls, IDENTICAL for `generic[T](x: Option[T])` and `plainT(x: Option[(String, String)])`, so this is the boxed-payload interior rather than anything monomorph-specific; the `Array[String, 2]` payload through the same generic fn is clean, and that asymmetry is the thing to explain | — |
 | B-2026-09-04-32 | 2026-09-04 | codegen+other | low | EVERY COMPILED BACKEND RELEASES AN AGGREGATE-HELD `shared` FIELD AT LEXICAL SCOPE EXIT while design.md pins RC decrements at the binding's LIVE-RANGE END -- one holder splits, `struct Mx { r: R, s: S }` giving `v2 dR1 post dS2`, so the plain field obeys the spec and the shared one does not; a BARE shared binding is unaffected | — |
 | B-2026-09-04-36 | 2026-09-04 | interp+codegen | low | A RECEIVER TEMP NESTED IN A LARGER EXPRESSION DRAINS AT THE STATEMENT'S `;` ON THE COMPILED BACKENDS AND AT THE CALL RETURN IN THE INTERPRETER -- `println(f"  {mk(1).peek()}")` prints `dR1/t1` BEFORE the value under `--interp` and AFTER it on jit/aot. Statement position agrees, which is why it hides: `let v = mk(1).peek()` is byte-identical on all four. This is B-2026-08-29-55's drain-point question one row over -- that row moved the three ARGUMENT registrars to a per-call window and deliberately left the fresh-temp RECEIVER (`__urecv_drop_tmp`) on the statement drain, on the grounds that a receiver has its own position-table row with a different end | — |
 | B-2026-09-05-22 | 2026-09-05 | runtime | medium | THE AUTO-PAR WORKER POOL AT N=2 IS SLOWER THAN AT N=1 AND BURNS 3.6x THE CPU -- kata:282 under HOMOGENEOUS all-E placement: N=1 4329.73ms/4272ms user, N=2 7710.74ms/15191ms user, sd 38% of mean; N=4 recovers, so the N>=2 general dispatch path has a degenerate TWO-WORKER case | none |
@@ -158,6 +157,10 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-40 | 2026-09-06 | interp+codegen | low | A REORDERED STRUCT `let` PATTERN DROPS ITS LEAVES IN REVERSE PATTERN ORDER ON THE INTERPRETER AND REVERSE DECLARATION ORDER ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(7), b: mk(8) }; let S3 { b, a } = s; return b.id * 100 + a.id;` prints `dR7 dR8 dR6 v=807` under `--interp` and `dR8 dR7 dR6 v=807` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs once, the sequence alone diverges | — |
 | B-2026-09-06-45 | 2026-09-06 | interp+codegen | low | A REBIND OF `self` NESTED IN A BRANCH OF AN OWNED-`self` METHOD RUNS THE RECEIVER'S OWN `Drop` BODY TWICE ON EVERY SURFACE -- `fn m_cond(self, c: bool) -> i64 { if c { let e = self; match e { .. } } else { match self { .. } } }` on a named-local enum receiver prints `dE dR11 dE x11` when `c` is true (the local `e`'s body, then the caller's retained walk) and the right `dR12 dE x112` when false; B-2026-09-06-42's top-level-only `fn_rebinds_self_whole` declines the nested spelling on purpose | — |
 | B-2026-09-06-46 | 2026-09-06 | codegen | medium | A PARTIAL `let` DESTRUCTURE OF A LOCAL WHOSE OTHER FIELD WAS MOVED OUT EARLIER LOSES THE BOUND LEAF'S `Drop` BODY ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(8), b: mk(9) }; let x: R = s.a; let S3 { b, .. } = s; return b.id + x.id;` prints `dR8 dR7` on jit / aot / `KARAC_AUTO_PAR=0` against the interpreter's `dR9 dR8 dR7`; `b`'s body (`dR9`) runs nowhere | — |
+| B-2026-09-06-48 | 2026-09-06 | codegen | low | THE GENERIC HALF OF B-2026-09-04-12 STILL LOSES A BOXED TUPLE PAYLOAD'S INTERIOR -- `generic[T](x: Option[T])` leaks the same 54 B in 6 blocks the non-generic `plainT(x: Option[(String, String)])` did before its fix, and by a DIFFERENT owner, so the parent row's "identical on both paths, therefore not monomorph-specific" premise is refuted rather than confirmed | — |
+| B-2026-09-06-49 | 2026-09-06 | codegen | low | AN INLINE-BUILT `Array` PAYLOAD LOSES ITS INTERIOR EXACTLY AS THE TUPLE DID -- 54 B in 6 blocks for `f(Some([f"a{i}", f"b{i}"]))`, while the same array through a NAMED LOCAL is clean, because the array's interior is owned by a caller-side drop that a missing move-suppressor leaves armed | — |
+| B-2026-09-06-50 | 2026-09-06 | codegen | high | A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE PARAM ABORTS ON BOTH COMPILED BACKENDS -- `free(): double free detected in tcache 2`, exit 134, at -O0 and -O2 alike, for `match x { Some(P { a, b, .. }) => ... }` over `x: Option[P]`, while the interpreter prints the right answer | — |
+| B-2026-09-06-51 | 2026-09-06 | codegen | medium | THE -O0 ASAN RATCHET HAS BEEN RED ON `main` SINCE edb7236 -- six fixtures that commit ADDED fail `scripts/asan-o0-leg.sh` unquarantined, so the gate that is supposed to fail on any new -O0 regression now reports the same six to every session and can no longer distinguish a fresh one | — |
 
 ### Relocated
 
@@ -2223,6 +2226,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-04-8 | interp | medium | THE TUPLE PROJECTION DESTRUCTURE DIVERGES FOR A LOCAL ROOT -- `struct W { inner: (R, Result[R, String]) }; let (a, b) = w.inner;` runs `rd9 dR9` unde… | fb04b87 |
 | B-2026-09-04-9 | codegen | medium | A FRESH TUPLE SOURCE'S `Option` BINDING LEAF STILL LOSES ITS PAYLOAD'S `Drop` BODY -- `let (_, o) = (mk(32), Option.Some(mk(132)));` and `let (a, b)… | 5f3c3be |
 | B-2026-09-04-10 | codegen | high | AN `Option[<struct>]` DESTRUCTURE LEAF OFF A PLACE SOURCE FREES ITS PAYLOAD TWICE WHEN THE LEAF IS MOVED WHOLE -- `let (_, o) = t; let q = o;` double… | 35d0ec0 |
+| B-2026-09-04-12 | codegen | low | A BOXED TWO-`String` TUPLE PAYLOAD LOSES ITS INTERIOR ON BOTH THE GENERIC AND NON-GENERIC PATHS -- 54 B in 6 blocks over three calls, IDENTICAL for `… | b597191 |
 | B-2026-09-04-13 | interp+codegen | medium | A `shared struct` HOLDER RUNS NO FIELD `Drop` BODY ON ANY OF THE FOUR SURFACES -- `shared struct Sh { a: R, b: R }` with a Drop-bearing `R` prints NE… | 2367ed5 |
 | B-2026-09-04-14 | codegen | high | A BINDING NAME CARRIES OWNERSHIP STATE OUT OF ITS FUNCTION, so an `Option` local moved in one function is double-freed because an UNCALLED function e… | 9e70222 |
 | B-2026-09-04-15 | interp+codegen | high | MOVING A FIELD OUT OF A `shared struct` LEAVES NO DISARM, SO AN ALIAS READS THE MOVED-FROM FIELD AFTER ITS `Drop` HAS RUN AND ITS BUFFER IS FREED --… | ad2f1b3 |
