@@ -69578,9 +69578,12 @@ fn main() {
     /// free at the caller and nowhere else, the path that does not must free
     /// inside the callee having just run the body there.
     ///
-    /// `agg` is the DECLINED aggregate-literal route, included because
-    /// admitting it ran one object's body twice; it must stay memory-clean
-    /// either way.
+    /// `agg` is the aggregate-literal route. It was the DECLINED one when this
+    /// was written (admitting it then ran one object's body twice), so the
+    /// `false` cell expected NO body for the dying param; B-2026-09-02-4
+    /// admits it now that the return-site retraction is aggregate-aware and
+    /// per path, so that cell runs `drop k1` inside the callee exactly once.
+    /// It must stay memory-clean either way.
     #[test]
     fn asan_conditionally_returned_param_bodies_are_memory_balanced() {
         assert_clean_asan_run(
@@ -69614,8 +69617,8 @@ fn main() {
 "#,
             &[
                 "drop a1", "99", "drop n99", "1", "drop b1", "drop c1", "98", "drop n98", "1",
-                "drop d1", "drop h1", "1", "drop g1", "1", "drop j1", "95", "drop n95", "drop l1",
-                "drop n99", "end",
+                "drop d1", "drop h1", "1", "drop g1", "1", "drop j1", "drop k1", "95", "drop n95",
+                "drop l1", "drop n99", "end",
             ],
             "conditionally-returned-param-bodies",
         );

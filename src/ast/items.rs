@@ -2326,14 +2326,16 @@ pub fn option_result_ctor_payload(e: &Expr) -> Option<&Expr> {
 ///   2. Some OTHER leaf tail does not mention the parameter at all — the
 ///      conditionality this row is about. An unconditionally-returned param has
 ///      no missed body to recover, so registering one is pure risk.
-///   3. No leaf tail mentions the parameter in any OTHER way. This is the one
-///      that rules out the aggregate-literal route `if k { H { r: r } } else
-///      { .. }`, which [`fn_returns_param`] counts as an escape (via its
-///      `expr_is_ident` recursion into struct/tuple literals) but the flag
-///      never clears. Measured with that route admitted: `drop 41` / `41` /
-///      `drop 41` on all three compiled backends — a double body plus a read of
-///      the dropped value, exactly the defect the union answer exists to
-///      prevent.
+///   3. No leaf tail mentions the parameter in any OTHER way. This used to
+///      rule out the aggregate-literal route `if k { H { r: r } } else { .. }`
+///      as well, on a measurement (`drop 41` / `41` / `drop 41`, a double body
+///      plus a read of the dropped value) taken when the flag was cleared only
+///      for a bare identifier. Both backends' return-site retractions have
+///      since become aggregate-aware and per path (B-2026-08-28-65,
+///      B-2026-08-31-35/-46), so B-2026-09-02-4 admits that route as a
+///      hand-over (`yields_wrapped` below); what condition 3 still declines is
+///      a leaf that mentions the param without handing it out (`consume(r)`,
+///      `r.id`), which no flag clears.
 ///   4. HISTORICAL, and no longer a condition: this used to read "no `return`
 ///      statement anywhere in the body mentions the parameter", on the grounds
 ///      that a `return`-borne escape was outside the flag's reach. It is not —
@@ -2457,6 +2459,28 @@ pub fn fn_conditionally_returns_param_bare(
     fn is_bare(e: &Expr, name: &[String]) -> bool {
         matches!(&e.kind, ExprKind::Identifier(n) if name.iter().any(|a| a == n))
     }
+    /// B-2026-09-02-4 — does the leaf hand the param out: bare, inside an
+    /// `Option`/`Result` constructor, or moved into a returned AGGREGATE
+    /// LITERAL (`Box2 { r: r }`, `(r, 2)`, nested)? The same shapes
+    /// `fn_always_returns_param`'s `yields` and both backends' tail-source
+    /// walkers (`collect_aggregate_literal_sources`) recognise, so a leaf
+    /// admitted here is one the per-path flag is cleared for at the return.
+    /// Condition 3's measurement against the aggregate route predates the
+    /// flag-aware aggregate retraction (B-2026-08-28-65, B-2026-08-31-46);
+    /// with it in place the wrap is a hand-over like any other, and declining
+    /// it left `fn f(r: R, k: bool) -> Box2 { if k { return Box2 { r: mk() };
+    /// } return Box2 { r: r }; }` with no owner on the dies-inside path for a
+    /// fresh temp and two on the hand-back path for a named one.
+    fn yields_wrapped(e: &Expr, name: &[String]) -> bool {
+        match &e.kind {
+            ExprKind::Identifier(_) => is_bare(e, name),
+            ExprKind::StructLiteral { fields, .. } => {
+                fields.iter().any(|f| yields_wrapped(&f.value, name))
+            }
+            ExprKind::Tuple(elems) => elems.iter().any(|el| yields_wrapped(el, name)),
+            _ => option_result_ctor_payload(e).is_some_and(|p| yields_wrapped(p, name)),
+        }
+    }
     /// The leaf tails of an escaping tail position, following exactly the
     /// branch structure `note_escaping_site` pushes escaping-ness down through.
     /// A branch arm with no tail expression contributes the branch expression
@@ -2571,8 +2595,9 @@ pub fn fn_conditionally_returns_param_bare(
         // `Option`/`Result` constructor yields it too: the value crosses the
         // frame boundary inside the ctor exactly as it does bare, and the
         // per-path flag clears it through the same source walk.
-        if is_bare(leaf, name) || option_result_ctor_payload(leaf).is_some_and(|p| is_bare(p, name))
-        {
+        // B-2026-09-02-4 — and the param moved into a returned aggregate
+        // literal; see `yields_wrapped`.
+        if yields_wrapped(leaf, name) {
             yields_bare = true;
         } else if may_mention(leaf, name) {
             // Condition 3 — an escape route the flag cannot clear.

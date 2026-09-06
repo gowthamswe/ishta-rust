@@ -32216,6 +32216,80 @@ fn main() {
         );
     }
 
+    /// B-2026-09-02-4 — a by-value `Drop` param moved into a returned
+    /// AGGREGATE LITERAL on some exits and absent from the others
+    /// (`fn fmake(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(77) };
+    /// } return Box2 { r: r }; }`) has one owner per path on every surface:
+    /// the callee's per-path flip when the value dies inside, the caller's
+    /// result binding when it comes back wrapped. `fn_conditionally_returns_
+    /// param_bare` now admits the wrap as a hand-over (`yields_wrapped`), the
+    /// same shape `fn_always_returns_param` and both tail-source walkers
+    /// already recognised. Before: the free fresh-temp spelling LOST the
+    /// dies-inside body on all four surfaces, the named and the associated /
+    /// method spellings ran the hand-back body TWICE compiled, and the
+    /// interpreter lost it for the associated spelling — the row's
+    /// "both directions at once". Cells: free / associated / method spellings
+    /// of a `Drop`-bearing wrapper and a plain one, a tuple wrap, the tail
+    /// spelling, a nested return on all three path combinations, a two-level
+    /// wrap on its dies-inside path, a unit-variant vs dying param, and named
+    /// arguments, each on both `k` values. Interpreter twin:
+    /// `test_param_wrapped_in_returned_aggregate_on_some_paths_has_one_owner`.
+    #[test]
+    fn e2e_param_wrapped_in_returned_aggregate_on_some_paths_has_one_owner() {
+        assert_eq!(
+            run_program(
+                r#"struct R { id: i64, s: String }
+impl Drop for R { fn drop(mut ref self) { println(f"d{self.id}") } }
+struct Box2 { r: R }
+impl Drop for Box2 { fn drop(mut ref self) { println(f"B{self.r.id}") } }
+struct P2 { r: R, n: i64 }
+enum Slot { Held(R), Empty }
+struct H { n: i64 }
+fn mk(i: i64) -> String { return f"pay-{i}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; }
+fn mr(i: i64) -> R { return R { id: i, s: mk(i) }; }
+fn fmake(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(77) }; } return Box2 { r: r }; }
+fn fplain(r: R, k: bool) -> P2 { if k { return P2 { r: mr(78), n: 1 }; } return P2 { r: r, n: 2 }; }
+fn ftup(r: R, k: bool) -> (R, i64) { if k { return (mr(79), 1); } return (r, 2); }
+fn fslot(r: R, k: bool) -> Slot { if k { return Slot.Empty; } return Slot.Held(r); }
+fn ftail(r: R, k: bool) -> P2 { if k { P2 { r: mr(80), n: 1 } } else { P2 { r: r, n: 2 } } }
+fn fnest(r: R, k: bool, j: bool) -> P2 { if k { if j { return P2 { r: r, n: 3 }; } } return P2 { r: mr(81), n: 1 }; }
+fn ftwo(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(82) }; } let p = P2 { r: r, n: 1 }; return Box2 { r: p.r }; }
+impl H {
+    fn amake(r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(87) }; } return Box2 { r: r }; }
+    fn aplain(r: R, k: bool) -> P2 { if k { return P2 { r: mr(88), n: 1 }; } return P2 { r: r, n: 2 }; }
+    fn mmake(ref self, r: R, k: bool) -> Box2 { if k { return Box2 { r: mr(89) }; } return Box2 { r: r }; }
+}
+fn main() {
+    let h = H { n: 0 };
+    println("ft"); { let x = fmake(mr(55), true); println(f"C{x.r.id}"); }
+    println("ff"); { let x = fmake(mr(53), false); println(f"C{x.r.id}"); }
+    println("at"); { let x = H.amake(mr(56), true); println(f"C{x.r.id}"); }
+    println("af"); { let x = H.amake(mr(57), false); println(f"C{x.r.id}"); }
+    println("pt"); { let x = fplain(mr(58), true); println(f"C{x.r.id}"); }
+    println("pf"); { let x = fplain(mr(59), false); println(f"C{x.r.id}"); }
+    println("apt"); { let x = H.aplain(mr(60), true); println(f"C{x.r.id}"); }
+    println("apf"); { let x = H.aplain(mr(61), false); println(f"C{x.r.id}"); }
+    println("tt"); { let x = ftup(mr(62), true); println(f"C{x.0.id}"); }
+    println("tf"); { let x = ftup(mr(63), false); println(f"C{x.0.id}"); }
+    println("st"); { let x = fslot(mr(64), true); match x { Slot.Held(v) => println(f"C{v.id}"), Slot.Empty => println("CE") } }
+    println("tlt"); { let x = ftail(mr(66), true); println(f"C{x.r.id}"); }
+    println("tlf"); { let x = ftail(mr(67), false); println(f"C{x.r.id}"); }
+    println("ntt"); { let x = fnest(mr(68), true, true); println(f"C{x.r.id}"); }
+    println("ntf"); { let x = fnest(mr(69), true, false); println(f"C{x.r.id}"); }
+    println("nff"); { let x = fnest(mr(70), false, false); println(f"C{x.r.id}"); }
+    println("twt"); { let x = ftwo(mr(71), true); println(f"C{x.r.id}"); }
+    println("mt"); { let x = h.mmake(mr(73), true); println(f"C{x.r.id}"); }
+    println("mf"); { let x = h.mmake(mr(74), false); println(f"C{x.r.id}"); }
+    println("nt"); { let a = mr(75); let x = fmake(a, true); println(f"C{x.r.id}"); }
+    println("nf"); { let b = mr(76); let x = fmake(b, false); println(f"C{x.r.id}"); }
+    println("end");
+}"#
+            ),
+            Some("ft\nd55\nC77\nB77\nd77\nff\nC53\nB53\nd53\nat\nd56\nC87\nB87\nd87\naf\nC57\nB57\nd57\npt\nd58\nC78\nd78\npf\nC59\nd59\napt\nd60\nC88\nd88\napf\nC61\nd61\ntt\nd62\nC79\nd79\ntf\nC63\nd63\nst\nd64\nCE\ntlt\nd66\nC80\nd80\ntlf\nC67\nd67\nntt\nC68\nd68\nntf\nd69\nC81\nd81\nnff\nd70\nC81\nd81\ntwt\nd71\nC82\nB82\nd82\nmt\nd73\nC89\nB89\nd89\nmf\nC74\nB74\nd74\nnt\nd75\nC77\nB77\nd77\nnf\nC76\nB76\nd76\nend\n".to_string()),
+            "a param wrapped in a returned aggregate on some paths has one owner per path"
+        );
+    }
+
     /// B-2026-08-29-31 — the `let _ =` spelling of a discarded branch now owns
     /// whatever its arm hands out, on all three backends.
     ///
