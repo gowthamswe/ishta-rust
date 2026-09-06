@@ -34221,6 +34221,131 @@ end
         );
     }
 
+    /// B-2026-09-06-53 — `let x = mkUses(i)` inside a function that took `i`
+    /// as a parameter ran the returned value's `Drop` body NOWHERE, on every
+    /// backend at both opt levels, with valgrind clean (the memory side was
+    /// never in doubt). The call-result view classifier concluded that the
+    /// result was a VIEW of the argument, because the callee does store the
+    /// parameter into the aggregate it returns — but an `i64` owns nothing and
+    /// runs no body, so the body was deferred to an owner that does not exist.
+    /// The scalar test now guards both the classifier and the whole-alias
+    /// closure that carries the same conclusion one hand-off further
+    /// (`let x = mkUses(i); let y = keep(x)`, which the interpreter alone lost).
+    /// Cells: the bare scalar argument, a rebound scalar, the chained hand-off,
+    /// an `Option` return, `f64` and `char` parameters, an associated function,
+    /// and — as controls that must keep their existing single body — a callee
+    /// that ignores the parameter, one that consumes it through an f-string, a
+    /// constant argument, an arithmetic argument, a genuine owned hand-back,
+    /// an owned wrap, a mixed scalar-and-owned signature and a scalar local.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_scalar_argument_does_not_make_the_result_a_view`, pinned to the same string.
+    #[test]
+    fn e2e_scalar_argument_does_not_make_the_result_a_view() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct H { r: R, n: i64 }
+fn mkUses(i: i64) -> R { return R { id: i, name: f"h{i}" }; }
+fn mkIgnores(i: i64) -> R { return R { id: 0, name: "z" }; }
+fn mkName(i: i64) -> R { return R { id: 7, name: f"n{i}" }; }
+fn mkOpt(i: i64) -> Option[R] { return Option.Some(R { id: i, name: f"o{i}" }); }
+fn mkFlt(x: f64) -> R { return R { id: 20, name: f"f{x}" }; }
+fn mkChr(c: char) -> R { return R { id: 21, name: f"c{c}" }; }
+fn keep(r: R) -> R { return r; }
+fn wrap(r: R) -> H { return H { r: r, n: 1 }; }
+fn both(i: i64, r: R) -> R { return r; }
+impl H { fn make(i: i64) -> R { return R { id: i, name: f"a{i}" }; } }
+
+fn scalar_arg(i: i64) { let x = mkUses(i); println(f"  v={x.id}"); }
+fn scalar_rebound(i: i64) { let j = i; let x = mkUses(j); println(f"  v={x.id}"); }
+fn scalar_chained(i: i64) { let x = mkUses(i); let y = keep(x); println(f"  v={y.id}"); }
+fn scalar_unused(i: i64) { let x = mkIgnores(i); println(f"  v={x.id}"); }
+fn scalar_interpolated(i: i64) { let x = mkName(i); println(f"  v={x.id}"); }
+fn scalar_constant(i: i64) { let x = mkUses(9); println(f"  v={x.id}"); }
+fn scalar_arith(i: i64) { let x = mkUses(i + 0); println(f"  v={x.id}"); }
+fn scalar_option(i: i64) { let o = mkOpt(i); match o { Option.Some(r) => { println(f"  v={r.id}"); } Option.None => { println("  v=none"); } } }
+fn scalar_float(x: f64) { let r = mkFlt(x); println(f"  v={r.id}"); }
+fn scalar_char(c: char) { let r = mkChr(c); println(f"  v={r.id}"); }
+fn scalar_assoc(i: i64) { let x = H.make(i); println(f"  v={x.id}"); }
+fn owned_handback(r: R) { let x = keep(r); println(f"  v={x.id}"); }
+fn owned_wrapped(r: R) { let x = wrap(r); println(f"  v={x.r.id}"); }
+fn mixed_args(i: i64, r: R) { let x = both(i, r); println(f"  v={x.id}"); }
+fn local_scalar() { let n = 31; let x = mkUses(n); println(f"  v={x.id}"); }
+
+fn main() {
+    println("scalar_arg"); scalar_arg(1);
+    println("scalar_rebound"); scalar_rebound(2);
+    println("scalar_chained"); scalar_chained(3);
+    println("scalar_unused"); scalar_unused(4);
+    println("scalar_interpolated"); scalar_interpolated(5);
+    println("scalar_constant"); scalar_constant(6);
+    println("scalar_arith"); scalar_arith(8);
+    println("scalar_option"); scalar_option(10);
+    println("scalar_float"); scalar_float(1.5);
+    println("scalar_char"); scalar_char('q');
+    println("scalar_assoc"); scalar_assoc(11);
+    println("owned_handback"); owned_handback(mkUses(12));
+    println("owned_wrapped"); owned_wrapped(mkUses(13));
+    println("mixed_args"); mixed_args(14, mkUses(15));
+    println("local_scalar"); local_scalar();
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"scalar_arg
+  v=1
+  dR1
+scalar_rebound
+  v=2
+  dR2
+scalar_chained
+  v=3
+  dR3
+scalar_unused
+  v=0
+  dR0
+scalar_interpolated
+  v=7
+  dR7
+scalar_constant
+  v=9
+  dR9
+scalar_arith
+  v=8
+  dR8
+scalar_option
+  v=10
+  dR10
+scalar_float
+  v=20
+  dR20
+scalar_char
+  v=21
+  dR21
+scalar_assoc
+  v=11
+  dR11
+owned_handback
+  v=12
+  dR12
+owned_wrapped
+  v=13
+  dR13
+mixed_args
+  v=15
+  dR15
+local_scalar
+  v=31
+  dR31
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value

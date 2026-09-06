@@ -2584,6 +2584,15 @@ impl<'a> super::Interpreter<'a> {
             .find_map(|(i, a)| match &a.value.kind {
                 ExprKind::Identifier(src)
                     if whole.contains(src.as_str())
+                        // B-2026-09-06-53 — a SCALAR parameter owns nothing, so
+                        // the result of a callee that merely stores it into the
+                        // aggregate it returns is not a view of it; marking it
+                        // one left the returned value's `Drop` body with no
+                        // owner. Codegen's twin gates on the same predicate over
+                        // the same declared type.
+                        && !f.params.get(i).is_some_and(|p| {
+                            crate::ast::type_expr_is_owned_scalar(&p.ty)
+                        })
                         && crate::ast::fn_always_returns_param(Some(self.program), f, i) =>
                 {
                     Some(src.clone())

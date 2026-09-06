@@ -3638,6 +3638,114 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-53 — the MEMORY half of `tests/codegen.rs`'s
+    /// `e2e_scalar_argument_does_not_make_the_result_a_view` under ASAN + LSan.
+    /// The row was a lost BODY with balanced memory, so this pins that giving
+    /// the result binding its own ownership back does not disturb that: one
+    /// owner and one free per object on every cell.
+    #[test]
+    fn asan_scalar_argument_result_keeps_one_owner() {
+        assert_clean_asan_run(
+            "struct R { id: i64, name: String }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             struct H { r: R, n: i64 }\n\
+             fn mkUses(i: i64) -> R { return R { id: i, name: f\"h{i}\" }; }\n\
+             fn mkIgnores(i: i64) -> R { return R { id: 0, name: \"z\" }; }\n\
+             fn mkName(i: i64) -> R { return R { id: 7, name: f\"n{i}\" }; }\n\
+             fn mkOpt(i: i64) -> Option[R] { return Option.Some(R { id: i, name: f\"o{i}\" }); }\n\
+             fn mkFlt(x: f64) -> R { return R { id: 20, name: f\"f{x}\" }; }\n\
+             fn mkChr(c: char) -> R { return R { id: 21, name: f\"c{c}\" }; }\n\
+             fn keep(r: R) -> R { return r; }\n\
+             fn wrap(r: R) -> H { return H { r: r, n: 1 }; }\n\
+             fn both(i: i64, r: R) -> R { return r; }\n\
+             impl H { fn make(i: i64) -> R { return R { id: i, name: f\"a{i}\" }; } }\n\
+             \n\
+             fn scalar_arg(i: i64) { let x = mkUses(i); println(f\"  v={x.id}\"); }\n\
+             fn scalar_rebound(i: i64) { let j = i; let x = mkUses(j); println(f\"  v={x.id}\"); }\n\
+             fn scalar_chained(i: i64) { let x = mkUses(i); let y = keep(x); println(f\"  v={y.id}\"); }\n\
+             fn scalar_unused(i: i64) { let x = mkIgnores(i); println(f\"  v={x.id}\"); }\n\
+             fn scalar_interpolated(i: i64) { let x = mkName(i); println(f\"  v={x.id}\"); }\n\
+             fn scalar_constant(i: i64) { let x = mkUses(9); println(f\"  v={x.id}\"); }\n\
+             fn scalar_arith(i: i64) { let x = mkUses(i + 0); println(f\"  v={x.id}\"); }\n\
+             fn scalar_option(i: i64) { let o = mkOpt(i); match o { Option.Some(r) => { println(f\"  v={r.id}\"); } Option.None => { println(\"  v=none\"); } } }\n\
+             fn scalar_float(x: f64) { let r = mkFlt(x); println(f\"  v={r.id}\"); }\n\
+             fn scalar_char(c: char) { let r = mkChr(c); println(f\"  v={r.id}\"); }\n\
+             fn scalar_assoc(i: i64) { let x = H.make(i); println(f\"  v={x.id}\"); }\n\
+             fn owned_handback(r: R) { let x = keep(r); println(f\"  v={x.id}\"); }\n\
+             fn owned_wrapped(r: R) { let x = wrap(r); println(f\"  v={x.r.id}\"); }\n\
+             fn mixed_args(i: i64, r: R) { let x = both(i, r); println(f\"  v={x.id}\"); }\n\
+             fn local_scalar() { let n = 31; let x = mkUses(n); println(f\"  v={x.id}\"); }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"scalar_arg\"); scalar_arg(1);\n\
+             \x20   println(\"scalar_rebound\"); scalar_rebound(2);\n\
+             \x20   println(\"scalar_chained\"); scalar_chained(3);\n\
+             \x20   println(\"scalar_unused\"); scalar_unused(4);\n\
+             \x20   println(\"scalar_interpolated\"); scalar_interpolated(5);\n\
+             \x20   println(\"scalar_constant\"); scalar_constant(6);\n\
+             \x20   println(\"scalar_arith\"); scalar_arith(8);\n\
+             \x20   println(\"scalar_option\"); scalar_option(10);\n\
+             \x20   println(\"scalar_float\"); scalar_float(1.5);\n\
+             \x20   println(\"scalar_char\"); scalar_char('q');\n\
+             \x20   println(\"scalar_assoc\"); scalar_assoc(11);\n\
+             \x20   println(\"owned_handback\"); owned_handback(mkUses(12));\n\
+             \x20   println(\"owned_wrapped\"); owned_wrapped(mkUses(13));\n\
+             \x20   println(\"mixed_args\"); mixed_args(14, mkUses(15));\n\
+             \x20   println(\"local_scalar\"); local_scalar();\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "scalar_arg",
+                "  v=1",
+                "  dR1",
+                "scalar_rebound",
+                "  v=2",
+                "  dR2",
+                "scalar_chained",
+                "  v=3",
+                "  dR3",
+                "scalar_unused",
+                "  v=0",
+                "  dR0",
+                "scalar_interpolated",
+                "  v=7",
+                "  dR7",
+                "scalar_constant",
+                "  v=9",
+                "  dR9",
+                "scalar_arith",
+                "  v=8",
+                "  dR8",
+                "scalar_option",
+                "  v=10",
+                "  dR10",
+                "scalar_float",
+                "  v=20",
+                "  dR20",
+                "scalar_char",
+                "  v=21",
+                "  dR21",
+                "scalar_assoc",
+                "  v=11",
+                "  dR11",
+                "owned_handback",
+                "  v=12",
+                "  dR12",
+                "owned_wrapped",
+                "  v=13",
+                "  dR13",
+                "mixed_args",
+                "  v=15",
+                "  dR15",
+                "local_scalar",
+                "  v=31",
+                "  dR31",
+                "end"
+            ],
+            "scalar_argument_result_one_owner",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

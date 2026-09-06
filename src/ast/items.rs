@@ -2234,7 +2234,21 @@ pub fn param_whole_aliases(
                 continue;
             };
             if idents.iter().any(|(i, n)| {
-                aliases.iter().any(|a| a == n) && fn_always_returns_param(None, g, *i)
+                aliases.iter().any(|a| a == n)
+                    // B-2026-09-06-53 — a SCALAR argument does not make the
+                    // call's result an alias of it. `let x = mk(i)` over
+                    // `fn mk(i: i64) -> R` satisfies the predicate beside this
+                    // (the parameter travels into the returned aggregate), and
+                    // an `i64` owns nothing, so calling `x` an alias of `i` made
+                    // every later question about `x` answer for a scalar: the
+                    // interpreter then lost the `R`'s `Drop` body one hand-off
+                    // later (`let y = keep(x)` printed nothing where both
+                    // compiled backends printed one body), a run-vs-build split.
+                    && !g
+                        .params
+                        .get(*i)
+                        .is_some_and(|p| type_expr_is_owned_scalar(&p.ty))
+                    && fn_always_returns_param(None, g, *i)
             }) {
                 aliases.push(x.clone());
             }
@@ -2424,6 +2438,57 @@ pub fn param_rebind_aliases(f: &Function, param_name: &str) -> Vec<String> {
 /// Deliberately NOT [`fn_returns_param`], which is the UNION over return sites
 /// and therefore answers true for a param that escapes on one path and dies on
 /// another. Standing a caller down on that union is exactly the trade
+/// B-2026-09-06-53 — can a value of `ty` OWN anything a `Drop` body or a heap
+/// free could reach: is it anything other than a primitive scalar?
+///
+/// The question the call-result VIEW classifiers have to ask before concluding
+/// that a call's result is a view of one of its arguments. "The parameter is
+/// handed back" ([`fn_always_returns_param`]) is true of a callee that merely
+/// STORES the parameter into the aggregate it returns — `fn mkUses(i: i64) -> R
+/// { return R { id: i, .. }; }` — and for an aggregate parameter that is the
+/// right conclusion: the returned value carries the argument's heap, so the
+/// argument's owner runs the body. For a SCALAR parameter it is not. An `i64`
+/// owns nothing, has no body and no owner to defer to, so marking the result a
+/// view left the `R` with no owner at all and its `Drop` body ran nowhere, on
+/// every backend at every opt level, with valgrind clean because the MEMORY
+/// side was never in doubt.
+///
+/// The same scalar false positive B-2026-09-06-26 and B-2026-09-06-41 fixed one
+/// site over, where a scalar leaf of an owned-param destructure stood the
+/// caller's walk down.
+///
+/// Bare primitive paths only. A generic parameter is spelled `T` here and
+/// answers `false` (not a scalar) even when instantiated with one — the
+/// direction that keeps today's behaviour rather than inventing a new one, and
+/// the same coverage limit the neighbouring per-monomorph predicates carry.
+pub fn type_expr_is_owned_scalar(ty: &TypeExpr) -> bool {
+    let crate::ast::TypeKind::Path(p) = &ty.kind else {
+        return false;
+    };
+    if p.generic_args.is_some() || p.segments.len() != 1 {
+        return false;
+    }
+    matches!(
+        p.segments[0].as_str(),
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "Unit"
+    )
+}
+
 /// B-2026-08-28-22 was filed for: measured on the method path, reusing it lost
 /// `impl B4 { fn early(ref self, r: R, k: bool) -> R { if k { return R { id: 98 }; } r } }`'s
 /// body for `r` when `k` was true, on all three compiled backends, where the

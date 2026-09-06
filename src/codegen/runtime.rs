@@ -6871,6 +6871,19 @@ impl<'ctx> super::Codegen<'ctx> {
             .find_map(|(i, a)| match &a.value.kind {
                 ExprKind::Identifier(src)
                     if self.ident_is_whole_param_alias(src)
+                        // B-2026-09-06-53 — a SCALAR parameter cannot make the
+                        // result a view of it. `fn mkUses(i: i64) -> R { return
+                        // R { id: i, .. }; }` satisfies the predicate below —
+                        // the parameter does travel into the returned aggregate
+                        // — but an `i64` owns nothing and runs no body, so the
+                        // caller's `let x = mkUses(i)` was registered as a view
+                        // of it and the `R`'s `Drop` body ran nowhere at all, on
+                        // every backend and both opt levels (valgrind clean: the
+                        // memory side was never in doubt). The interpreter's
+                        // twin asks the same question of the same type.
+                        && !f.params.get(i).is_some_and(|p| {
+                            crate::ast::type_expr_is_owned_scalar(&p.ty)
+                        })
                         && crate::ast::fn_always_returns_param(
                             self.program_snapshot.as_deref(),
                             f,
