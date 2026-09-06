@@ -8994,6 +8994,39 @@ impl<'ctx> super::Codegen<'ctx> {
                 if let Some(layout) = self.type_decls.enum_layouts.get(fname).cloned() {
                     if !layout.is_shared {
                         self.zero_enum_payload_caps(field_ptr, &layout);
+                        // B-2026-09-06-28 — the source field's payload memory is
+                        // now cap-zeroed, so the leaf binding is the SOLE owner
+                        // of the moved-in enum payload. In the MATCH path the
+                        // leaf is already bound (`bind_pattern_values` runs
+                        // before this suppressor), and it got NO memory
+                        // registration of its own — only an Option/Result-payload
+                        // enum reaches `track_enum_var` in `bind_pattern_values`
+                        // — so an arm that never consumes it leaked the payload
+                        // (`match self { H1 { e } => 9 }`, both by-value param
+                        // and local scrutinees). Register the memory-only
+                        // `EnumDrop` here: an unconsumed leaf frees itself, a
+                        // consumed one is retracted by the arm body's move hooks
+                        // (the channel the Option/Result arm already relies on),
+                        // and bodies are untouched (EnumDrop frees, runs no
+                        // body). Gated on the leaf ALREADY being bound, which is
+                        // exactly what separates the match path (binds first,
+                        // registers here) from the `let`-destructure path (this
+                        // suppressor runs BEFORE its bind, whose own site already
+                        // owns the leaf memory — so nothing to double).
+                        let leaf_name = match &field_pat.pattern {
+                            None => Some(field_pat.name.clone()),
+                            Some(p) => match &p.kind {
+                                crate::ast::PatternKind::Binding(n) => Some(n.clone()),
+                                _ => None,
+                            },
+                        };
+                        if let Some(leaf_name) = leaf_name {
+                            if let Some(slot) =
+                                self.variables.get(leaf_name.as_str()).map(|s| s.ptr)
+                            {
+                                self.track_enum_var(fname, slot);
+                            }
+                        }
                     }
                 } else if self.type_decls.struct_types.contains_key(fname)
                     && !self.type_decls.shared_types.contains_key(fname)

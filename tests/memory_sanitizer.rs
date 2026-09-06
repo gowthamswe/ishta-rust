@@ -1624,6 +1624,62 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-28 — an enum leaf bound out of an owned-struct-pattern
+    /// match arm and NEVER consumed frees its payload. These are the `shell`
+    /// cells the parent test (B-2026-09-06-15) deliberately omitted: a
+    /// `match self { H1 { e } => 9 }` binds `e` but the arm returns without
+    /// touching it, so the source field's cap-zero (needed for a consumed leaf)
+    /// left nobody freeing the payload — 10 B/call at `-O0`, before this fix, on
+    /// the by-value PARAM and free-function-param spellings alike. The fix
+    /// registers the leaf's memory-only `EnumDrop` from the struct-pattern
+    /// suppressor (where the leaf is already bound in the match path), so an
+    /// unconsumed leaf frees itself; a consumed one is retracted by the arm
+    /// body's move hooks, and the `let`-destructure path is untouched (its
+    /// suppressor runs BEFORE its bind, so the leaf is not yet there).
+    ///
+    /// Method-receiver `self` (local and temp receiver) and the free-function
+    /// param, results bound to locals so the drop order is stable (an inline
+    /// receiver temp in a larger expression drains at a different point on the
+    /// two backends — B-2026-09-04-36, unrelated). The LOCAL-scrutinee spelling
+    /// is memory-clean too but still loses the leaf's Drop BODY on the compiled
+    /// backends, a separate run-vs-build split filed on its own row.
+    #[test]
+    fn asan_unconsumed_enum_leaf_of_owned_param_struct_pattern_freed() {
+        assert_clean_asan_run(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct H1 { e: E }
+impl H1 { fn shell(self) -> i64 { match self { H1 { e } => { return 9; } } } }
+fn p_shell(h: H1) -> i64 { match h { H1 { e } => { return 9; } } }
+fn main() {
+    println("recv/local"); let a1 = H1 { e: E.A(mk(31)) }; let x1 = a1.shell(); println(f"  r{x1}");
+    println("recv/temp"); let x2 = H1 { e: E.A(mk(32)) }.shell(); println(f"  r{x2}");
+    println("param/local"); let b1 = H1 { e: E.A(mk(33)) }; let y1 = p_shell(b1); println(f"  r{y1}");
+    println("end");
+}
+"#,
+            &[
+                "recv/local",
+                "  dE",
+                "  dR31",
+                "  r9",
+                "recv/temp",
+                "  dE",
+                "  dR32",
+                "  r9",
+                "param/local",
+                "  dE",
+                "  dR33",
+                "  r9",
+                "end",
+            ],
+            "unconsumed_enum_leaf_of_owned_param_struct_pattern_freed",
+        );
+    }
+
     /// B-2026-09-04-29 — a by-value param destructure leaf REBOUND (`let c = b;`)
     /// runs the payload's body exactly once.
     ///
