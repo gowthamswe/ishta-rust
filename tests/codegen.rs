@@ -34443,10 +34443,12 @@ end
     /// Controls and neighbours, all byte-identical on the four surfaces: the consuming
     /// arm (`r/*`, hand-back) was already right; a guarded pair (`guard`), a
     /// non-returning read (`print`), a shell-less enum (`noshell`), and the
-    /// free-function twin (`free`) agree. Two AGREED gaps are pinned as they stand and
-    /// filed on their own rows: a WILDCARD arm (`E.A(_)`, `none/*`) runs the payload
-    /// body on no surface, and a TEMP enum receiver loses the shell's own `dE` on
-    /// every surface (B-2026-09-04-30's registrar declines enum receiver bodies).
+    /// free-function twin (`free`) agree. The WILDCARD arm (`E.A(_)`, `none/*`) ran
+    /// the payload body on no surface when this row closed; B-2026-09-06-37's lowering
+    /// rewrite now binds that position to a never-read name, so `none/*` fire `dR5` /
+    /// `dR6` at the arm's end like the bound cells. One AGREED gap stays pinned as it
+    /// stands and filed on its own row: a TEMP enum receiver loses the shell's own `dE`
+    /// on every surface (B-2026-09-04-30's registrar declines enum receiver bodies).
     ///
     /// Twin of `tests/interpreter.rs`'s `test_read_only_arm_on_owned_enum_receiver_runs_payload_body`, pinned to the same string.
     #[test]
@@ -34511,9 +34513,11 @@ r/temp
   y4
   dR4
 none/local
+  dR5
   dE
   z1
 none/temp
+  dR6
   z1
 print/local
   p7
@@ -34662,6 +34666,126 @@ hand/local
 hand/temp
   r10
   dR10
+end
+"#
+        );
+    }
+
+    /// B-2026-09-06-37 — a WILDCARD arm over an owned ENUM receiver ran the payload's
+    /// `Drop` body on no surface: `impl E { fn m_wild(self) -> i64 { match self {
+    /// E.A(_) => { return 1; } E.B => { return 0; } } } }` printed `dE x1` for a named
+    /// local and `x1` for a temp on --interp / jit / -O0 / -O2 alike, and the half-bound
+    /// `T.A(_, r) => r.id` ran only the bound half's. An owned enum receiver's payload
+    /// bodies belong to the match-ARM channel on both backends (B-2026-08-01-6,
+    /// B-2026-09-04-30), which fires the body of each payload the arm BINDS; a wildcard
+    /// binds nothing, and no other owner exists. The shared lowering pass
+    /// (`Lowerer::bind_receiver_wildcards`) now rewrites every wildcard payload
+    /// position whose declared type can carry a user `Drop` body — under a `match` /
+    /// `if let` / `while let` over a bare owned enum `self` — into a fresh, never-read
+    /// binding, recording its surface type for codegen's payload reconstitution. That
+    /// binding is exactly the read-only payload binding both backends already run once
+    /// at the arm's end (B-2026-09-06-27), with the same memory hand-off: the position
+    /// becomes a consumed one, the source's payload words are zeroed, the binding
+    /// frees them.
+    ///
+    /// Cells: `wild` (local / temp), `ifwild` (local / temp), `noshell` (an enum with no
+    /// own `Drop`), `half` (one wildcard beside a bound payload), `both` (two
+    /// wildcards), against the controls `bound` (arm binds the payload), `free` (the
+    /// by-value param twin, whose caller walk was always right) and `localmatch` (a
+    /// local scrutinee, untouched by the rewrite). The temp cells keep losing the
+    /// shell's `dE` (B-2026-09-06-38) and the arm channel keeps firing the payload
+    /// before the shell (B-2026-09-06-39); both are pinned as they stand.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_wildcard_arm_over_owned_enum_receiver_runs_payload_body`, pinned to the same string.
+    #[test]
+    fn e2e_wildcard_arm_over_owned_enum_receiver_runs_payload_body() {
+        let Some(out) = run_program(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+enum P { A(R), B }
+enum T { A(R, R), B }
+impl Drop for T { fn drop(mut ref self) { println("  dT") } }
+impl E {
+    fn m_wild(self) -> i64 { match self { E.A(_) => { return 1; } E.B => { return 0; } } }
+    fn m_unit(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_ifwild(self) -> i64 { if let E.A(_) = self { return 1; } else { return 0; } }
+}
+impl P { fn m_wild(self) -> i64 { match self { P.A(_) => { return 1; } P.B => { return 0; } } } }
+impl T {
+    fn m_half(self) -> i64 { match self { T.A(_, r) => { return r.id; } T.B => { return 0; } } }
+    fn m_both(self) -> i64 { match self { T.A(_, _) => { return 2; } T.B => { return 0; } } }
+}
+fn f_wild(e: E) -> i64 { match e { E.A(_) => { return 1; } E.B => { return 0; } } }
+fn main() {
+    println("wild/local"); let a = E.A(mk(1)); let x = a.m_wild(); println(f"  x{x}");
+    println("wild/temp"); let x2 = E.A(mk(2)).m_wild(); println(f"  x{x2}");
+    println("bound/local"); let b = E.A(mk(3)); let y = b.m_unit(); println(f"  y{y}");
+    println("ifwild/local"); let c = E.A(mk(4)); let z = c.m_ifwild(); println(f"  z{z}");
+    println("ifwild/temp"); let z2 = E.A(mk(5)).m_ifwild(); println(f"  z{z2}");
+    println("noshell/local"); let d = P.A(mk(6)); let w = d.m_wild(); println(f"  w{w}");
+    println("noshell/temp"); let w2 = P.A(mk(7)).m_wild(); println(f"  w{w2}");
+    println("half/local"); let g = T.A(mk(8), mk(108)); let v = g.m_half(); println(f"  v{v}");
+    println("both/local"); let h = T.A(mk(9), mk(109)); let v2 = h.m_both(); println(f"  v{v2}");
+    println("free/local"); let i = E.A(mk(10)); let u = f_wild(i); println(f"  u{u}");
+    println("free/temp"); let u2 = f_wild(E.A(mk(11))); println(f"  u{u2}");
+    println("localmatch"); let j = E.A(mk(12)); match j { E.A(_) => { println("  arm"); } E.B => { } }
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"wild/local
+  dR1
+  dE
+  x1
+wild/temp
+  dR2
+  x1
+bound/local
+  dR3
+  dE
+  y3
+ifwild/local
+  dR4
+  dE
+  z1
+ifwild/temp
+  dR5
+  z1
+noshell/local
+  dR6
+  w1
+noshell/temp
+  dR7
+  w1
+half/local
+  dR108
+  dR8
+  dT
+  v108
+both/local
+  dR109
+  dR9
+  dT
+  v2
+free/local
+  dE
+  dR10
+  u1
+free/temp
+  dE
+  dR11
+  u1
+localmatch
+  arm
+  dE
+  dR12
 end
 "#
         );

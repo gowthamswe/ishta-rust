@@ -1624,6 +1624,109 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-37 — the MEMORY half of
+    /// `e2e_wildcard_arm_over_owned_enum_receiver_runs_payload_body`
+    /// (tests/codegen.rs). The lowering-pass rewrite turns a wildcard payload
+    /// position of a `match` over an owned enum `self` into a never-read
+    /// binding, which moves the payload's MEMORY as well as its body: the
+    /// position becomes a consumed one, the receiver's payload words are zeroed
+    /// (`suppress_destructured_enum_payload_cleanup_at`), and the minted binding
+    /// frees them at the arm's end. This pins that hand-off balanced under
+    /// ASAN/LSan for every cell — one wildcard, two wildcards, a wildcard beside a
+    /// bound payload, the `if let` spelling, an enum without its own `Drop`, and
+    /// the local-scrutinee / by-value-param controls the rewrite must not touch.
+    /// valgrind measured 0 errors at -O0 and -O2 before this landed as a test.
+    #[test]
+    fn asan_wildcard_arm_over_owned_enum_receiver_is_balanced() {
+        assert_clean_asan_run(
+            r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+enum P { A(R), B }
+enum T { A(R, R), B }
+impl Drop for T { fn drop(mut ref self) { println("  dT") } }
+impl E {
+    fn m_wild(self) -> i64 { match self { E.A(_) => { return 1; } E.B => { return 0; } } }
+    fn m_unit(self) -> i64 { match self { E.A(r) => { return r.id; } E.B => { return 0; } } }
+    fn m_ifwild(self) -> i64 { if let E.A(_) = self { return 1; } else { return 0; } }
+}
+impl P { fn m_wild(self) -> i64 { match self { P.A(_) => { return 1; } P.B => { return 0; } } } }
+impl T {
+    fn m_half(self) -> i64 { match self { T.A(_, r) => { return r.id; } T.B => { return 0; } } }
+    fn m_both(self) -> i64 { match self { T.A(_, _) => { return 2; } T.B => { return 0; } } }
+}
+fn f_wild(e: E) -> i64 { match e { E.A(_) => { return 1; } E.B => { return 0; } } }
+fn main() {
+    println("wild/local"); let a = E.A(mk(1)); let x = a.m_wild(); println(f"  x{x}");
+    println("wild/temp"); let x2 = E.A(mk(2)).m_wild(); println(f"  x{x2}");
+    println("bound/local"); let b = E.A(mk(3)); let y = b.m_unit(); println(f"  y{y}");
+    println("ifwild/local"); let c = E.A(mk(4)); let z = c.m_ifwild(); println(f"  z{z}");
+    println("ifwild/temp"); let z2 = E.A(mk(5)).m_ifwild(); println(f"  z{z2}");
+    println("noshell/local"); let d = P.A(mk(6)); let w = d.m_wild(); println(f"  w{w}");
+    println("noshell/temp"); let w2 = P.A(mk(7)).m_wild(); println(f"  w{w2}");
+    println("half/local"); let g = T.A(mk(8), mk(108)); let v = g.m_half(); println(f"  v{v}");
+    println("both/local"); let h = T.A(mk(9), mk(109)); let v2 = h.m_both(); println(f"  v{v2}");
+    println("free/local"); let i = E.A(mk(10)); let u = f_wild(i); println(f"  u{u}");
+    println("free/temp"); let u2 = f_wild(E.A(mk(11))); println(f"  u{u2}");
+    println("localmatch"); let j = E.A(mk(12)); match j { E.A(_) => { println("  arm"); } E.B => { } }
+    println("end");
+}
+"#,
+            &[
+                "wild/local",
+                "  dR1",
+                "  dE",
+                "  x1",
+                "wild/temp",
+                "  dR2",
+                "  x1",
+                "bound/local",
+                "  dR3",
+                "  dE",
+                "  y3",
+                "ifwild/local",
+                "  dR4",
+                "  dE",
+                "  z1",
+                "ifwild/temp",
+                "  dR5",
+                "  z1",
+                "noshell/local",
+                "  dR6",
+                "  w1",
+                "noshell/temp",
+                "  dR7",
+                "  w1",
+                "half/local",
+                "  dR108",
+                "  dR8",
+                "  dT",
+                "  v108",
+                "both/local",
+                "  dR109",
+                "  dR9",
+                "  dT",
+                "  v2",
+                "free/local",
+                "  dE",
+                "  dR10",
+                "  u1",
+                "free/temp",
+                "  dE",
+                "  dR11",
+                "  u1",
+                "localmatch",
+                "  arm",
+                "  dE",
+                "  dR12",
+                "end",
+            ],
+            "asan_wildcard_arm_over_owned_enum_receiver_is_balanced",
+        );
+    }
+
     /// B-2026-09-06-28 — an enum leaf bound out of an owned-struct-pattern
     /// match arm and NEVER consumed frees its payload. These are the `shell`
     /// cells the parent test (B-2026-09-06-15) deliberately omitted: a

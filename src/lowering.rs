@@ -208,13 +208,43 @@ fn display_peel_ref(ty: &Type) -> &Type {
 }
 
 pub fn lower_program(program: &mut Program, tc: &TypeCheckResult) {
+    // B-2026-09-06-37 — the declarations the owned-enum-receiver wildcard
+    // rewrite reads (see `Lowerer::bind_receiver_wildcards`): every
+    // non-shared user enum's variants, and the set of type names whose value
+    // can carry a user `Drop` body (a non-shared user struct or enum).
+    let mut value_enums: std::collections::HashMap<String, Vec<(String, VariantKind)>> =
+        std::collections::HashMap::new();
+    let mut body_carrying: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in &program.items {
+        match item {
+            Item::EnumDef(e) if !e.is_shared && !e.is_par => {
+                value_enums.insert(
+                    e.name.clone(),
+                    e.variants
+                        .iter()
+                        .map(|v| (v.name.clone(), v.kind.clone()))
+                        .collect(),
+                );
+                body_carrying.insert(e.name.clone());
+            }
+            Item::StructDef(sd) if !sd.is_shared && !sd.is_par => {
+                body_carrying.insert(sd.name.clone());
+            }
+            _ => {}
+        }
+    }
     let mut lowerer = Lowerer {
         tc,
         type_param_bounds: std::collections::HashMap::new(),
+        value_enums,
+        body_carrying,
+        owned_enum_self: None,
+        wild_binding_types: Vec::new(),
     };
     for item in &mut program.items {
         lowerer.lower_item(item);
     }
+    let wild_binding_types = std::mem::take(&mut lowerer.wild_binding_types);
     // Collapse `let rows = t.iter_axis(0); for row in rows { … }` into the
     // direct `for row in t.iter_axis(0) { … }` — B-2026-07-29-24. Only the
     // direct form reaches codegen's fused row-buffer lowering (the for-loop
@@ -632,6 +662,13 @@ pub fn lower_program(program: &mut Program, tc: &TypeCheckResult) {
         .iter()
         .map(|(k, v)| ((k.0, k.1), v.clone()))
         .collect();
+    // B-2026-09-06-37 — the bindings `bind_receiver_wildcards` minted in place
+    // of wildcards were never seen by the typechecker, so their surface types
+    // are recorded here from the variant declaration; codegen reconstitutes a
+    // struct payload at a bind site from exactly this entry.
+    for (key, name) in wild_binding_types {
+        program.pattern_binding_types.entry(key).or_insert(name);
+    }
     // PB sibling slice (2026-05-09): forward the inner element-type table
     // for `Vec[T]` / `Slice[T]` pattern bindings so codegen can populate
     // `vec_elem_types` / `slice_elem_types` keyed by the binding's variable
@@ -1208,6 +1245,21 @@ struct Lowerer<'a> {
     /// desugaring emittable anyway: a METHOD call dispatches on the receiver,
     /// so `a.cmp(b).is_lt()` needs no `T` substitution at all.
     type_param_bounds: std::collections::HashMap<String, Vec<String>>,
+    /// B-2026-09-06-37 — every non-shared user enum's variants, by name; the
+    /// declarations `bind_receiver_wildcards` resolves a payload position's
+    /// declared type from.
+    value_enums: std::collections::HashMap<String, Vec<(String, VariantKind)>>,
+    /// Type names whose value can carry a user `Drop` body (non-shared user
+    /// structs and enums). A wildcard over any other payload is left alone.
+    body_carrying: std::collections::HashSet<String>,
+    /// The variants of the enum the CURRENT method receives by value as
+    /// `self`, when it does; `None` everywhere else, which disables the
+    /// wildcard rewrite.
+    owned_enum_self: Option<Vec<(String, VariantKind)>>,
+    /// `(span key, surface type name)` of each binding minted in place of a
+    /// wildcard, merged into `Program::pattern_binding_types` by
+    /// `lower_program`.
+    wild_binding_types: Vec<((usize, usize), String)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -1216,9 +1268,25 @@ impl<'a> Lowerer<'a> {
             Item::Function(f) => self.lower_function(f),
             Item::ImplBlock(imp) => {
                 let saved = self.push_type_param_bounds(imp.generic_params.as_ref());
+                // B-2026-09-06-37 — is this an impl of a non-shared user
+                // enum? Its owned-`self` methods get the receiver wildcard
+                // rewrite below.
+                let enum_variants = match &imp.target_type.kind {
+                    TypeKind::Path(tp) => tp
+                        .segments
+                        .last()
+                        .and_then(|n| self.value_enums.get(n).cloned()),
+                    _ => None,
+                };
                 for it in &mut imp.items {
                     if let ImplItem::Method(m) = it {
+                        self.owned_enum_self = if matches!(m.self_param, Some(SelfParam::Owned)) {
+                            enum_variants.clone()
+                        } else {
+                            None
+                        };
                         self.lower_function(m);
+                        self.owned_enum_self = None;
                     }
                 }
                 self.type_param_bounds = saved;
@@ -1232,6 +1300,110 @@ impl<'a> Lowerer<'a> {
         let saved = self.push_type_param_bounds(f.generic_params.as_ref());
         self.lower_block(&mut f.body);
         self.type_param_bounds = saved;
+    }
+
+    /// B-2026-09-06-37 — in a `match` / `if let` / `while let` over a bare
+    /// owned ENUM `self`, bind every WILDCARD payload position whose declared
+    /// type can carry a user `Drop` body to a fresh, never-read name.
+    ///
+    /// An owned enum receiver's payload bodies belong to the match-ARM channel
+    /// on both backends (B-2026-08-01-6; B-2026-09-04-30's receiver-temp
+    /// registrar is memory-only for a value enum, and the interpreter's
+    /// `run_fresh_recv_temp_drop` walks structs only), and the caller's walk
+    /// over a named-local receiver masks the payload at the call for the same
+    /// reason. That channel fires the body of each payload the arm BINDS — so
+    /// `E.A(_) => 1` ran the payload's body on no surface at all (`dE z1` for a
+    /// local, `z1` for a temp), and `T.A(_, r) => r.id` ran only the bound
+    /// half's. A wildcard binds nothing; a never-read binding in its place is
+    /// exactly the read-only payload binding both backends already run once
+    /// at the arm's end (B-2026-09-06-27), with the same memory hand-off (the
+    /// position becomes a consumed one, so the source's payload words are
+    /// zeroed and the binding frees them).
+    ///
+    /// One AST rewrite in the shared lowering pass rather than a hook in each
+    /// backend, so the two cannot answer differently. Restricted to a
+    /// declared payload type that is a non-shared user struct or enum
+    /// (`body_carrying`): a scalar or `String` wildcard has no body to run and
+    /// keeps the source's own free; `Option` / `Result` payloads keep their
+    /// own trackers. The minted name carries the wildcard's span, and its
+    /// surface type is recorded for codegen's payload reconstitution
+    /// (`wild_binding_types`), which the typechecker never did for a `_`.
+    fn bind_receiver_wildcards(&mut self, pattern: &mut Pattern) {
+        let Some(variants) = self.owned_enum_self.clone() else {
+            return;
+        };
+        match &mut pattern.kind {
+            PatternKind::TupleVariant { path, patterns } => {
+                let Some(vname) = path.last() else {
+                    return;
+                };
+                let Some((_, VariantKind::Tuple(tes))) = variants.iter().find(|(n, _)| n == vname)
+                else {
+                    return;
+                };
+                for (i, sub) in patterns.iter_mut().enumerate() {
+                    if !matches!(sub.kind, PatternKind::Wildcard) {
+                        continue;
+                    }
+                    let Some(tn) = tes.get(i).and_then(|te| self.body_carrying_type_name(te))
+                    else {
+                        continue;
+                    };
+                    self.mint_wild_binding(sub, i, tn);
+                }
+            }
+            PatternKind::Struct { path, fields, .. } => {
+                let Some(vname) = path.last() else {
+                    return;
+                };
+                let Some((_, VariantKind::Struct(fs))) = variants.iter().find(|(n, _)| n == vname)
+                else {
+                    return;
+                };
+                for (i, fp) in fields.iter_mut().enumerate() {
+                    let Some(sub) = fp.pattern.as_mut() else {
+                        continue;
+                    };
+                    if !matches!(sub.kind, PatternKind::Wildcard) {
+                        continue;
+                    }
+                    let Some(tn) = fs
+                        .iter()
+                        .find(|f| f.name == fp.name)
+                        .and_then(|f| self.body_carrying_type_name(&f.ty))
+                    else {
+                        continue;
+                    };
+                    self.mint_wild_binding(sub, i, tn);
+                }
+            }
+            PatternKind::Or(alts) => {
+                for alt in alts.iter_mut() {
+                    self.bind_receiver_wildcards(alt);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mint_wild_binding(&mut self, sub: &mut Pattern, position: usize, type_name: String) {
+        let name = format!("__karac_wild_{}_{}", sub.span.offset, position);
+        sub.kind = PatternKind::Binding(name);
+        self.wild_binding_types
+            .push(((sub.span.offset, sub.span.length), type_name));
+    }
+
+    /// The declared type's name when a value of it can carry a user `Drop`
+    /// body: a bare, non-generic path naming a non-shared user struct or enum.
+    fn body_carrying_type_name(&self, te: &TypeExpr) -> Option<String> {
+        let TypeKind::Path(p) = &te.kind else {
+            return None;
+        };
+        if p.generic_args.is_some() {
+            return None;
+        }
+        let n = p.segments.last()?;
+        self.body_carrying.contains(n).then(|| n.clone())
     }
 
     /// Add `params`' bounds to the in-scope set, returning the previous map for
@@ -1517,11 +1689,14 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ExprKind::IfLet {
+                pattern,
                 value,
                 then_block,
                 else_branch,
-                ..
             } => {
+                if matches!(value.kind, ExprKind::SelfValue) {
+                    self.bind_receiver_wildcards(pattern);
+                }
                 self.lower_expr(value);
                 self.lower_block(then_block);
                 if let Some(eb) = else_branch {
@@ -1529,6 +1704,11 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
+                if matches!(scrutinee.kind, ExprKind::SelfValue) {
+                    for arm in arms.iter_mut() {
+                        self.bind_receiver_wildcards(&mut arm.pattern);
+                    }
+                }
                 self.lower_expr(scrutinee);
                 for arm in arms {
                     if let Some(g) = &mut arm.guard {
@@ -1543,7 +1723,15 @@ impl<'a> Lowerer<'a> {
                 self.lower_expr(condition);
                 self.lower_block(body);
             }
-            ExprKind::WhileLet { value, body, .. } => {
+            ExprKind::WhileLet {
+                pattern,
+                value,
+                body,
+                ..
+            } => {
+                if matches!(value.kind, ExprKind::SelfValue) {
+                    self.bind_receiver_wildcards(pattern);
+                }
                 self.lower_expr(value);
                 self.lower_block(body);
             }
