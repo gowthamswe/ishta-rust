@@ -57272,6 +57272,112 @@ end
     );
 }
 
+/// B-2026-09-06-29 — a payload handed back out of a TWO-LEVEL owned-param
+/// destructure ran its `Drop` body twice on every surface: `fn p_h(h: H1) -> R {
+/// match h { H1 { e } => { match e { E.A(r) => { return r; } .. } } } }` printed
+/// `dE dR2 r2 dR2` where the one-level `match h.e { E.A(r) => return r }` printed
+/// `dE r6 dR6`. The caller masks a handed-back payload out of its retained walk
+/// over the argument through the field-payload path channel
+/// (`fn_escaping_param_field_payload_paths`, B-2026-09-06-17), whose scanner
+/// denoted PROJECTION scrutinees only (`h.e`, `h.s.e`); the inner scrutinee here
+/// is the bare leaf `e` that the outer destructure bound, so no path was reported
+/// and the walk ran the payload's body under the result's owner. The scanner now
+/// carries the destructure-alias table the part-path scanner has had since
+/// B-2026-08-28-23 (`alias_destructure` / `set_alias` / `clear_alias`, hoisted to
+/// module level and shared): a `match` / `if let` / `while let` / `let` /
+/// `let … else` that destructures the param or one of its parts makes each leaf an
+/// alias of that part, so `match e` denotes `["e"]`, `match s { S { e } => match e
+/// {..} }` denotes `["s", "e"]`, and a rebind `let k = e` follows. Both backends
+/// consume the one predicate, so both moved together.
+///
+/// Cells: `h/local`, `h/temp`, `let/local`, `iflet/local`, `deep/local` (three
+/// levels), `two/local` (a sibling field whose bodies must keep running), and the
+/// owned-`self` receiver `hand/local`; `r/local` and `proj/local` are the one-level
+/// controls. `hand/temp` keeps losing the shell's `dE` — B-2026-09-04-30's
+/// receiver-temp registrar declines a method whose return can carry the receiver,
+/// the documented conservative direction — and is pinned as it stands.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_two_level_destructure_hand_back_runs_one_payload_body`, pinned to the same string.
+#[test]
+fn test_two_level_destructure_hand_back_runs_one_payload_body() {
+    assert_eq!(
+        run(r#"struct R { id: i64, tag: String, xs: Vec[i64] }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, tag: f"t{i}", xs: [i] } }
+enum E { A(R), B }
+impl Drop for E { fn drop(mut ref self) { println("  dE") } }
+struct H1 { e: E }
+struct S { e: E }
+struct H2 { s: S }
+struct Hb { e: E, b: E }
+fn p_r(e: E) -> R { match e { E.A(r) => { return r; } E.B => { return mk(0); } } }
+fn p_h(h: H1) -> R { match h { H1 { e } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } }
+fn p_let(h: H1) -> R { let H1 { e } = h; match e { E.A(r) => { return r; } E.B => { return mk(0); } } }
+fn p_iflet(h: H1) -> R { match h { H1 { e } => { if let E.A(r) = e { return r; } else { return mk(0); } } } }
+fn p_proj(h: H1) -> R { match h.e { E.A(r) => { return r; } E.B => { return mk(0); } } }
+fn p_deep(h: H2) -> R { match h { H2 { s } => { match s { S { e } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } } } }
+fn p_two(h: Hb) -> R { match h { Hb { e, b } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } }
+impl H1 { fn hand(self) -> R { match self { H1 { e } => { match e { E.A(r) => { return r; } E.B => { return mk(0); } } } } } }
+fn main() {
+    println("r/local"); let a1 = E.A(mk(1)); let x1 = p_r(a1); println(f"  r{x1.id}");
+    println("h/local"); let a2 = H1 { e: E.A(mk(2)) }; let x2 = p_h(a2); println(f"  r{x2.id}");
+    println("h/temp"); let x3 = p_h(H1 { e: E.A(mk(3)) }); println(f"  r{x3.id}");
+    println("let/local"); let a4 = H1 { e: E.A(mk(4)) }; let x4 = p_let(a4); println(f"  r{x4.id}");
+    println("iflet/local"); let a5 = H1 { e: E.A(mk(5)) }; let x5 = p_iflet(a5); println(f"  r{x5.id}");
+    println("proj/local"); let a6 = H1 { e: E.A(mk(6)) }; let x6 = p_proj(a6); println(f"  r{x6.id}");
+    println("deep/local"); let a7 = H2 { s: S { e: E.A(mk(7)) } }; let x7 = p_deep(a7); println(f"  r{x7.id}");
+    println("two/local"); let a8 = Hb { e: E.A(mk(8)), b: E.A(mk(108)) }; let x8 = p_two(a8); println(f"  r{x8.id}");
+    println("hand/local"); let a9 = H1 { e: E.A(mk(9)) }; let x9 = a9.hand(); println(f"  r{x9.id}");
+    println("hand/temp"); let x10 = H1 { e: E.A(mk(10)) }.hand(); println(f"  r{x10.id}");
+    println("end");
+}
+"#),
+        r#"r/local
+  dE
+  r1
+  dR1
+h/local
+  dE
+  r2
+  dR2
+h/temp
+  dE
+  r3
+  dR3
+let/local
+  dE
+  r4
+  dR4
+iflet/local
+  dE
+  r5
+  dR5
+proj/local
+  dE
+  r6
+  dR6
+deep/local
+  dE
+  r7
+  dR7
+two/local
+  dE
+  dR108
+  dE
+  r8
+  dR8
+hand/local
+  dE
+  r9
+  dR9
+hand/temp
+  r10
+  dR10
+end
+"#
+    );
+}
+
 #[test]
 fn test_deep_projection_scrutinee_runs_one_payload_body() {
     let hdr = "struct R { id: i64 }\n\

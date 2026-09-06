@@ -2896,6 +2896,62 @@ pub fn fn_escaping_param_part_paths(
     returned_param_part_paths_impl(f, arg_index, Some(program))
 }
 
+/// Shared by the two part-path scanners (`returned_param_part_paths_impl`,
+/// `escaping_field_payload_paths_impl`) since B-2026-09-06-29, so the
+/// destructure-alias rule cannot be spelled twice.
+fn set_alias(aliases: &mut Vec<(String, ParamPath)>, name: &str, p: ParamPath) {
+    if let Some(slot) = aliases.iter_mut().find(|(a, _)| a == name) {
+        slot.1 = p;
+    } else {
+        aliases.push((name.to_string(), p));
+    }
+}
+
+fn clear_alias(aliases: &mut Vec<(String, ParamPath)>, name: &str) {
+    aliases.retain(|(a, _)| a != name);
+}
+
+/// A destructure of `base` (the param or one of its parts): each leaf
+/// binding denotes the source's path extended by its own element / field.
+/// Shared by the `let` / `let … else` statements and by every pattern
+/// construct (`match`, `if let`, `while let`) — B-2026-09-02-24 taught the
+/// `match` arm this, and B-2026-09-05-34 found `if let (r, k) = t { r }`
+/// still opaque: `r` was an unknown name, the handed-back element never
+/// registered as escaping, and the caller ran its `Drop` body a SECOND time
+/// on top of the result's owner (`dR3 r3 dR3` against the interpreter's
+/// `r3 dR3`). One walk for every destructuring position, so the `if let`
+/// spelling cannot fall behind the `match` spelling again.
+fn alias_destructure(pattern: &Pattern, base: &ParamPath, aliases: &mut Vec<(String, ParamPath)>) {
+    match &pattern.kind {
+        PatternKind::Tuple(pats) => {
+            for (i, p) in pats.iter().enumerate() {
+                if let PatternKind::Binding(n) = &p.kind {
+                    let mut path = base.clone();
+                    path.push(ParamPart::TupleIndex(i));
+                    set_alias(aliases, n, path);
+                }
+            }
+        }
+        PatternKind::Struct { fields, .. } => {
+            for fp in fields {
+                let mut path = base.clone();
+                path.push(ParamPart::Field(fp.name.clone()));
+                match &fp.pattern {
+                    // `W { r, n }` — shorthand binds the field name itself.
+                    None => set_alias(aliases, &fp.name, path),
+                    // `W { r: inner, .. }` — renamed leaf.
+                    Some(p) => {
+                        if let PatternKind::Binding(n) = &p.kind {
+                            set_alias(aliases, n, path);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn returned_param_part_paths_impl(
     f: &Function,
     arg_index: usize,
@@ -2967,63 +3023,6 @@ fn returned_param_part_paths_impl(
                 Some(path)
             }
             _ => None,
-        }
-    }
-
-    fn set_alias(aliases: &mut Vec<(String, ParamPath)>, name: &str, p: ParamPath) {
-        if let Some(slot) = aliases.iter_mut().find(|(a, _)| a == name) {
-            slot.1 = p;
-        } else {
-            aliases.push((name.to_string(), p));
-        }
-    }
-
-    fn clear_alias(aliases: &mut Vec<(String, ParamPath)>, name: &str) {
-        aliases.retain(|(a, _)| a != name);
-    }
-
-    /// A destructure of `base` (the param or one of its parts): each leaf
-    /// binding denotes the source's path extended by its own element / field.
-    /// Shared by the `let` / `let … else` statements and by every pattern
-    /// construct (`match`, `if let`, `while let`) — B-2026-09-02-24 taught the
-    /// `match` arm this, and B-2026-09-05-34 found `if let (r, k) = t { r }`
-    /// still opaque: `r` was an unknown name, the handed-back element never
-    /// registered as escaping, and the caller ran its `Drop` body a SECOND time
-    /// on top of the result's owner (`dR3 r3 dR3` against the interpreter's
-    /// `r3 dR3`). One walk for every destructuring position, so the `if let`
-    /// spelling cannot fall behind the `match` spelling again.
-    fn alias_destructure(
-        pattern: &Pattern,
-        base: &ParamPath,
-        aliases: &mut Vec<(String, ParamPath)>,
-    ) {
-        match &pattern.kind {
-            PatternKind::Tuple(pats) => {
-                for (i, p) in pats.iter().enumerate() {
-                    if let PatternKind::Binding(n) = &p.kind {
-                        let mut path = base.clone();
-                        path.push(ParamPart::TupleIndex(i));
-                        set_alias(aliases, n, path);
-                    }
-                }
-            }
-            PatternKind::Struct { fields, .. } => {
-                for fp in fields {
-                    let mut path = base.clone();
-                    path.push(ParamPart::Field(fp.name.clone()));
-                    match &fp.pattern {
-                        // `W { r, n }` — shorthand binds the field name itself.
-                        None => set_alias(aliases, &fp.name, path),
-                        // `W { r: inner, .. }` — renamed leaf.
-                        Some(p) => {
-                            if let PatternKind::Binding(n) = &p.kind {
-                                set_alias(aliases, n, path);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -3569,9 +3568,26 @@ fn escaping_field_payload_paths_impl(
                 || program.is_some_and(|p| stored_via_call_block(body, n, p))
         })
     };
-    /// The path a scrutinee denotes off `root`: at least one `FieldAccess` /
-    /// `TupleIndex` hop down to the root identifier (or `self`).
-    fn denote(e: &Expr, root: &str, root_is_self: bool) -> Option<ParamPath> {
+    /// The path a scrutinee denotes off `root`: `FieldAccess` / `TupleIndex`
+    /// hops down to the root identifier (or `self`), OR to a name a
+    /// destructure has made an alias of one of the root's parts. An EMPTY
+    /// path is the whole parameter — a legal BASE for a destructure to alias
+    /// from, never a reported path (the callers check `is_empty`).
+    ///
+    /// B-2026-09-06-29 — the alias half is what reaches a TWO-LEVEL
+    /// destructure. `match h { H1 { e } => match e { E.A(r) => return r } }`
+    /// hands `h.e`'s payload back exactly as `match h.e { .. }` does, but its
+    /// inner scrutinee is the bare leaf `e`, which the projection-only walk
+    /// declined; the caller's retained walk over the argument then ran the
+    /// payload's body a second time under the result's owner, on every
+    /// surface. The part-path scanner has carried this alias table since
+    /// B-2026-08-28-23; the shared helpers below are its.
+    fn denote(
+        e: &Expr,
+        root: &str,
+        root_is_self: bool,
+        aliases: &[(String, ParamPath)],
+    ) -> Option<ParamPath> {
         let mut path: Vec<ParamPart> = Vec::new();
         let mut cur = e;
         loop {
@@ -3584,11 +3600,18 @@ fn escaping_field_payload_paths_impl(
                     path.push(ParamPart::TupleIndex(*index as usize));
                     cur = object;
                 }
-                ExprKind::Identifier(n) if !root_is_self && n == root && !path.is_empty() => {
+                ExprKind::Identifier(n) => {
+                    let base: ParamPath = if !root_is_self && n == root {
+                        Vec::new()
+                    } else {
+                        aliases.iter().find(|(a, _)| a == n)?.1.clone()
+                    };
                     path.reverse();
-                    return Some(path);
+                    let mut full = base;
+                    full.extend(path);
+                    return Some(full);
                 }
-                ExprKind::SelfValue if root_is_self && !path.is_empty() => {
+                ExprKind::SelfValue if root_is_self => {
                     path.reverse();
                     return Some(path);
                 }
@@ -3601,46 +3624,63 @@ fn escaping_field_payload_paths_impl(
             out.push(path);
         }
     }
-    #[allow(clippy::too_many_arguments)]
+    struct Cx<'a> {
+        root: &'a str,
+        root_is_self: bool,
+        fn_body: &'a Block,
+        rule: CallYieldRule<'a>,
+        stored: &'a dyn Fn(&Expr, &[String]) -> bool,
+        stored_block: &'a dyn Fn(&Block, &[String]) -> bool,
+    }
+    /// Does a `match` arm / `if let` / `while let` over a denoted base hand
+    /// one of its bindings out? `block` is the arm's scope when the construct
+    /// binds into a block rather than an arm expression.
+    fn arm_hands_out(
+        cx: &Cx<'_>,
+        names: &[String],
+        body: Option<&Expr>,
+        block: Option<&Block>,
+    ) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        match (body, block) {
+            (Some(body), _) => {
+                names.iter().any(|n| payload_yields(body, n, cx.rule))
+                    || payload_returns_any(body, names, cx.rule)
+                    || payload_escapes_by_assignment(body, names, cx.fn_body, cx.rule)
+                    || (cx.stored)(body, names)
+            }
+            (None, Some(block)) => {
+                payload_returns_any_block(block, names, cx.rule)
+                    || payload_escapes_by_assignment_block(block, names, cx.fn_body, cx.rule)
+                    || (cx.stored_block)(block, names)
+            }
+            (None, None) => false,
+        }
+    }
     fn walk(
         e: &Expr,
-        root: &str,
-        root_is_self: bool,
-        fn_body: &Block,
-        rule: CallYieldRule<'_>,
-        stored: &dyn Fn(&Expr, &[String]) -> bool,
-        stored_block: &dyn Fn(&Block, &[String]) -> bool,
+        cx: &Cx<'_>,
+        aliases: &mut Vec<(String, ParamPath)>,
         out: &mut Vec<ParamPath>,
     ) {
         match &e.kind {
             ExprKind::Match { scrutinee, arms } => {
-                if let Some(path) = denote(scrutinee, root, root_is_self) {
-                    for a in arms {
-                        if matches!(a.pattern.kind, PatternKind::Tuple(_)) {
-                            continue;
-                        }
-                        let names: Vec<String> = a.pattern.binding_names();
-                        if !names.is_empty()
-                            && (names.iter().any(|n| payload_yields(&a.body, n, rule))
-                                || payload_returns_any(&a.body, &names, rule)
-                                || payload_escapes_by_assignment(&a.body, &names, fn_body, rule)
-                                || stored(&a.body, &names))
+                let base = denote(scrutinee, cx.root, cx.root_is_self, aliases);
+                for a in arms {
+                    if let Some(base) = &base {
+                        // A destructuring arm makes each leaf an alias of the
+                        // base's part, for the arm body that follows.
+                        alias_destructure(&a.pattern, base, aliases);
+                        if !base.is_empty()
+                            && !matches!(a.pattern.kind, PatternKind::Tuple(_))
+                            && arm_hands_out(cx, &a.pattern.binding_names(), Some(&a.body), None)
                         {
-                            push(out, path.clone());
+                            push(out, base.clone());
                         }
                     }
-                }
-                for a in arms {
-                    walk(
-                        &a.body,
-                        root,
-                        root_is_self,
-                        fn_body,
-                        rule,
-                        stored,
-                        stored_block,
-                        out,
-                    );
+                    walk(&a.body, cx, aliases, out);
                 }
             }
             ExprKind::IfLet {
@@ -3649,41 +3689,18 @@ fn escaping_field_payload_paths_impl(
                 then_block,
                 else_branch,
             } => {
-                if let Some(path) = denote(value, root, root_is_self) {
-                    if !matches!(pattern.kind, PatternKind::Tuple(_)) {
-                        let names: Vec<String> = pattern.binding_names();
-                        if !names.is_empty()
-                            && (payload_returns_any_block(then_block, &names, rule)
-                                || payload_escapes_by_assignment_block(
-                                    then_block, &names, fn_body, rule,
-                                )
-                                || stored_block(then_block, &names))
-                        {
-                            push(out, path);
-                        }
+                if let Some(base) = denote(value, cx.root, cx.root_is_self, aliases) {
+                    alias_destructure(pattern, &base, aliases);
+                    if !base.is_empty()
+                        && !matches!(pattern.kind, PatternKind::Tuple(_))
+                        && arm_hands_out(cx, &pattern.binding_names(), None, Some(then_block))
+                    {
+                        push(out, base);
                     }
                 }
-                walk_block_for(
-                    then_block,
-                    root,
-                    root_is_self,
-                    fn_body,
-                    rule,
-                    stored,
-                    stored_block,
-                    out,
-                );
+                walk_block_for(then_block, cx, aliases, out);
                 if let Some(x) = else_branch.as_deref() {
-                    walk(
-                        x,
-                        root,
-                        root_is_self,
-                        fn_body,
-                        rule,
-                        stored,
-                        stored_block,
-                        out,
-                    );
+                    walk(x, cx, aliases, out);
                 }
             }
             ExprKind::WhileLet {
@@ -3692,167 +3709,87 @@ fn escaping_field_payload_paths_impl(
                 body,
                 ..
             } => {
-                if let Some(path) = denote(value, root, root_is_self) {
-                    if !matches!(pattern.kind, PatternKind::Tuple(_)) {
-                        let names: Vec<String> = pattern.binding_names();
-                        if !names.is_empty()
-                            && (payload_returns_any_block(body, &names, rule)
-                                || payload_escapes_by_assignment_block(body, &names, fn_body, rule)
-                                || stored_block(body, &names))
-                        {
-                            push(out, path);
-                        }
+                if let Some(base) = denote(value, cx.root, cx.root_is_self, aliases) {
+                    alias_destructure(pattern, &base, aliases);
+                    if !base.is_empty()
+                        && !matches!(pattern.kind, PatternKind::Tuple(_))
+                        && arm_hands_out(cx, &pattern.binding_names(), None, Some(body))
+                    {
+                        push(out, base);
                     }
                 }
-                walk_block_for(
-                    body,
-                    root,
-                    root_is_self,
-                    fn_body,
-                    rule,
-                    stored,
-                    stored_block,
-                    out,
-                );
+                walk_block_for(body, cx, aliases, out);
             }
             ExprKind::Block(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Try(b)
             | ExprKind::Seq(b)
-            | ExprKind::Par(b) => walk_block_for(
-                b,
-                root,
-                root_is_self,
-                fn_body,
-                rule,
-                stored,
-                stored_block,
-                out,
-            ),
-            ExprKind::Return(Some(inner)) => walk(
-                inner,
-                root,
-                root_is_self,
-                fn_body,
-                rule,
-                stored,
-                stored_block,
-                out,
-            ),
+            | ExprKind::Par(b) => walk_block_for(b, cx, aliases, out),
+            ExprKind::Return(Some(inner)) => walk(inner, cx, aliases, out),
             ExprKind::If {
                 condition,
                 then_block,
                 else_branch,
             } => {
-                walk(
-                    condition,
-                    root,
-                    root_is_self,
-                    fn_body,
-                    rule,
-                    stored,
-                    stored_block,
-                    out,
-                );
-                walk_block_for(
-                    then_block,
-                    root,
-                    root_is_self,
-                    fn_body,
-                    rule,
-                    stored,
-                    stored_block,
-                    out,
-                );
+                walk(condition, cx, aliases, out);
+                walk_block_for(then_block, cx, aliases, out);
                 if let Some(x) = else_branch.as_deref() {
-                    walk(
-                        x,
-                        root,
-                        root_is_self,
-                        fn_body,
-                        rule,
-                        stored,
-                        stored_block,
-                        out,
-                    );
+                    walk(x, cx, aliases, out);
                 }
             }
             ExprKind::While { body, .. }
             | ExprKind::For { body, .. }
             | ExprKind::Loop { body, .. }
-            | ExprKind::LabeledBlock { body, .. } => walk_block_for(
-                body,
-                root,
-                root_is_self,
-                fn_body,
-                rule,
-                stored,
-                stored_block,
-                out,
-            ),
+            | ExprKind::LabeledBlock { body, .. } => walk_block_for(body, cx, aliases, out),
             _ => {}
         }
     }
-    #[allow(clippy::too_many_arguments)]
     fn walk_block_for(
         b: &Block,
-        root: &str,
-        root_is_self: bool,
-        fn_body: &Block,
-        rule: CallYieldRule<'_>,
-        stored: &dyn Fn(&Expr, &[String]) -> bool,
-        stored_block: &dyn Fn(&Block, &[String]) -> bool,
+        cx: &Cx<'_>,
+        aliases: &mut Vec<(String, ParamPath)>,
         out: &mut Vec<ParamPath>,
     ) {
         for st in &b.stmts {
             match &st.kind {
-                StmtKind::Expr(e) => walk(
-                    e,
-                    root,
-                    root_is_self,
-                    fn_body,
-                    rule,
-                    stored,
-                    stored_block,
-                    out,
-                ),
-                StmtKind::Let { value, .. } | StmtKind::LetElse { value, .. } => walk(
-                    value,
-                    root,
-                    root_is_self,
-                    fn_body,
-                    rule,
-                    stored,
-                    stored_block,
-                    out,
-                ),
+                StmtKind::Expr(e) => walk(e, cx, aliases, out),
+                StmtKind::Let { pattern, value, .. } => {
+                    walk(value, cx, aliases, out);
+                    // `let H1 { e } = h;` / `let k = e;` — the leaf (or the
+                    // rebind) denotes the source's part from here on; a `let`
+                    // of an unrelated value un-records a shadowed alias.
+                    let d = denote(value, cx.root, cx.root_is_self, aliases);
+                    match (&pattern.kind, d) {
+                        (PatternKind::Binding(n), Some(p)) => set_alias(aliases, n, p),
+                        (PatternKind::Binding(n), None) => clear_alias(aliases, n),
+                        (_, Some(base)) => alias_destructure(pattern, &base, aliases),
+                        _ => {}
+                    }
+                }
+                StmtKind::LetElse { pattern, value, .. } => {
+                    walk(value, cx, aliases, out);
+                    if let Some(base) = denote(value, cx.root, cx.root_is_self, aliases) {
+                        alias_destructure(pattern, &base, aliases);
+                    }
+                }
                 _ => {}
             }
         }
         if let Some(fe) = b.final_expr.as_deref() {
-            walk(
-                fe,
-                root,
-                root_is_self,
-                fn_body,
-                rule,
-                stored,
-                stored_block,
-                out,
-            );
+            walk(fe, cx, aliases, out);
         }
     }
-    let mut out = Vec::new();
-    walk_block_for(
-        &f.body,
+    let cx = Cx {
         root,
         root_is_self,
-        &f.body,
+        fn_body: &f.body,
         rule,
-        &stored,
-        &stored_block,
-        &mut out,
-    );
+        stored: &stored,
+        stored_block: &stored_block,
+    };
+    let mut out = Vec::new();
+    let mut aliases: Vec<(String, ParamPath)> = Vec::new();
+    walk_block_for(&f.body, &cx, &mut aliases, &mut out);
     out
 }
 
