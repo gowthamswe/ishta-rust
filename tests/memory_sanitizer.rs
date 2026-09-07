@@ -4134,6 +4134,66 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-11 — the MEMORY half: the same program under ASAN + LSan,
+    /// where the pre-fix build double-freed the object the method stored. One
+    /// owner and one free per object in both copy classes, and the free-function
+    /// control still frees its own.
+    #[test]
+    fn asan_named_local_into_a_storing_method() {
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             struct S { id: i64, name: String }\n\
+             impl Drop for S { fn drop(mut ref self) { println(f\"  dS{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn mks(i: i64) -> S { return S { id: i, name: f\"s{i}\" }; }\n\
+             struct Box2 { mut xs: Vec[R] }\n\
+             impl Box2 { fn push(mut ref self, r: R) { self.xs.push(r); } }\n\
+             struct BoxS { mut ys: Vec[S] }\n\
+             impl BoxS { fn add(mut ref self, s: S) { self.ys.push(s); } }\n\
+             fn take(b: mut ref Box2, r: R) { b.xs.push(r); }\n\
+             fn main() {\n\
+               println(\"named_method\");\n\
+               let mut b = Box2 { xs: Vec.new() };\n\
+               let a = mk(1); b.push(a); println(f\"  len={b.xs.len()}\");\n\
+               println(\"fresh_method\");\n\
+               let mut c = Box2 { xs: Vec.new() };\n\
+               c.push(mk(2)); println(f\"  len={c.xs.len()}\");\n\
+               println(\"named_free_fn\");\n\
+               let mut d = Box2 { xs: Vec.new() };\n\
+               let e = mk(3); take(mut d, e); println(f\"  len={d.xs.len()}\");\n\
+               println(\"copy_supported_method\");\n\
+               let mut g = BoxS { ys: Vec.new() };\n\
+               let h = mks(4); g.add(h); println(f\"  len={g.ys.len()}\");\n\
+               println(\"two_named\");\n\
+               let mut i = Box2 { xs: Vec.new() };\n\
+               let j = mk(5); i.push(j); let k = mk(6); i.push(k); println(f\"  len={i.xs.len()}\");\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "named_method",
+                "  len=1",
+                "  dR1",
+                "fresh_method",
+                "  len=1",
+                "  dR2",
+                "named_free_fn",
+                "  len=1",
+                "  dR3",
+                "copy_supported_method",
+                "  len=1",
+                "  dS4",
+                "two_named",
+                "  len=2",
+                "  dR5",
+                "  dR6",
+                "end"
+            ],
+            "named_local_into_a_storing_method",
+        );
+    }
+
     /// B-2026-09-07-10 — the MEMORY half: the same program under ASAN + LSan,
     /// where the pre-fix build double-freed the object handed back through the
     /// hop. One owner and one free per object on every spelling, including the

@@ -7792,7 +7792,49 @@ impl<'ctx> super::Codegen<'ctx> {
                         if self.callee_takes_over_arg_drop_body(&qualified, i) {
                             if let ExprKind::Identifier(var_name) = &a.value.kind {
                                 let var_name = var_name.clone();
-                                self.suppress_user_drop_body_keeping_memory(&var_name);
+                                // B-2026-09-07-11 — the METHOD leg of
+                                // B-2026-09-06-71's split, which the free-fn arm
+                                // in `compile_call` got and this one did not.
+                                // Keeping the memory is right for an
+                                // ENTRY-COPIED param: the callee owns its copy
+                                // and the caller's slot owns the original, so
+                                // only the body moves. A struct that DECLINES
+                                // copy support — a direct `shared` field is this
+                                // row's shape — is FORWARDED, so the object the
+                                // callee stored IS this binding's, and keeping a
+                                // memory action here gave it two owners:
+                                // `let a = mk(28); b.push(a);` over
+                                // `impl Box2 { fn push(mut ref self, r: R) {
+                                // self.xs.push(r); } }` aborted `free(): double
+                                // free detected in tcache 2` on every compiled
+                                // surface while the FREE-FUNCTION twin
+                                // (`take(mut b, a)`) and the FRESH-TEMP spelling
+                                // of the method were both clean.
+                                //
+                                // `aggregate_param_copy_supported_struct` is the
+                                // same split the free-fn arm uses, so the two
+                                // legs cannot drift on which params are
+                                // forwarded rather than copied.
+                                let forwarded_not_copied = self
+                                    .var_types
+                                    .var_type_names
+                                    .get(var_name.as_str())
+                                    .is_some_and(|tn| {
+                                        self.type_decls.struct_types.contains_key(tn.as_str())
+                                            && !self
+                                                .type_decls
+                                                .shared_types
+                                                .contains_key(tn.as_str())
+                                            && !self.aggregate_param_copy_supported_struct(
+                                                tn,
+                                                &mut Vec::new(),
+                                            )
+                                    });
+                                if forwarded_not_copied {
+                                    self.suppress_user_drop_for_var(&var_name);
+                                } else {
+                                    self.suppress_user_drop_body_keeping_memory(&var_name);
+                                }
                             }
                         }
                     }

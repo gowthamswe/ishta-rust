@@ -35312,6 +35312,89 @@ end
         );
     }
 
+    /// B-2026-09-07-11 (codegen) and B-2026-09-07-12 (interpreter) — one program,
+    /// two defects, one on each backend.
+    ///
+    /// `let a = mk(1); b.push(a);` over
+    /// `impl Box2 { fn push(mut ref self, r: R) { self.xs.push(r); } }` aborted
+    /// `free(): double free detected in tcache 2` on every compiled surface for a
+    /// struct with a `shared` field, while the FREE-FUNCTION twin `take(mut d, e)`
+    /// and the FRESH-TEMP spelling of the method were both clean: the method arm of
+    /// the named-argument stand-down kept the binding's MEMORY action, which is the
+    /// entry-copy contract and wrong for a forwarded (declined-copy) param.
+    /// B-2026-09-06-71 made that split in the free-function arm and the method arm
+    /// did not inherit it.
+    ///
+    /// The same program ran the `Drop` body TWICE under `--interp`, in BOTH copy
+    /// classes: `record_method_arg_moves` excluded the STORE route from the set of
+    /// escapes that disarm the binding's own body, while its free-function twin
+    /// `record_passthrough_arg_moves` includes it (B-2026-08-29-49) — and that leg
+    /// is the one that measures correct, because the value's new home runs the body.
+    ///
+    /// Cells: the named local into a storing method (both classes), the fresh-temp
+    /// control, the free-function control, and two named locals in a row.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_named_local_into_a_storing_method`, pinned to the same string.
+    #[test]
+    fn e2e_named_local_into_a_storing_method() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"  dS{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn mks(i: i64) -> S { return S { id: i, name: f"s{i}" }; }
+struct Box2 { mut xs: Vec[R] }
+impl Box2 { fn push(mut ref self, r: R) { self.xs.push(r); } }
+struct BoxS { mut ys: Vec[S] }
+impl BoxS { fn add(mut ref self, s: S) { self.ys.push(s); } }
+fn take(b: mut ref Box2, r: R) { b.xs.push(r); }
+fn main() {
+  println("named_method");
+  let mut b = Box2 { xs: Vec.new() };
+  let a = mk(1); b.push(a); println(f"  len={b.xs.len()}");
+  println("fresh_method");
+  let mut c = Box2 { xs: Vec.new() };
+  c.push(mk(2)); println(f"  len={c.xs.len()}");
+  println("named_free_fn");
+  let mut d = Box2 { xs: Vec.new() };
+  let e = mk(3); take(mut d, e); println(f"  len={d.xs.len()}");
+  println("copy_supported_method");
+  let mut g = BoxS { ys: Vec.new() };
+  let h = mks(4); g.add(h); println(f"  len={g.ys.len()}");
+  println("two_named");
+  let mut i = Box2 { xs: Vec.new() };
+  let j = mk(5); i.push(j); let k = mk(6); i.push(k); println(f"  len={i.xs.len()}");
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"named_method
+  len=1
+  dR1
+fresh_method
+  len=1
+  dR2
+named_free_fn
+  len=1
+  dR3
+copy_supported_method
+  len=1
+  dS4
+two_named
+  len=2
+  dR5
+  dR6
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-10 — `let a = mk(1); let z = via(a);` over
     /// `fn via(r: R) -> R { return f(r); }` and `fn f(r: R) -> R { return r; }`
     /// aborted `free(): double free detected in tcache 2` on every compiled backend

@@ -3083,11 +3083,25 @@ impl<'a> super::Interpreter<'a> {
                 // (`fn_always_returns_param`, bare or wrapped in a returned
                 // aggregate), or hands it back on some paths and lets it die
                 // inside on the rest (`fn_conditionally_returns_param_bare`),
-                // where the callee frame owns it. Escaping into an OUTLIVING
-                // PLACE is deliberately not in the union — there the argument
-                // binding is still an owner and must keep firing. The two
-                // rules compose: this one is asked only of what the escape
-                // gate admits.
+                // where the callee frame owns it. The two rules compose: this
+                // one is asked only of what the escape gate admits.
+                //
+                // B-2026-09-07-12 — and the STORE route, which this site used
+                // to exclude with the note "there the argument binding is still
+                // an owner and must keep firing". Its free-function twin
+                // `record_passthrough_arg_moves` concluded the opposite in
+                // B-2026-08-29-49 and is the leg that measures correct: the
+                // value's new HOME runs the body, so a binding that keeps
+                // firing is a SECOND fire, not the only one. Measured on
+                // `let a = mk(28); b.push(a);` over
+                // `impl Box2 { fn push(mut ref self, r: R) { self.xs.push(r); } }`:
+                // `dR28 len=1 dR28` under `--interp` — the binding at the call
+                // and the Vec at its drain — against `len=1 dR28` from the
+                // identical free function `take(mut b, a)` and from all four
+                // compiled surfaces. The ALL-paths predicate, because a param
+                // stored on SOME path must keep its owner on the paths where it
+                // dies (the same split `method_param_drop_names` draws two
+                // functions up, with the same two predicates).
                 Some((
                     n.clone(),
                     crate::ast::fn_always_returns_param(Some(self.program), f, i)
@@ -3095,7 +3109,8 @@ impl<'a> super::Interpreter<'a> {
                             Some(self.program),
                             f,
                             i,
-                        ),
+                        )
+                        || crate::ast::fn_always_moves_param_into_outliving_place(f, i),
                 ))
             })
             .collect();
