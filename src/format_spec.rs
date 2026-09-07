@@ -210,7 +210,7 @@ impl FormatSpec {
         }
     }
 
-    fn render_int_magnitude(&self, mag: u64) -> String {
+    fn render_int_magnitude(&self, mag: u128) -> String {
         match self.radix {
             Radix::Dec => mag.to_string(),
             Radix::Hex => format!("{mag:x}"),
@@ -220,16 +220,18 @@ impl FormatSpec {
         }
     }
 
-    /// Format a signed integer. Zero-pad inserts zeros between the sign and the
-    /// digits (`{-7:05}` -> `-0007`); otherwise the whole rendered number is
-    /// padded per `align` (default right).
-    pub fn apply_int(&self, v: i64) -> String {
-        let neg = v < 0 && self.radix == Radix::Dec;
-        let mag = if self.radix == Radix::Dec {
-            (v as i128).unsigned_abs() as u64
-        } else {
-            v as u64
-        };
+    /// Render a sign plus an ALREADY-REINTERPRETED magnitude. Zero-pad inserts
+    /// zeros between the sign and the digits (`{-7:05}` -> `-0007`); otherwise
+    /// the whole rendered number is padded per `align` (default right).
+    ///
+    /// The magnitude is 128 bits because that is the widest integer the
+    /// language has — but the width-DEPENDENT decision, whether a negative
+    /// value reinterprets as 64 or 128 bits under a non-decimal radix, belongs
+    /// to the caller, which is the only party that knows the hole's own width.
+    /// `{-1:x}` is `ffffffffffffffff` on an `i64` hole and thirty-two f's on an
+    /// `i128` one; both are correct, and folding the two together here is
+    /// exactly the mistake that would silently make one of them wrong.
+    fn apply_magnitude(&self, neg: bool, mag: u128) -> String {
         let digits = self.render_int_magnitude(mag);
         let sign = if neg { "-" } else { "" };
         if self.zero_pad {
@@ -244,19 +246,48 @@ impl FormatSpec {
         self.pad(&format!("{sign}{digits}"), false)
     }
 
-    /// Format an unsigned integer (same rules, never negative).
+    /// Format a signed integer AT 64-BIT WIDTH. Only decimal takes the sign; a
+    /// non-decimal radix reinterprets the value as `u64`, so `{-1:x}` renders
+    /// `ffffffffffffffff` rather than `-1`.
+    pub fn apply_int(&self, v: i64) -> String {
+        let dec = self.radix == Radix::Dec;
+        let mag = if dec {
+            u128::from(v.unsigned_abs())
+        } else {
+            u128::from(v as u64)
+        };
+        self.apply_magnitude(v < 0 && dec, mag)
+    }
+
+    /// Format an unsigned integer at 64-bit width (same rules, never negative).
     pub fn apply_uint(&self, v: u64) -> String {
-        let digits = self.render_int_magnitude(v);
-        if self.zero_pad {
-            if let Some(width) = self.width {
-                let have = digits.chars().count();
-                if have < width {
-                    let zeros = "0".repeat(width - have);
-                    return format!("{zeros}{digits}");
-                }
-            }
-        }
-        self.pad(&digits, false)
+        self.apply_magnitude(false, u128::from(v))
+    }
+
+    /// Format a signed integer AT 128-BIT WIDTH — the `i128` twin of
+    /// [`Self::apply_int`], reinterpreting as `u128` under a non-decimal radix
+    /// so `{-1:x}` is thirty-two f's rather than sixteen.
+    ///
+    /// B-2026-09-07-35: until this existed there was nothing for the
+    /// interpreter's spec'd f-string arm to call with a 128-bit value, so it
+    /// went through `narrow_to_i64` — which PANICS by design rather than
+    /// truncate silently — and `f"{big:44}"` on a `u128` ABORTED the
+    /// interpreter while both compiled backends rendered it correctly.
+    ///
+    /// This pair is also the oracle `karac_runtime_int_fmt`'s 128-bit arm was
+    /// missing: that test had to reach for Rust's own `{}`/`{:x}` because
+    /// `FormatSpec` stopped at 64 bits, which is a weaker check than the
+    /// interpreter-vs-runtime agreement every other width gets.
+    pub fn apply_int128(&self, v: i128) -> String {
+        let dec = self.radix == Radix::Dec;
+        let mag = if dec { v.unsigned_abs() } else { v as u128 };
+        self.apply_magnitude(v < 0 && dec, mag)
+    }
+
+    /// Format an unsigned integer at 128-bit width — the `u128` twin of
+    /// [`Self::apply_uint`]. See [`Self::apply_int128`].
+    pub fn apply_uint128(&self, v: u128) -> String {
+        self.apply_magnitude(false, v)
     }
 
     /// Format a float. `precision` fixes the fractional digit count (default: the
@@ -401,6 +432,95 @@ mod tests {
         assert_eq!(spec("X").apply_int(255), "FF");
         assert_eq!(spec("o").apply_int(8), "10");
         assert_eq!(spec("08x").apply_int(255), "000000ff");
+    }
+
+    /// B-2026-09-07-35 — the 128-bit renderers. `FormatSpec` stopped at 64
+    /// bits, which left the interpreter's spec'd f-string arm nothing to call
+    /// for an `i128`/`u128` hole.
+    ///
+    /// The load-bearing assertion is the LAST group: a non-decimal radix
+    /// reinterprets at the value's OWN width, so `{-1:x}` is sixteen f's
+    /// through `apply_int` and thirty-two through `apply_int128`. Both are
+    /// correct; a single shared renderer would have to get one of them wrong.
+    #[test]
+    fn int_128_bit_width_and_radix() {
+        // Magnitudes no 64-bit reading can represent.
+        assert_eq!(
+            spec("").apply_uint128(u128::MAX),
+            "340282366920938463463374607431768211455"
+        );
+        assert_eq!(
+            spec("44").apply_uint128(u128::MAX),
+            "     340282366920938463463374607431768211455"
+        );
+        assert_eq!(spec("").apply_int128(i128::MAX), format!("{}", i128::MAX));
+        assert_eq!(spec("").apply_int128(i128::MIN), format!("{}", i128::MIN));
+        // 2^100 — its LOW WORD IS ZERO, which is exactly what a 64-bit
+        // truncation renders as "0".
+        assert_eq!(
+            spec("").apply_int128(1 << 100),
+            "1267650600228229401496703205376"
+        );
+
+        // Sign and zero-pad behave as at 64 bits.
+        assert_eq!(spec("06").apply_int128(-7), "-00007");
+        assert_eq!(spec("<8").apply_int128(-7), "-7      ");
+        assert_eq!(spec("08").apply_uint128(42), "00000042");
+
+        // Non-decimal reinterprets at the value's own width.
+        assert_eq!(spec("x").apply_int(-1), "f".repeat(16));
+        assert_eq!(spec("x").apply_int128(-1), "f".repeat(32));
+        assert_eq!(spec("X").apply_int128(-1), "F".repeat(32));
+        assert_eq!(spec("o").apply_int128(-1), format!("{:o}", u128::MAX));
+        assert_eq!(spec("b").apply_int128(-1), "1".repeat(128));
+        // Decimal is the one that keeps the sign at either width.
+        assert_eq!(spec("").apply_int(-1), "-1");
+        assert_eq!(spec("").apply_int128(-1), "-1");
+    }
+
+    /// The 64-bit helpers must be UNCHANGED by the widening — they now share
+    /// `apply_magnitude` with the 128-bit pair, and the way that refactor goes
+    /// wrong is by silently promoting a 64-bit hole to a 128-bit
+    /// reinterpretation.
+    ///
+    /// Checked against INDEPENDENT references rather than against the helper
+    /// under test: a non-decimal radix is defined as the `u64` reinterpretation
+    /// (so `apply_int(v)` must equal `apply_uint(v as u64)`, and Rust's own
+    /// `{:x}` of that `u64`), and decimal is defined as sign + magnitude.
+    #[test]
+    fn int_64_bit_readings_are_unchanged_by_the_128_bit_widening() {
+        for v in [0i64, 1, -1, 7, -7, i64::MAX, i64::MIN, -255, 255] {
+            let u = v as u64;
+            // Non-decimal: the `u64` reinterpretation, at 64 bits.
+            assert_eq!(spec("x").apply_int(v), format!("{u:x}"), "hex of {v}");
+            assert_eq!(spec("X").apply_int(v), format!("{u:X}"), "HEX of {v}");
+            assert_eq!(spec("o").apply_int(v), format!("{u:o}"), "oct of {v}");
+            assert_eq!(spec("b").apply_int(v), format!("{u:b}"), "bin of {v}");
+            for raw in ["x", "X", "o", "b", "08x", "<12x", ">12o"] {
+                assert_eq!(
+                    spec(raw).apply_int(v),
+                    spec(raw).apply_uint(u),
+                    "spec {raw:?}: a signed 64-bit hole reinterprets as u64, value {v}"
+                );
+            }
+            // Decimal: sign + magnitude, unpadded.
+            assert_eq!(spec("").apply_int(v), format!("{v}"), "dec of {v}");
+        }
+        // Widening a u64 to u128 changes nothing, at every spec shape.
+        for v in [0u64, 1, 255, u64::MAX, u64::MAX - 1, 1 << 63] {
+            for raw in ["", "8", "08", "<8", ">8", "x", "X", "o", "b", "020"] {
+                assert_eq!(
+                    spec(raw).apply_uint(v),
+                    spec(raw).apply_uint128(u128::from(v)),
+                    "spec {raw:?} value {v}"
+                );
+            }
+        }
+        // The same BIT PATTERN read at three (width, signedness) combinations.
+        // The first two agree and the third must not join them.
+        assert_eq!(spec("x").apply_uint(u64::MAX), "f".repeat(16));
+        assert_eq!(spec("x").apply_int(-1), "f".repeat(16));
+        assert_eq!(spec("x").apply_int128(-1), "f".repeat(32));
     }
 
     #[test]

@@ -15,7 +15,6 @@ use crate::ast::*;
 use crate::resolver::SpanKey;
 
 use super::exec::{add_pattern_bindings, collect_free_idents_expr, ControlFlow};
-use super::value::narrow_to_i64;
 use super::value::{primitive_const_to_value, EnumData, IteratorSource, OrdValue, Value};
 
 impl<'a> super::Interpreter<'a> {
@@ -242,18 +241,69 @@ impl<'a> super::Interpreter<'a> {
                                         // `None` for `u8`..`u32` deliberately:
                                         // those fit the signed carrier
                                         // non-negatively, so the two readings
-                                        // already coincide. `Some(128)` falls
-                                        // through to the signed arm because
-                                        // `FormatSpec` has no 128-bit renderer
-                                        // — unchanged behaviour, tracked
-                                        // separately.
+                                        // already coincide.
+                                        //
+                                        // B-2026-09-07-35 — the 128-bit arms.
+                                        // These used to fall through to
+                                        // `apply_int(narrow_to_i64(..))`
+                                        // because `FormatSpec` stopped at 64
+                                        // bits, and that cost THREE different
+                                        // wrong answers rather than one:
+                                        //
+                                        //  * a value too wide for `i64` hit
+                                        //    `narrow_to_i64`, which PANICS by
+                                        //    design rather than truncate — so
+                                        //    `f"{big:44}"` aborted the
+                                        //    interpreter outright;
+                                        //  * a `u128` whose i128
+                                        //    reinterpretation happens to FIT
+                                        //    `i64` never reached that panic and
+                                        //    printed a NEGATIVE number instead
+                                        //    — `u128::MAX` rendered `-1`,
+                                        //    which is B-2026-09-07-24 exactly,
+                                        //    one width over;
+                                        //  * an `i128` under a NON-DECIMAL
+                                        //    radix reinterprets at the hole's
+                                        //    own width, so reading it at 64
+                                        //    bits printed sixteen f's for
+                                        //    `{-1i128:x}` where all three
+                                        //    compiled backends print
+                                        //    thirty-two.
+                                        //
+                                        // Only the first was loud. Hence two
+                                        // questions, not one: signedness picks
+                                        // the renderer, `span_int_is_128`
+                                        // picks the width.
+                                        Value::Int(i)
+                                            if self.span_unsigned_int_width(&e.span)
+                                                == Some(128) =>
+                                        {
+                                            fs.apply_uint128(*i as u128)
+                                        }
                                         Value::Int(i)
                                             if self.span_unsigned_int_width(&e.span)
                                                 == Some(64) =>
                                         {
                                             fs.apply_uint(*i as u64)
                                         }
-                                        Value::Int(i) => fs.apply_int(narrow_to_i64(*i)),
+                                        Value::Int(i) if self.span_int_is_128(&e.span) => {
+                                            fs.apply_int128(*i)
+                                        }
+                                        // Signed, and narrower than 128 — but
+                                        // `expr_types` is populated sparsely,
+                                        // so an UNRECORDED span lands here too.
+                                        // If the value does not fit `i64` there
+                                        // is no 64-bit reading of it to render,
+                                        // and 128 is the only width that can
+                                        // represent what the carrier holds; the
+                                        // old `narrow_to_i64` turned that case
+                                        // into an abort. This is that helper's
+                                        // stage-3/5 worklist entry for this
+                                        // site, retired.
+                                        Value::Int(i) => match i64::try_from(*i) {
+                                            Ok(v) => fs.apply_int(v),
+                                            Err(_) => fs.apply_int128(*i),
+                                        },
                                         Value::Float(f) => fs.apply_float(*f),
                                         Value::String(s) => fs.apply_str(s),
                                         other => fs.apply_str(&self.display_render_typed(

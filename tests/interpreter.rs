@@ -111,6 +111,114 @@ fn main() {
     );
 }
 
+/// B-2026-09-07-35 — A SPEC'D 128-BIT f-STRING HOLE MUST RENDER LIKE THE
+/// COMPILED BACKENDS, which for `u128`/`i128` meant three different wrong
+/// answers before this, only one of them loud.
+///
+///  * A magnitude too wide for `i64` reached `narrow_to_i64` — which PANICS by
+///    design rather than truncate silently — so `f"{big:44}"` ABORTED the
+///    interpreter outright while all three compiled legs printed it.
+///  * A `u128` whose i128 reinterpretation FITS `i64` never reached that panic
+///    and printed a NEGATIVE number instead: `u128::MAX` rendered `-1`. That is
+///    B-2026-09-07-24 exactly, one width over, and it was silent.
+///  * An `i128` under a NON-DECIMAL radix reinterprets at the hole's own width,
+///    so reading it at 64 bits gave sixteen f's for `{-1i128:x}` where every
+///    compiled backend gives thirty-two.
+///
+/// The last four holes are the CONTROLS that make the fix falsifiable: a `u64`
+/// hole, an `i64` hole under `:x`, and a `u64` hole under `:x` must all keep
+/// their 64-bit readings. Widening them along with the 128-bit ones is the way
+/// this fix would go wrong — `{-1i64:x}` staying sixteen f's while
+/// `{-1i128:x}` becomes thirty-two is the whole point.
+///
+/// Expected output is the COMPILED oracle: `karac build` (auto-par default),
+/// `KARAC_AUTO_PAR=0 karac build` and `karac run` (JIT) all produce these exact
+/// bytes, and this asserts the interpreter now joins them.
+#[test]
+fn test_interp_spec_128_bit_hole_matches_the_compiled_backends() {
+    let out = run(r#"
+fn main() {
+    let umax: u128 = 340282366920938463463374607431768211455u128;
+    let umid: u128 = 170141183460469231731687303715884105728u128;
+    let usml: u128 = 42u128;
+    let imax: i128 = 170141183460469231731687303715884105727i128;
+    let imin: i128 = -170141183460469231731687303715884105728i128;
+    let ineg: i128 = -1i128;
+    let isml: i128 = -7i128;
+    let p100: i128 = 1267650600228229401496703205376i128;
+    println(f"[{umax:44}][{umid:44}][{usml:44}]");
+    println(f"[{umax:<42}][{usml:06}][{p100:34}]");
+    println(f"[{imax:44}][{imin:44}][{isml:08}]");
+    println(f"[{ineg:x}]");
+    println(f"[{ineg:o}]");
+    println(f"[{umax:x}][{umid:X}]");
+    let u64v: u64 = 18446744073709551615u64;
+    let i64v: i64 = -1;
+    println(f"[{u64v:22}][{i64v:x}][{u64v:x}]");
+}
+"#);
+    assert_eq!(
+        out,
+        "[     340282366920938463463374607431768211455][     170141183460469231731687303715884105728][                                          42]\n\
+         [340282366920938463463374607431768211455   ][000042][   1267650600228229401496703205376]\n\
+         [     170141183460469231731687303715884105727][    -170141183460469231731687303715884105728][-0000007]\n\
+         [ffffffffffffffffffffffffffffffff]\n\
+         [3777777777777777777777777777777777777777777]\n\
+         [ffffffffffffffffffffffffffffffff][80000000000000000000000000000000]\n\
+         [  18446744073709551615][ffffffffffffffff][ffffffffffffffff]\n"
+    );
+}
+
+/// B-2026-09-07-45 (interpreter half) — the specs
+/// `needs_runtime_formatter()` diverts, at 128 bits.
+///
+/// Center align, binary radix and a non-space fill take a different codegen
+/// entrypoint than plain width/zero-pad/hex do, and that entrypoint was the
+/// one still stuck at 64 bits. The interpreter reaches all of them through the
+/// same `FormatSpec`, so this asserts the interpreter half of the agreement
+/// the codegen E2E asserts on the compiled side — the expected bytes are the
+/// compiled oracle, measured on all three compiled legs.
+///
+/// The last three holes are the width CONTROLS: `{-1i64:b}` is sixty-four ones
+/// where `{-1i128:b}` is a hundred and twenty-eight, and a `u8` hole stays
+/// eight bits. A non-decimal radix reinterprets at the hole's OWN width, so
+/// widening every hole to 128 bits would break these three while fixing the
+/// others.
+#[test]
+fn test_interp_spec_128_bit_runtime_formatter_holes() {
+    let out = run(r#"
+fn main() {
+    let big: u128 = 170141183460469231731687303715884105727u128;
+    let umax: u128 = 340282366920938463463374607431768211455u128;
+    let ineg: i128 = -1i128;
+    let ism: i128 = -7i128;
+    println(f"[{big:^44}]");
+    println(f"[{big:*>44}]");
+    println(f"[{umax:b}]");
+    println(f"[{ineg:b}]");
+    println(f"[{ism:^12}]");
+    println(f"[{ism:=^12}]");
+    let n64: i64 = -1;
+    let u8v: u8 = 255;
+    println(f"[{n64:b}]");
+    println(f"[{u8v:*>12b}]");
+    println(f"[{n64:^8}]");
+}
+"#);
+    assert_eq!(
+        out,
+        "[  170141183460469231731687303715884105727   ]\n\
+         [*****170141183460469231731687303715884105727]\n\
+         [11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111]\n\
+         [11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111]\n\
+         [     -7     ]\n\
+         [=====-7=====]\n\
+         [1111111111111111111111111111111111111111111111111111111111111111]\n\
+         [****11111111]\n\
+         [   -1   ]\n"
+    );
+}
+
 #[test]
 fn test_conditional_return_param_drop_matrix() {
     let out = run(

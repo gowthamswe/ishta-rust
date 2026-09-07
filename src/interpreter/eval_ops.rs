@@ -1815,6 +1815,37 @@ impl<'a> super::Interpreter<'a> {
         self.type_unsigned_int_width_in_scope(ty)
     }
 
+    /// Whether the value at `span` is a 128-BIT integer of EITHER signedness.
+    ///
+    /// The width question that [`Self::span_unsigned_int_width`] cannot answer:
+    /// that predicate reports `None` for every signed type, so `i128` and
+    /// `i64` are indistinguishable through it. A spec'd f-string hole needs
+    /// both facts — signedness picks the renderer, width picks how a NEGATIVE
+    /// value reinterprets under a non-decimal radix. `f"{-1i128:x}"` is
+    /// thirty-two f's and `f"{-1i64:x}"` is sixteen; reading the first at 64
+    /// bits printed the second, on a path where nothing crashed and nothing
+    /// looked wrong (B-2026-09-07-35).
+    ///
+    /// Structured like its sibling on purpose — the generic-substitution arm
+    /// first (a `T` bound to `i128` inside `fn show[T](x: T)` is still a
+    /// 128-bit hole, which is B-2026-08-30-44's lesson one type family over),
+    /// then the plain type. A span the typechecker did not record answers
+    /// `false`, which is the narrower reading and the previous behaviour.
+    pub(crate) fn span_int_is_128(&self, span: &Span) -> bool {
+        use crate::typechecker::types::{IntSize, Type, UIntSize};
+        let key = crate::resolver::SpanKey::from_span(span);
+        let Some(ty) = self.typecheck_result.expr_types.get(&key) else {
+            return false;
+        };
+        if let Type::TypeParam(name) = ty {
+            return matches!(
+                self.resolve_type_param(name).as_deref(),
+                Some("i128") | Some("u128")
+            );
+        }
+        matches!(ty, Type::Int(IntSize::I128) | Type::UInt(UIntSize::U128))
+    }
+
     /// [`Self::type_unsigned_int_width`] with the enclosing call's GENERIC
     /// SUBSTITUTIONS applied first — the signedness twin of the
     /// `Type::TypeParam` arm in [`Self::span_float_width`], and the same defect
