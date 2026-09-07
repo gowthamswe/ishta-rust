@@ -2,11 +2,22 @@
 //!
 //! Compiles representative Kāra programs, links them with `-fsanitize=address`,
 //! runs the resulting binary, and asserts a clean ASAN exit. Catches leaks,
-//! use-after-free, and double-free from codegen-emitted heap operations
+//! double free and invalid free from codegen-emitted heap operations
 //! (`emit_rc_dec`, `emit_scope_vec_cleanup`, `scope_cleanup_actions`).
 //!
-//! Necessary-but-not-sufficient: ASAN is blind to drop *ordering* and to
-//! "freed late" bugs (frees that happen at process exit rather than scope
+//! WHAT THE DEFAULT LEG DOES NOT CATCH, and how to catch it (B-2026-09-07-40).
+//! `-fsanitize=address` is passed to `cc` at the LINK step, which gives the
+//! ASAN RUNTIME — allocator interposition, i.e. LeakSanitizer, double free,
+//! invalid free, allocator-side overflow. ASAN's memory-ACCESS checking is a
+//! COMPILER pass, and an object nobody instrumented carries no shadow-memory
+//! checks, so a use-after-free READ or WRITE that never reaches `free` passes
+//! here. Set `KARAC_SANITIZE_ADDRESS=1` to run the `asan` pass over the emitted
+//! module; `scripts/asan-instrumented-leg.sh` is that whole-suite leg, with its
+//! own quarantine ratchet. `asan_instrumentation_tracks_the_sanitize_address_knob`
+//! is the mechanism's positive control and runs on every leg.
+//!
+//! Necessary-but-not-sufficient even so: ASAN is blind to drop *ordering* and
+//! to "freed late" bugs (frees that happen at process exit rather than scope
 //! exit). See `Drop-order E2E tests` and the `scope_cleanup_actions` testing
 //! note in `docs/implementation_checklist/` for those gaps.
 //!
@@ -168,6 +179,75 @@ mod memory_sanitizer_tests {
     /// in the LIFO drain exactly as before. Verified to reach it, on all four
     /// surfaces: `a10 b1 done10 dR10` -- the body after the final expression,
     /// with the correct id rather than a freed-block read.
+    /// B-2026-09-07-40 — the instrumentation's OWN positive control.
+    ///
+    /// This suite links `-fsanitize=address` but, until this row, never
+    /// INSTRUMENTED the karac-emitted object. ASAN's memory-ACCESS checking is
+    /// a compiler pass; the link flag alone buys only the allocator
+    /// interposition (LeakSanitizer, double/invalid free, allocator-side
+    /// overflow). So every fixture here was blind to an invalid read or write,
+    /// and `memory_sanitizer` reported clean on a program that wrote three zero
+    /// words into a block it had just freed (B-2026-09-07-33).
+    ///
+    /// `KARAC_SANITIZE_ADDRESS=1` turns the instrumentation on
+    /// (`codegen::driver::apply_address_sanitizer`), and this test is what keeps
+    /// that knob honest IN BOTH DIRECTIONS: with the knob off the object must
+    /// carry no `__asan_report*` reference, with it on it must. Without such a
+    /// check a knob that silently stopped working — an LLVM upgrade renaming the
+    /// `asan` pass, or the `sanitize_address` attribute failing to land, either
+    /// of which makes the pass return every function untouched — would leave the
+    /// instrumented leg reporting green over an uninstrumented suite. That is
+    /// the exact vacuous pass this row is about, one level up.
+    ///
+    /// Deliberately NOT gated on `asan_available()`: that probes for a `cc` that
+    /// can LINK the sanitizer runtime, and instrumentation is a compile-side
+    /// property that holds on a host with no such `cc` at all.
+    #[test]
+    fn asan_instrumentation_tracks_the_sanitize_address_knob() {
+        let src = "fn main() { let v = [1, 2, 3]; println(f\"n={v.len()}\") }";
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        karac::prepare_for_resolve(&mut parsed.program);
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let ownership = karac::ownershipcheck(&parsed.program, &typed);
+        super::common::assert_check_clean(&resolved, &typed, src);
+
+        let obj_path = format!("/tmp/karac_asan_selfcheck_{}.o", std::process::id());
+        compile_to_object(&parsed.program, &obj_path, Some(&ownership), None)
+            .expect("the self-check program must compile");
+        let bytes = std::fs::read(&obj_path).expect("emitted object must be readable");
+        let _ = std::fs::remove_file(&obj_path);
+
+        let needle = b"__asan_report";
+        let instrumented = bytes.windows(needle.len()).any(|w| w == needle);
+        let requested = !matches!(
+            std::env::var("KARAC_SANITIZE_ADDRESS").as_deref(),
+            Err(_) | Ok("0") | Ok("")
+        );
+        assert_eq!(
+            instrumented,
+            requested,
+            "KARAC_SANITIZE_ADDRESS requested={requested} but the emitted object \
+             {} an `__asan_report*` reference. With the knob ON and no reference, \
+             every access-checking fixture in this suite is vacuous — the `asan` \
+             pass ran over functions that carry no `sanitize_address` attribute, \
+             or the pass name changed under this LLVM. With the knob OFF and a \
+             reference present, the default leg pays for instrumentation it never \
+             asked for and will fail to link.",
+            if instrumented {
+                "carries"
+            } else {
+                "carries no"
+            },
+        );
+    }
+
     #[test]
     fn asan_par_field_bodies_walk_does_not_read_freed_buffer() {
         assert_clean_asan_run_min_allocs_auto_par(
@@ -10645,10 +10725,19 @@ fn main() {
         // ASAN runtime print "detect_leaks is not supported on this platform"
         // and exit with the configured `exitcode=23`, which the harness
         // would interpret as a memory error. Drop the flag on macOS — keep
-        // ASAN's UAF / double-free / heap-buffer-overflow coverage there.
+        // ASAN's double-free / invalid-free coverage there.
         // Leak-style bugs are caught separately on Linux + by the runtime
         // alloc/free counter assertion described in phase-7-codegen.md
         // (`scope_cleanup_actions` testing note).
+        //
+        // B-2026-09-07-40 — that list used to read "UAF / double-free /
+        // heap-buffer-overflow", which overstated it on EVERY platform, not
+        // just macOS. What the link flag alone buys is the ALLOCATOR
+        // interposition; the memory-ACCESS checks are a compiler pass, and this
+        // harness did not run it. `KARAC_SANITIZE_ADDRESS=1` does
+        // (`scripts/asan-instrumented-leg.sh`), and only under that knob does
+        // this suite see a use-after-free READ or WRITE or a heap-buffer
+        // overflow that never reaches `free`.
         // LeakSanitizer ships only with upstream LLVM's ASAN runtime on Linux
         // (macOS Apple clang has no LSan — see the cfg below). `detect_leaks`
         // is the caller's steady-state-vs-panic-path choice; on macOS the flag
@@ -42029,11 +42118,18 @@ fn main() {
     /// reason this fixture exists at all: the bug itself is INVISIBLE here.
     ///
     /// Its fault is a stray refcount dec through a freed box, which writes
-    /// `-1` over the freed chunk rather than calling `free` twice, and the
-    /// sanitizer is linked in rather than compiled in (see
-    /// `link_executable_with_sanitizer`), so nothing at the allocator boundary
-    /// sees it. `option_shared_from_every_branch_leaf_form_survives_repeated_consumption`
+    /// `-1` over the freed chunk rather than calling `free` twice, so nothing
+    /// at the allocator boundary sees it.
+    /// `option_shared_from_every_branch_leaf_form_survives_repeated_consumption`
     /// in `tests/codegen.rs` is what gates the use-after-free.
+    ///
+    /// B-2026-09-07-40 UPDATE: on the DEFAULT leg that is still exactly true —
+    /// `link_executable_with_sanitizer` passes `-fsanitize=address` at the link
+    /// step, which interposes the allocator and nothing more. The
+    /// `KARAC_SANITIZE_ADDRESS=1` leg (`scripts/asan-instrumented-leg.sh`) does
+    /// instrument the emitted object, so the write through the freed box IS
+    /// visible there. The E2E twin stays the named gate — it runs on every leg,
+    /// where this fixture's access coverage exists only on the opt-in one.
     ///
     /// What LSan DOES gate is the obvious wrong fix. The defect is a missing
     /// `+1`, so retaining harder makes the symptom go away — and a retain
@@ -42086,11 +42182,13 @@ fn main() {
 
     /// B-2026-08-27-43 — the BALANCE half of the arm-local branch-leaf fix.
     ///
-    /// Like its sibling above, the reported fault is invisible to this harness:
-    /// it is a read through a box the callee's param dec already freed, and the
-    /// sanitizer is linked in rather than compiled in, so
+    /// Like its sibling above, the reported fault is invisible to this harness
+    /// on the DEFAULT leg: it is a read through a box the callee's param dec
+    /// already freed, and the link-step `-fsanitize=address` buys only the
+    /// allocator interposition, so
     /// `option_shared_from_an_arm_local_leaf_survives_repeated_consumption` in
-    /// `tests/codegen.rs` is what gates the use-after-free. What LSan gates is
+    /// `tests/codegen.rs` is what gates the use-after-free. The
+    /// `KARAC_SANITIZE_ADDRESS=1` leg sees the read itself (B-2026-09-07-40). What LSan gates is
     /// the pair of wrong fixes on either side of it.
     ///
     /// The fix teaches case (g) to register the consuming binding when the
@@ -42365,13 +42463,17 @@ fn main() {
     /// satisfies both; a single retain at the phi either double frees one arm
     /// or leaks the other.
     ///
-    /// READ THIS BEFORE TRUSTING IT: this fixture is the LEAK half of the gate
-    /// and nothing more. It was MEASURED green against the unfixed compiler —
-    /// it does not catch the double free it is named for, and no ASAN fixture
-    /// can. `link_executable_with_sanitizer` passes `-fsanitize=address` to
-    /// `cc` at LINK time only, so ASAN interposes the allocator but never
-    /// instruments the Kāra-emitted object: it sees double free, invalid free
-    /// and leaks, and is blind to a use-after-free ACCESS. This bug's fault is
+    /// READ THIS BEFORE TRUSTING IT: on the default leg this fixture is the
+    /// LEAK half of the gate and nothing more. It was MEASURED green against
+    /// the unfixed compiler — it does not catch the double free it is named
+    /// for. `link_executable_with_sanitizer` passes `-fsanitize=address` to
+    /// `cc` at LINK time only, so ASAN interposes the allocator but does not
+    /// instrument the Kāra-emitted object: it sees double free, invalid free
+    /// and leaks, and is blind to a use-after-free ACCESS. The sentence that
+    /// stood here — "and no ASAN fixture can" — was wrong about the tool rather
+    /// than about the fixture, and B-2026-09-07-40 removed the reason for it:
+    /// `KARAC_SANITIZE_ADDRESS=1` runs the `asan` pass over the module, and the
+    /// instrumented leg does see this access class. This bug's fault is
     /// a stray refcount decrement THROUGH a freed box — one extra dec takes
     /// the count to `-1`, not to a second `free` — so nothing crosses the
     /// allocator boundary. The double-free half is gated E2E, by
@@ -78996,16 +79098,27 @@ fn main() {
     /// levels and under `--interp`.
     ///
     /// WHAT THIS PIN DOES AND DOES NOT CATCH, stated plainly because the
-    /// distinction cost a measurement to find. It does NOT catch the row's
-    /// defect: this suite links `-fsanitize=address` but the karac-emitted
-    /// object is never INSTRUMENTED (`link_executable_with_sanitizer` passes
-    /// the flag at the link step only), so the ASAN runtime sees what it can
-    /// intercept in the allocator — leaks, double and invalid frees — and an
-    /// invalid WRITE into a freed block is invisible to it. Measured: this
-    /// fixture is green on the PARENT at `-O2` and reports no use-after-free on
-    /// the parent at `-O0` either, while valgrind reports three `Invalid write
-    /// of size 8` on the same program. The defect is valgrind-only, and this
-    /// repo has no valgrind harness (B-2026-09-07-40).
+    /// distinction cost a measurement to find. On the DEFAULT leg it does NOT
+    /// catch the row's defect: this suite links `-fsanitize=address` but the
+    /// karac-emitted object is not INSTRUMENTED there
+    /// (`link_executable_with_sanitizer` passes the flag at the link step
+    /// only), so the ASAN runtime sees what it can intercept in the allocator —
+    /// leaks, double and invalid frees — and an invalid WRITE into a freed
+    /// block is invisible to it. Measured: this fixture is green on the PARENT
+    /// at `-O2` and reports no use-after-free on the parent at `-O0` either,
+    /// while valgrind reports three `Invalid write of size 8` on the same
+    /// program.
+    ///
+    /// B-2026-09-07-40 CLOSED THAT GAP, and this fixture is the row's own
+    /// A/B. `KARAC_SANITIZE_ADDRESS=1` runs LLVM's `asan` module pass over the
+    /// emitted module, and on a compiler with this fix REVERTED the same
+    /// program at `-O0` now exits 23 with `AddressSanitizer:
+    /// heap-use-after-free`, `WRITE of size 8`, 0 bytes into the same 56-byte
+    /// region — valgrind's offset-0 write, seen by the suite that is named for
+    /// it. Uninstrumented, that identical binary exits 0 and prints the right
+    /// answer. So this fixture is a real regression gate on the
+    /// `scripts/asan-instrumented-leg.sh` leg and remains the trade-pin
+    /// described below on every other one.
     ///
     /// What it DOES pin is the fix's own risk direction, which is the reason to
     /// keep it. The fix works by DROPPING a registration, and an over-broad

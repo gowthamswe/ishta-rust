@@ -2108,48 +2108,148 @@ pub(super) fn apply_optimization_passes(
     }
 
     let level = read_opt_level_env();
-    if level == "0" {
+    if level != "0" {
+        let pipeline = match level {
+            "1" => "default<O1>",
+            "3" => "default<O3>",
+            _ => "default<O2>",
+        };
+        let options = inkwell::passes::PassBuilderOptions::create();
+        module
+            .run_passes(pipeline, target_machine, options)
+            .map_err(|e| {
+                format!(
+                    "LLVM optimization pass `{}` failed: {}. \
+                     Workaround: set KARAC_OPT_LEVEL=0 to skip the pass run.",
+                    pipeline,
+                    e.to_string()
+                )
+            })?;
+
+        // Binary-search midpoint BCE (control_flow_bce.rs § midpoint): the
+        // `assume(lo <= mid < hi)` facts only fold the `nums[mid]` bounds
+        // check once they are co-resident with it post-inline, which the
+        // single pipeline above doesn't reach (callee-optimize-then-inline
+        // phase ordering). A second pipeline run completes the fold. Gated on
+        // emission, so non-binary-search modules never pay it; `default<O1>`
+        // suffices (verified) and is cheaper than re-running the full level.
+        if binsearch_reopt {
+            let opts2 = inkwell::passes::PassBuilderOptions::create();
+            module
+                .run_passes("default<O1>", target_machine, opts2)
+                .map_err(|e| format!("LLVM binary-search re-optimization pass failed: {e}."))?;
+        }
+
+        // B-2026-08-30-32 — the f16 rounding guard runs LAST, after every pass
+        // that could have undone it. See the function's own doc-comment for why
+        // this one is placed after optimization where its bf16 sibling
+        // (`verify_no_native_bf16_ops`) runs before it.
+        if crate::target::active_target_is_wasm() {
+            verify_no_native_f16_arith(module)?;
+        }
+    }
+
+    // B-2026-09-07-40 — AddressSanitizer INSTRUMENTATION, opt-in and last.
+    // Runs at every optimization level, `-O0` included: the whole point of the
+    // knob is the `-O0` leg, where an allocation the optimizer would have
+    // folded away is still real. Placed after the pipeline because that is
+    // where clang places it (`registerOptimizerLastEPCallback`), so an
+    // instrumented `-O2` build checks the accesses that actually survived
+    // optimization rather than the ones codegen happened to emit.
+    apply_address_sanitizer(module, target_machine)?;
+    Ok(())
+}
+
+/// Instrument the module with **AddressSanitizer's access checks** when
+/// `KARAC_SANITIZE_ADDRESS` is set (B-2026-09-07-40). Off by default: an
+/// instrumented build is a different binary, materially bigger and slower, and
+/// nothing but a sanitizer leg wants one.
+///
+/// WHY THIS EXISTS AT ALL. `tests/memory_sanitizer.rs` links its programs with
+/// `-fsanitize=address`, and that flag at the LINK step buys only the ASAN
+/// **runtime** — the allocator interposition, which is what catches leaks,
+/// double frees and invalid frees. ASAN's memory-ACCESS checking is a compiler
+/// pass, so an object nobody instrumented carries no shadow-memory checks and a
+/// program that reads or writes freed memory runs clean. Measured on
+/// B-2026-09-07-33's callee, which writes three zero words into an envelope it
+/// just freed: ASAN reported a leak and nothing else, while valgrind reported
+/// three `Invalid write of size 8`. So the suite named `memory_sanitizer` was
+/// blind to the entire use-after-free and buffer-overflow class, and every row
+/// in the ledger whose evidence is an invalid read or write was unpinnable.
+///
+/// TWO HALVES, BOTH REQUIRED. Running the `asan` pass is not enough on its own:
+/// `AddressSanitizer::instrumentFunction` returns early for any function
+/// without the `sanitize_address` attribute, which clang stamps on everything
+/// it compiles under `-fsanitize=address` and karac stamps nowhere. Measured
+/// directly on a two-function module under `opt -passes=asan`: the attributed
+/// function got its `__asan_report_load8`, the bare one was returned untouched.
+/// Stamping happens here, over `module.get_functions()`, rather than at the ~395
+/// `add_function` call sites — one central place that cannot be forgotten by
+/// the next site to be added.
+///
+/// Declarations are skipped (`count_basic_blocks() == 0`): the attribute is
+/// meaningless without a body, and the runtime archive this module links
+/// against is not instrumented either. That mix is fine and is the normal ASAN
+/// arrangement — uninstrumented code simply is not access-checked, while the
+/// allocator interposition it shares still sees every `malloc`/`free`.
+pub(super) fn apply_address_sanitizer(
+    module: &Module<'_>,
+    target_machine: &TargetMachine,
+) -> Result<(), String> {
+    if !read_sanitize_address_env() {
         return Ok(());
     }
-    let pipeline = match level {
-        "1" => "default<O1>",
-        "3" => "default<O3>",
-        _ => "default<O2>",
-    };
-    let options = inkwell::passes::PassBuilderOptions::create();
+
+    let kind_id = inkwell::attributes::Attribute::get_named_enum_kind_id("sanitize_address");
+    if kind_id == 0 {
+        return Err(
+            "KARAC_SANITIZE_ADDRESS is set, but this LLVM build does not know the \
+                    `sanitize_address` function attribute, so the `asan` pass would return \
+                    every function untouched and the instrumentation would be silently absent."
+                .to_string(),
+        );
+    }
+    let attr = module.get_context().create_enum_attribute(kind_id, 0);
+
+    let mut bodies = 0usize;
+    for func in module.get_functions() {
+        if func.count_basic_blocks() > 0 {
+            func.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
+            bodies += 1;
+        }
+    }
+    if bodies == 0 {
+        // A declarations-only module (nothing to check). Running the pass would
+        // still emit the module ctor and the `__asan_*` declarations, which is
+        // pure cost.
+        return Ok(());
+    }
+
+    let opts = inkwell::passes::PassBuilderOptions::create();
     module
-        .run_passes(pipeline, target_machine, options)
+        .run_passes("asan", target_machine, opts)
         .map_err(|e| {
             format!(
-                "LLVM optimization pass `{}` failed: {}. \
-                 Workaround: set KARAC_OPT_LEVEL=0 to skip the pass run.",
-                pipeline,
+                "LLVM AddressSanitizer pass failed: {}. Unset KARAC_SANITIZE_ADDRESS to \
+                 compile without instrumentation.",
                 e.to_string()
             )
-        })?;
+        })
+}
 
-    // Binary-search midpoint BCE (control_flow_bce.rs § midpoint): the
-    // `assume(lo <= mid < hi)` facts only fold the `nums[mid]` bounds
-    // check once they are co-resident with it post-inline, which the
-    // single pipeline above doesn't reach (callee-optimize-then-inline
-    // phase ordering). A second pipeline run completes the fold. Gated on
-    // emission, so non-binary-search modules never pay it; `default<O1>`
-    // suffices (verified) and is cheaper than re-running the full level.
-    if binsearch_reopt {
-        let opts2 = inkwell::passes::PassBuilderOptions::create();
-        module
-            .run_passes("default<O1>", target_machine, opts2)
-            .map_err(|e| format!("LLVM binary-search re-optimization pass failed: {e}."))?;
-    }
-
-    // B-2026-08-30-32 — the f16 rounding guard runs LAST, after every pass
-    // that could have undone it. See the function's own doc-comment for why
-    // this one is placed after optimization where its bf16 sibling
-    // (`verify_no_native_bf16_ops`) runs before it.
-    if crate::target::active_target_is_wasm() {
-        verify_no_native_f16_arith(module)?;
-    }
-    Ok(())
+/// Read the `KARAC_SANITIZE_ADDRESS` env var: absent or `0` leaves the module
+/// uninstrumented (the default for every build), any other value turns
+/// [`apply_address_sanitizer`] on.
+///
+/// Deliberately UNCACHED, unlike [`read_opt_level_env`]. That one is cached so
+/// repeated `karac build` calls inside one process agree on a level; here the
+/// value is read once per compile and the knob is set for a whole leg, so a
+/// cache would buy nothing and would make the test that toggles it lie.
+pub(super) fn read_sanitize_address_env() -> bool {
+    !matches!(
+        std::env::var("KARAC_SANITIZE_ADDRESS").as_deref(),
+        Err(_) | Ok("0") | Ok("")
+    )
 }
 
 /// Reject any native `half` ARITHMETIC instruction surviving into the backend
