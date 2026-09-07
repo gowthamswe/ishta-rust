@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 394 |
 | run-vs-build | 369 |
-| leak | 291 |
+| leak | 292 |
 | double-free | 212 |
 | missing-feature | 194 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1578 |
+| codegen | 1579 |
 | interp | 403 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -161,7 +161,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
 | B-2026-09-06-66 | 2026-09-07 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Option[Node], tag: String }` loses 67 bytes (64 direct, 3 indirect) in 1 block at both opt levels, while every EMPTY-`next` spelling of the same type is clean; both `Drop` bodies run, so it is the boxed payload's memory alone | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
-| B-2026-09-07-13 | 2026-09-07 | codegen | medium | A STORED ENUM ARGUMENT RUNS ITS `Drop` BODY TWICE ON EVERY COMPILED BACKEND, IN THE FN-CALL SPELLING ONLY -- `b.put(mke(60))` over `fn put(mut ref self, e: Ev) { self.xs.push(e); }` prints `dEv len=1 dEv` on `karac run` and at both opt levels against `len=1 dEv` under `--interp`, while the CTOR spelling `b.put(Ev.A(77, In2 { v: 1 }))` and the GENERIC leg `stashg(mut v, mkes(75))` are correct everywhere; memory is balanced, only the body is doubled | src/codegen/call_dispatch.rs (track_inline_owned_aggregate_arg_inst enum arm, payload_skip); arg_is_entry_copied_heap_enum resolution |
 | B-2026-09-07-20 | 2026-09-07 | codegen | medium | `asan_stored_argument_is_owned_by_its_new_home_not_the_caller` LEAKS 35 B AT -O0 AND HAS SINCE THE DAY IT LANDED -- its `[b0907-5-outliving-store-admission]` cell loses 32 B in 2 objects plus 3 B in 1, clean at the default -O2, and nothing has run the -O0 leg since `d971ad5` added the fixture | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
@@ -169,6 +168,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-30 | 2026-09-07 | codegen | medium | A PROJECTION OFF AN RC-PROMOTED LOCAL STRANDS 40 B WHEN ITS DESTINATION IS A `Vec.push` OR AN EXISTING BINDING -- `v.push(t.a)` also invalid-frees once, `s = t.a` leaks silently, and both survive B-2026-09-07-19's copy because neither destination routes through the let-binding or struct-literal registrars | — |
 | B-2026-09-07-33 | 2026-09-07 | codegen | high | A CALLEE HANDING A BOXED PAYLOAD OUT OF A `match` ARM WRITES INTO THE ENVELOPE IT JUST FREED -- `fn payout(w: W) -> X1 { return match w { W.T(x) => x, .. } }` prints the right answer and leaves 3 `Invalid write of size 8` into a freed 56-byte block, because the param's envelope free runs BEFORE the moved-from zeroing; PRE-EXISTING and previously masked by B-2026-09-07-16's abort | — |
 | B-2026-09-07-35 | 2026-09-07 | interp | medium | A SPEC'D 128-BIT f-STRING HOLE PANICS THE INTERPRETER -- `f"{big:44}"` on a `u128` aborts with "128-bit value reached an i64-only consumer" while both compiled backends now render it correctly; the UNSPEC'D `f"{big}"` is fine on all three | none |
+| B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
 
 ### Relocated
 
@@ -2359,6 +2359,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-10 | codegen+interp | high | A NAMED-LOCAL ARGUMENT TO A CALLEE THAT FORWARDS IT ONE HOP DOUBLE-FREES ON EVERY COMPILED BACKEND, AND THE INTERPRETER RUNS THE `Drop` BODY TWICE --… | 4d90d12 |
 | B-2026-09-07-11 | codegen | high | A NAMED-LOCAL ARGUMENT TO A METHOD THAT STORES IT DOUBLE-FREES A DECLINED-COPY STRUCT -- `let a = mk(28); b.push(a);` over `impl Box2 { fn push(mut r… | eae2779 |
 | B-2026-09-07-12 | interp | medium | A NAMED-LOCAL ARGUMENT TO A STORING METHOD RUNS ITS `Drop` BODY TWICE UNDER `--interp`, IN BOTH COPY CLASSES, WHILE THE FREE-FUNCTION TWIN IS CORRECT… | eae2779 |
+| B-2026-09-07-13 | codegen | medium | A STORED ENUM ARGUMENT RUNS ITS `Drop` BODY TWICE ON EVERY COMPILED BACKEND, IN THE FN-CALL SPELLING ONLY -- `b.put(mke(60))` over `fn put(mut ref se… | f097e16 |
 | B-2026-09-07-14 | codegen | medium | A DISCARDED ARM WHOSE TAIL IS AN AGGREGATE LITERAL OVER A NAMED LOCAL STRANDS THAT LOCAL'S BUFFER -- `let s = payload(); let _ = if n >= 0 { D { s: s… | 58e6a5b |
 | B-2026-09-07-15 | codegen+interp | high | A MIXED-PATH CALLEE THAT HANDS ITS ARGUMENT BACK THROUGH ONE FURTHER CALL DOUBLE-FREES ON ITS HAND-BACK LEG -- `fn mvia(r: R, c: bool) -> R { if c {… | 99bd72d |
 | B-2026-09-07-16 | codegen | high | A BY-VALUE ENUM PARAM WHOSE `NestedOwnedStruct` PAYLOAD OWNS HEAP STILL DOUBLE-FREES THAT HEAP -- the entry copy cannot duplicate contents the copy p… | 6a4a86c78 |
