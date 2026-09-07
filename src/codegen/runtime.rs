@@ -5952,6 +5952,40 @@ impl<'ctx> super::Codegen<'ctx> {
         self.emit_vecstr_defensive_copy(val, elem_ty, elem_te.as_ref())
     }
 
+    /// The declared `TypeExpr` of the FIELD a projection reads, resolved from
+    /// the source struct's own declaration (B-2026-09-07-30).
+    ///
+    /// [`Self::rc_boxed_projection_field_copy`] needs a field type to derive a
+    /// `Vec`'s element type from, and at a struct-literal field init it has the
+    /// DESTINATION field's declaration to hand. The two other destinations this
+    /// row covers — an assignment to an existing binding, and a `Vec.push`
+    /// argument — have no destination declaration at that point, so they read
+    /// the SOURCE field's instead. For the shapes that matter the two agree by
+    /// construction: the value being moved is the source field, so its declared
+    /// type is what describes the buffer.
+    pub(super) fn rc_boxed_projection_source_field_te(&self, e: &Expr) -> Option<TypeExpr> {
+        let ExprKind::FieldAccess { object, field } = &e.kind else {
+            return None;
+        };
+        let obj = match &object.kind {
+            ExprKind::Identifier(o) => o.as_str(),
+            ExprKind::SelfValue => "self",
+            _ => return None,
+        };
+        let sname = self.var_types.var_type_names.get(obj)?;
+        let idx = self
+            .type_decls
+            .struct_field_names
+            .get(sname.as_str())?
+            .iter()
+            .position(|n| n == field)?;
+        self.type_decls
+            .struct_field_type_exprs
+            .get(sname.as_str())?
+            .get(idx)
+            .cloned()
+    }
+
     /// B-2026-08-15-10 — the CALL-ARGUMENT half of the same defensive copy,
     /// taken from the SOURCE side because that is the only side an argument
     /// position still has.
@@ -6021,6 +6055,7 @@ impl<'ctx> super::Codegen<'ctx> {
         // an 8-byte pointer into the CALLER's frame — the same gate the disarm
         // applies, and for the same reason: writing a fresh buffer through it
         // would replace a field the caller still owns.
+        //
         let BasicTypeEnum::StructType(held) = slot.ty else {
             return false;
         };

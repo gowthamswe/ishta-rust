@@ -13424,6 +13424,58 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-30, auto-par twin of
+    /// `e2e_rc_boxed_projection_push_and_assign_destinations_copy`.
+    ///
+    /// A projection off an RC-FALLBACK-PROMOTED local handed the box's buffer
+    /// to a `Vec.push` argument or an assignment target, which the box does not
+    /// give up. Auto-par is a distinct surface here for a reason this row
+    /// measured directly: with fan-out ON the `assign` shape prints CORRECTLY
+    /// and merely strands the box, so the corruption is invisible in this lane
+    /// and only a `KARAC_AUTO_PAR=0` build aborts. The `push` shape aborts in
+    /// both lanes. This twin therefore pins the OUTPUT of both under fan-out;
+    /// leak-freedom is asserted in `memory_sanitizer`, with fan-out off.
+    ///
+    /// The payload is an f-string rather than a literal because a string
+    /// LITERAL does not heap-allocate, so a literal-payload fixture gives the
+    /// box no buffer for a second owner to free and pins nothing.
+    fn test_e2e_auto_par_rc_boxed_projection_push_and_assign_destinations_copy() {
+        let out = run_program(
+            r#"
+struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn pushed() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;
+  while i < 3i64 { v.push(t.a); i = i + 1; }
+  return v.len(); }
+fn assigned() -> i64 { let t = mkp(9); let mut s = payload(); let mut i = 0i64;
+  while i < 3i64 { s = t.a; i = i + 1; }
+  return s.len(); }
+fn live() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { v.push(t.a); n = n + t.a.len(); i = i + 1; }
+  return n + v.len(); }
+fn letbound() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let s = t.a; n = n + s.len(); i = i + 1; }
+  return n; }
+fn main() {
+  println(pushed());
+  println(assigned());
+  println(live());
+  println(letbound());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "3\n38\n117\n114\n",
+                "the RC box must stay the only owner of its own buffer under auto-par too; \
+                 got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-07-29, auto-par twin of
     /// `e2e_whole_consume_in_a_running_loop_keeps_the_rc_box_the_only_owner`.
     ///

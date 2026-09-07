@@ -12410,6 +12410,39 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
     /// The clean-exit and stdout assertions come along for the opposite reason:
     /// they are what fails if the transfer is ever widened past the shapes the
     /// whole-program prepass admits. Both directions matter, so both are here.
+    /// Run a fixture with AUTO-PAR OFF and assert it is clean.
+    ///
+    /// B-2026-09-07-30 — the auto-par-on configuration of these fixtures still
+    /// strands the 40-byte RC-fallback BOX, which is a SEPARATE defect with its
+    /// own trigger set (it reproduces with no projection at all, on an
+    /// owned-`self` method receiver, and disappears entirely when the program
+    /// is BUILT with `KARAC_AUTO_PAR=0`). Asserting leak-freedom under fan-out
+    /// here would fail on that row's defect rather than this one's, so the
+    /// double-free fix is asserted in the lane where these cells are fully
+    /// clean. The auto-par lane is still covered — for OUTPUT and EXIT STATUS,
+    /// which is what the double free actually broke — by the `codegen.rs` and
+    /// `par_codegen.rs` twins, neither of which inspects leaks.
+    fn assert_clean_asan_run_no_auto_par(src: &str, expected_stdout: &[&str], label: &str) {
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, _stderr, status)) = run_under_asan_opts(src, label, true, true, false)
+        else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported a memory error (exit code {:?}). A `double-free` here \
+             means the destination and the RC-fallback box both own the projected buffer; a \
+             `LeakSanitizer` report means neither does.",
+            status.code()
+        );
+        let got: Vec<&str> = stdout.trim().lines().collect();
+        assert_eq!(got, expected_stdout, "[{label}] stdout mismatch");
+    }
+
     fn assert_clean_asan_run_max_allocs(
         src: &str,
         expected_stdout: &[&str],
@@ -65283,6 +65316,160 @@ fn main() { println(go()); }
             &["drop P 38", "1", "drop Q 38", "2"],
             "rc_fb_twin_shape_both_boxed",
             9,
+        );
+    }
+
+    /// B-2026-09-07-30 — a projection off an RC-FALLBACK-PROMOTED local whose
+    /// destination is a `Vec.push` ARGUMENT or an EXISTING BINDING hands that
+    /// destination the box's buffer, which the box does not give up.
+    ///
+    ///     let t = mkp(9); while i < 3i64 { v.push(t.a); i = i + 1; }   // 4 owners
+    ///     let t = mkp(9); while i < 3i64 { s = t.a;     i = i + 1; }   // 2, then more
+    ///
+    /// This is B-2026-09-07-23's defect at the two destinations that row's fix
+    /// did not reach. Every disarm reaches the source field by GEP-ing the
+    /// binding's slot, and a promoted slot holds a `{i64 rc, T}` box HANDLE
+    /// rather than the struct, so each bails on its shape test and the field's
+    /// cap is never zeroed. `-23` gave the `let` binding and the struct-literal
+    /// field an independent buffer; the push argument and the assignment target
+    /// kept taking the alias.
+    ///
+    /// THE `push` CELL ABORTS ON EVERY COMPILED CONFIGURATION, which is what
+    /// the row filing this understated as a leak: one buffer acquires FOUR
+    /// owners (three elements and the box), so the program dies with
+    /// `free(): double free detected in tcache 2` before printing, against an
+    /// interpreter that prints `3`. Measured 18 allocs / 21 frees with 3
+    /// invalid frees at `KARAC_AUTO_PAR=0`, 51/29 with 1 under fan-out.
+    ///
+    /// THE `assign` CELL IS THE ONE AUTO-PAR HID. With fan-out ON it prints
+    /// correctly and merely strands 40 B; only a `KARAC_AUTO_PAR=0` BUILD
+    /// aborts, at 25 allocs / 26 frees. Same defect, two lanes — which is why
+    /// the row that found it recorded a leak and not a corruption.
+    ///
+    /// WHY AUTO-PAR IS OFF HERE: see `assert_clean_asan_run_no_auto_par`. The
+    /// residual 40 B under fan-out is a different defect with a different
+    /// trigger set, filed separately; the output-and-exit-status half of the
+    /// auto-par lane is covered by the `codegen.rs` and `par_codegen.rs` twins.
+    ///
+    /// COPYING AT EACH DESTINATION'S OWN LOWERING, not in the shared argument
+    /// disarm, and the difference is measured rather than stylistic. Routing the
+    /// push copy through `suppress_source_vec_cleanup_for_arg_ex` — which ~59
+    /// call sites funnel through, including the `let` and struct-literal
+    /// destinations `-23` already fixed — STACKS a second copy on theirs and
+    /// leaks the first: 114 B in 3 blocks on both of those cells, 38 B per trip.
+    /// Cells 7 and 8 are those two shapes, kept as controls precisely so that
+    /// regression fails here.
+    #[test]
+    fn asan_rc_boxed_projection_push_and_assign_destinations_copy() {
+        const OWN: &str = "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn main() { println(go()); }\n";
+        // 1 — the row's `push` cell. Three trips, four owners, aborts on the
+        // parent before it can print.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ v.push(t.a); i = i + 1; }}\n\
+                 \x20 return v.len(); }}\n"
+            ),
+            &["3"],
+            "rc_boxed_proj_push_three_trips",
+        );
+        // 2 — ONE trip: the smallest dirty `push` cell.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;\n\
+                 \x20 while i < 1i64 {{ v.push(t.a); i = i + 1; }}\n\
+                 \x20 return v.len(); }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_push_one_trip",
+        );
+        // 3 — FIVE trips: the damage is per-iteration, so this is six owners.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;\n\
+                 \x20 while i < 5i64 {{ v.push(t.a); i = i + 1; }}\n\
+                 \x20 return v.len(); }}\n"
+            ),
+            &["5"],
+            "rc_boxed_proj_push_five_trips",
+        );
+        // 4 — the `assign` cell: the destination is an EXISTING binding, which
+        // also frees its own displaced value each trip.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut s = payload(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ s = t.a; i = i + 1; }}\n\
+                 \x20 return s.len(); }}\n"
+            ),
+            &["38"],
+            "rc_boxed_proj_assign_three_trips",
+        );
+        // 5 — the LIVE-VALUE oracle, and what rules out the fix that looks
+        // equivalent. Zeroing the box's own field would neutralize the source,
+        // but the box is the surviving owner precisely because the binding is
+        // read again — so `t.a` must still be 38 bytes on every trip, not 38
+        // once and 0 after. 3 x 38 + 3 = 117, which is what the interpreter
+        // prints.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64; let mut n = 0i64;\n\
+                 \x20 while i < 3i64 {{ v.push(t.a); n = n + t.a.len(); i = i + 1; }}\n\
+                 \x20 return n + v.len(); }}\n"
+            ),
+            &["117"],
+            "rc_boxed_proj_push_source_stays_live",
+        );
+        // 6 — the ELEMENTS must be independent of each other, not three
+        // aliases of one buffer: reading two of them back is 76, and a fix
+        // that shared one buffer would still print 76 while double-freeing —
+        // which is why this cell's value is a check on the copy COUNT, and the
+        // clean-exit assertion is what makes it bite.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ v.push(t.a); i = i + 1; }}\n\
+                 \x20 return v[0].len() + v[2].len(); }}\n"
+            ),
+            &["76"],
+            "rc_boxed_proj_push_elements_are_independent",
+        );
+        // 7 — CONTROL, and the first half of the stacking regression: the
+        // `let`-bound destination B-2026-09-07-23 already fixed. It must keep
+        // taking exactly ONE copy.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64; let mut n = 0i64;\n\
+                 \x20 while i < 3i64 {{ let s = t.a; n = n + s.len(); i = i + 1; }}\n\
+                 \x20 return n; }}\n"
+            ),
+            &["114"],
+            "rc_boxed_proj_control_let_destination_unchanged",
+        );
+        // 8 — CONTROL, the other half: the struct-literal field destination,
+        // likewise already fixed and likewise at risk of a second copy.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64; let mut n = 0i64;\n\
+                 \x20 while i < 3i64 {{ let p = P {{ a: t.a, b: 1 }}; n = n + p.a.len(); i = i + 1; }}\n\
+                 \x20 return n; }}\n"
+            ),
+            &["114"],
+            "rc_boxed_proj_control_literal_destination_unchanged",
+        );
+        // 9 — CONTROL: no loop, so no promotion. The disarm works and the
+        // destination legitimately takes the buffer; nothing may change.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut v: Vec[String] = Vec.new();\n\
+                 \x20 v.push(t.a);\n\
+                 \x20 return v.len(); }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_control_no_promotion",
         );
     }
 

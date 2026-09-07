@@ -10523,7 +10523,7 @@ impl<'ctx> Codegen<'ctx> {
     /// Module binding: returns the global's pointer (the global IS the storage,
     /// equivalent to an owned alloca for dispatch-shape purposes — used by the
     /// Vec/Map/Set method-call paths to dispatch on a global like `TODOS`).
-    fn get_data_ptr(&self, name: &str) -> Option<PointerValue<'ctx>> {
+    pub(crate) fn get_data_ptr(&self, name: &str) -> Option<PointerValue<'ctx>> {
         if let Some(slot) = self.variables.get(name) {
             // RC-fallback: the alloca holds a heap ptr → `{ i64 rc, T value }`;
             // the data lives at field 1 (offset 8 past the refcount header).

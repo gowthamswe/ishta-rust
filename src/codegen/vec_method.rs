@@ -3013,6 +3013,43 @@ impl<'ctx> super::Codegen<'ctx> {
                 // container must own a deep copy, not an alias. See
                 // `emit_vecstr_defensive_copy`.
                 let elem_val = self.maybe_defensive_copy_param_arg(&args[0].value, elem_val);
+                // B-2026-09-07-30 — an argument that PROJECTS off an
+                // RC-FALLBACK-PROMOTED local, which retains the field for the
+                // same reason a by-value param does one line above.
+                //
+                // The move-semantics cap-zero below cannot neutralize it: a
+                // promoted binding's alloca holds a `{i64 rc, T}` box HANDLE
+                // rather than the struct, so the disarm bails on its shape test
+                // and the box goes on owning the field. `v.push(t.a)` in a loop
+                // therefore pushes ONE `{ptr,len,cap}` three times and the
+                // buffer acquires four owners — three elements and the box.
+                // Measured at `KARAC_AUTO_PAR=0`: 18 allocs / 21 frees, 3
+                // invalid frees, `free(): double free detected in tcache 2`
+                // before the program prints, against an interpreter printing 3.
+                //
+                // Copied HERE, at the push lowering, rather than in the shared
+                // argument disarm. That was tried and is wrong: ~59 call sites
+                // funnel through `suppress_source_vec_cleanup_for_arg_ex`,
+                // including the `let` and struct-literal destinations that
+                // already take an independent buffer from
+                // `deep_copy_owned_struct_param_field_move` — so a copy there
+                // STACKS on theirs and the first one leaks. Measured exactly
+                // that way, 114 B in 3 blocks on both cells (38 B per trip),
+                // which is the hazard `uam_reclone_source_field`'s own doc
+                // names for its four excluded roots. The ordering rules out the
+                // obvious guard as well: the `let` arm calls that disarm BEFORE
+                // its consumer-side copy runs, so `uam_copied_sites` is still
+                // empty when the argument path would have to consult it.
+                //
+                // At this site the destination is known and singular, so the
+                // copy lands once — the same consumer-side direction
+                // B-2026-09-07-23 used for the other three destinations.
+                let elem_val = if self.projection_root_is_rc_boxed(&args[0].value) {
+                    let fte = self.rc_boxed_projection_source_field_te(&args[0].value);
+                    self.rc_boxed_projection_field_copy(&args[0].value, fte.as_ref(), elem_val)
+                } else {
+                    elem_val
+                };
                 // Move semantics: when the argument is a tracked Vec /
                 // String binding, push bit-copies its `{ptr, len, cap}`
                 // into the container's data buffer. Both source and

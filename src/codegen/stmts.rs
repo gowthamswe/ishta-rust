@@ -11429,6 +11429,37 @@ impl<'ctx> super::Codegen<'ctx> {
                 // from it the first time either gate is tuned, and the failure
                 // mode of drift here is a double free.
                 let rhs_index_deep_cloned = !rhs_is_owned_param && val != pre_clone_val;
+                // B-2026-09-07-30 — an RHS that PROJECTS off an RC-FALLBACK-
+                // PROMOTED local hands the target the BOX's buffer, and the box
+                // does not give it up.
+                //
+                // This is B-2026-09-07-23's defect at the assignment
+                // destination. Every disarm reaches the source field by GEP-ing
+                // the binding's slot, and a promoted slot holds a `{i64 rc, T}`
+                // box HANDLE rather than the struct, so
+                // `suppress_struct_field_move_into_literal` above bails on its
+                // shape test and the field's cap is never zeroed. The target
+                // then owns a buffer the box still owns too. Inside a loop the
+                // assignment ALSO frees its own displaced value each trip,
+                // which from the second trip on is the box's buffer again.
+                //
+                // AUTO-PAR HIDES IT, which is why the row that found this
+                // recorded a leak rather than a corruption: with fan-out on the
+                // program prints correctly and strands 40 B (the box), and only
+                // a `KARAC_AUTO_PAR=0` BUILD aborts with `free(): double free
+                // detected in tcache 2` at 25 allocs / 26 frees. Both are the
+                // same defect seen from two lanes.
+                //
+                // Copying rather than declining the target's ownership, for the
+                // reason `projection_root_is_rc_boxed` records: the box keeps a
+                // LIVE value the next iteration reads, and a destination whose
+                // registration is declined leaks the moment it is mutated. The
+                // copy runs AFTER `clone_owned_vec_index_element` so the
+                // identity test above still answers about that clone alone.
+                if self.projection_root_is_rc_boxed(value) {
+                    let fte = self.rc_boxed_projection_source_field_te(value);
+                    val = self.rc_boxed_projection_field_copy(value, fte.as_ref(), val);
+                }
                 // Consume the f-string acc staging slot once compile_expr
                 // returns — even on the rare paths where the Assign arm
                 // doesn't reach the transfer step below, the slot must not

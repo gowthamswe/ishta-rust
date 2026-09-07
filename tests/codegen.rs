@@ -36262,6 +36262,150 @@ end
         );
     }
 
+    /// B-2026-09-07-30 — a projection off an RC-FALLBACK-PROMOTED local whose
+    /// destination is a `Vec.push` ARGUMENT or an EXISTING BINDING.
+    ///
+    /// B-2026-09-07-23 gave the `let` binding and the struct-literal field an
+    /// independent buffer; these two destinations kept taking the box's alias,
+    /// because every disarm reaches the source field by GEP-ing the binding's
+    /// slot and a promoted slot holds a `{i64 rc, T}` box HANDLE.
+    ///
+    /// THE STDOUT ASSERTION IS THE ONE THAT FAILS ON THE PARENT for the `push`
+    /// cells: one buffer acquires four owners, so the program aborts with
+    /// `free(): double free detected in tcache 2` BEFORE printing and stdout is
+    /// empty. The `assign` cells are the opposite — under the default auto-par
+    /// build they print correctly and merely strand the box, so only the
+    /// `memory_sanitizer` twin (which builds with fan-out OFF) catches those.
+    /// Both directions are needed; neither suite covers this alone.
+    ///
+    /// The VALUES rule out the fix that looks equivalent. Zeroing the box's own
+    /// field would neutralize the source, but the box is the surviving owner
+    /// exactly because the binding is read again — cell 5 reads `t.a` on every
+    /// trip and would print 3 rather than 117 under that fix, and cell 6 reads
+    /// two elements back and would see one shared buffer.
+    #[test]
+    fn e2e_rc_boxed_projection_push_and_assign_destinations_copy() {
+        // The payload must be HEAP-allocated: a string LITERAL does not
+        // allocate, so a literal-payload fixture gives the box no buffer for a
+        // second owner to free and pins nothing.
+        const PRE: &str = r#"struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+"#;
+        // (source tail, expected stdout, cell name)
+        let cells: [(&str, &str, &str); 9] = [
+            // 1 — the row's `push` cell, three trips.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;
+  while i < 3i64 { v.push(t.a); i = i + 1; }
+  return v.len(); }
+fn main() { println(go()); }
+"#,
+                "3",
+                "push_three_trips",
+            ),
+            // 2 — ONE trip, the smallest dirty push cell.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;
+  while i < 1i64 { v.push(t.a); i = i + 1; }
+  return v.len(); }
+fn main() { println(go()); }
+"#,
+                "1",
+                "push_one_trip",
+            ),
+            // 3 — FIVE trips: six owners on the parent.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;
+  while i < 5i64 { v.push(t.a); i = i + 1; }
+  return v.len(); }
+fn main() { println(go()); }
+"#,
+                "5",
+                "push_five_trips",
+            ),
+            // 4 — the `assign` destination, which also frees its own displaced
+            // value each trip.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut s = payload(); let mut i = 0i64;
+  while i < 3i64 { s = t.a; i = i + 1; }
+  return s.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "assign_three_trips",
+            ),
+            // 5 — the LIVE-VALUE oracle: `t.a` must still read 38 on every
+            // trip. 3 x 38 + 3 = 117.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { v.push(t.a); n = n + t.a.len(); i = i + 1; }
+  return n + v.len(); }
+fn main() { println(go()); }
+"#,
+                "117",
+                "push_source_stays_live",
+            ),
+            // 6 — the elements must be independent buffers, not three aliases.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;
+  while i < 3i64 { v.push(t.a); i = i + 1; }
+  return v[0].len() + v[2].len(); }
+fn main() { println(go()); }
+"#,
+                "76",
+                "push_elements_independent",
+            ),
+            // 7 — the assign destination read back on every trip.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut s = payload(); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { s = t.a; n = n + s.len(); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "114",
+                "assign_destination_read_each_trip",
+            ),
+            // 8 — CONTROL: the `let` destination B-2026-09-07-23 fixed. It must
+            // keep taking exactly ONE copy — a second one leaks 38 B per trip,
+            // which is what routing this fix through the shared argument disarm
+            // measured.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let s = t.a; n = n + s.len(); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "114",
+                "control_let_destination_unchanged",
+            ),
+            // 9 — CONTROL: no loop, so no promotion; the destination
+            // legitimately takes the buffer.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new();
+  v.push(t.a);
+  return v.len(); }
+fn main() { println(go()); }
+"#,
+                "1",
+                "control_no_promotion",
+            ),
+        ];
+        for (tail, want, name) in cells {
+            let Some(cap) = run_program_capturing(&format!("{PRE}{tail}")) else {
+                return;
+            };
+            assert_eq!(cap.stdout.trim(), want, "cell {name}: stdout");
+            assert!(
+                cap.status.success(),
+                "cell {name}: exited {:?}; stderr={:?}",
+                cap.status,
+                cap.stderr
+            );
+        }
+    }
+
     /// B-2026-09-07-29 — a WHOLE consume inside a loop that actually RUNS
     /// double-frees an RC-fallback-promoted local. No projection is involved:
     /// `takep(t)` takes the entire binding and there is no `t.a` in the
