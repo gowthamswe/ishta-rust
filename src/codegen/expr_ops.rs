@@ -2847,10 +2847,89 @@ impl<'ctx> super::Codegen<'ctx> {
             .builder
             .build_struct_gep(struct_ty, base_ptr, idx, &format!("old_{field}_ptr"))
             .unwrap();
-        let drop_fn = self.emit_drop_fn_for_type_expr(&field_te);
+        let drop_fn = self
+            .displaced_struct_combined_drop(&field_te)
+            .unwrap_or_else(|| self.emit_drop_fn_for_type_expr(&field_te));
         self.builder
             .build_call(drop_fn, &[field_ptr.into()], "")
             .unwrap();
+    }
+
+    /// B-2026-09-07-20 — the COMBINED drop for a displaced field value whose
+    /// struct owns a `shared` field, so the old value's refcount block is
+    /// released along with its buffers.
+    ///
+    /// `emit_drop_fn_for_type_expr` resolves a named struct to
+    /// `emit_struct_drop_synthesis`, the VALUE drop — and that drop skips
+    /// `shared` fields BY DESIGN, because for a live binding the release rides
+    /// a separate scope-exit channel (`track_struct_var_inst` selects the
+    /// combined drop for exactly this class; see its note, "the value drop
+    /// SKIPS shared fields by design"). A DISPLACED value has no such channel:
+    /// the binding's action reads the field slot at scope exit and finds the
+    /// NEW occupant, so the overwritten one is released by nobody.
+    ///
+    /// Measured at `KARAC_OPT_LEVEL=0` over `struct Bi { mut one: Ri }` with
+    /// `Ri { id: i64, inner: Inner }` and `shared struct Inner`: `b.one =
+    /// mki(7)` lost `16 bytes in 1 blocks`, and two successive assignments lost
+    /// 32 in 2 — one block per overwrite, which is what identifies the
+    /// displaced value rather than the stored one as the unowned party. The
+    /// same program with a `String` field in place of the `shared` one is
+    /// clean, and so is the plain local rebind `let mut r = mki(1); r =
+    /// mki(7);`, whose old value goes out through a different path entirely.
+    ///
+    /// Cannot double-release: this fires only where a value is being
+    /// overwritten, and the scope-exit action for the same slot reads whatever
+    /// occupies it then. Returns `None` for every type that is not a
+    /// non-generic named struct owning a `shared` field, so every other field
+    /// shape keeps the resolver it had.
+    fn displaced_struct_combined_drop(
+        &mut self,
+        field_te: &TypeExpr,
+    ) -> Option<inkwell::values::FunctionValue<'ctx>> {
+        let TypeKind::Path(p) = &field_te.kind else {
+            return None;
+        };
+        if p.generic_args.is_some() {
+            return None;
+        }
+        let [single] = p.segments.as_slice() else {
+            return None;
+        };
+        let single = single.clone();
+        self.displaced_struct_shared_drop(&single)
+    }
+
+    /// The name-keyed half of [`Self::displaced_struct_combined_drop`], shared
+    /// with the INDEX-assign displacement (`v[i] = <new>`,
+    /// `emit_displaced_index_elem_drop`), which reaches the same value drop by
+    /// struct name rather than through a field `TypeExpr`.
+    ///
+    /// Both displacement sites need the identical answer for the identical
+    /// reason, and the element one is the more visible of the two: it leaks at
+    /// the DEFAULT opt level as well as at `-O0` (measured, 16 B in 1 block at
+    /// both), because the element buffer stays live through the container and
+    /// LLVM has no dead allocation to elide. Factored rather than repeated so
+    /// the two cannot drift — the hazard every paired ownership site in this
+    /// file records.
+    ///
+    /// `None` for anything that is not a non-generic named struct owning a
+    /// `shared` field, so each caller keeps the resolver it had.
+    pub(super) fn displaced_struct_shared_drop(
+        &mut self,
+        struct_name: &str,
+    ) -> Option<inkwell::values::FunctionValue<'ctx>> {
+        if self.type_decls.shared_types.contains_key(struct_name)
+            || !self.type_decls.struct_types.contains_key(struct_name)
+            || self
+                .type_decls
+                .struct_generic_params
+                .get(struct_name)
+                .is_some_and(|g| !g.is_empty())
+            || !self.struct_owns_shared_field_subst(struct_name, &mut Vec::new(), None)
+        {
+            return None;
+        }
+        self.emit_vec_elem_struct_with_shared_drop_fn(struct_name)
     }
 
     /// Resolve the declared TypeExpr of `object.field` for a plain (named)

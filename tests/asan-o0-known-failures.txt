@@ -219,17 +219,44 @@
 # The predicate now also admits a heap-carrying struct. It was answering the
 # BODIES question at a caller that needed the MEMORY one.
 
-# ── 2026-09-07: the list goes NON-EMPTY again, with one entry. ──
-memory_sanitizer_tests::asan_stored_argument_is_owned_by_its_new_home_not_the_caller  # B-2026-09-07-20
+# ── 2026-09-07: the list went NON-EMPTY and its entry is REMOVED again. ──
 #
-# Found by running this leg for the first time since `d971ad5` (B-2026-09-07-5)
-# added the fixture. Its `[b0907-5-outliving-store-admission]` cell leaks 35 B in
-# 3 allocations at -O0 and is clean at the default -O2 — the classic shape this
-# file exists for, and invisible to every session because nothing runs this leg
-# automatically.
+# B-2026-09-07-20's entry
+# (asan_stored_argument_is_owned_by_its_new_home_not_the_caller) was REMOVED
+# 2026-09-07: the 35 B is fixed and the fixture is clean at BOTH opt levels.
 #
-# PRE-EXISTING, measured rather than assumed: the same test fails identically on
-# a tree with the in-flight fix stashed, i.e. on unmodified `main`.
+# It was found by running this leg for the first time since `d971ad5`
+# (B-2026-09-07-5) added the fixture, which had asserted a clean run at both
+# levels from the day it landed and been wrong at one of them ever since.
+#
+# Worth recording: the 35 B was TWO UNRELATED DEFECTS sharing one fixture, and
+# the summary line hid that — three allocations, all attributed to `mk`, which
+# reads like one leak with one cause. Reduced cell by cell under valgrind they
+# split 19 / 16 across two cells with nothing in common but the struct type:
+#
+#   * the `k` cell (19 B) — a CONDITIONAL store whose non-storing path had no
+#     owner. B-2026-08-30-28 registers such a param BODIES ONLY on the premise
+#     that "the caller still owns the memory", which is false for a param the
+#     prologue REFUSED to own: it is forwarded, and the caller stands all the
+#     way down. The `Drop` body ran while the whole of the struct's heap
+#     leaked, which is the signature of that premise failing. The conditional
+#     -RETURN sibling had already been corrected the same way (B-2026-09-06-69);
+#     this is the STORE escape route, one over.
+#   * the `b` cell (16 B) — a field ASSIGN displacing a struct that owns a
+#     `shared` field. `emit_struct_drop_synthesis` skips shared fields by
+#     design, because a live binding releases through a separate scope-exit
+#     channel; a DISPLACED value has no such channel.
+#
+# The second root has an INDEX-assign twin (`v[0] = mk(38)`) that leaks at the
+# DEFAULT -O2 as well, since the element stays reachable through the container
+# and LLVM has no dead allocation to elide. It is fixed with the same helper and
+# pinned in `asan_conditionally_unstored_and_displaced_struct_values_have_an_owner`,
+# which is what gives this family a gate on the leg CI actually runs — every
+# other cell of it is -O0-only.
+#
+# The reduction is the lesson: an -O0 summary line names allocation SITES, not
+# causes, and `mk` was the allocation site of both. Splitting by CELL before
+# reading any codegen is what separated them.
 
 # ── 2026-09-07 (second entry of the day): two IF/ELSE spellings, one row. ──
 memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_local_declines  # B-2026-09-07-43

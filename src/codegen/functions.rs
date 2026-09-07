@@ -3201,7 +3201,60 @@ impl<'ctx> super::Codegen<'ctx> {
                                     .shared_types
                                     .contains_key(struct_name.as_str())
                             {
-                                if let Some(bodies) =
+                                // B-2026-09-07-20 — the MEMORY too, for the
+                                // one param class whose bodies-only premise is
+                                // false, exactly as the conditional-RETURN
+                                // sibling above takes it.
+                                //
+                                // "The caller still owns the memory" holds for
+                                // every param that reaches here except one: a
+                                // struct the prologue REFUSED to own
+                                // (copy-unsupported, and carrying a `shared`
+                                // field or self-referential, so the transfer
+                                // bargain is off too). That one is FORWARDED,
+                                // and the caller has stood ALL the way down for
+                                // it — `arg_var_is_forwarded_not_copied` turns
+                                // the three argument registrars'
+                                // body-only retraction into
+                                // `suppress_user_drop_for_var` whenever
+                                // `callee_takes_over_arg_drop_body` fires, and
+                                // `fn_moves_param_into_outliving_place` is one
+                                // of its disjuncts. So on the path that does
+                                // NOT store, a bodies-only registration left
+                                // the buffer with no owner in any frame.
+                                //
+                                // Measured at `KARAC_OPT_LEVEL=0` on
+                                // `fn maybe(mut ref self, r: R, k: bool) { if k
+                                // { self.xs.push(r); } }` called with `false`:
+                                // the `Drop` body ran and valgrind reported
+                                // `definitely lost: 19 bytes in 2 blocks` — the
+                                // WHOLE of `R`'s heap, its `String` and its
+                                // `shared` field's refcount block, which is the
+                                // signature of a stand-down with nothing on the
+                                // other side. Clean on the storing path, clean
+                                // for an unconditional store, and clean for a
+                                // copy-supported struct, whose entry copy makes
+                                // the bodies-only premise true.
+                                //
+                                // Same flag, same admitted set: the wrapper is
+                                // guarded per path exactly as the body was
+                                // (`cmdrop.armed` gates whatever function the
+                                // action names), so the storing path still
+                                // hands the value to the container untouched.
+                                let owns_memory = self
+                                    .struct_param_memory_stays_with_caller(struct_name)
+                                    && self
+                                        .type_decls
+                                        .struct_generic_params
+                                        .get(struct_name.as_str())
+                                        .is_none_or(|g| g.is_empty());
+                                if owns_memory {
+                                    self.track_user_drop_var(struct_name, &param_name, alloca);
+                                    let _ = self.cond_move_drop_flag_for(&param_name);
+                                    self.drop_rc
+                                        .cond_store_flag_params
+                                        .insert(param_name.clone());
+                                } else if let Some(bodies) =
                                     self.emit_struct_user_drop_bodies_only_fn(struct_name)
                                 {
                                     self.track_user_drop_var_with_fn(

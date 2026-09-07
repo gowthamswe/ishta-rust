@@ -20326,8 +20326,20 @@ impl<'ctx> super::Codegen<'ctx> {
         }
         // Memory: the cap-guarded synthesizer closes the field-buffer leak;
         // a moved-out / already-freed element no-ops on the cap guards.
+        // B-2026-09-07-20 — and the COMBINED drop when the element owns a
+        // `shared` field, because the synthesizer skips those by design (the
+        // release rides a scope-exit channel that a DISPLACED value no longer
+        // has; see `displaced_struct_shared_drop`). Measured on
+        // `Vec[Ri]` with `Ri { id: i64, inner: Inner }` and `shared struct
+        // Inner`: `v[0] = mki(7)` lost 16 B in 1 block at `-O0` AND at the
+        // default `-O2` — unlike the field-assign twin, the element's buffer
+        // stays reachable through the container, so there is no dead
+        // allocation for LLVM to elide and the leak is on the ordinary gate.
         if is_struct {
-            if let Some(f) = self.emit_struct_drop_synthesis(&etn) {
+            if let Some(f) = self
+                .displaced_struct_shared_drop(&etn)
+                .or_else(|| self.emit_struct_drop_synthesis(&etn))
+            {
                 self.builder.build_call(f, &[elem_ptr.into()], "").unwrap();
             }
         } else if let Some(f) = self.emit_enum_drop_switch(&etn) {

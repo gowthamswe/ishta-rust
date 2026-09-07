@@ -8230,6 +8230,98 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-20 — a struct value that is DISPLACED by a store, or handed
+    /// to a callee whose store does not happen, has an owner in some frame.
+    ///
+    /// Both halves were found by running `scripts/asan-o0-leg.sh`, which is how
+    /// this row exists at all: `asan_stored_argument_is_owned_by_its_new_home_not_the_caller`
+    /// asserted a clean run at both opt levels from the day it landed and had
+    /// been leaking 35 B at `-O0` ever since, invisibly, because nothing runs
+    /// that leg. Reduced with valgrind, the 35 B is two unrelated defects —
+    /// 19 B on its `k` cell and 16 B on its `b` cell — and this fixture carries
+    /// both roots plus the neighbours that locate them.
+    ///
+    ///   * `a`/`b`/`c`/`e` — a CONDITIONAL store (`if k { self.xs.push(r); }`)
+    ///     at `k = false`, over a param whose prologue REFUSED to own it (a
+    ///     `shared` field declines copy support, and the transfer bargain with
+    ///     it). B-2026-08-30-28 registers such a param BODIES ONLY, on the
+    ///     premise that "the caller still owns the memory" — false for exactly
+    ///     this class, which is FORWARDED, and for which the caller has stood
+    ///     all the way down. So the `Drop` body ran and the whole of `R`'s heap
+    ///     went unowned: `definitely lost: 19 bytes in 2 blocks`, its `String`
+    ///     and its `shared` field's refcount block. Method, free-fn, assoc-fn
+    ///     and named-local spellings are all carried because all four leaked
+    ///     and one predicate now covers them.
+    ///   * `d` — the STORING path of the same callee, which was clean before
+    ///     and must stay clean: the registration is guarded per path, so a fix
+    ///     that fired the wrapper here would double-free what the container
+    ///     drains.
+    ///   * `f`/`g` — a struct field ASSIGN displacing a value whose type owns a
+    ///     `shared` field. `emit_struct_drop_synthesis` skips `shared` fields BY
+    ///     DESIGN (a live binding releases through a separate scope-exit
+    ///     channel), and a displaced value has no such channel, so the block
+    ///     was released by nobody — 16 B per assignment, confirmed by a
+    ///     two-assignment probe losing exactly 32 B in 2 blocks.
+    ///   * `h` — the INDEX-assign twin (`v[0] = mk(38)`), the same root one
+    ///     site over, and THE CELL THAT GATES ON THE ORDINARY LEG: it leaks at
+    ///     the default `-O2` as well as at `-O0`, because the element buffer
+    ///     stays reachable through the container and LLVM has no dead
+    ///     allocation to elide. Every other cell here is `-O0`-only, so without
+    ///     `h` this fixture would assert nothing on the leg CI actually runs.
+    ///
+    /// Measured on the parent: 35 B in 3 allocations for the two cells the
+    /// owning fixture carries, 120 B in 12 blocks for the conditional store
+    /// over a six-trip loop, and 16 B at BOTH opt levels for `h`. On the fix:
+    /// 42 allocs / 42 frees, 0 valgrind errors at `-O0` and at `-O2`.
+    ///
+    /// STDOUT IS BYTE-IDENTICAL ACROSS THE FIX, and identical under `--interp`,
+    /// so there is no E2E or interpreter twin to pair with this — a leak of a
+    /// value nothing reads again is invisible to every output assertion, which
+    /// is the whole reason the row needed a sanitizer to find it.
+    ///
+    /// ONE EXPECTATION HERE ENCODES A DEFECT DELIBERATELY: `f` expects no
+    /// `dR1`. A field assign written as `self.one = r` INSIDE a method loses
+    /// the displaced value's user `Drop` body, while the caller-side spelling
+    /// `h.one = mk(37)` in `g` runs it (`dR2`). That is not this row's leak —
+    /// it is cross-backend consistent (the interpreter prints the same lines)
+    /// and is filed as B-2026-09-07-52; whoever closes that row must add `dR1`
+    /// here.
+    fn asan_conditionally_unstored_and_displaced_struct_values_have_an_owner() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct Box2 { mut xs: Vec[R] }
+impl Box2 {
+    fn maybe(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } }
+    fn amaybe(b: mut ref Box2, r: R, k: bool) { if k { b.xs.push(r); } }
+}
+struct Box3 { mut one: R }
+impl Box3 { fn set(mut ref self, r: R) { self.one = r; } }
+fn fcond(b: mut ref Box2, r: R, k: bool) { if k { b.xs.push(r); } }
+
+fn c_cond()  { let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(31), false); println(f"a{b.xs.len()}"); }
+fn c_condf() { let mut b = Box2 { xs: Vec.new() }; fcond(mut b, mk(32), false); println(f"b{b.xs.len()}"); }
+fn c_conda() { let mut b = Box2 { xs: Vec.new() }; Box2.amaybe(mut b, mk(33), false); println(f"c{b.xs.len()}"); }
+fn c_condy() { let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(34), true); println(f"d{b.xs.len()}"); }
+fn c_condn() { let mut b = Box2 { xs: Vec.new() }; let r = mk(35); b.maybe(r, false); println(f"e{b.xs.len()}"); }
+fn c_setm()  { let mut h = Box3 { one: mk(1) }; h.set(mk(36)); println(f"f{h.one.id}"); }
+fn c_setd()  { let mut h = Box3 { one: mk(2) }; h.one = mk(37); println(f"g{h.one.id}"); }
+fn c_elem()  { let mut v: Vec[R] = Vec.new(); v.push(mk(3)); v[0] = mk(38); println(f"h{v[0].id}"); }
+fn main() { c_cond(); c_condf(); c_conda(); c_condy(); c_condn(); c_setm(); c_setd(); c_elem(); println("end"); }
+"#,
+            &[
+                "dR31", "a0", "dR32", "b0", "dR33", "c0", "d1", "dR34", "dR35", "e0", "f36",
+                "dR36", "dR2", "g37", "dR37", "dR3", "h38", "dR38", "end",
+            ],
+            "b0907-20-unstored-and-displaced",
+            30,
+        );
+    }
+
+    #[test]
     /// B-2026-09-07-5 — the FREEING half of
     /// `test_e2e_stored_argument_is_owned_by_its_new_home_not_the_caller`.
     ///
