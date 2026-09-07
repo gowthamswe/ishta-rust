@@ -288,19 +288,28 @@ mod tests {
 
         // Every spec shape the fast path can actually receive.
         let specs = [
-            "", "5", "1", "20", "<5", ">5", "<12", ">12", "05", "020", "08",
-            "x", "X", "o", "5x", "5X", "5o", "05x", "05X", "05o",
-            "<8x", ">8X", "<8o", "020x",
+            "", "5", "1", "20", "<5", ">5", "<12", ">12", "05", "020", "08", "x", "X", "o", "5x",
+            "5X", "5o", "05x", "05X", "05o", "<8x", ">8X", "<8o", "020x",
         ];
         // Boundaries first: i64::MIN is where a naive negate wraps, and the
         // powers of ten/two are where digit counts cross the width.
         let signed_vals: [i64; 14] = [
-            0, 1, -1, 7, -7, 9, -9, 10, -10, 99999, -99999,
-            i64::MAX, i64::MIN, i64::MIN + 1,
+            0,
+            1,
+            -1,
+            7,
+            -7,
+            9,
+            -9,
+            10,
+            -10,
+            99999,
+            -99999,
+            i64::MAX,
+            i64::MIN,
+            i64::MIN + 1,
         ];
-        let unsigned_vals: [u64; 8] = [
-            0, 1, 9, 10, 255, u64::MAX, u64::MAX - 1, 1 << 63,
-        ];
+        let unsigned_vals: [u64; 8] = [0, 1, 9, 10, 255, u64::MAX, u64::MAX - 1, 1 << 63];
 
         for raw in specs {
             let fs = FormatSpec::parse(raw).expect("spec parses");
@@ -334,18 +343,21 @@ mod tests {
     fn i64_fmt_fast_path_truncates_into_a_short_buffer() {
         unsafe {
             let mut buf = [0xAAu8; 8];
-            let n = crate::karac_runtime_i64_fmt(
-                1234567890123u64, 1, 10, 0, 0, 0,
-                buf.as_mut_ptr(), 4,
-            );
+            let n =
+                crate::karac_runtime_i64_fmt(1234567890123u64, 1, 10, 0, 0, 0, buf.as_mut_ptr(), 4);
             assert_eq!(n, 4, "should stop at the cap");
             assert_eq!(&buf[..4], b"1234");
             assert_eq!(&buf[4..], &[0xAA; 4], "must not write past buf_len");
 
             // null / non-positive cap write nothing
-            assert_eq!(crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, std::ptr::null_mut(), 8), 0);
-            assert_eq!(crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, buf.as_mut_ptr(), 0), 0);
+            assert_eq!(
+                crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, std::ptr::null_mut(), 8),
+                0
+            );
+            assert_eq!(
+                crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, buf.as_mut_ptr(), 0),
+                0
+            );
         }
     }
-
 }

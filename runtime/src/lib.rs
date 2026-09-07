@@ -9554,7 +9554,11 @@ pub unsafe extern "C" fn karac_runtime_i64_fmt(
         let upper = radix == -16;
         // `unsigned_abs` for the same reason as `karac_runtime_i64_to_str`:
         // negating `i64::MIN` as an `i64` overflows.
-        let mut mag: u64 = if neg { (val as i64).unsigned_abs() } else { val };
+        let mut mag: u64 = if neg {
+            (val as i64).unsigned_abs()
+        } else {
+            val
+        };
 
         // 22 covers the longest rendering in any base handled here (octal
         // u64::MAX is 22 digits); no bounds check needed inside the loop.

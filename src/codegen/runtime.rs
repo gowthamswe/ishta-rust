@@ -15875,9 +15875,7 @@ impl<'ctx> super::Codegen<'ctx> {
                             &[
                                 widened.into(),
                                 i32_t.const_int(u64::from(!unsigned), false).into(),
-                                i32_t
-                                    .const_int(fs.fast_radix_code() as u64, true)
-                                    .into(),
+                                i32_t.const_int(fs.fast_radix_code() as u64, true).into(),
                                 i32_t.const_int(u64::from(fs.zero_pad), false).into(),
                                 i64_t.const_int(width as u64, false).into(),
                                 i32_t
@@ -15894,8 +15892,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         .into_int_value();
                     return Ok((buf_ptr, len));
                 }
-                let (fmt, arg): (String, BasicValueEnum<'ctx>) =
-                    (fs.to_printf("", 'f', true), val);
+                let (fmt, arg): (String, BasicValueEnum<'ctx>) = (fs.to_printf("", 'f', true), val);
                 let fmt_g = self
                     .builder
                     .build_global_string_ptr(&fmt, "fss.nfmt")
