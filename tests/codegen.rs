@@ -35829,10 +35829,14 @@ end
     /// caller slot keeps its own entry copy (B-2026-08-26-9's carve-out), and
     /// `k`/`l` are the free-fn shape that was already correct.
     ///
-    /// NOT covered and filed as B-2026-09-07-16: the mixed-path VIA-CALL
-    /// spelling (`if k { return mk(95); } return fwd(r);`), which needs the
-    /// per-path flag clearers to see a via-call tail before its callee may own
-    /// the memory — the same missing piece B-2026-09-07-3 needs on the free leg.
+    /// The mixed-path VIA-CALL spelling (`if k { return mk(95); } return
+    /// fwd(r);`) is NOT covered here — it needed the per-path flag clearers to
+    /// see a via-call tail before its callee may own the memory. That is
+    /// B-2026-09-07-3, closed by `99bd72d`, and pinned by
+    /// `test_e2e_free_fn_mixed_path_hand_back_through_a_hop_owns_its_argument`
+    /// below. (This paragraph cited B-2026-09-07-16 for it, which is an
+    /// unrelated enum-payload double free — an id allocated by two sessions in
+    /// the same window, the hazard CLAUDE.md's late-allocation rule warns about.)
     fn test_e2e_method_and_assoc_mixed_path_hand_back_owns_its_argument() {
         let Some(out) = run_program(
             r#"shared struct Inner { v: i64 }
@@ -35922,6 +35926,93 @@ dS41
 dS42
 n96
 dS96
+end
+"#
+        );
+    }
+
+    #[test]
+    /// B-2026-09-07-3, the VIA-CALL half — the spelling
+    /// `test_e2e_method_and_assoc_mixed_path_hand_back_owns_its_argument`'s own
+    /// doc named as NOT covered. A MIXED-PATH callee that hands its by-value
+    /// param back through ONE HOP (`if k { return mk(92); } return fwd(r); }`)
+    /// leaked 19 bytes in 2 blocks on the DIES-INSIDE leg and lost the argument's
+    /// `Drop` body outright — `dR40` never fired, on every compiled surface,
+    /// while `--interp` printed it. Body AND bytes, so no output assertion and no
+    /// leak gate caught it alone.
+    ///
+    /// It took two independent halves to close, which is why it is pinned here
+    /// rather than with either one. `6ef13bb` (B-2026-09-06-69) moved the memory
+    /// onto the callee's per-path registration for the class whose prologue
+    /// declines to own it, and stood the caller all the way down. That fixed the
+    /// BARE spelling and left this one still silent in both frames:
+    /// `fn_conditionally_returns_param_bare`'s condition 3 declined a leaf that
+    /// reaches the param through a call, because `is_bare` did not recognise a
+    /// plain call as a hand-out — so the callee registered nothing while the
+    /// caller had already stood down through `fn_returns_param_via_call`.
+    /// `99bd72d` (B-2026-09-07-15/-22) taught that leaf test the one-hop
+    /// hand-back and made the hand-off inside the callee disarm PER PATH.
+    ///
+    /// Both legs and both argument spellings are covered because the two failures
+    /// are opposite and each masks the other: the dies-inside leg is where the
+    /// memory strands, the escaping leg is where an over-eager owner would double
+    /// free. The method and assoc twins ride along — the predicate is resolved by
+    /// name through `Item::Function`, so a method reaches it by a different route
+    /// and has regressed independently before (B-2026-09-07-4).
+    ///
+    /// Note the ORIENTATION: the hand-back is on the FALLTHROUGH and the fresh
+    /// value in the branch, the mirror of `e2e_mixed_path_hand_back_through_a_hop`.
+    /// The per-path flag is armed in a different basic block each way round.
+    fn test_e2e_free_fn_mixed_path_hand_back_through_a_hop_owns_its_argument() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn fwd(r: R) -> R { return r; }
+struct Hold { n: i64 }
+impl Hold { fn pv(ref self, r: R, k: bool) -> R { if k { return mk(90); } return fwd(r); } }
+impl R { fn av(r: R, k: bool) -> R { if k { return mk(91); } return fwd(r); } }
+fn fv(r: R, k: bool) -> R { if k { return mk(92); } return fwd(r); }
+// free fn via-call, ESCAPING leg then DIES-INSIDE leg, fresh temp
+fn c1() { let z = fv(mk(11), false); println(f"c1={z.id}"); }
+fn c2() { let z = fv(mk(12), true);  println(f"c2={z.id}"); }
+// the same two legs with a NAMED LOCAL argument -- the caller-side retraction
+fn c3() { let a = mk(13); let z = fv(a, false); println(f"c3={z.id}"); }
+fn c4() { let a = mk(14); let z = fv(a, true);  println(f"c4={z.id}"); }
+// method twin, both legs
+fn c5() { let h = Hold { n: 1 }; let z = h.pv(mk(15), false); println(f"c5={z.id}"); }
+fn c6() { let h = Hold { n: 1 }; let z = h.pv(mk(16), true);  println(f"c6={z.id}"); }
+// assoc twin, both legs
+fn c7() { let z = R.av(mk(17), false); println(f"c7={z.id}"); }
+fn c8() { let z = R.av(mk(18), true);  println(f"c8={z.id}"); }
+fn main() { c1(); c2(); c3(); c4(); c5(); c6(); c7(); c8(); println("end"); }
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"c1=11
+dR11
+dR12
+c2=92
+dR92
+c3=13
+dR13
+dR14
+c4=92
+dR92
+c5=15
+dR15
+dR16
+c6=90
+dR90
+c7=17
+dR17
+dR18
+c8=91
+dR91
 end
 "#
         );

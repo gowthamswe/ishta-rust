@@ -4572,6 +4572,56 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-3, the VIA-CALL half — the MEMORY side of
+    /// `test_e2e_free_fn_mixed_path_hand_back_through_a_hop_owns_its_argument`.
+    ///
+    /// A MIXED-PATH callee handing its by-value param back through ONE HOP
+    /// (`if k { return mk(92); } return fwd(r); }`) stranded 19 bytes in 2
+    /// blocks on the DIES-INSIDE leg: the caller stood down through
+    /// `fn_returns_param_via_call` while the callee registered nothing, because
+    /// `fn_conditionally_returns_param_bare` declined a leaf that reaches the
+    /// param through a call. Two frames each deferring to the other. It took
+    /// `6ef13bb` (per-path memory ownership for the declined-copy class) and
+    /// `99bd72d` (the one-hop leaf test plus the per-path disarm) together.
+    ///
+    /// The A/B string caught the lost `Drop` body; only LSan catches the bytes,
+    /// which is why the leg is pinned here as well.
+    ///
+    /// Floored because this class hides under DCE exactly as its method/assoc
+    /// sibling above does: an allocation whose only consumer hands it straight
+    /// back is what LLVM deletes at -O2, and a collapsed program reads clean
+    /// with nothing left to free.
+    #[test]
+    fn asan_free_fn_mixed_path_hand_back_through_a_hop_owns_its_argument() {
+        assert_clean_asan_run_min_allocs(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn fwd(r: R) -> R { return r; }\n\
+             struct Hold { n: i64 }\n\
+             impl Hold { fn pv(ref self, r: R, k: bool) -> R { if k { return mk(90); } return fwd(r); } }\n\
+             impl R { fn av(r: R, k: bool) -> R { if k { return mk(91); } return fwd(r); } }\n\
+             fn fv(r: R, k: bool) -> R { if k { return mk(92); } return fwd(r); }\n\
+             fn c1() { let z = fv(mk(11), false); println(f\"c1={z.id}\"); }\n\
+             fn c2() { let z = fv(mk(12), true); println(f\"c2={z.id}\"); }\n\
+             fn c3() { let a = mk(13); let z = fv(a, false); println(f\"c3={z.id}\"); }\n\
+             fn c4() { let a = mk(14); let z = fv(a, true); println(f\"c4={z.id}\"); }\n\
+             fn c5() { let h = Hold { n: 1 }; let z = h.pv(mk(15), false); println(f\"c5={z.id}\"); }\n\
+             fn c6() { let h = Hold { n: 1 }; let z = h.pv(mk(16), true); println(f\"c6={z.id}\"); }\n\
+             fn c7() { let z = R.av(mk(17), false); println(f\"c7={z.id}\"); }\n\
+             fn c8() { let z = R.av(mk(18), true); println(f\"c8={z.id}\"); }\n\
+             fn main() { c1(); c2(); c3(); c4(); c5(); c6(); c7(); c8(); println(\"end\"); }\n",
+            &[
+                "c1=11", "dR11", "dR12", "c2=92", "dR92", "c3=13", "dR13", "dR14", "c4=92",
+                "dR92", "c5=15", "dR15", "dR16", "c6=90", "dR90", "c7=17", "dR17", "dR18",
+                "c8=91", "dR91", "end",
+            ],
+            "free_fn_mixed_path_hand_back_through_a_hop",
+            40,
+        );
+    }
+
     /// B-2026-09-07-10 — the MEMORY half: the same program under ASAN + LSan,
     /// where the pre-fix build double-freed the object handed back through the
     /// hop. One owner and one free per object on every spelling, including the
