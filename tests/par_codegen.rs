@@ -13424,6 +13424,58 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-29, auto-par twin of
+    /// `e2e_whole_consume_in_a_running_loop_keeps_the_rc_box_the_only_owner`.
+    ///
+    /// A WHOLE consume inside a loop that runs (`takep(t)`, no projection
+    /// anywhere) let the callee take buffers the RC-fallback box never gave
+    /// up, once per trip. Auto-par is a distinct surface because a fan-out
+    /// statement is compiled TWICE — a `__par_branch_*` worker and the
+    /// sequential lane — and the decline is a whole-program PREPASS fact, so
+    /// this asserts it reaches both lanes rather than only the one the
+    /// sequential compile walks.
+    ///
+    /// The payload is an f-string rather than a literal because a string
+    /// LITERAL does not heap-allocate, so a literal-payload fixture gives the
+    /// box no buffer for a second owner to free and pins nothing. On the parent
+    /// this program aborts inside `loop3()` with `free(): double free detected
+    /// in tcache 2` before printing anything.
+    fn test_e2e_auto_par_whole_consume_in_a_running_loop_keeps_the_rc_box_the_only_owner() {
+        let out = run_program(
+            r#"
+struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn takep(p: P) -> i64 { return p.b; }
+fn two(x: P, y: P) -> i64 { return x.b + y.b; }
+fn loop3() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { n = n + takep(t); i = i + 1; }
+  return n; }
+fn forloop() -> i64 { let t = mkp(9); let mut n = 0i64;
+  for _k in 0i64..3i64 { n = n + takep(t); }
+  return n; }
+fn second() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { n = n + two(mkp(1), t); i = i + 1; }
+  return n; }
+fn noloop() -> i64 { let t = mkp(9); return takep(t); }
+fn main() {
+  println(loop3());
+  println(forloop());
+  println(second());
+  println(noloop());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "27\n27\n30\n9\n",
+                "the RC box must stay the only owner under auto-par too; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-07-23, auto-par twin of
     /// `e2e_rc_boxed_projection_copies_instead_of_sharing_an_owner`.
     ///

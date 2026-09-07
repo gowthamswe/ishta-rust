@@ -7702,9 +7702,15 @@ impl<'ctx> Codegen<'ctx> {
         // prologue may act on it. Runs here, after `uam_consume_sites` is
         // seeded by `load_rc_fallback` (the reused-binding sites it must
         // exclude live there) and before any function compiles.
+        // B-2026-09-07-29 — and the RC-FALLBACK PROMOTED bindings, which are the
+        // ownership pass's OTHER answer to "this source is read again after the
+        // consume". `load_rc_fallback` seeds both tables from the same result,
+        // so this reads the promotion set at exactly the point the walk already
+        // reads the use-after-move set.
         let transferable = crate::codegen::param_transfer::compute_transferable_struct_params(
             program,
             &self.span_tables.uam_consume_sites,
+            &self.drop_rc.rc_fallback_fns,
         );
         self.transfer_struct_params = transferable;
         // B-2026-09-06-69 — the CONDITIONAL hand-back's call-site gate, computed

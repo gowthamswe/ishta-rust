@@ -47,7 +47,12 @@
 //!     own-mode parameter — never a `ref`/`mut ref` parameter, whose buffers
 //!     belong to a frame further up), and
 //!   * is NOT in `use_after_move_consume_sites`, i.e. the ownership pass did not
-//!     report the source as read again after this move.
+//!     report the source as read again after this move, and
+//!   * was NOT RC-FALLBACK PROMOTED by that pass, which is its OTHER answer for
+//!     a source that outlives its consume and the one it gives for a consume
+//!     inside a LOOP (B-2026-09-07-29). See `FrameOwned::rc_promoted`: the
+//!     caller's retraction cannot fire against a `{i64 rc, T}` box handle, so
+//!     admitting such a site is a double free once per trip.
 //!
 //! Every other shape disqualifies: a fresh temp (`eat(mk())`, `eat(R { .. })`)
 //! whose caller-side cleanup is registered by
@@ -134,11 +139,59 @@ struct FrameOwned {
     /// by value elsewhere in the same function, which is the cheap side of the
     /// trade.
     assigned: FxHashSet<String>,
+    /// Names the ownership pass RC-FALLBACK PROMOTED in this frame
+    /// (`OwnershipCheckResult::rc_values`, reaching here through
+    /// `Codegen::drop_rc.rc_fallback_fns`). Subtracted for the same reason
+    /// `Cx::uam` excludes a use-after-move consume site, and it is the SECOND
+    /// HALF of that same condition rather than a new rule (B-2026-09-07-29).
+    ///
+    /// The gate's own statement of transfer-safety is "names a binding the
+    /// enclosing function owns AND that the ownership pass did not report as
+    /// read again after this move". A consume the source outlives has TWO
+    /// possible answers from that pass, not one: report `UseAfterMove` — the
+    /// `uam_consume_sites` half, already excluded — or RC-FALLBACK PROMOTE the
+    /// binding, which is what it does for a consume inside a LOOP (`while i <
+    /// 3 { takep(t); .. }`, the shape whose note reads `RC fallback inserted
+    /// for 't' (direct re-use after consume)`). Only the first was subtracted,
+    /// so the second admitted the param.
+    ///
+    /// Admitting it is a double free per TRIP, because the caller's half of the
+    /// bargain cannot be paid. A promoted binding's alloca holds a `{i64 rc, T}`
+    /// box HANDLE and its cleanup is an `RcDec` on the box, so
+    /// `move_transferred_struct_arg`'s retraction — a `StructDrop`/`UserDrop`
+    /// scan keyed on the binding — matches nothing and silently no-ops, exactly
+    /// as its own doc says it will ("a no-op when no struct drop was registered
+    /// for the binding"). The callee then takes buffers the box never gave up.
+    /// Measured at -O0 and -O2 and on the JIT: 25 allocs against 26 / 27 / 28 /
+    /// 30 frees at 1 / 2 / 3 / 5 trips, `free(): double free detected in tcache
+    /// 2` before the program can print, against an interpreter that prints its
+    /// output and exits clean.
+    ///
+    /// Nor can the box give the buffer up: the binding is promoted PRECISELY
+    /// because it is read again on the next iteration, so the box has to go on
+    /// owning it — the same conclusion B-2026-09-07-23 reached one shape over,
+    /// where the answer was likewise to leave the retaining owner alone and
+    /// change the consumer's side.
+    ///
+    /// Declining is the whole fix here, and it is cheap: the param falls back to
+    /// today's entry copy, which is what a `Drop`-bearing struct in this exact
+    /// shape already does (`struct_param_transfer_eligible` declines a type that
+    /// reaches a user `Drop`) — and that spelling is measurably clean at every
+    /// trip count, which is the control that says the entry-copy path handles
+    /// this shape correctly and only the transfer path did not.
+    ///
+    /// Whole-frame rather than per-site, like `borrowed` and `assigned` above:
+    /// the set is per-FUNCTION in the ownership result, and a binding promoted
+    /// anywhere in a frame is never transferred from it.
+    rc_promoted: FxHashSet<String>,
 }
 
 impl FrameOwned {
     fn admits(&self, name: &str) -> bool {
-        self.owned.contains(name) && !self.borrowed.contains(name) && !self.assigned.contains(name)
+        self.owned.contains(name)
+            && !self.borrowed.contains(name)
+            && !self.assigned.contains(name)
+            && !self.rc_promoted.contains(name)
     }
 }
 
@@ -188,6 +241,7 @@ impl Cx<'_> {
 pub(super) fn compute_transferable_struct_params(
     program: &Program,
     uam_consume_sites: &std::collections::HashSet<(usize, usize)>,
+    rc_fallback_bindings: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> FxHashSet<ParamKey> {
     if std::env::var("KARAC_MOVE_STRUCT_PARAMS").as_deref() == Ok("0") {
         return FxHashSet::default();
@@ -233,12 +287,23 @@ pub(super) fn compute_transferable_struct_params(
     // call records are classified against that frame. Splitting it this way is
     // what lets a call site anywhere in the body be judged against a `let` that
     // appears later in it.
-    for region in all_regions(program) {
+    for (fn_key, region) in all_regions(program) {
         let params: &[Param] = match region {
             Region::Body(p, _) => p,
             Region::Loose(_) => &[],
         };
         let mut fr = frame_of(params);
+        // B-2026-09-07-29 — the frame's RC-fallback-promoted bindings, keyed the
+        // way the ownership pass keys them (bare name for a free function,
+        // `Type.method` for an impl method). A region with no key is one the
+        // ownership pass does not visit at all — a trait default body, a test
+        // case, a `const` initializer — so it has no promotions to subtract;
+        // see `all_regions`.
+        if let Some(k) = fn_key.as_deref() {
+            if let Some(names) = rc_fallback_bindings.get(k) {
+                fr.rc_promoted.extend(names.iter().cloned());
+            }
+        }
         let mut calls: Vec<(String, &[crate::ast::CallArg])> = Vec::new();
         let mut callees: FxHashSet<*const Expr> = FxHashSet::default();
         let mut mentions: Vec<(String, *const Expr)> = Vec::new();
@@ -339,15 +404,27 @@ enum Region<'a> {
 /// memory is exactly how one gets missed — `TestCase` carries a `Block` and
 /// `ConstDecl` / `ModuleBinding` carry an initializer `Expr`, none of which look
 /// like function definitions.
-fn all_regions(program: &Program) -> Vec<Region<'_>> {
-    let mut out: Vec<Region<'_>> = Vec::new();
+fn all_regions(program: &Program) -> Vec<(Option<String>, Region<'_>)> {
+    let mut out: Vec<(Option<String>, Region<'_>)> = Vec::new();
     for item in &program.items {
         match item {
-            Item::Function(f) => out.push(Region::Body(&f.params, &f.body)),
+            Item::Function(f) => out.push((Some(f.name.clone()), Region::Body(&f.params, &f.body))),
             Item::ImplBlock(b) => {
+                // The ownership pass's own key for a method body
+                // (`OwnershipChecker::check_function`): the impl target's LAST
+                // path segment, then `.`, then the method name. Built the same
+                // way here — and to the same `TypeKind::Path`-only restriction,
+                // where that pass `continue`s — so a lookup into `rc_values`
+                // either hits the right frame or misses a frame that pass never
+                // recorded anything for.
+                let type_name = match &b.target_type.kind {
+                    TypeKind::Path(p) => p.segments.last().cloned(),
+                    _ => None,
+                };
                 for inner in &b.items {
                     if let ImplItem::Method(m) = inner {
-                        out.push(Region::Body(&m.params, &m.body));
+                        let key = type_name.as_ref().map(|t| format!("{}.{}", t, m.name));
+                        out.push((key, Region::Body(&m.params, &m.body)));
                     }
                 }
             }
@@ -355,16 +432,23 @@ fn all_regions(program: &Program) -> Vec<Region<'_>> {
                 for inner in &t.items {
                     if let TraitItem::Method(m) = inner {
                         if let Some(body) = &m.body {
-                            out.push(Region::Body(&m.params, body));
+                            // No key: `check_function` is reached only from
+                            // `Item::Function` and `Item::ImplBlock`, so a trait
+                            // DEFAULT body is never ownership-checked and can
+                            // carry no RC-fallback promotion. Codegen agrees —
+                            // `is_rc_fallback_binding` reads the same table — so
+                            // nothing there is boxed either.
+                            out.push((None, Region::Body(&m.params, body)));
                         }
                     }
                 }
             }
             // A test body is ordinary code and calls ordinary functions; it is
-            // simply not spelled `fn`.
-            Item::TestCase(t) => out.push(Region::Body(&[], &t.body)),
-            Item::ConstDecl(c) => out.push(Region::Loose(&c.value)),
-            Item::ModuleBinding(m) => out.push(Region::Loose(&m.value)),
+            // simply not spelled `fn`. Keyless for the same reason as a trait
+            // default body.
+            Item::TestCase(t) => out.push((None, Region::Body(&[], &t.body))),
+            Item::ConstDecl(c) => out.push((None, Region::Loose(&c.value))),
+            Item::ModuleBinding(m) => out.push((None, Region::Loose(&m.value))),
             // Carry no expression that can contain a call: type and effect
             // declarations, imports, aliases, and `extern` signatures (whose
             // bodies live in another language entirely).
@@ -847,7 +931,7 @@ pub(crate) fn compute_handback_safe_params(program: &Program) -> FxHashSet<Param
     }
     let mut poisoned: FxHashSet<String> = FxHashSet::default();
 
-    for region in all_regions(program) {
+    for (_, region) in all_regions(program) {
         let params: &[Param] = match region {
             Region::Body(p, _) => p,
             Region::Loose(_) => &[],

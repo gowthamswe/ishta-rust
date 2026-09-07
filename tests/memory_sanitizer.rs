@@ -65286,6 +65286,229 @@ fn main() { println(go()); }
         );
     }
 
+    /// B-2026-09-07-29 — a WHOLE consume inside a loop that actually RUNS
+    /// double-frees an RC-fallback-promoted local, with no projection anywhere
+    /// in the program.
+    ///
+    ///     fn takep(p: P) -> i64 { return p.b; }
+    ///     let t = mkp(9); while i < 3i64 { takep(t); i = i + 1; }
+    ///
+    /// `takep(t)` consumes the WHOLE binding — there is no `t.a` here, which is
+    /// what separates this from the projection family (B-2026-09-07-19 /
+    /// -23 / B-2026-09-01-5) and from every disarm those rows touch.
+    ///
+    /// THE DEFECT IS IN THE TRANSFER GATE, not in the box. The whole-program
+    /// prepass (`codegen::param_transfer`) admits a by-value struct param as
+    /// owned by TRANSFER — the callee takes the caller's buffers and the caller
+    /// retracts its own drop in lockstep — only when EVERY call site passes it
+    /// in a shape whose caller-side owner can actually be retracted. Its own
+    /// statement of that shape is "an `Identifier` naming a binding the frame
+    /// owns, that the ownership pass did not report as read again after this
+    /// move", and it enforced the second clause by subtracting
+    /// `use_after_move_consume_sites`.
+    ///
+    /// But that pass has TWO answers for a consume the source outlives, and
+    /// `UseAfterMove` is only one of them: for a consume inside a LOOP it
+    /// RC-FALLBACK PROMOTES the binding instead (`perf[rc-fallback]: RC
+    /// fallback inserted for 't' (direct re-use after consume)`). Those sites
+    /// were never subtracted, so the param was admitted and the caller could
+    /// not pay its half — a promoted binding's alloca holds a `{i64 rc, T}` box
+    /// HANDLE and its cleanup is an `RcDec`, so `move_transferred_struct_arg`'s
+    /// retraction finds no `StructDrop` keyed on the binding and silently
+    /// no-ops, exactly as its own doc says it will. Both frames then free.
+    ///
+    /// THE TRIP COUNT IS THE AXIS, and it is why five of these cells differ
+    /// only in it. B-2026-09-07-17 fixed the same `takep(t)`-in-a-loop shape
+    /// and its regression cells all either never ENTER the loop or carry a user
+    /// `Drop` — so the executing loop was an untested axis of that fix in
+    /// exactly the way it was of B-2026-09-07-19's. Measured on the parent at
+    /// -O0: 25 allocs against 26 / 27 / 28 / 30 frees at 1 / 2 / 3 / 5 trips,
+    /// with `free(): double free detected in tcache 2` killing the program
+    /// before it prints, on the JIT and at both optimization levels.
+    ///
+    /// THE FIX DECLINES THE TRANSFER; it does not move an owner. The box has to
+    /// go on owning the value — the binding is promoted precisely because the
+    /// next iteration reads it — which is the same conclusion B-2026-09-07-23
+    /// reached one shape over. Declining puts the param back on the entry copy,
+    /// so the callee frees a buffer of its own: every extra free above becomes
+    /// a matching alloc (26/26, 27/27, 28/28, 30/30).
+    ///
+    /// CELL 8 IS WHY THAT IS THE RIGHT SHAPE OF FIX rather than a guess. Give
+    /// `P` an `impl Drop` and the identical program was ALWAYS clean, because
+    /// `struct_param_transfer_eligible` already declines a type that reaches a
+    /// user `Drop` — so the entry-copy path was demonstrably handling this
+    /// shape correctly all along, and only the transfer path was not.
+    #[test]
+    fn asan_whole_consume_in_a_running_loop_keeps_the_rc_box_the_only_owner() {
+        const OWN: &str = "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn takep(p: P) -> i64 { return p.b; }\n\
+             fn main() { println(esc()); }\n";
+        // 1 — the row's own spelling. Three trips, three extra frees on the
+        // parent, and the program aborts before `println` can run.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn esc() -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20 while i < 3i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return r; }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_three_trips",
+            10,
+        );
+        // 2 — ONE trip: the smallest cell that is dirty on the parent, and the
+        // one that shows the damage is per-ITERATION rather than per-loop.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn esc() -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20 while i < 1i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return r; }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_one_trip",
+            10,
+        );
+        // 3 — FIVE trips: five extra frees on the parent, the other end of the
+        // scaling.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn esc() -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20 while i < 5i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return r; }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_five_trips",
+            10,
+        );
+        // 4 — the `for` spelling. The promotion is about the consume being
+        // inside a LOOP, not about which loop keyword spells it.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn esc() -> String {{ let t = mkp(9); let mut r = payload();\n\
+                 \x20 for _k in 0i64..3i64 {{ takep(t); }}\n\
+                 \x20 return r; }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_for_loop",
+            10,
+        );
+        // 5 — NO surviving local. The returned `r` in the cells above is
+        // incidental; a freshly-minted return measures identically.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn esc() -> String {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return payload(); }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_fresh_return",
+            10,
+        );
+        // 6 — CONTROL: no loop, so no promotion. `t` is consumed once and the
+        // caller's retraction really can fire, which is the population the
+        // transfer gate exists to serve. It must keep its transfer.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn esc() -> String {{ let t = mkp(9); let mut r = payload();\n\
+                 \x20 takep(t);\n\
+                 \x20 return r; }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_control_no_loop",
+            10,
+        );
+        // 7 — CONTROL: the loop is NEVER ENTERED. Promotion is static, so `t`
+        // is boxed here too — but no call happens, so nothing is transferred
+        // and this cell was clean on the parent. It is B-2026-09-07-17's own
+        // shape, kept so a regression there fails here as well.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn esc() -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20 while i < 0i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return r; }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_control_never_entered",
+            10,
+        );
+        // 8 — CONTROL, and the cell that pinned the fix's shape: the same
+        // program with an `impl Drop for P`. Transfer eligibility already
+        // declines a type that reaches a user `Drop`, so this was clean on the
+        // parent at every trip count — the entry-copy path handling the shape
+        // correctly while the transfer path did not. The body fires ONCE, from
+        // the box, not once per trip.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}impl Drop for P {{ fn drop(mut ref self) {{ println(f\"dP{{self.b}}\"); }} }}\n\
+                 fn esc() -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20 while i < 3i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return r; }}\n"
+            ),
+            &["dP9", "payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_control_user_drop",
+            10,
+        );
+        // 9 — CONTROL for the PER-FUNCTION keying. The promotion set is read by
+        // the ownership pass's own fn key, so a promoted `t` in one frame must
+        // not disqualify a DIFFERENT callee consumed from an unpromoted `t` in
+        // another. `takeq` keeps its transfer; both frames stay clean.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn takeq(p: P) -> i64 {{ return p.b; }}\n\
+                 fn plain() -> i64 {{ let t = mkp(4); return takeq(t); }}\n\
+                 fn esc() -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20 while i < 3i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 println(plain());\n\
+                 \x20 return r; }}\n"
+            ),
+            &["4", "payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_control_other_frame_keeps_transfer",
+            10,
+        );
+        // 10 — the promoted binding in the SECOND parameter slot, beside a
+        // fresh temp that disqualifies the first on its own. The gate is keyed
+        // by `(callee, index)`, so this asserts the decline lands on the index
+        // the promoted argument actually occupies.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn two(x: P, y: P) -> i64 {{ return x.b + y.b; }}\n\
+                 fn esc() -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20 while i < 3i64 {{ two(mkp(1), t); i = i + 1; }}\n\
+                 \x20 return r; }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_second_param_slot",
+            10,
+        );
+        // 11 — the promoted binding lives in an IMPL METHOD's frame, not a free
+        // function's. The promotion set is keyed the way the ownership pass
+        // keys it -- bare name for a free fn, `Type.method` for a method -- and
+        // this cell is what makes that arm load-bearing rather than assumed.
+        // Verified by neutering just that key and rebuilding: this program goes
+        // to 25 allocs / 28 frees with 3 errors at three trips and 25/30 with 5
+        // at five, aborting before it prints, exactly as the free-function
+        // spelling does. With the key intact it is flat 24/24 at every trip
+        // count -- note this frame lands on caller-retains rather than on the
+        // entry copy the free-function cells take, which is a different
+        // non-transfer path and equally correct.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}struct Runner {{ id: i64 }}\n\
+                 impl Runner {{\n\
+                 \x20 fn drive(ref self) -> String {{ let t = mkp(9); let mut i = 0i64; let mut r = payload();\n\
+                 \x20   while i < 3i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20   return r; }}\n\
+                 }}\n\
+                 fn esc() -> String {{ let q = Runner {{ id: 1 }}; return q.drive(); }}\n"
+            ),
+            &["payload-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            "rc_promoted_whole_consume_inside_an_impl_method",
+            10,
+        );
+    }
+
     /// B-2026-09-07-23 — a heap field PROJECTED out of an RC-FALLBACK-PROMOTED
     /// local was freed by the destination AND by the box, once per loop
     /// iteration.

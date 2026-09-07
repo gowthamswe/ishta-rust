@@ -36219,6 +36219,157 @@ end
         );
     }
 
+    /// B-2026-09-07-29 — a WHOLE consume inside a loop that actually RUNS
+    /// double-frees an RC-fallback-promoted local. No projection is involved:
+    /// `takep(t)` takes the entire binding and there is no `t.a` in the
+    /// program, which is what separates this from the row directly below.
+    ///
+    /// The whole-program transfer gate (`codegen::param_transfer`) may hand a
+    /// by-value struct param to the callee OUTRIGHT — no entry copy — only when
+    /// every call site passes a binding the caller can then stop owning. It
+    /// enforced that by subtracting `use_after_move_consume_sites`, which is
+    /// only ONE of the ownership pass's two answers for a source that outlives
+    /// its consume; for a consume inside a LOOP that pass RC-FALLBACK PROMOTES
+    /// the binding instead, and those sites were never subtracted. The promoted
+    /// binding's cleanup is an `RcDec` on a `{i64 rc, T}` box, so the caller's
+    /// retraction — a `StructDrop`/`UserDrop` scan keyed on the binding — finds
+    /// nothing and no-ops, and both frames free the same buffer, once per TRIP.
+    ///
+    /// STDOUT ALONE IS ENOUGH HERE, unlike its projection sibling below. This
+    /// double free lands inside the loop rather than at scope exit, so the
+    /// parent aborts with `free(): double free detected in tcache 2` BEFORE
+    /// printing anything and the stdout assertion fails on its own. The status
+    /// assertion is kept regardless, because which side of the print an abort
+    /// lands on is not a property worth relying on.
+    ///
+    /// The VALUES are what rule out the fix that looks equivalent. Declining
+    /// the callee's ownership instead of its transfer would leave the buffer
+    /// with no owner as soon as the callee touched it; taking the value OUT of
+    /// the box would give the second trip an emptied `t`. Every cell sums
+    /// `t.b` across its trips, so a `t` that lost its contents reads 0 rather
+    /// than 27 / 45 / 30 — and all four surfaces (interpreter, JIT, and the
+    /// compiled build at both auto-par settings) print what is pinned here.
+    #[test]
+    fn e2e_whole_consume_in_a_running_loop_keeps_the_rc_box_the_only_owner() {
+        // The payload must be HEAP-allocated: a string LITERAL does not
+        // allocate, so a literal-payload fixture gives the box no buffer for a
+        // second owner to free and pins nothing (measured on this family's
+        // sibling, which shipped such a fixture once).
+        const PRE: &str = r#"struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn takep(p: P) -> i64 { return p.b; }
+"#;
+        // (source tail, expected stdout, cell name)
+        let cells: [(&str, &str, &str); 8] = [
+            // 1 — the row's own spelling: three trips, three extra frees.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { n = n + takep(t); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "27",
+                "three_trips",
+            ),
+            // 2 — ONE trip: the smallest dirty cell, and the one that shows the
+            // damage is per-iteration rather than per-loop.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 1i64 { n = n + takep(t); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "9",
+                "one_trip",
+            ),
+            // 3 — FIVE trips, the other end of the scaling.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 5i64 { n = n + takep(t); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "45",
+                "five_trips",
+            ),
+            // 4 — the `for` spelling: the promotion is about the consume being
+            // inside a loop, not about the keyword.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut n = 0i64;
+  for _k in 0i64..3i64 { n = n + takep(t); }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "27",
+                "for_loop",
+            ),
+            // 5 — CONTROL: no loop, so no promotion. This is the population the
+            // transfer gate exists to serve; it must keep its transfer.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); return takep(t); }
+fn main() { println(go()); }
+"#,
+                "9",
+                "control_no_loop",
+            ),
+            // 6 — CONTROL: the loop is NEVER ENTERED. Promotion is static so
+            // `t` is still boxed, but nothing is transferred — B-2026-09-07-17's
+            // own shape, kept so a regression there fails here too.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 0i64 { n = n + takep(t); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "0",
+                "control_never_entered",
+            ),
+            // 7 — CONTROL, and the cell that pinned the fix's shape: the same
+            // program with an `impl Drop for P`. A type reaching a user `Drop`
+            // was already transfer-INELIGIBLE, so this was clean on the parent
+            // — the entry-copy path handling the shape correctly while the
+            // transfer path did not. The body fires ONCE, from the box, not
+            // once per trip.
+            (
+                r#"impl Drop for P { fn drop(mut ref self) { println(f"dP{self.b}"); } }
+fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { n = n + takep(t); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "dP9\n27",
+                "control_user_drop_fires_once",
+            ),
+            // 8 — the promoted binding in the SECOND parameter slot, beside a
+            // fresh temp that disqualifies the first on its own. The gate is
+            // keyed by `(callee, index)`.
+            (
+                r#"fn two(x: P, y: P) -> i64 { return x.b + y.b; }
+fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { n = n + two(mkp(1), t); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "30",
+                "second_param_slot",
+            ),
+        ];
+        for (tail, want, name) in cells {
+            let Some(cap) = run_program_capturing(&format!("{PRE}{tail}")) else {
+                return;
+            };
+            assert_eq!(cap.stdout.trim(), want, "cell {name}: stdout");
+            assert!(
+                cap.status.success(),
+                "cell {name}: exited {:?}; stderr={:?}",
+                cap.status,
+                cap.stderr
+            );
+        }
+    }
+
     /// B-2026-09-07-23 — a heap field PROJECTED out of an RC-FALLBACK-PROMOTED
     /// local shared one buffer with the box, and both freed it once per loop
     /// iteration. (Its never-entered sibling, B-2026-09-07-19, is clean and was
