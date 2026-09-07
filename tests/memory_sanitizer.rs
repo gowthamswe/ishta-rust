@@ -8166,6 +8166,70 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-13 — the OWNERSHIP half of
+    /// `test_e2e_stored_enum_argument_is_owned_by_its_new_home_not_the_caller`.
+    ///
+    /// That row's defect was a DOUBLE `Drop` BODY with balanced memory, so this
+    /// fixture is not asserting that the fix stopped a leak — it is asserting
+    /// that standing the caller down did not START one. The carve-out drops the
+    /// caller's `Drop` body and its payload walker on the escape path and keeps
+    /// ONLY the memory registration; the failure mode to guard is therefore the
+    /// mirror image of the row's own, and it is exactly the trade
+    /// B-2026-09-07-5 refused when it declined to widen the shared predicate:
+    /// stand the whole registration down and the callee's entry copy leaves the
+    /// caller's original orphaned. LSan is the only gate that can see that,
+    /// because the output is correct either way.
+    ///
+    /// `Es`-ONLY, and both omissions are deliberate rather than incidental. The
+    /// `Ev` cells of the E2E fixture carry a `shared` field whose 16-byte
+    /// refcount block is stranded on the CORRECT ctor cell too
+    /// (B-2026-09-06-72's class, not this row's), and the return-route cell
+    /// strands its payload at `-O0` — an `-O0`-only residual that `-O2` hides by
+    /// eliding the dead malloc, on a path this row's arm never runs for. Both
+    /// are pre-existing and filed separately; carrying either here would pin a
+    /// defect this fix neither caused nor addresses.
+    ///
+    /// All four legs are present — method (`a`), free (`c`), assoc (`d`),
+    /// monomorph (`e`) — plus the ctor spelling (`b`) that was already correct
+    /// and a plain `let` (`f`). Measured on the fix: 27 allocs / 27 frees at
+    /// `-O2`, 28 / 28 at `-O0`, 0 valgrind errors at both.
+    fn asan_stored_enum_argument_is_owned_by_its_new_home_not_the_caller() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+enum Es { A(String), B }
+impl Drop for Es { fn drop(mut ref self) { println("dEs") } }
+fn mkes(i: i64) -> Es { return Es.A(f"e{i}"); }
+impl Es { fn is_a(ref self) -> i64 { match self { Es.A(s) => { return 1; } Es.B => { return 0; } } } }
+
+struct BoxS { mut ys: Vec[Es] }
+impl BoxS {
+    fn puts(mut ref self, e: Es) { self.ys.push(e); }
+    fn stash(b: mut ref BoxS, e: Es) { b.ys.push(e); }
+}
+fn pute(b: mut ref BoxS, e: Es) { b.ys.push(e); }
+fn stashg[T](v: mut ref Vec[T], x: T) { v.push(x); }
+
+fn c_meth()   { let mut d = BoxS { ys: Vec.new() }; d.puts(mkes(61)); println(f"a{d.ys.len()}"); }
+fn c_ctor()   { let mut d = BoxS { ys: Vec.new() }; d.puts(Es.A("z")); println(f"b{d.ys.len()}"); }
+fn c_free()   { let mut d = BoxS { ys: Vec.new() }; pute(mut d, mkes(76)); println(f"c{d.ys.len()}"); }
+fn c_assoc()  { let mut d = BoxS { ys: Vec.new() }; BoxS.stash(mut d, mkes(78)); println(f"d{d.ys.len()}"); }
+fn c_generic(){ let mut v: Vec[Es] = Vec.new(); stashg(mut v, mkes(75)); println(f"e{v.len()}"); }
+fn c_plain()  { let e = mkes(79); println(f"f{e.is_a()}"); }
+
+fn main() {
+    c_meth(); c_ctor(); c_free(); c_assoc(); c_generic(); c_plain();
+    println("end");
+}
+"#,
+            &[
+                "a1", "dEs", "b1", "dEs", "c1", "dEs", "d1", "dEs", "e1", "dEs", "f1", "dEs", "end",
+            ],
+            "b0907-13-stored-enum-arg",
+            20,
+        );
+    }
+
+    #[test]
     /// B-2026-09-07-5 — the FREEING half of
     /// `test_e2e_stored_argument_is_owned_by_its_new_home_not_the_caller`.
     ///

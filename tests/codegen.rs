@@ -5912,6 +5912,102 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-13 — the ENUM twin of
+    /// `test_e2e_stored_argument_is_owned_by_its_new_home_not_the_caller`, and
+    /// the row that twin's own fix note deferred.
+    ///
+    /// A stored enum argument ran its `Drop` body TWICE on every compiled
+    /// backend in the FN-CALL spelling only: `b.put(mke(60))` over
+    /// `fn put(mut ref self, e: Ev) { self.xs.push(e); }` printed
+    /// `dEv a1 dEv` under `karac run` and at both opt levels against
+    /// `--interp`'s `a1 dEv`, while `b.put(Ev.A(77, ..))` — the same type into
+    /// the same callee — was correct everywhere.
+    ///
+    /// THE SPELLING IS THE DISCRIMINATOR BECAUSE IT PICKS THE REGISTRAR ARM.
+    /// `track_inline_owned_aggregate_arg_inst`'s CTOR arm has stood down on the
+    /// escape path since B-2026-08-01-14 (memory alone via `track_enum_var`,
+    /// then return); its FN-CALL-RETURNED arm gated the same carve-out on
+    /// `is_struct`, with a note claiming "the enum leg's dual registration
+    /// below has no memory-half-alone form". The ctor arm was that form. So an
+    /// enum temp produced by a CALL fell through to the dual registration and
+    /// the caller became a second owner of a body the value's new home already
+    /// runs.
+    ///
+    /// FOUR LEGS FROM ONE ARM. The method (`a`), free-function (`d`), assoc-fn
+    /// (`e`) and MONOMORPH (`f`) legs all doubled, and all four are fixed by
+    /// the single carve-out, because `method_call.rs`, `assoc_call.rs`,
+    /// `call_dispatch.rs` and `mono.rs` share this registrar. That is what
+    /// separates this row from B-2026-09-06-70's and B-2026-09-07-5's per-leg
+    /// gaps.
+    ///
+    /// `b` AND `g`/`h` ARE THE CONTROLS, and they are the reason the fix is a
+    /// carve-out rather than a wider predicate. `b` is the ctor spelling, which
+    /// reaches the arm that was already right. `g` (`let z = passe(mkes(71))`)
+    /// is the RETURN route, whose registration the free-leg gate declines
+    /// outright — so this arm never runs for it, and its behaviour is unchanged
+    /// here by construction. `h` is a plain `let`, owned by its binding.
+    ///
+    /// MEMORY IS UNTOUCHED, deliberately: valgrind reports the same 3
+    /// errors / 48 B at `-O2` and 4 / 51 B at `-O0` before and after, all of it
+    /// the `shared` handle's refcount block (B-2026-09-06-72's class, carried by
+    /// the CORRECT ctor cell too) plus the return route's own `-O0` residual.
+    /// No A/B leak gate could ever see this defect — it was one body too many,
+    /// not one byte.
+    ///
+    /// Non-vacuous on the parent: five compiled surfaces print six doubled
+    /// bodies against a correct `--interp`.
+    fn test_e2e_stored_enum_argument_is_owned_by_its_new_home_not_the_caller() {
+        let out = run_program(
+            r#"
+shared struct In2 { v: i64 }
+enum Ev { A(i64, In2), B }
+impl Drop for Ev { fn drop(mut ref self) { println("dEv") } }
+fn mke(i: i64) -> Ev { return Ev.A(i, In2 { v: i }); }
+
+enum Es { A(String), B }
+impl Drop for Es { fn drop(mut ref self) { println("dEs") } }
+fn mkes(i: i64) -> Es { return Es.A(f"e{i}"); }
+impl Es { fn is_a(ref self) -> i64 { match self { Es.A(s) => { return 1; } Es.B => { return 0; } } } }
+
+struct BoxE { mut xs: Vec[Ev] }
+impl BoxE {
+    fn put(mut ref self, e: Ev) { self.xs.push(e); }
+    fn stash(b: mut ref BoxE, e: Ev) { b.xs.push(e); }
+}
+struct BoxS { mut ys: Vec[Es] }
+impl BoxS { fn puts(mut ref self, e: Es) { self.ys.push(e); } }
+
+fn pute(b: mut ref BoxS, e: Es) { b.ys.push(e); }
+fn stashg[T](v: mut ref Vec[T], x: T) { v.push(x); }
+fn passe(e: Es) -> Es { return e; }
+
+fn c_meth()   { let mut b = BoxE { xs: Vec.new() }; b.put(mke(60)); println(f"a{b.xs.len()}"); }
+fn c_ctor()   { let mut b = BoxE { xs: Vec.new() }; b.put(Ev.A(77, In2 { v: 1 })); println(f"b{b.xs.len()}"); }
+fn c_meths()  { let mut d = BoxS { ys: Vec.new() }; d.puts(mkes(61)); println(f"c{d.ys.len()}"); }
+fn c_free()   { let mut d = BoxS { ys: Vec.new() }; pute(mut d, mkes(76)); println(f"d{d.ys.len()}"); }
+fn c_assoc()  { let mut b = BoxE { xs: Vec.new() }; BoxE.stash(mut b, mke(78)); println(f"e{b.xs.len()}"); }
+fn c_generic(){ let mut v: Vec[Es] = Vec.new(); stashg(mut v, mkes(75)); println(f"f{v.len()}"); }
+fn c_ret()    { let z = passe(mkes(71)); println(f"g{z.is_a()}"); }
+fn c_plain()  { let e = mkes(79); println(f"h{e.is_a()}"); }
+
+fn main() {
+    c_meth(); c_ctor(); c_meths(); c_free(); c_assoc(); c_generic(); c_ret(); c_plain();
+    println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out,
+                "a1\ndEv\nb1\ndEv\nc1\ndEs\nd1\ndEs\ne1\ndEv\nf1\ndEs\ng1\ndEs\nh1\ndEs\nend\n",
+                "a callee that stores a CALL-produced enum argument owns its \
+                 body; the caller keeps only the orphaned memory, exactly as \
+                 the ctor spelling already did; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-06-69 — a MIXED-PATH callee hands its by-value param back on
     /// one exit and lets it die on another, and exactly one frame frees it
     /// either way.

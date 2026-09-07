@@ -6168,15 +6168,47 @@ impl<'ctx> super::Codegen<'ctx> {
                             let slot =
                                 self.create_entry_alloca(cur_fn, "__owned_agg_tmp", agg_ty.into());
                             self.builder.build_store(slot, val).unwrap();
-                            if arg_escapes_frame && is_struct {
-                                // B-2026-07-30-12 — MEMORY ONLY, for the reason
-                                // spelled out at the struct-literal sibling
-                                // below: on the entry-copy passthrough path the
-                                // orphaned buffer is ours to free but the body
-                                // belongs to the result's consumer. Struct-only
-                                // because the enum leg's dual registration below
-                                // has no memory-half-alone form.
-                                self.track_struct_var(&ret_ty_name, slot);
+                            if arg_escapes_frame {
+                                // B-2026-07-30-12 — MEMORY ONLY: on the
+                                // entry-copy passthrough path the orphaned
+                                // buffer is ours to free but the body belongs to
+                                // the result's consumer (or, on the store route,
+                                // to the value's new home).
+                                //
+                                // B-2026-09-07-13 — the ENUM half. This read
+                                // `arg_escapes_frame && is_struct`, with the
+                                // note "the enum leg's dual registration below
+                                // has no memory-half-alone form" — but the CTOR
+                                // arm has had exactly that form since
+                                // B-2026-08-01-14 (`track_enum_var` alone, then
+                                // return), so the shape existed and only this
+                                // arm was short it. An enum temp that escaped
+                                // fell through to the dual registration and the
+                                // caller ran a `Drop` body the value's new home
+                                // runs too: `b.put(mke(60))` over `fn put(mut
+                                // ref self, e: Ev) { self.xs.push(e); }` printed
+                                // `dEv len=1 dEv` under `karac run` and at both
+                                // opt levels against `--interp`'s `len=1 dEv`.
+                                //
+                                // THE SPELLING WAS THE WHOLE DISCRIMINATOR, and
+                                // this is why: `b.put(Ev.A(77, ..))` is claimed
+                                // by the ctor arm, which stands down here, while
+                                // only a CALL-returned enum reaches this one.
+                                // Memory is untouched either way, which is what
+                                // kept it invisible to every A/B leak gate — the
+                                // defect was one body too many, not one byte.
+                                //
+                                // The memory predicate is the ctor arm's
+                                // `enum_drop_switch_does_work`, not the
+                                // `enum_has_heap_payload` this arm uses below: a
+                                // temp whose only drop work is freeing an
+                                // `Option`/`Result` payload BOX still has no
+                                // binding to own it here (B-2026-08-06-9 leg B).
+                                if is_struct {
+                                    self.track_struct_var(&ret_ty_name, slot);
+                                } else if self.enum_drop_switch_does_work(&ret_ty_name) {
+                                    self.track_enum_var(&ret_ty_name, slot);
+                                }
                                 return;
                             }
                             // B-2026-08-28-21, fn-call arm — same mask as the
