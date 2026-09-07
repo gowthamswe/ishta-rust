@@ -93,9 +93,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 393 |
-| run-vs-build | 366 |
-| leak | 287 |
-| double-free | 207 |
+| run-vs-build | 367 |
+| leak | 289 |
+| double-free | 208 |
 | missing-feature | 194 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
@@ -104,13 +104,13 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | perf | 95 |
 | other | 80 |
 | crash | 75 |
-| use-after-free | 31 |
+| use-after-free | 32 |
 
 ### By surface
 
 | surface | total |
 |---|---|
-| codegen | 1561 |
+| codegen | 1566 |
 | interp | 401 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -132,7 +132,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 |---|---|---|---|---|---|
 | B-2026-08-28-76 | 2026-08-28 | autopar | high | AUTO-PAR RETURNS 1.08x FOR 15.7 CORES on the M5 (kata:288) and 3.09x (kata:282), against 3.06x/3.87x on 4 HOMOGENEOUS container cores -- the parallel lane burns 3.1-5.1x the sequential lane's USER CPU where the container burned 1.00x, and NO KARAC_PAR_WORKERS setting recovers it | kata:288-README |
 | B-2026-08-28-77 | 2026-08-28 | codegen | medium | kata:895 IS THE ONLY CORPUS ROW THAT GOT SLOWER ON THE FASTER HOST -- 26.50ms on 4 x86 container cores -> 29.63ms on the M5, while rust_ovf went 34.71 -> 16.49 (2.10x faster), go 1.68x and c 1.75x; kara falls from 1.31x AHEAD of checked Rust to 1.80x behind. Prime suspect: the map hash-tag probe is DISABLED on aarch64 for primitive keys | kata:895-README |
-| B-2026-09-01-5 | 2026-09-01 | codegen | low | A DISCARDED BRANCH LITERAL WHOSE FIELD IS A PROJECTION OFF A NAMED LOCAL STILL STRANDS 38 B -- `P { a: t.a, b: 1 }` is the half of B-2026-08-29-32's guard that B-2026-08-31-44 could NOT admit, because the aggregate-literal move takeover does not extend to named locals and admitting it double-frees in a loop | — |
 | B-2026-09-01-17 | 2026-09-01 | interp+codegen | low | THE PROJECTED SPELLING OF B-2026-08-31-35 STILL RUNS THE LOCAL'S `Drop` BODY TWICE -- `let _ = if c { W { r: t.r, b: 1 } } else { .. };` over a local `W` doubles on all three backends because the aggregate-literal source walker resolves a bare NAME and not a field projection, so the disarm e49a85f wired up never names `t` | — |
 | B-2026-09-01-23 | 2026-09-01 | codegen | low | THE BRANCH ARM-OWNER SLOT IS ONE PER CONSTRUCT AND RESET EACH PASS, so a branch inside a loop whose owner frame lives OUTSIDE the loop frees only the LAST pass's escaping value -- `while i < 3 { let k = if i > 0 { mkA(n) } else { t }.contains("aaa"); }` strands `iterations - 1` of them (42 B in 2 blocks at 3 iterations, 72 B in 4 at 5); the same branch with the sibling binding declared INSIDE the loop body is clean, which isolates the frame CHOICE rather than the slot as the cause | — |
 | B-2026-09-01-27 | 2026-09-01 | interp | low | A FRESH-TEMP owned argument DESTRUCTURED inside a method runs the right Drop bodies in the WRONG ORDER -- the payload's body fires before the enum shell's under `--interp` and after it on both compiled backends, so the counts agree and the sequence does not | — |
@@ -166,12 +165,14 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-3 | 2026-09-07 | codegen | medium | THE FREE-FUNCTION ARGUMENT ADMISSION GATE STANDS THE CALLER DOWN ON A MIXED-PATH CALLEE AND LEAKS THE DIES-INSIDE LEG -- `fn pick3(r: R, k: bool) -> R { if k { return mk(96); } return r; }` called at `k = true` prints correctly and loses 19 B in 2 blocks (2 valgrind errors) on every compiled surface, because `call_arg_flows_into_return` admits on the UNION `fn_returns_param`, which is true for a param that escapes on one path and dies on another; the `return fwd(r)` spelling loses the same 19 B through `fn_returns_param_via_call` | src/codegen/call_dispatch.rs (compile_call's argument loop; the admission gate built on `call_arg_flows_into_return`) |
 | B-2026-09-07-4 | 2026-09-07 | codegen | high | A METHOD OR ASSOC-FN ARGUMENT ON A MIXED-PATH CALLEE STILL DOUBLE-FREES ON ITS ESCAPING LEG -- `impl Hold { fn pick(ref self, r: R, k: bool) -> R { if k { return mk(98); } return r; } }` at `k = false`, and its `return fwd(r)` sibling, abort `free(): double free detected in tcache 2` (3 valgrind errors) while the DIES-INSIDE leg of the same method is clean; B-2026-09-06-70's admission gate is deliberately ALL-PATHS and cannot reach these | src/codegen/method_call.rs and src/codegen/assoc_call.rs (the `always_handed_back` admission gate and its `handed_off` sibling); crate::ast::fn_conditionally_returns_param_bare |
 | B-2026-09-07-6 | 2026-09-07 | interp+codegen | medium | A WHOLE-TUPLE ARGUMENT TO A PASSTHROUGH METHOD OR ASSOC FN LOSES ITS ELEMENT'S `Drop` BODY ON EVERY COMPILED BACKEND -- `impl Hold { fn thrut(ref self, t: (Q, i64)) -> (Q, i64) { return t; } }` under `h.thrut((mkq(31), 7))` prints `m11=7 dQ31` under `--interp` and `m11=7` alone under `karac run` and at both opt levels, and the assoc twin `Q.passt` the same; the FREE-FUNCTION twin `fn passt(t: (Q, i64)) -> (Q, i64)` is correct on all five surfaces, so this is the method and assoc legs alone | src/codegen/method_call.rs (track_inline_owned_aggregate_arg_parts' `declared_elem_tes` argument, passed None) and src/codegen/assoc_call.rs (track_inline_owned_aggregate_arg, which has no such channel); callee_tuple_param_elem_type_exprs |
-| B-2026-09-07-7 | 2026-09-07 | codegen | medium | TWO SHIPPED ASAN FIXTURES FAIL AT THE DEFAULT -O2 ON `main`, AND A STALE RUNTIME ARCHIVE HAD BEEN MASKING THEM -- `asan_no_else_if_arm_owns_the_value_it_mints` and `asan_discarded_branch_literal_field_over_a_loop_outer_local_declines` each leak 38 B in 1 object on their `[control: field-is-a-place]` cell, which is B-2026-09-01-5's documented shape; both are red at `a3d6390`, at `9b686d4` and on a working tree, byte-identical, once the lean/full/unicode archives are rebuilt against current `runtime/src` | tests/memory_sanitizer.rs (asan_no_else_if_arm_owns_the_value_it_mints, asan_discarded_branch_literal_field_over_a_loop_outer_local_declines); tests/asan-o0-known-failures.txt; B-2026-09-01-5 owns the leak |
 | B-2026-09-07-8 | 2026-09-07 | codegen | high | A MIXED-PATH CALLEE REACHED WITH THE ENCLOSING FRAME'S OWN DECLINED-COPY PARAM DOUBLE-FREES, and the REBOUND spelling additionally runs one EXTRA `Drop` BODY ON EVERY SURFACE -- `fn g(a: R, c: bool) { f(a, c); }` over `fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(99); }` aborts `free(): double free detected in tcache 2` under `karac run` and at both opt levels on the hand-back path while `--interp` is correct, and `let q = a; f(q, c);` prints `dR1 g dR1` -- two bodies for one object -- on the interpreter AND the compiled backends alike, which no A/B gate and no sanitizer sees. B-2026-09-06-69's fix DELIBERATELY DECLINES this shape: its whole-program call-site gate disqualifies the callee outright, so behaviour here is the parent's | — |
-| B-2026-09-07-9 | 2026-09-07 | codegen | medium | THE `memory_sanitizer` SUITE HAS BEEN RED ON `main` SINCE 7542b0f -- `asan_no_else_if_arm_owns_the_value_it_mints` and `asan_discarded_branch_literal_field_over_a_loop_outer_local_declines` each lose 38 B in 1 block, bisected to the integer-formatting commit, which introduced NO ownership defect: it removed the `snprintf` call LLVM could see through, so the dead allocation chain now survives `-O2` DCE and the PRE-EXISTING discarded-branch-literal-field-is-a-place hole (B-2026-09-01-5's family, red at `-O0` since edb7236 per B-2026-09-06-51) is finally observable at the level the harness builds at. Every session now sees two failures that are not theirs | — |
 | B-2026-09-07-13 | 2026-09-07 | codegen | medium | A STORED ENUM ARGUMENT RUNS ITS `Drop` BODY TWICE ON EVERY COMPILED BACKEND, IN THE FN-CALL SPELLING ONLY -- `b.put(mke(60))` over `fn put(mut ref self, e: Ev) { self.xs.push(e); }` prints `dEv len=1 dEv` on `karac run` and at both opt levels against `len=1 dEv` under `--interp`, while the CTOR spelling `b.put(Ev.A(77, In2 { v: 1 }))` and the GENERIC leg `stashg(mut v, mkes(75))` are correct everywhere; memory is balanced, only the body is doubled | src/codegen/call_dispatch.rs (track_inline_owned_aggregate_arg_inst enum arm, payload_skip); arg_is_entry_copied_heap_enum resolution |
 | B-2026-09-07-15 | 2026-09-07 | codegen+interp | high | A MIXED-PATH CALLEE THAT HANDS ITS ARGUMENT BACK THROUGH ONE FURTHER CALL DOUBLE-FREES ON ITS HAND-BACK LEG -- `fn mvia(r: R, c: bool) -> R { if c { return f(r); } return mk(99); }` over `fn f(r: R) -> R { return r; }` and a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at both opt levels (2 valgrind errors at -O2, 3 at -O0) when `c = true`, while the DIES-INSIDE leg is clean and the same mixed callee with NO hop (`if c { return r; }`) is clean on all five surfaces since 6ef13bb; `--interp` runs the `Drop` body twice for one object. The intersection of B-2026-09-06-69 (mixed path, no hop) and B-2026-09-07-10 (a hop, all paths) is claimed by neither | — |
 | B-2026-09-07-16 | 2026-09-07 | codegen | high | A BY-VALUE ENUM PARAM WHOSE `NestedOwnedStruct` PAYLOAD OWNS HEAP STILL DOUBLE-FREES THAT HEAP -- the entry copy cannot duplicate contents the copy paths decline and neither frame stands down, so `sink(W.T(X1 { a: Option[i64], s: String }))` aborts `free(): double free detected in tcache 2` at -O0 and -O2 while `--interp` is right; the `Map`-field spellings SEGV instead, and an INLINE `Drop`-bearing payload is the clean control | — |
+| B-2026-09-07-18 | 2026-09-07 | codegen | medium | THE ENUM SIBLING OF B-2026-09-07-17 IS UNTOUCHED -- an RC-fallback-promoted local of a `Drop`-bearing ENUM loses its `Drop` body entirely on the compiled backends AND leaks its payload, and the no-`Drop` enum leaks the payload too, so the box's value-drop is wrong for enums on both axes | — |
+| B-2026-09-07-19 | 2026-09-07 | codegen | high | A `let`-BOUND STRUCT LITERAL WHOSE FIELD PROJECTS AN RC-PROMOTED LOCAL FREES FIVE BUFFERS IT DOES NOT OWN -- `while i < 0 { let p = P { a: t.a, b: 1 }; }` over a loop-outer `t` measures 17 allocs against 22 frees with three invalid frees, on a loop whose body NEVER RUNS | — |
+| B-2026-09-07-20 | 2026-09-07 | codegen | medium | `asan_stored_argument_is_owned_by_its_new_home_not_the_caller` LEAKS 35 B AT -O0 AND HAS SINCE THE DAY IT LANDED -- its `[b0907-5-outliving-store-admission]` cell loses 32 B in 2 objects plus 3 B in 1, clean at the default -O2, and nothing has run the -O0 leg since `d971ad5` added the fixture | — |
+| B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 
 ### Relocated
 
@@ -2106,6 +2107,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-01-2 | interp | medium | THE INTERPRETER LOSES A MIXED WRAP'S FRESH FIELD BODY WHEN THE VIEW FIELD IS MOVED OUT -- `let s = S3 { a: r, b: mk(2) }; let x = s.a;` prints `dR1`… | 8a3f0a8 |
 | B-2026-09-01-3 | interp+codegen | medium | THE TUPLE SPELLING OF B-2026-08-29-47 STILL DOUBLES A PARAM VIEW'S `Drop` BODY -- `let t = (r, 5); let x = t.0;` prints `dR1 dR1` where one is due, a… | 39d41b6 |
 | B-2026-09-01-4 | codegen | medium | READING A NON-`Copy` FIELD OUT OF A `ref` PARAM MINTS AN IMPLICIT DEEP COPY -- silently allocating and running a user `Drop` body the source never wr… | e207be3 |
+| B-2026-09-01-5 | codegen | low | A DISCARDED BRANCH LITERAL WHOSE FIELD IS A PROJECTION OFF A NAMED LOCAL STILL STRANDS 38 B -- `P { a: t.a, b: 1 }` is the half of B-2026-08-29-32's… | 9a50182d5 |
 | B-2026-09-01-6 | codegen | medium | CODEGEN DECLINES A NESTED `ref v[0][1]` WITH THE INTERNAL STRING `unreachable: Ref handled in compile_expr` WHILE THE INTERPRETER READS THE ELEMENT C… | b7674909 |
 | B-2026-09-01-7 | interp | medium | A BARE `if` WITH NO `else` IN STATEMENT POSITION, WHOSE ARM LITERAL CONSUMES A LIVE LOCAL, RUNS THAT LOCAL'S `Drop` BODY TWICE UNDER `--interp` AND O… | e49a85f |
 | B-2026-09-01-8 | codegen | low | CODEGEN'S ERROR CHANNEL CARRIES NO SPAN, SO EVERY `codegen failed: ...` DIAGNOSTIC IS SOURCE-LESS -- ~135 messages render as a bare sentence with no… | 71bb567 |
@@ -2352,10 +2354,13 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-71 | codegen | high | A NAMED-LOCAL ARGUMENT TO A PASSTHROUGH FREE FUNCTION DOUBLE-FREES -- `let a = mk(15); let z = f(a);` over `fn f(r: R) -> R { return r; }` and a stru… | 6b21fe8 |
 | B-2026-09-07-2 | codegen | medium | A DISCARDED ASSOCIATED-FUNCTION CALL REGISTERS NO OWNER AT ALL, so its returned value's `Drop` body runs on NO compiled backend and its heap leaks --… | c76f658 |
 | B-2026-09-07-5 | codegen | high | A METHOD THAT STORES ITS BY-VALUE ARGUMENT INTO `self` DOUBLE-FREES A DECLINED-COPY STRUCT -- `impl Box2 { fn push(mut ref self, r: R) { self.xs.push… | d971ad5 |
+| B-2026-09-07-7 | codegen | medium | TWO SHIPPED ASAN FIXTURES FAIL AT THE DEFAULT -O2 ON `main`, AND A STALE RUNTIME ARCHIVE HAD BEEN MASKING THEM -- `asan_no_else_if_arm_owns_the_value… | 9a50182d5 |
+| B-2026-09-07-9 | codegen | medium | THE `memory_sanitizer` SUITE HAS BEEN RED ON `main` SINCE 7542b0f -- `asan_no_else_if_arm_owns_the_value_it_mints` and `asan_discarded_branch_literal… | 9a50182d5 |
 | B-2026-09-07-10 | codegen+interp | high | A NAMED-LOCAL ARGUMENT TO A CALLEE THAT FORWARDS IT ONE HOP DOUBLE-FREES ON EVERY COMPILED BACKEND, AND THE INTERPRETER RUNS THE `Drop` BODY TWICE --… | 4d90d12 |
 | B-2026-09-07-11 | codegen | high | A NAMED-LOCAL ARGUMENT TO A METHOD THAT STORES IT DOUBLE-FREES A DECLINED-COPY STRUCT -- `let a = mk(28); b.push(a);` over `impl Box2 { fn push(mut r… | eae2779 |
 | B-2026-09-07-12 | interp | medium | A NAMED-LOCAL ARGUMENT TO A STORING METHOD RUNS ITS `Drop` BODY TWICE UNDER `--interp`, IN BOTH COPY CLASSES, WHILE THE FREE-FUNCTION TWIN IS CORRECT… | eae2779 |
 | B-2026-09-07-14 | codegen | medium | A DISCARDED ARM WHOSE TAIL IS AN AGGREGATE LITERAL OVER A NAMED LOCAL STRANDS THAT LOCAL'S BUFFER -- `let s = payload(); let _ = if n >= 0 { D { s: s… | 58e6a5b |
+| B-2026-09-07-17 | codegen | high | AN RC-FALLBACK-PROMOTED LOCAL'S USER `Drop` RUNS OVER THE RELEASED BOX AND FREES IT A SECOND TIME -- the binding's alloca holds a `{i64 rc, T}` box H… | 9a50182d5 |
 
 </details>
 
