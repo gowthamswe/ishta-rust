@@ -1,0 +1,27 @@
+// Spec'd-f-string twin of docs/investigations/autopar-alloc-scaling/alloc2.kara.
+// Identical shape and uniform per-iteration cost; the ONLY difference from the
+// plain-interpolation version is that the hole carries a width spec, so it
+// takes `compile_fstr_part_spec`'s inline `snprintf` path instead of
+// `karac_runtime_i64_to_str`.
+fn work(seed: i64) -> i64 {
+    let mut acc = seed + 1;
+    let mut k = 0;
+    while k < 600 {
+        let s = f"n{acc:5}-{k:3}";
+        let t = s + "x";
+        acc = (acc * 7 + t.len()) % 100000;
+        k = k + 1;
+    }
+    return acc % 1000;
+}
+
+fn main() {
+    let n = 720;
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n {
+        acc = acc + work(i);
+        i = i + 1;
+    }
+    println(f"sum {acc}");
+}

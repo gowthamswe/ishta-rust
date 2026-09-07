@@ -315,6 +315,32 @@ impl FormatSpec {
         }
     }
 
+    /// Radix operand for the runtime's allocation-free integer formatter,
+    /// `karac_runtime_i64_fmt`: `10`, `8`, `16` (lower) or `-16` (upper).
+    ///
+    /// This encoding lives HERE, beside [`Self::apply_int`], because two
+    /// separate places consume it — codegen stamps it as an LLVM constant, and
+    /// the runtime's oracle-agreement test decodes the same spec — and a
+    /// mapping duplicated at both ends is one that drifts. `Bin` never reaches
+    /// the fast path ([`Self::needs_runtime_formatter`] diverts it), so its arm
+    /// is a defined value rather than a panic, matching [`Self::int_conv`].
+    pub fn fast_radix_code(&self) -> i32 {
+        match self.radix {
+            Radix::Dec => 10,
+            Radix::Oct => 8,
+            Radix::Hex => 16,
+            Radix::HexUpper => -16,
+            Radix::Bin => 2,
+        }
+    }
+
+    /// Whether the numeric fast path left-aligns. Numerics default to RIGHT —
+    /// see [`Self::pad`]'s `default_left = false` — so only an explicit `<`
+    /// selects Left.
+    pub fn numeric_align_left(&self) -> bool {
+        self.align == Some(Align::Left)
+    }
+
     /// Build the printf conversion string codegen feeds to `snprintf` — e.g.
     /// `%04lld`, `%-8.2f`, `%6s`. `length_mod` is the C length modifier (`"ll"`
     /// for i64, `""` for double / string), `conv` the conversion char, and

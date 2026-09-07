@@ -73613,10 +73613,13 @@ fn main() {
     /// every byte identical and only costs speed.
     #[test]
     fn ir_integer_display_never_calls_snprintf() {
-        // Both spellings that used to reach `snprintf("%lld"/"%llu")`: the bare
-        // `println(int)` path (codegen/control_flow.rs) and plain f-string
-        // interpolation (codegen/runtime.rs). The third, the synthesized
-        // container Display (codegen/synth_display.rs), rides the Vec here.
+        // Every integer spelling that has ever reached `snprintf`: the bare
+        // `println(int)` path (codegen/control_flow.rs), plain f-string
+        // interpolation (codegen/runtime.rs), the synthesized container
+        // Display (codegen/synth_display.rs, riding the Vec here), and the
+        // SPEC'D hole — width, zero-pad and radix — which B-2026-09-05-23 left
+        // behind on snprintf and which therefore kept the whole pathology for
+        // `f"{n:5}"` while `f"{n}"` was fast.
         let ir = ir_for(
             r#"
 fn main() {
@@ -73627,6 +73630,7 @@ fn main() {
     println(b);
     println(f"{a}{b}");
     println(f"{v}");
+    println(f"{a:6}{b:06}{b:<4x}");
 }
 "#,
         );
@@ -73651,6 +73655,46 @@ fn main() {
             !main_body.contains("@snprintf"),
             "main must not CALL snprintf for integer display; found in:\n{main_body}"
         );
+    }
+
+    /// The SPEC'D integer path must render exactly what `snprintf` did.
+    ///
+    /// Verified byte-identical against the pre-change compiler over these
+    /// cases before the swap landed. The subtle ones: zero-pad inserts its
+    /// zeros BETWEEN the sign and the digits (`{-7:05}` -> `-0007`, not
+    /// `00-07` and not `-00007`), a width narrower than the number does not
+    /// truncate, and a negative value in a non-decimal radix reinterprets as
+    /// unsigned rather than growing a `-`.
+    #[test]
+    fn e2e_spec_integer_holes_match_the_snprintf_renderings() {
+        if let Some(out) = run_program(
+            r#"
+fn main() {
+    let min: i64 = -9223372036854775808;
+    let max: i64 = 9223372036854775807;
+    println(f"[{0:5}][{7:5}][{-7:5}][{123456:5}]");
+    println(f"[{42:<8}][{42:>8}][{-42:<8}]");
+    println(f"[{7:05}][{-7:05}][{0:05}]");
+    println(f"[{max:25}][{min:25}]");
+    println(f"[{max:025}][{min:025}]");
+    println(f"[{255:x}][{255:X}][{255:o}]");
+    println(f"[{255:08x}][{255:<8X}]");
+    println(f"[{-1:x}][{-1:o}]");
+    println(f"[{123456789:3}][{-123456789:3}]");
+}
+"#,
+        ) {
+            let want = "[    0][    7][   -7][123456]\n\
+                        [42      ][      42][-42     ]\n\
+                        [00007][-0007][00000]\n\
+                        [      9223372036854775807][     -9223372036854775808]\n\
+                        [0000009223372036854775807][-000009223372036854775808]\n\
+                        [ff][FF][377]\n\
+                        [000000ff][FF      ]\n\
+                        [ffffffffffffffff][1777777777777777777777]\n\
+                        [123456789][-123456789]\n";
+            assert_eq!(out, want, "spec'd integer rendering drifted");
+        }
     }
 
     /// B-2026-09-05-23 — the replacement formatter must agree with the old

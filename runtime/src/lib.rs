@@ -538,6 +538,7 @@ pub fn __preserve_no_mangle_symbols() -> usize {
         karac_runtime_f64_to_str,
         karac_runtime_i128_to_str,
         karac_runtime_i64_to_str,
+        karac_runtime_i64_fmt,
         karac_vec_sort_by,
         karac_vec_sort_i64_8,
         karac_vec_reverse,
@@ -9486,6 +9487,147 @@ pub unsafe extern "C" fn karac_runtime_i64_to_str(
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n as usize);
         }
         n
+    }
+}
+
+/// Format a 64-bit integer under a `f"{x:spec}"` specifier, into a
+/// caller-supplied buffer. Returns the byte length written.
+///
+/// The spec-carrying sibling of [`karac_runtime_i64_to_str`], and it exists for
+/// the same reason (B-2026-09-07-*): `f"{n}"` moved off libc `snprintf` in
+/// B-2026-09-05-23, but `f"{n:5}"` stayed on it, leaving two nearly identical
+/// spellings ~23x apart inside a parallel loop. Measured on the uniform
+/// 18-worker probe, the spec'd spelling still showed the full original
+/// pathology: system time 0.76 -> 553.46 ms across a worker sweep.
+///
+/// **The spec arrives PRE-DECODED as constants, not as text.** The existing
+/// `karac_runtime_fmt_int` re-parses the raw spec string and returns a
+/// `String` from `FormatSpec::apply_int`; routing the fast path there was
+/// measured at 97.73 ms against `snprintf`'s 23.71 ms single-threaded (4.1x
+/// WORSE) — the per-call parse plus allocation cost more than the lock saved.
+/// Codegen knows the spec at compile time, so it passes the decoded fields and
+/// this renders straight into `buf` with no parse, no allocation and no lock.
+///
+/// **This must agree with `FormatSpec::apply_int` / `apply_uint` byte for
+/// byte** — that pair is the interpreter's path, and the two backends are
+/// required to match. `format_spec::tests` pins the agreement over a matrix
+/// rather than leaving it to inspection. Only the subset codegen routes here
+/// is handled: `needs_runtime_formatter()` already diverts binary radix,
+/// center align and non-space fill, and `precision` is unused by the integer
+/// arms, so fill is always a space and align is Left or Right.
+///
+/// `radix` is `10`, `8`, `16` (lower) or `-16` (upper). `width` of 0 means no
+/// width. `align_left` selects Left; anything else is Right, the numeric
+/// default.
+///
+/// # Safety
+/// `buf` must point to at least `buf_len` writable bytes. A null `buf` or
+/// non-positive `buf_len` writes nothing and returns 0. Output is NOT
+/// NUL-terminated; the caller uses the returned length.
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_i64_fmt(
+    val: u64,
+    is_signed: i32,
+    radix: i32,
+    zero_pad: i32,
+    width: i64,
+    align_left: i32,
+    buf: *mut u8,
+    buf_len: i64,
+) -> i64 {
+    unsafe {
+        if buf.is_null() || buf_len <= 0 {
+            return 0;
+        }
+        let cap = buf_len as usize;
+
+        // `apply_int`: the sign is only taken in DECIMAL. In hex/octal the
+        // value is reinterpreted as unsigned, so `{-1:x}` renders the full
+        // 64-bit pattern rather than "-1".
+        let dec = radix == 10;
+        let neg = is_signed != 0 && dec && (val as i64) < 0;
+        let base: u64 = match radix {
+            8 => 8,
+            16 | -16 => 16,
+            _ => 10,
+        };
+        let upper = radix == -16;
+        // `unsigned_abs` for the same reason as `karac_runtime_i64_to_str`:
+        // negating `i64::MIN` as an `i64` overflows.
+        let mut mag: u64 = if neg { (val as i64).unsigned_abs() } else { val };
+
+        // 22 covers the longest rendering in any base handled here (octal
+        // u64::MAX is 22 digits); no bounds check needed inside the loop.
+        let mut scratch = [0u8; 24];
+        let mut i = scratch.len();
+        loop {
+            i -= 1;
+            let d = (mag % base) as u8;
+            scratch[i] = if d < 10 {
+                b'0' + d
+            } else if upper {
+                b'A' + (d - 10)
+            } else {
+                b'a' + (d - 10)
+            };
+            mag /= base;
+            if mag == 0 {
+                break;
+            }
+        }
+        let digits = &scratch[i..];
+        let sign_len = usize::from(neg);
+        let body = sign_len + digits.len();
+        let w = if width > 0 { width as usize } else { 0 };
+        let pad = w.saturating_sub(body);
+
+        // Cursor that silently drops anything past `cap`, so a caller buffer
+        // smaller than the rendering truncates instead of writing out of
+        // bounds. Codegen sizes the buffer as `max(64, width + 2)`, so this is
+        // a guard rather than an expected path.
+        let mut n = 0usize;
+        let put = |b: u8, n: &mut usize| {
+            if *n < cap {
+                // SAFETY: `*n < cap <= buf_len` writable bytes.
+                std::ptr::write(buf.add(*n), b);
+                *n += 1;
+            }
+        };
+
+        if zero_pad != 0 && pad > 0 {
+            // Zero-pad inserts zeros BETWEEN the sign and the digits
+            // (`{-7:05}` -> `-0007`), and ignores align entirely.
+            if neg {
+                put(b'-', &mut n);
+            }
+            for _ in 0..pad {
+                put(b'0', &mut n);
+            }
+            for &d in digits {
+                put(d, &mut n);
+            }
+        } else if align_left != 0 {
+            if neg {
+                put(b'-', &mut n);
+            }
+            for &d in digits {
+                put(d, &mut n);
+            }
+            for _ in 0..pad {
+                put(b' ', &mut n);
+            }
+        } else {
+            for _ in 0..pad {
+                put(b' ', &mut n);
+            }
+            if neg {
+                put(b'-', &mut n);
+            }
+            for &d in digits {
+                put(d, &mut n);
+            }
+        }
+        n as i64
     }
 }
 

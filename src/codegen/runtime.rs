@@ -15838,13 +15838,23 @@ impl<'ctx> super::Codegen<'ctx> {
                     .builder
                     .build_pointer_cast(buf, ptr_ty, "fss.nbufp")
                     .unwrap();
-                let (fmt, arg): (String, BasicValueEnum<'ctx>) = if is_float {
-                    (fs.to_printf("", 'f', true), val)
-                } else {
+                // Integer holes take the allocation-free runtime formatter.
+                // This used to build a printf conversion and call `snprintf`
+                // like the float arm below still does — but `snprintf`
+                // serializes on locale and lock state, so `f"{n:5}"` inside a
+                // parallel loop kept the whole pathology B-2026-09-05-23
+                // removed from `f"{n}"`: measured on the uniform 18-worker
+                // probe, system time 0.76 -> 553.46 ms across a worker sweep,
+                // leaving the two spellings ~23x apart.
+                //
+                // The spec crosses as PRE-DECODED constants. Re-parsing it at
+                // run time — which is what routing to `karac_runtime_fmt_int`
+                // would do — measured 97.73 ms against `snprintf`'s 23.71 ms
+                // single-threaded, because the per-call parse and `String`
+                // cost more than the lock saved.
+                if !is_float {
                     let iv = val.into_int_value();
                     let unsigned = self.expr_is_unsigned_int(e);
-                    // Widen to i64 for the varargs slot (sext signed / zext
-                    // unsigned) — same as the no-spec path.
                     let widened = if iv.get_type().get_bit_width() < 64 {
                         if unsigned {
                             self.builder
@@ -15858,17 +15868,34 @@ impl<'ctx> super::Codegen<'ctx> {
                     } else {
                         iv
                     };
-                    let conv = if fs.radix == crate::format_spec::Radix::Dec {
-                        if unsigned {
-                            'u'
-                        } else {
-                            'd'
-                        }
-                    } else {
-                        fs.int_conv()
-                    };
-                    (fs.to_printf("ll", conv, true), widened.into())
-                };
+                    let len = self
+                        .builder
+                        .build_call(
+                            self.i64_fmt_fn(),
+                            &[
+                                widened.into(),
+                                i32_t.const_int(u64::from(!unsigned), false).into(),
+                                i32_t
+                                    .const_int(fs.fast_radix_code() as u64, true)
+                                    .into(),
+                                i32_t.const_int(u64::from(fs.zero_pad), false).into(),
+                                i64_t.const_int(width as u64, false).into(),
+                                i32_t
+                                    .const_int(u64::from(fs.numeric_align_left()), false)
+                                    .into(),
+                                buf_ptr.into(),
+                                i64_t.const_int(cap, false).into(),
+                            ],
+                            "fss.ifmt",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    return Ok((buf_ptr, len));
+                }
+                let (fmt, arg): (String, BasicValueEnum<'ctx>) =
+                    (fs.to_printf("", 'f', true), val);
                 let fmt_g = self
                     .builder
                     .build_global_string_ptr(&fmt, "fss.nfmt")
@@ -16159,6 +16186,40 @@ impl<'ctx> super::Codegen<'ctx> {
         );
         self.module
             .add_function("karac_runtime_i64_to_str", fn_ty, None)
+    }
+
+    /// Lazily declare `karac_runtime_i64_fmt(val: i64, is_signed: i32,
+    /// radix: i32, zero_pad: i32, width: i64, align_left: i32, buf: ptr,
+    /// buf_len: i64) -> i64` — the SPEC-carrying integer formatter, sibling of
+    /// `i64_to_str_fn`.
+    ///
+    /// The spec goes across as pre-decoded constants rather than as text: the
+    /// existing `karac_runtime_fmt_int` re-parses the raw spec and returns a
+    /// `String`, and routing this path there measured 4.1x WORSE than
+    /// `snprintf` single-threaded. Codegen knows the spec at compile time, so
+    /// there is nothing to parse and nothing to allocate.
+    pub(super) fn i64_fmt_fn(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("karac_runtime_i64_fmt") {
+            return f;
+        }
+        let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let fn_ty = i64_t.fn_type(
+            &[
+                i64_t.into(),
+                i32_t.into(),
+                i32_t.into(),
+                i32_t.into(),
+                i64_t.into(),
+                i32_t.into(),
+                ptr_t.into(),
+                i64_t.into(),
+            ],
+            false,
+        );
+        self.module
+            .add_function("karac_runtime_i64_fmt", fn_ty, None)
     }
 
     /// Lazily declare `karac_runtime_gpu_map(wgsl_ptr: ptr, wgsl_len: i64,

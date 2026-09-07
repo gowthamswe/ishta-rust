@@ -118,6 +118,26 @@ This is the most tractable of the three: a lock-free integer/float formatter in
 the runtime, used by the f-string lowering instead of `snprintf`, removes it
 without touching the pool or the partition.
 
+### 5. The same bug survived in the SPEC'D f-string path
+
+`B-2026-09-05-23` moved `f"{n}"` off `snprintf` but left `f"{n:5}"` on it, so
+the two spellings sat ~23x apart. `spec.kara` is `alloc2.kara` with width specs
+on the holes and nothing else changed:
+
+| N | snprintf | via `karac_runtime_fmt_int` | allocation-free fast path |
+|---|---:|---:|---:|
+| 1 | 23.71 ms | 97.73 ms | **6.58 ms** |
+| 18 | 46.71 ms | 35.32 ms | **2.16 ms** |
+| sys @ 18 | 553.46 ms | 4.78 ms | **1.12 ms** |
+
+The middle column is the obvious fix that does not work, and it is worth
+keeping: routing spec'd holes to the EXISTING runtime formatter removes the
+lock but is **4.1x slower single-threaded**, because that entry point re-parses
+the spec string and returns a `String` from `FormatSpec::apply_int` on every
+call. Codegen knows the spec at compile time, so the fix that works passes the
+decoded fields as constants and renders straight into the caller's buffer —
+no parse, no allocation, no lock. Fixed in `B-2026-09-07-24`.
+
 ## What this leaves open
 
 - **`B-2026-09-05-22`** — why exactly two active workers, and not three,

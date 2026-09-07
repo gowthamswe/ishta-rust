@@ -254,4 +254,98 @@ mod tests {
             assert_eq!(&buf, b"1111");
         }
     }
+
+    /// ORACLE AGREEMENT for the allocation-free fast path.
+    ///
+    /// `karac_runtime_i64_fmt` reproduces `FormatSpec::apply_int` /
+    /// `apply_uint` from PRE-DECODED constants instead of parsing the spec and
+    /// building a `String`. Those two are the interpreter's path, so the fast
+    /// path is only correct insofar as it matches them byte for byte — and the
+    /// failure mode is silent (a wrong pad or a dropped sign still prints
+    /// something plausible). So this asserts the whole cross product rather
+    /// than a handful of eyeballed cases.
+    ///
+    /// Specs `needs_runtime_formatter()` diverts (binary radix, center align,
+    /// non-space fill) are excluded: codegen never routes them here.
+    #[test]
+    fn i64_fmt_fast_path_matches_apply_int_over_a_matrix() {
+        unsafe fn fast(fs: &FormatSpec, raw: u64, signed: bool) -> String {
+            unsafe {
+                let mut buf = [0u8; 256];
+                let n = crate::karac_runtime_i64_fmt(
+                    raw,
+                    signed as i32,
+                    fs.fast_radix_code(),
+                    fs.zero_pad as i32,
+                    fs.width.unwrap_or(0) as i64,
+                    fs.numeric_align_left() as i32,
+                    buf.as_mut_ptr(),
+                    buf.len() as i64,
+                );
+                String::from_utf8(buf[..n as usize].to_vec()).unwrap()
+            }
+        }
+
+        // Every spec shape the fast path can actually receive.
+        let specs = [
+            "", "5", "1", "20", "<5", ">5", "<12", ">12", "05", "020", "08",
+            "x", "X", "o", "5x", "5X", "5o", "05x", "05X", "05o",
+            "<8x", ">8X", "<8o", "020x",
+        ];
+        // Boundaries first: i64::MIN is where a naive negate wraps, and the
+        // powers of ten/two are where digit counts cross the width.
+        let signed_vals: [i64; 14] = [
+            0, 1, -1, 7, -7, 9, -9, 10, -10, 99999, -99999,
+            i64::MAX, i64::MIN, i64::MIN + 1,
+        ];
+        let unsigned_vals: [u64; 8] = [
+            0, 1, 9, 10, 255, u64::MAX, u64::MAX - 1, 1 << 63,
+        ];
+
+        for raw in specs {
+            let fs = FormatSpec::parse(raw).expect("spec parses");
+            if fs.needs_runtime_formatter() {
+                continue;
+            }
+            for v in signed_vals {
+                let want = fs.apply_int(v);
+                let got = unsafe { fast(&fs, v as u64, true) };
+                assert_eq!(
+                    got, want,
+                    "signed mismatch: spec {raw:?} value {v} -> fast {got:?} vs apply_int {want:?}"
+                );
+            }
+            for v in unsigned_vals {
+                let want = fs.apply_uint(v);
+                let got = unsafe { fast(&fs, v, false) };
+                assert_eq!(
+                    got, want,
+                    "unsigned mismatch: spec {raw:?} value {v} -> fast {got:?} vs apply_uint {want:?}"
+                );
+            }
+        }
+    }
+
+    /// The fast path must TRUNCATE rather than write past a short buffer.
+    /// Codegen sizes the buffer as `max(64, width + 2)` so this is a guard, not
+    /// an expected path — but it is the one bug in a hand-rolled renderer that
+    /// corrupts memory instead of printing wrong.
+    #[test]
+    fn i64_fmt_fast_path_truncates_into_a_short_buffer() {
+        unsafe {
+            let mut buf = [0xAAu8; 8];
+            let n = crate::karac_runtime_i64_fmt(
+                1234567890123u64, 1, 10, 0, 0, 0,
+                buf.as_mut_ptr(), 4,
+            );
+            assert_eq!(n, 4, "should stop at the cap");
+            assert_eq!(&buf[..4], b"1234");
+            assert_eq!(&buf[4..], &[0xAA; 4], "must not write past buf_len");
+
+            // null / non-positive cap write nothing
+            assert_eq!(crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, std::ptr::null_mut(), 8), 0);
+            assert_eq!(crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, buf.as_mut_ptr(), 0), 0);
+        }
+    }
+
 }
