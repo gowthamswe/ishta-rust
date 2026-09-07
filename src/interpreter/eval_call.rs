@@ -3072,7 +3072,15 @@ impl<'a> super::Interpreter<'a> {
                     )
                     || crate::ast::fn_moves_param_into_outliving_place(f, i)
                     || crate::ast::fn_moves_param_into_outliving_place_via_call(self.program, f, i)
-                    || crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i);
+                    || crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i)
+                    // B-2026-09-07-4 — and the ONE-HOP hand-back
+                    // (`fn thruv(ref self, r: R) -> R { return fwd(r); }`), the
+                    // method twin of the disjunct B-2026-09-07-10 added to
+                    // `record_passthrough_arg_moves`. Without it the
+                    // interpreter ran the argument's body twice for
+                    // `let a = mk(7); let b = h.thruv(a);` while every compiled
+                    // surface ran it once.
+                    || crate::ast::fn_always_returns_param_via_call(self.program, f, i);
                 if !escapes {
                     return None;
                 }
@@ -3110,7 +3118,12 @@ impl<'a> super::Interpreter<'a> {
                             f,
                             i,
                         )
-                        || crate::ast::fn_always_moves_param_into_outliving_place(f, i),
+                        || crate::ast::fn_always_moves_param_into_outliving_place(f, i)
+                        // B-2026-09-07-4 — the one-hop hand-back gives the same
+                        // every-path guarantee the bare one does: the inner
+                        // callee returns it, this one returns that, so the
+                        // caller's result binding owns it.
+                        || crate::ast::fn_always_returns_param_via_call(self.program, f, i),
                 ))
             })
             .collect();

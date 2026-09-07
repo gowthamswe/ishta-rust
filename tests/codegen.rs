@@ -35312,6 +35312,87 @@ end
         );
     }
 
+    /// B-2026-09-07-4, the via-call half — an argument handed back THROUGH one
+    /// further call double-freed on the METHOD and ASSOC-FN legs, where the free
+    /// leg was clean: `R.passb(mk(1))` over
+    /// `impl R { fn passb(r: R) -> R { return fwd(r); } }` aborted `free(): double
+    /// free detected in tcache 2` on all four compiled surfaces while the DIRECT
+    /// `return r;` spelling beside it (`R.passa`) was fine.
+    ///
+    /// Three legs of one rule, each missing a piece its sibling had. The two
+    /// registrars' ADMISSION gates asked `fn_always_returns_param`, whose `yields`
+    /// walker admits an identifier, an aggregate literal and an optres ctor and
+    /// lets a `Call` fall through, so a hop was invisible; they now also ask
+    /// `fn_always_returns_param_via_call` (B-2026-09-07-10's predicate). The ASSOC
+    /// leg's named-argument stand-down kept the binding's MEMORY, which is the
+    /// entry-copy contract and wrong for a forwarded param — B-2026-09-06-71's
+    /// split, applied here as it was to the method leg in B-2026-09-07-11. And the
+    /// interpreter's `record_method_arg_moves` did not count a hop as an escape at
+    /// all, so it ran the body twice for a named local.
+    ///
+    /// Cells: the assoc hop, the assoc direct control, the method hop, a
+    /// copy-supported assoc hop (whose caller slot keeps its own copy), a method
+    /// whose value dies one hop down, and a named local into the assoc hop.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_argument_handed_back_through_a_hop_by_a_method`, pinned to the same string.
+    #[test]
+    fn e2e_argument_handed_back_through_a_hop_by_a_method() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct P { id: i64, name: String, xs: Vec[i64] }
+impl Drop for P { fn drop(mut ref self) { println(f"  dP{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}", xs: [i] }; }
+fn fwd(r: R) -> R { return r; }
+fn pfwd(p: P) -> P { return p; }
+fn dies(r: R) -> i64 { return r.id; }
+struct Hold { n: i64 }
+impl R { fn passb(r: R) -> R { return fwd(r); } }
+impl R { fn passa(r: R) -> R { return r; } }
+impl P { fn ppassb(p: P) -> P { return pfwd(p); } }
+impl Hold { fn thruv(ref self, r: R) -> R { return fwd(r); } }
+impl Hold { fn eats(ref self, r: R) -> i64 { return dies(r); } }
+fn main() {
+  let h = Hold { n: 0 };
+  println("assoc_hop"); let z = R.passb(mk(1)); println(f"  v={z.inner.v}");
+  println("assoc_direct"); let y = R.passa(mk(2)); println(f"  v={y.inner.v}");
+  println("method_hop"); let w = h.thruv(mk(3)); println(f"  v={w.inner.v}");
+  println("assoc_hop_copyable"); let c = P.ppassb(mkp(4)); println(f"  v={c.id}");
+  println("method_hop_dies"); println(f"  v={h.eats(mk(5))}");
+  println("named_into_assoc_hop"); let a = mk(6); let b = R.passb(a); println(f"  v={b.inner.v}");
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"assoc_hop
+  v=1
+  dR1
+assoc_direct
+  v=2
+  dR2
+method_hop
+  v=3
+  dR3
+assoc_hop_copyable
+  v=4
+  dP4
+method_hop_dies
+  dR5
+  v=5
+named_into_assoc_hop
+  v=6
+  dR6
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-11 (codegen) and B-2026-09-07-12 (interpreter) — one program,
     /// two defects, one on each backend.
     ///

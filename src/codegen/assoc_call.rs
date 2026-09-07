@@ -3226,7 +3226,37 @@ impl<'ctx> super::Codegen<'ctx> {
                         let var_name = var_name.clone();
                         if self.callee_takes_over_arg_drop_body(&qualified, i) {
                             self.suppress_container_elem_bodies_for_var(&var_name);
-                            self.suppress_user_drop_body_keeping_memory(&var_name);
+                            // B-2026-09-07-4 — the ASSOC leg of
+                            // B-2026-09-06-71's split, which the free arm got
+                            // and this one did not. Keeping the MEMORY is the
+                            // entry-copy contract: the callee owns its own copy
+                            // and the caller's slot owns the original, so only
+                            // the body moves. A param the prologue DECLINED to
+                            // copy is forwarded instead, so the object the
+                            // callee handed on IS this binding's, and the
+                            // memory action left here was its second owner —
+                            // `let a = mk(6); let b = R.passb(a);` over
+                            // `impl R { fn passb(r: R) -> R { return fwd(r); } }`
+                            // printed the right answer and left 2 valgrind
+                            // errors (an invalid free and a read of the freed
+                            // refcount block).
+                            let forwarded_not_copied = self
+                                .var_types
+                                .var_type_names
+                                .get(var_name.as_str())
+                                .is_some_and(|tn| {
+                                    self.type_decls.struct_types.contains_key(tn.as_str())
+                                        && !self.type_decls.shared_types.contains_key(tn.as_str())
+                                        && !self.aggregate_param_copy_supported_struct(
+                                            tn,
+                                            &mut Vec::new(),
+                                        )
+                                });
+                            if forwarded_not_copied {
+                                self.suppress_user_drop_for_var(&var_name);
+                            } else {
+                                self.suppress_user_drop_body_keeping_memory(&var_name);
+                            }
                         }
                     }
                     // B-2026-08-29-54 — the caller-side owner for a BY-VALUE
@@ -3278,6 +3308,27 @@ impl<'ctx> super::Codegen<'ctx> {
                                 f,
                                 i,
                             )
+                            // B-2026-09-07-4 — or handed back THROUGH one
+                            // further call (`fn passb(r: R) -> R { return
+                            // fwd(r); } }`), which is just as certain an owner
+                            // as the bare hand-back and which
+                            // `fn_always_returns_param`'s `yields` walker
+                            // cannot see: it admits an identifier, an aggregate
+                            // literal and an optres ctor, and a `Call` falls
+                            // through. Without it the fresh-temp registrar's
+                            // memory-only registration was a second owner of the
+                            // buffer the result binding already owns, and
+                            // `R.passb(mk(19))` aborted `free(): double free
+                            // detected in tcache 2` on all four compiled
+                            // surfaces while the DIRECT `return r;` spelling
+                            // beside it was clean.
+                            //
+                            // The ALL-paths form, like everything else this gate
+                            // consults: see
+                            // `crate::ast::fn_always_returns_param_via_call`.
+                            || self.program_snapshot.as_deref().is_some_and(|p| {
+                                crate::ast::fn_always_returns_param_via_call(p, f, i)
+                            })
                         });
                     let handed_off = always_handed_back
                         || self

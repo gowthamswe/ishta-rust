@@ -8081,6 +8081,27 @@ impl<'ctx> super::Codegen<'ctx> {
                                 f,
                                 i,
                             )
+                            // B-2026-09-07-4 — or handed back THROUGH one
+                            // further call (`fn passb(r: R) -> R { return
+                            // fwd(r); } }`), which is just as certain an owner
+                            // as the bare hand-back and which
+                            // `fn_always_returns_param`'s `yields` walker
+                            // cannot see: it admits an identifier, an aggregate
+                            // literal and an optres ctor, and a `Call` falls
+                            // through. Without it the fresh-temp registrar's
+                            // memory-only registration was a second owner of the
+                            // buffer the result binding already owns, and
+                            // `R.passb(mk(19))` aborted `free(): double free
+                            // detected in tcache 2` on all four compiled
+                            // surfaces while the DIRECT `return r;` spelling
+                            // beside it was clean.
+                            //
+                            // The ALL-paths form, like everything else this gate
+                            // consults: see
+                            // `crate::ast::fn_always_returns_param_via_call`.
+                            || self.program_snapshot.as_deref().is_some_and(|p| {
+                                crate::ast::fn_always_returns_param_via_call(p, f, i)
+                            })
                         });
                     let handed_off = self
                         .program_snapshot

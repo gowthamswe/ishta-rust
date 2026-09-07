@@ -4134,6 +4134,63 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-4 — the MEMORY half of the via-call legs: the same program
+    /// under ASAN + LSan, where the pre-fix build double-freed the object each
+    /// hop handed on. One owner and one free per object on every leg.
+    #[test]
+    fn asan_argument_handed_back_through_a_hop_by_a_method() {
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             struct P { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for P { fn drop(mut ref self) { println(f\"  dP{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn mkp(i: i64) -> P { return P { id: i, name: f\"p{i}\", xs: [i] }; }\n\
+             fn fwd(r: R) -> R { return r; }\n\
+             fn pfwd(p: P) -> P { return p; }\n\
+             fn dies(r: R) -> i64 { return r.id; }\n\
+             struct Hold { n: i64 }\n\
+             impl R { fn passb(r: R) -> R { return fwd(r); } }\n\
+             impl R { fn passa(r: R) -> R { return r; } }\n\
+             impl P { fn ppassb(p: P) -> P { return pfwd(p); } }\n\
+             impl Hold { fn thruv(ref self, r: R) -> R { return fwd(r); } }\n\
+             impl Hold { fn eats(ref self, r: R) -> i64 { return dies(r); } }\n\
+             fn main() {\n\
+               let h = Hold { n: 0 };\n\
+               println(\"assoc_hop\"); let z = R.passb(mk(1)); println(f\"  v={z.inner.v}\");\n\
+               println(\"assoc_direct\"); let y = R.passa(mk(2)); println(f\"  v={y.inner.v}\");\n\
+               println(\"method_hop\"); let w = h.thruv(mk(3)); println(f\"  v={w.inner.v}\");\n\
+               println(\"assoc_hop_copyable\"); let c = P.ppassb(mkp(4)); println(f\"  v={c.id}\");\n\
+               println(\"method_hop_dies\"); println(f\"  v={h.eats(mk(5))}\");\n\
+               println(\"named_into_assoc_hop\"); let a = mk(6); let b = R.passb(a); println(f\"  v={b.inner.v}\");\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "assoc_hop",
+                "  v=1",
+                "  dR1",
+                "assoc_direct",
+                "  v=2",
+                "  dR2",
+                "method_hop",
+                "  v=3",
+                "  dR3",
+                "assoc_hop_copyable",
+                "  v=4",
+                "  dP4",
+                "method_hop_dies",
+                "  dR5",
+                "  v=5",
+                "named_into_assoc_hop",
+                "  v=6",
+                "  dR6",
+                "end"
+            ],
+            "argument_handed_back_through_a_hop_by_a_method",
+        );
+    }
+
     /// B-2026-09-07-11 — the MEMORY half: the same program under ASAN + LSan,
     /// where the pre-fix build double-freed the object the method stored. One
     /// owner and one free per object in both copy classes, and the free-function
