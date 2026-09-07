@@ -93,7 +93,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 393 |
-| run-vs-build | 361 |
+| run-vs-build | 362 |
 | leak | 283 |
 | double-free | 200 |
 | missing-feature | 194 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1546 |
-| interp | 396 |
+| codegen | 1547 |
+| interp | 397 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -157,7 +157,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-49 | 2026-09-06 | codegen | low | AN INLINE-BUILT `Array` PAYLOAD LOSES ITS INTERIOR EXACTLY AS THE TUPLE DID -- 54 B in 6 blocks for `f(Some([f"a{i}", f"b{i}"]))`, while the same array through a NAMED LOCAL is clean, because the array's interior is owned by a caller-side drop that a missing move-suppressor leaves armed | — |
 | B-2026-09-06-51 | 2026-09-06 | codegen | medium | THE -O0 ASAN RATCHET HAS BEEN RED ON `main` SINCE edb7236 -- six fixtures that commit ADDED fail `scripts/asan-o0-leg.sh` unquarantined, so the gate that is supposed to fail on any new -O0 regression now reports the same six to every session and can no longer distinguish a fresh one | — |
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
-| B-2026-09-06-55 | 2026-09-06 | interp+codegen | low | A DEEP-CHAIN FIELD MOVE-OUT STILL LOSES THE MOVED HOP'S SIBLING ONE LEVEL DOWN, ON EVERY SURFACE -- `let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r;` prints `dR1 dR3` on `--interp` / jit / aot / `KARAC_AUTO_PAR=0` alike; `q`'s body (`dR2`) runs nowhere | — |
 | B-2026-09-06-59 | 2026-09-06 | codegen | low | READING A DECLINED-COPY PARAM AFTER A WHOLE REBIND LEAVES ITS `String` UNOWNED -- `fn f(r: R) -> String { let m = r; return f"{r.name}"; }` over a struct with a `shared` field loses 3 B in 1 block at KARAC_OPT_LEVEL=0 (clean at -O2, correct output on every surface). INTRODUCED BY B-2026-09-06-52's fix, which correctly stopped the destination registering a second owner for buffers the caller still holds; on that fix's parent this same cell was a use-after-free of the `shared` handle's refcount block with no leak, so the trade is UAF -> 3-byte leak. The sibling that does NOT read the source after the rebind is fully clean on the fix and double-freed before it. The trigger is the read alone -- an i64 return, a non-heap field read and a named-binding argument all leak identically | — |
 | B-2026-09-06-63 | 2026-09-06 | interp+codegen | low | A CALLEE THAT WRAPS A `Drop`-BEARING ARGUMENT IN ANOTHER `Drop`-BEARING TYPE LOSES THE WRAPPER'S OWN BODY -- `fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }` called as `let h = wrap_bodied(r)` prints the `R`'s body once and the `H`'s never, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; the view mark that keeps the `R` correct is what suppresses the `H` | — |
 | B-2026-09-06-65 | 2026-09-06 | interp+codegen | low | A PLAIN OWNED-`self` METHOD ON A FRESH TEMP RUNS THE RECEIVER'S `Drop` BODY BEFORE THE CALL'S RESULT IS PRINTED ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `println(f"v={mk(4).plain()}")` over `fn plain(self) -> i64 { return self.id; }` prints `dR4 v=4` under --interp and `v=4 dR4` on jit / aot / -O0, a stdout-visible A/B divergence with no memory difference | — |
@@ -168,6 +167,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-71 | 2026-09-06 | codegen | high | A NAMED-LOCAL ARGUMENT TO A PASSTHROUGH FREE FUNCTION DOUBLE-FREES -- `let a = mk(15); let z = f(a);` over `fn f(r: R) -> R { return r; }` and a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at both opt levels (3 valgrind errors from 3 contexts), while the FRESH-TEMP spelling of the same call (`f(mk(15))`) is clean on every surface; `--interp` is correct. The caller's binding and the result binding both own the forwarded object because the arg-pass move-suppression does not retract a declined-copy param's source | — |
 | B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
 | B-2026-09-06-66 | 2026-09-07 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Option[Node], tag: String }` loses 67 bytes (64 direct, 3 indirect) in 1 block at both opt levels, while every EMPTY-`next` spelling of the same type is clean; both `Drop` bodies run, so it is the boxed payload's memory alone | — |
+| B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
 
 ### Relocated
 
@@ -2333,6 +2333,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-50 | codegen | high | A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE PARAM ABORTS ON BOTH COMPILED BACKENDS -- `free(): double free detected in tcache 2`, exit 134,… | 7020445 |
 | B-2026-09-06-52 | codegen | high | A TOP-LEVEL WHOLE REBIND OF A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `shared` FIELD DOUBLE-FREES ON EVERY COMPILED SURFACE -- `fn topreb(r: R) -> i… | 0083494 |
 | B-2026-09-06-53 | interp+codegen | medium | A `Drop`-BEARING LOCAL BUILT FROM THE ENCLOSING FUNCTION'S PARAMETER RUNS NO `Drop` BODY AT ALL, ON EVERY SURFACE -- `fn a(i: i64) { let x = mkUses(i… | 35aff00 |
+| B-2026-09-06-55 | interp+codegen | low | A DEEP-CHAIN FIELD MOVE-OUT STILL LOSES THE MOVED HOP'S SIBLING ONE LEVEL DOWN, ON EVERY SURFACE -- `let o = Outer { h: Inner { r: mk(1), q: mk(2) },… | c68b7c2 |
 | B-2026-09-06-56 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-50 LEAKS ITS WHOLE BOXED STRUCT PAYLOAD -- 192 B in 3 blocks over three calls for `fn show(x: Result[P, i64])`… | 6a0daa1 |
 | B-2026-09-06-57 | codegen | high | `main` IS RED: B-2026-09-06-45's OWN TWO REGRESSION TESTS FAIL ON A CLEAN CHECKOUT OF 6138e02 -- `asan_nested_self_rebind_keeps_one_owner` double-fre… | d3b39b8 |
 | B-2026-09-06-58 | interp+codegen | medium | THE `String`-PARAMETER SIBLING OF B-2026-09-06-53 STILL LOSES THE RETURNED VALUE'S `Drop` BODY -- `fn mk2(i: i64, s: String) -> R { return R { id: i,… | c88eb3f |
