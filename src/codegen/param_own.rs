@@ -2915,6 +2915,89 @@ impl<'ctx> super::Codegen<'ctx> {
     /// (String / Vec / Map / Set / heap-owning aggregate elements) — the same
     /// set `elem_te_needs_direct_recursive_drain` plus
     /// `vec_elem_agg_drop_for_type_expr` drain on the other side.
+    /// B-2026-09-06-4 — duplicate the heap ENVELOPE of a BOXED struct payload
+    /// of a by-value enum param, in place at its payload word.
+    ///
+    /// The counterpart of `emit_enum_drop_switch`'s boxed `NestedStruct` /
+    /// `NestedOwnedStruct` arm, which loads the same word, drops through the box
+    /// and then frees it. That free has to hit a box this frame owns, and until
+    /// this existed the entry copy left the callee's payload word holding the
+    /// CALLER's box — one allocation with two owners.
+    ///
+    /// `copy_contents` splits the two kinds. A `NestedStruct` payload is
+    /// copy-supported, so the copy is envelope AND contents and the two frames
+    /// share nothing. A `NestedOwnedStruct` payload is one the copy paths
+    /// decline, and it reaches here only when it owns no drop-heap of its own —
+    /// the box IS its whole cleanup — so the envelope alone is the complete
+    /// copy. Copying its contents partially would alias exactly the fields the
+    /// walk skipped, which is why the flag is a parameter rather than a
+    /// judgement made here.
+    ///
+    /// Null-guarded: a variant whose payload word was never boxed (a `None`-side
+    /// merge, a zeroed move-suppressed slot) holds a null pointer, and `memcpy`
+    /// through it would fault where the old code merely did nothing.
+    pub(super) fn deep_copy_boxed_enum_struct_payload(
+        &mut self,
+        word_ptr: PointerValue<'ctx>,
+        struct_ty: StructType<'ctx>,
+        struct_name: &str,
+        copy_contents: bool,
+    ) {
+        let Some(fn_val) = self.current_fn else {
+            return;
+        };
+        let Some(raw_size) = struct_ty.size_of() else {
+            return;
+        };
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let old_p = self
+            .builder
+            .build_load(ptr_ty, word_ptr, "p14e.box.old")
+            .unwrap()
+            .into_pointer_value();
+        let is_null = self
+            .builder
+            .build_is_null(old_p, "p14e.box.isnull")
+            .unwrap();
+        let copy_bb = self.context.append_basic_block(fn_val, "p14e.box.copy");
+        let join_bb = self.context.append_basic_block(fn_val, "p14e.box.join");
+        self.builder
+            .build_conditional_branch(is_null, join_bb, copy_bb)
+            .unwrap();
+        self.builder.position_at_end(copy_bb);
+        let size = if raw_size.get_type().get_bit_width() == 64 {
+            raw_size
+        } else {
+            self.builder
+                .build_int_z_extend(raw_size, i64_t, "p14e.box.sz64")
+                .unwrap()
+        };
+        let new_p = self
+            .builder
+            .build_call(self.runtime_fns.malloc_fn, &[size.into()], "p14e.box.new")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_pointer_value();
+        // Alignment 8 on both sides — the boxing store itself relaxes to 8
+        // (B-2026-08-31-18), so nothing here may assume the natural alignment
+        // of an over-aligned payload.
+        self.builder.build_memcpy(new_p, 8, old_p, 8, size).unwrap();
+        let new_w = self
+            .builder
+            .build_ptr_to_int(new_p, i64_t, "p14e.box.w")
+            .unwrap();
+        self.builder.build_store(word_ptr, new_w).unwrap();
+        if copy_contents {
+            self.deep_copy_struct_heap_fields_in_place(new_p, struct_name);
+        }
+        // The contents walk may have split blocks; branch from wherever the
+        // builder ended up rather than from `copy_bb`.
+        self.builder.build_unconditional_branch(join_bb).unwrap();
+        self.builder.position_at_end(join_bb);
+    }
+
     pub(super) fn deep_copy_enum_heap_payload_in_place(
         &mut self,
         enum_name: &str,
@@ -2978,7 +3061,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 layout.field_drop_kinds.get(name),
                 layout.field_word_offsets.get(name),
             ) {
-                for (fi, (kind, (start_word, _num_words))) in
+                for (fi, (kind, (start_word, num_words))) in
                     kinds.iter().zip(offsets.iter()).enumerate()
                 {
                     // B-2026-06-13-13: a nested-struct payload is deep-copied by
@@ -2986,7 +3069,52 @@ impl<'ctx> super::Codegen<'ctx> {
                     // symmetric peer of the enum drop's `NestedStruct` arm, so the
                     // callee copy and caller temp own independent buffers (no
                     // double-free). The struct's words start at `start_word + 1`.
-                    if *kind == EnumDropKind::NestedStruct {
+                    //
+                    // B-2026-09-06-4 — …unless the payload was heap-BOXED, and
+                    // then the ENVELOPE is the thing that has to be duplicated.
+                    //
+                    // `payload_word_count_for_type_expr` sizes an `Option` /
+                    // `Result` / enum FIELD at one word while its real LLVM
+                    // width is four or six, so any struct carrying one is
+                    // under-sized and `coerce_to_payload_words` heap-boxes it,
+                    // leaving the box POINTER in the payload word. The drop
+                    // switch recomputes that same `llvm_type_word_count(S) >
+                    // num_words` predicate and drops THROUGH the box before
+                    // freeing it (`synth_drop.rs`, B-2026-09-05-26); this arm
+                    // did not, so it (a) handed `deep_copy_struct_heap_fields_in_place`
+                    // a pointer to the box POINTER as if the struct were inline,
+                    // and (b) never duplicated the envelope. The callee's
+                    // `track_enum_var` drop and the caller's own drop then freed
+                    // ONE box: `free(): double free detected in tcache 2` at -O0
+                    // on `sink(It.A(Sm { a: None, sp: 2 }))`, a ten-line program
+                    // (valgrind: two frees of one 40-byte block).
+                    //
+                    // Duplicate the envelope — malloc + memcpy of the struct's
+                    // LLVM width, the exact allocation `coerce_to_payload_words`
+                    // made — then recurse into the COPY's heap fields, so the
+                    // two frames own independent boxes AND independent buffers.
+                    // Alignment 8 on both sides, matching the relaxed alignment
+                    // the boxing store itself uses (B-2026-08-31-18).
+                    //
+                    // `NestedOwnedStruct` joins the arm here, for the same
+                    // envelope and NOT for the contents. That kind exists for a
+                    // payload struct the copy paths DECLINE (a `Drop`-bearing or
+                    // `Map` field — B-2026-09-05-26), so duplicating its heap is
+                    // exactly what must not happen: a partial copy would alias
+                    // the fields it skipped, which the drop then frees twice. The
+                    // envelope is a different question with a different answer —
+                    // it is a plain fixed-size allocation this module made, and
+                    // the drop switch frees it for BOTH kinds — so it is
+                    // duplicated whenever the payload struct owns no drop-heap of
+                    // its own, i.e. whenever the box IS the whole cleanup. A
+                    // `NestedOwnedStruct` with heap below it keeps today's
+                    // behaviour untouched: it needs the caller and callee to
+                    // agree about ownership rather than a copy, which is a
+                    // separate change with its own measurements.
+                    if matches!(
+                        *kind,
+                        EnumDropKind::NestedStruct | EnumDropKind::NestedOwnedStruct
+                    ) {
                         let sname =
                             variant_tes
                                 .get(name)
@@ -2996,13 +3124,52 @@ impl<'ctx> super::Codegen<'ctx> {
                                     _ => None,
                                 });
                         if let Some(sname) = sname {
-                            if let Ok(field_ptr) = self.builder.build_struct_gep(
-                                enum_ty,
-                                base_ptr,
-                                (*start_word + 1) as u32,
-                                "p14e.nstruct.p",
-                            ) {
-                                self.deep_copy_struct_heap_fields_in_place(field_ptr, &sname);
+                            let struct_ty = self.type_decls.struct_types.get(&sname).copied();
+                            let boxed = struct_ty.is_some_and(|st| {
+                                Self::llvm_type_word_count(st.into()) > *num_words
+                            });
+                            // Does the payload struct's own drop free anything
+                            // BELOW the envelope? Asked with the same pair the
+                            // caller-side entry-copy predicate uses
+                            // (`struct_type_is_entry_copied_heap`), so the
+                            // `Option`-only-heap class is not read as heapless.
+                            let owns_heap = self
+                                .type_decls
+                                .struct_field_type_exprs
+                                .get(&sname)
+                                .is_some_and(|ftes| {
+                                    ftes.iter().any(|f| {
+                                        self.type_expr_has_drop_heap(f)
+                                            || self.option_field_te_has_drop_heap(f)
+                                    })
+                                });
+                            let copy_contents = *kind == EnumDropKind::NestedStruct;
+                            if boxed && (copy_contents || !owns_heap) {
+                                if let (Ok(word_ptr), Some(st)) = (
+                                    self.builder.build_struct_gep(
+                                        enum_ty,
+                                        base_ptr,
+                                        (*start_word + 1) as u32,
+                                        "p14e.nstruct.box.wp",
+                                    ),
+                                    struct_ty,
+                                ) {
+                                    self.deep_copy_boxed_enum_struct_payload(
+                                        word_ptr,
+                                        st,
+                                        &sname,
+                                        copy_contents,
+                                    );
+                                }
+                            } else if !boxed && copy_contents {
+                                if let Ok(field_ptr) = self.builder.build_struct_gep(
+                                    enum_ty,
+                                    base_ptr,
+                                    (*start_word + 1) as u32,
+                                    "p14e.nstruct.p",
+                                ) {
+                                    self.deep_copy_struct_heap_fields_in_place(field_ptr, &sname);
+                                }
                             }
                         }
                         continue;

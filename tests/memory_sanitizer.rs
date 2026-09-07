@@ -78627,4 +78627,77 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-4 — a by-value enum param whose struct payload was heap
+    /// BOXED must copy the BOX, not just what is inside it.
+    ///
+    /// `payload_word_count_for_type_expr` sizes an `Option` / `Result` / enum
+    /// FIELD at one word against a real LLVM width of four or six, so any
+    /// payload struct carrying one is under-sized and `coerce_to_payload_words`
+    /// heap-boxes it. The drop switch recomputes that same predicate and frees
+    /// the envelope; the ENTRY COPY did not, so the callee's payload word kept
+    /// pointing at the CALLER's box and both frames freed it —
+    /// `free(): double free detected in tcache 2` at `-O0`, and at `-O2` as well
+    /// for the copy-supported half (valgrind: two frees of one 40-byte block).
+    /// This is what aborted `tests/selfhost_resolver.rs`'s two oracles four
+    /// times per run on glibc: the resolver's `Item.Impl(ImplBlockNode { generics:
+    /// Option[…], trait_ty: Option[…], … })` reaching `walk_item(item)`.
+    ///
+    /// Both payload KINDS are here because the entry copy treated them
+    /// differently and both were wrong:
+    ///
+    ///   * `Sm { a: Option[i64], sp: i64 }` is `NestedOwnedStruct` — the copy
+    ///     paths decline it (an `Option[i64]` field is not copy-supported) and
+    ///     the walk skipped it outright. It owns no drop-heap, so the box IS its
+    ///     whole cleanup and duplicating the envelope is the complete fix.
+    ///   * `S1 { a: Option[String], n: i64 }` is `NestedStruct` — copy-supported,
+    ///     so the walk DID run, but it handed the struct copier a pointer to the
+    ///     box POINTER as though the payload were inline. Envelope plus contents.
+    ///
+    /// Four call shapes per kind's worth of coverage, because the caller-side
+    /// registration differs across them and only the callee's prologue is being
+    /// fixed: a fresh ctor temp (`t1`/`t5`), a NAMED LOCAL (`t2`/`t6`), and a
+    /// MATCH-CONSUMING callee over both spellings (`t3`/`t4`/`t7`) — the arm
+    /// binds the payload out, which suppresses the param's own drop, so a fixture
+    /// with only the pass-through shapes would not notice a copy that duplicated
+    /// the wrong thing.
+    ///
+    /// RED pre-fix on the single-statement spellings of `t1`, `t3`, `t4` and
+    /// `t5`, each measured on its own ten-line program; `--interp` prints the
+    /// expected output on every one of them, so this is a compiled-backend
+    /// defect throughout.
+    #[test]
+    fn asan_boxed_struct_payload_of_by_value_enum_param_copies_its_box() {
+        assert_clean_asan_run(
+            r#"
+struct Sm { a: Option[i64], sp: i64 }
+struct S1 { a: Option[String], n: i64 }
+enum It { A(Sm), B(i64) }
+enum W1 { T(S1), U(i64) }
+
+fn sink(it: It) -> i64 { return 1 }
+fn eat(it: It) -> i64 { return match it { It.A(s) => s.sp, It.B(n) => n } }
+fn sinkw(w: W1) -> i64 { return 2 }
+fn eatw(w: W1) -> i64 { return match w { W1.T(s) => s.n, W1.U(n) => n } }
+
+fn main() {
+    println(f"t1={sink(It.A(Sm { a: None, sp: 2 }))}")
+    let a = It.A(Sm { a: None, sp: 3 });
+    println(f"t2={sink(a)}")
+    println(f"t3={eat(It.A(Sm { a: None, sp: 4 }))}")
+    let b = It.A(Sm { a: None, sp: 5 });
+    println(f"t4={eat(b)}")
+    println(f"t5={sinkw(W1.T(S1 { a: Option.Some("hi"), n: 6 }))}")
+    let c = W1.T(S1 { a: Option.Some("ho"), n: 7 });
+    println(f"t6={sinkw(c)}")
+    println(f"t7={eatw(W1.T(S1 { a: Option.Some("he"), n: 8 }))}")
+    println("end")
+}
+"#,
+            &[
+                "t1=1", "t2=1", "t3=4", "t4=5", "t5=2", "t6=2", "t7=8", "end",
+            ],
+            "b4-boxed-enum-struct-payload-box-copy",
+        );
+    }
 }
