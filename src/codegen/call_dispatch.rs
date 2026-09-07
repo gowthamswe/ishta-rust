@@ -2151,6 +2151,51 @@ impl<'ctx> super::Codegen<'ctx> {
                     inner_struct.as_deref(),
                 );
             }
+            // B-2026-09-06-56 — the `Result` sibling of the arm above, and the
+            // reason it exists is that NEITHER frame owned the box: this arm
+            // declined every non-`Option` param, and the callee's owned-param
+            // loop declines every non-`Option` enum, each citing the same
+            // per-variant asymmetry. Two considered reasons to stand down, and
+            // between them a fresh-temp `Result[P, i64]` argument's box was
+            // nobody's — 64 B per call, quietly, with no invalid free to give
+            // it away. `Option` is clean only because this arm registers.
+            //
+            // The asymmetry is real but it is about a DISARM, not about
+            // ownership; see the predicate's note. Both sides are registered
+            // when both are boxed, and `BoxedEnumDrop`'s tag guard makes them
+            // mutually exclusive at run time.
+            //
+            // The callee-side reach fix lands in the same commit and is not
+            // optional: disarming the fields an arm binds, out of a box nobody
+            // frees, would have WIDENED this leak, and adding this owner
+            // without that disarm would have converted it into a double free.
+            let result_boxed = if !flows_into_return
+                && val.is_struct_value()
+                && self.expr_yields_fresh_owned_temp(&a.value)
+            {
+                self.owned_boxed_result_param_structs(&name, i)
+            } else {
+                Vec::new()
+            };
+            if !result_boxed.is_empty() {
+                let cur_fn = self
+                    .builder
+                    .get_insert_block()
+                    .and_then(|bb| bb.get_parent())
+                    .expect("compile_call inside a function context");
+                let slot =
+                    self.create_entry_alloca(cur_fn, &format!("resbox_arg_tmp{i}"), val.get_type());
+                self.builder.build_store(slot, val).unwrap();
+                for (variant, struct_name) in &result_boxed {
+                    self.track_boxed_enum_var(
+                        &format!("__resbox_arg_tmp{i}_{variant}"),
+                        slot,
+                        "Result",
+                        variant,
+                        Some(struct_name.as_str()),
+                    );
+                }
+            }
             // B-2026-08-29-63 — a param the prepass proved TRANSFER-safe has no
             // caller-side temp to own. Every registration below rests on the
             // callee entry-copying, so that "this caller temp is an INDEPENDENT
@@ -2853,6 +2898,64 @@ impl<'ctx> super::Codegen<'ctx> {
             .filter(|s| self.type_decls.struct_types.contains_key(s.as_str()))?;
         self.option_payload_is_boxed(payload_te)
             .then(|| struct_name.clone())
+    }
+
+    /// The `Result` peer of [`Self::owned_boxed_option_param_struct`], returning
+    /// EVERY side whose payload is a heap-boxed user struct as
+    /// `(variant, struct name)` — `Ok`, `Err`, or both. B-2026-09-06-56.
+    ///
+    /// A `Vec` rather than an `Option` because `Result` measures each side
+    /// against its 5-word area independently, so `Result[Wide, Wider]` carries
+    /// two boxes and one registration cannot stand for both: leaving `Err` to
+    /// the sibling arm leaked its half at exactly the `Ok` half's rate (384 B
+    /// over six calls, three per side).
+    ///
+    /// THE PER-VARIANT TAG IS WHY THE `Option` ARM DECLINED `Result`, AND IT IS
+    /// NOT A PROBLEM HERE. That note is about a caller-side DISARM having to
+    /// zero the right word without knowing the live tag. This registration
+    /// zeroes nothing: `BoxedEnumDrop` reads the tag at run time and frees only
+    /// when it matches the variant registered for, so two registrations against
+    /// one slot are mutually exclusive by construction and exactly one fires.
+    ///
+    /// STRUCT payloads only, mirroring the `Option` arm — `boxed_enum_payload_variants`
+    /// also admits a boxed user ENUM payload (B-2026-08-28-64), but who owns
+    /// THAT box is a separate question this row did not measure, so it is left
+    /// to the callee arm that owns it today.
+    pub(super) fn owned_boxed_result_param_structs(
+        &self,
+        name: &str,
+        i: usize,
+    ) -> Vec<(&'static str, String)> {
+        let flagged = |table: &HashMap<String, Vec<bool>>| {
+            table
+                .get(name)
+                .and_then(|v| v.get(i))
+                .copied()
+                .unwrap_or(false)
+        };
+        if flagged(&self.fn_sig.fn_param_ref) || flagged(&self.fn_sig.fn_param_mut_ref) {
+            return Vec::new();
+        }
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return Vec::new();
+        };
+        let Some(param_te) = program.items.iter().find_map(|item| match item {
+            Item::Function(f) if f.name == name => f.params.get(i).map(|p| p.ty.clone()),
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+        self.boxed_enum_payload_variants(&param_te)
+            .into_iter()
+            .filter(|(enum_lit, _, _)| *enum_lit == "Result")
+            .filter_map(|(_, variant, inner)| {
+                let inner = inner?;
+                self.type_decls
+                    .struct_types
+                    .contains_key(inner.as_str())
+                    .then_some((variant, inner))
+            })
+            .collect()
     }
 
     /// Would an `Option[T]` payload of type `T` be HEAP-BOXED — i.e. does `T`'s

@@ -16761,6 +16761,143 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-56 — the `Result` sibling of the test above, and NOT the
+    /// same defect despite the identical source shape. The `Option` spelling
+    /// had TWO owners and aborted; the `Result` spelling had NONE and leaked,
+    /// because both frames declined it citing the same per-variant asymmetry:
+    /// the caller-side registration read `Option` only, and the callee's
+    /// owned-param loop skipped every non-`Option` enum.
+    ///
+    /// Measured before the fix, `KARAC_AUTO_PAR=0` at `-O0` under valgrind:
+    /// 192 B definitely lost in 3 blocks for the fresh-temp partial
+    /// destructure, 0 invalid frees. 64 B per call is the ENVELOPE alone —
+    /// both heap fields are bound by the arm, so the bindings own them.
+    ///
+    /// The cells and what each pins:
+    ///   - `Ok(P { a, b, .. })` fresh temp — the reported leak;
+    ///   - `Ok(P { a, .. })` — `b` is neither bound nor owned by anyone, so the
+    ///     interior leaked too (27 B indirect over three calls), which is what
+    ///     makes this the WHOLE payload and not just its envelope;
+    ///   - `Ok(P { a: _, b, .. })` — `a` is TESTED, not bound; the box keeps it;
+    ///   - `Ok(p)` whole binding — no destructure, nothing to disarm;
+    ///   - a NAMED-LOCAL `Result[P, i64]` argument, which is the row's
+    ///     correction: it does not leak, it ABORTS (`free(): double free
+    ///     detected in tcache 2`, 6 invalid frees over three calls). Its let
+    ///     site already owns the box interior, so the callee's silent
+    ///     destructure made the arm's leaf bindings a second owner — the
+    ///     `Option` mechanism exactly, in the spelling the row filed as a leak;
+    ///   - the `Err` SIDE boxed (`Result[i64, P]`), which leaked at the same
+    ///     rate and was on the row's NOT-MEASURED list;
+    ///   - BOTH sides boxed (`Result[P, Q]`), exercised down both paths: 384 B
+    ///     over six calls before the fix, which is why the registration is
+    ///     per-variant rather than one arm standing for the pair;
+    ///   - a single-heap-field payload wide enough to box against `Result`'s
+    ///     5-word area, pinning that the axis is boxedness and not field count;
+    ///   - a NESTED destructure, pinning that the recursive disarm added for
+    ///     B-2026-09-06-50 reaches through the `Result` gate too.
+    #[test]
+    fn asan_boxed_struct_result_param_payload_destructure_no_leak() {
+        assert_clean_asan_run(
+            r#"
+struct P { a: String, b: String, c: i64, d: i64 }
+struct Q { m: String, n: String, o: i64, p: i64 }
+struct W { g: String, h: i64, i: i64, j: i64, k: i64, l: i64 }
+struct Inner { s: String, t: String }
+struct N { i: Inner, u: String, v: i64, w: i64, x: i64 }
+
+fn partial(x: Result[P, i64]) {
+    match x { Ok(P { a, b, .. }) => { println(f"p:{a}:{b}"); } Err(e) => { println(f"pe:{e}"); } }
+}
+
+fn unbound(x: Result[P, i64]) {
+    match x { Ok(P { a, .. }) => { println(f"u:{a}"); } Err(e) => { println(f"ue:{e}"); } }
+}
+
+fn tested(x: Result[P, i64]) {
+    match x { Ok(P { a: _, b, .. }) => { println(f"t:{b}"); } Err(e) => { println(f"te:{e}"); } }
+}
+
+fn whole(x: Result[P, i64]) {
+    match x { Ok(r) => { println(f"w:{r.a}"); } Err(e) => { println(f"we:{e}"); } }
+}
+
+fn errside(x: Result[i64, P]) {
+    match x { Ok(v) => { println(f"k:{v}"); } Err(P { a, b, .. }) => { println(f"r:{a}:{b}"); } }
+}
+
+fn bothsides(x: Result[P, Q]) {
+    match x { Ok(P { a, b, .. }) => { println(f"b:{a}:{b}"); } Err(Q { m, n, .. }) => { println(f"c:{m}:{n}"); } }
+}
+
+fn onefield(x: Result[W, i64]) {
+    match x { Ok(W { g, .. }) => { println(f"o:{g}"); } Err(e) => { println(f"oe:{e}"); } }
+}
+
+fn nested(x: Result[N, i64]) {
+    match x { Ok(N { i: Inner { s, .. }, u, .. }) => { println(f"n:{s}:{u}"); } Err(e) => { println(f"ne:{e}"); } }
+}
+
+fn main() {
+    let mut n = 0;
+    while n < 3 {
+        partial(Ok(P { a: f"pa-{n}-padpad", b: f"pb-{n}-padpad", c: 1, d: 2 }));
+        unbound(Ok(P { a: f"ua-{n}-padpad", b: f"ub-{n}-padpad", c: 3, d: 4 }));
+        tested(Ok(P { a: f"ta-{n}-padpad", b: f"tb-{n}-padpad", c: 5, d: 6 }));
+        whole(Ok(P { a: f"wa-{n}-padpad", b: f"wb-{n}-padpad", c: 7, d: 8 }));
+        // The NAMED-LOCAL spelling, which ABORTED rather than leaked: its let
+        // site owns the box, so only the callee-side disarm keeps the arm's
+        // bindings from becoming a second owner.
+        let named: Result[P, i64] = Ok(P { a: f"na-{n}-padpad", b: f"nb-{n}-padpad", c: 9, d: 0 });
+        partial(named);
+        errside(Err(P { a: f"ra-{n}-padpad", b: f"rb-{n}-padpad", c: 1, d: 2 }));
+        errside(Ok(7));
+        bothsides(Ok(P { a: f"ba-{n}-padpad", b: f"bb-{n}-padpad", c: 1, d: 2 }));
+        bothsides(Err(Q { m: f"cm-{n}-padpad", n: f"cn-{n}-padpad", o: 1, p: 2 }));
+        onefield(Ok(W { g: f"og-{n}-padpad", h: 1, i: 2, j: 3, k: 4, l: 5 }));
+        nested(Ok(N { i: Inner { s: f"ns-{n}-padpad", t: f"nt-{n}-padpad" }, u: f"nu-{n}-padpad", v: 1, w: 2, x: 3 }));
+        n = n + 1;
+    }
+}
+"#,
+            &[
+                "p:pa-0-padpad:pb-0-padpad",
+                "u:ua-0-padpad",
+                "t:tb-0-padpad",
+                "w:wa-0-padpad",
+                "p:na-0-padpad:nb-0-padpad",
+                "r:ra-0-padpad:rb-0-padpad",
+                "k:7",
+                "b:ba-0-padpad:bb-0-padpad",
+                "c:cm-0-padpad:cn-0-padpad",
+                "o:og-0-padpad",
+                "n:ns-0-padpad:nu-0-padpad",
+                "p:pa-1-padpad:pb-1-padpad",
+                "u:ua-1-padpad",
+                "t:tb-1-padpad",
+                "w:wa-1-padpad",
+                "p:na-1-padpad:nb-1-padpad",
+                "r:ra-1-padpad:rb-1-padpad",
+                "k:7",
+                "b:ba-1-padpad:bb-1-padpad",
+                "c:cm-1-padpad:cn-1-padpad",
+                "o:og-1-padpad",
+                "n:ns-1-padpad:nu-1-padpad",
+                "p:pa-2-padpad:pb-2-padpad",
+                "u:ua-2-padpad",
+                "t:tb-2-padpad",
+                "w:wa-2-padpad",
+                "p:na-2-padpad:nb-2-padpad",
+                "r:ra-2-padpad:rb-2-padpad",
+                "k:7",
+                "b:ba-2-padpad:bb-2-padpad",
+                "c:cm-2-padpad:cn-2-padpad",
+                "o:og-2-padpad",
+                "n:ns-2-padpad:nu-2-padpad",
+            ],
+            "asan_boxed_struct_result_param_payload_destructure_no_leak",
+        );
+    }
+
     #[test]
     fn asan_sorted_map_string_key_iter_no_leak() {
         // B-2026-07-09-17: `SortedMap[String, String]` ordered observation. The

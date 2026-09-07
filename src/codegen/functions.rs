@@ -2652,10 +2652,31 @@ impl<'ctx> super::Codegen<'ctx> {
                     for (enum_lit, variant, inner_struct) in
                         self.boxed_enum_payload_variants(&mono_ty)
                     {
-                        if enum_lit != "Option" {
-                            continue;
-                        }
                         if inner_struct.is_some() {
+                            // B-2026-09-06-56 — the REACH half runs for
+                            // `Result` as well as `Option`, and it is tested
+                            // BEFORE the `Option`-only gate below precisely
+                            // because the two halves answer different
+                            // questions. That gate is about who OWNS an
+                            // unowned box, and its reason (a `Result` box is
+                            // per-variant, so a caller-side disarm cannot know
+                            // which tag is live) is an argument about
+                            // ownership. Reach is not: the zero below travels
+                            // through the box, under a guard that has already
+                            // matched a variant, so the live tag is answered
+                            // by the arm itself.
+                            //
+                            // Leaving `Result` out cost an ABORT, not a leak:
+                            // a NAMED-LOCAL `Result[P, i64]` argument is
+                            // already owned by its let site
+                            // (`track_boxed_enum_var`, interior walk and all),
+                            // so with the callee silent the arm's leaf
+                            // bindings became a second owner of every field
+                            // they bound and both freed it — `free(): double
+                            // free detected in tcache 2`, 6 invalid frees over
+                            // three calls. Only the FRESH-TEMP spelling was a
+                            // leak, and that is the half the row was filed on.
+                            //
                             // B-2026-09-06-50 — still no registration for a
                             // struct payload (the box's interior is the
                             // caller's, per the note above), but it must be
@@ -2676,6 +2697,13 @@ impl<'ctx> super::Codegen<'ctx> {
                             self.payload_vars
                                 .boxed_struct_payload_param_vars
                                 .insert(param_name.clone());
+                            continue;
+                        }
+                        // `Option` ONLY from here down — the OWNERSHIP half,
+                        // whose reason is the per-variant `Result` box quoted
+                        // above. Unchanged by B-2026-09-06-56, which moved the
+                        // reach test in front of it rather than widening it.
+                        if enum_lit != "Option" {
                             continue;
                         }
                         // B-2026-08-07-11 leg (a) — the box may hold a further
