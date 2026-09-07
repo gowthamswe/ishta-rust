@@ -3618,16 +3618,73 @@ impl<'ctx> super::Codegen<'ctx> {
         };
         program.items.iter().any(|item| {
             matches!(item, crate::ast::Item::Function(f)
-                if f.name == callee_name
-                    && (crate::ast::fn_returns_param(f, arg_index)
-                        // B-2026-08-28-62 — the FORWARDING route: the callee
-                        // hands the argument to another call whose result it
-                        // returns. Asked here rather than inside
-                        // `fn_returns_param` because that predicate's eight
-                        // ownership consumers are documented as turning a leak
-                        // into corruption if its answer moves; this is the
-                        // caller-side Drop-BODY question alone.
-                        || crate::ast::fn_returns_param_via_call(program, f, arg_index)))
+            if f.name == callee_name
+                && (crate::ast::fn_returns_param(f, arg_index)
+                    // B-2026-08-28-62 — the FORWARDING route: the callee
+                    // hands the argument to another call whose result it
+                    // returns. Asked here rather than inside
+                    // `fn_returns_param` because that predicate's eight
+                    // ownership consumers are documented as turning a leak
+                    // into corruption if its answer moves; this is the
+                    // caller-side Drop-BODY question alone.
+                    || crate::ast::fn_returns_param_via_call(program, f, arg_index)
+                    // B-2026-09-06-61 — the hand-back THROUGH A REBIND
+                    // (`fn f(r: R) -> R { let m = r; return m; }`), and the
+                    // other whole-value routes `fn_always_returns_param`
+                    // recognizes.
+                    //
+                    // This gate and `escapes_frame`, a few lines below at
+                    // the registrar, are two halves of ONE fact — does the
+                    // argument outlive the call — asked of two different
+                    // predicates. `escapes_frame` already ORs in
+                    // `callee_hands_arg_off`, which IS
+                    // `fn_always_returns_param`, so the rebind route was
+                    // ALREADY visible at this call site; only the ADMISSION
+                    // test could not see it. So the defect was not a missing
+                    // registration but a HALF one: the registrar ran in its
+                    // memory-only mode (`escapes_frame` true, so no body)
+                    // over a buffer the callee had handed back, and the
+                    // caller's temp and its result binding both freed it
+                    // while the `Drop` body correctly fired once. That is
+                    // why the symptom is a program that prints the right
+                    // answer and double-frees, rather than one with a
+                    // doubled body.
+                    //
+                    // Widening toward `true` here is the SUPPRESSING
+                    // direction, so it takes the ALL-paths predicate rather
+                    // than `fn_returns_param`'s union: every exit hands the
+                    // argument back, so the caller's result binding owns it
+                    // on every path and no dies-inside path is left to
+                    // strand. Mixed-path callees are unaffected — the union
+                    // is already true for them.
+                    //
+                    // The ALL-paths restriction is not caution, it is the CALLEE's
+                    // own contract. A mixed-path callee registers its dies-inside
+                    // path through `fn_conditionally_returns_param_bare`, and that
+                    // registration is deliberately BODIES-ONLY
+                    // (`emit_struct_user_drop_bodies_only_fn` frees nothing)
+                    // precisely "because the caller still owns the memory" -- see
+                    // `compile_function`. Suppressing the caller here for a
+                    // mixed-path callee would retract the only memory owner its
+                    // dies-inside path has. Measured while writing this: extending
+                    // the disjunct to the UNION over the same aliases does fix the
+                    // conditional `let m = r; if c { return m; } return mk(9);`
+                    // (a double free on all three compiled surfaces) but leaks
+                    // 18 B at -O0 on the `c = false` path, which is clean today.
+                    // That spelling needs both sides moved together, and is filed
+                    // as its own row rather than bought at that price.
+                    //
+                    // The entry-copy carve-outs at the registrar are what
+                    // keep this sound for a COPY-SUPPORTED param, and they
+                    // are load-bearing rather than incidental: there the
+                    // callee deep-copies at entry and hands back an
+                    // INDEPENDENT object, so the caller's original still
+                    // needs its drop. `arg_is_entry_copied_heap_struct`
+                    // re-admits exactly that case through `||`, which is
+                    // why `fn f(s: S) -> S { let m = s; return m; }` over a
+                    // copy-supported `S` is clean before and after.
+                    || crate::ast::fn_always_returns_param(Some(program), f, arg_index)
+                    ))
         })
     }
 

@@ -7347,6 +7347,71 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-61 — the FREEING half of
+    /// `test_e2e_param_handed_back_through_a_rebind_leaves_one_owner`.
+    ///
+    /// That test asserts the output, which on the parent was already correct at
+    /// `-O2` while the program held a use-after-free; only a sanitizer
+    /// separates "prints the right lines" from "owns its memory once". Measured
+    /// here: 52 allocs / 52 frees and 0 valgrind errors after the fix, against
+    /// `free(): double free detected in tcache 2` and 26/27 errors on the
+    /// parent.
+    ///
+    /// DELIBERATELY OMITS the `tp` and `op` cells the E2E fixture carries. Both
+    /// go from a double free to a 16-byte leak of the `shared` handle's
+    /// refcount block at `-O0` — strictly less severe, and not this fix's to
+    /// close: their no-rebind twin (`fn f(r: R) -> (R, i64) { return (r, 9); }`)
+    /// leaks the same 16 bytes on the PARENT, so the residual is a pre-existing
+    /// defect in the aggregate-return path that this change merely lands them
+    /// on. Filed separately; including them here would make this fixture red for
+    /// someone else's bug.
+    fn asan_param_handed_back_through_a_rebind_leaves_one_owner() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct Box2 { r: R }
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkP(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+
+fn top(r: R) -> R { let m = r; return m; }
+fn two(r: R) -> R { let m = r; let n = m; return n; }
+fn tail(r: R) -> R { let m = r; m }
+fn pair(a: i64, r: R) -> R { let m = r; return m; }
+fn bx(r: R) -> Box2 { let m = r; return Box2 { r: m }; }
+fn rd(r: R) -> R { let m = r; println(f"in={m.name}"); return m; }
+fn ctl(p: P) -> P { let m = p; return m; }
+fn ret(r: R) -> R { return r; }
+
+fn main() {
+  let a = top(mk(41)); println(f"top={a.inner.v}");
+  let b = two(mk(42)); println(f"two={b.inner.v}");
+  let c = tail(mk(43)); println(f"tail={c.inner.v}");
+  let d = pair(7, mk(44)); println(f"pair={d.inner.v}");
+  let e = bx(mk(45)); println(f"bx={e.r.inner.v}");
+  let h = rd(mk(48)); println(f"rd={h.name}");
+  top(mk(49));
+  let mut i = 0;
+  while i < 2 { let z = top(mk(50)); println(f"lp={z.inner.v}"); i = i + 1; }
+  let p = ctl(mkP(52)); println(f"ctl={p.name}");
+  let r = ret(mk(53)); println(f"ret={r.inner.v}");
+  println("end");
+}
+"#,
+            &[
+                "top=41", "dR41", "two=42", "dR42", "tail=43", "dR43", "pair=44", "dR44", "bx=45",
+                "dR45", "in=h48", "rd=h48", "dR48", "dR49", "lp=50", "dR50", "lp=50", "dR50",
+                "ctl=p52", "dP52", "ret=53", "dR53", "end",
+            ],
+            "b0906-61-rebind-handback",
+            40,
+        );
+    }
+
+    #[test]
     fn asan_branch_nested_param_rebind_frees_the_entry_copy() {
         assert_clean_asan_run_min_allocs(
             r#"

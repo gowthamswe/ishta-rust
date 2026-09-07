@@ -5541,6 +5541,98 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-61 — a callee that hands a by-value param back THROUGH A
+    /// REBIND leaves the caller owning nothing.
+    ///
+    /// `fn top(r: R) -> R { let m = r; return m; }` over a struct with a
+    /// `shared` field: the param is not copy-supported, so it FORWARDS the
+    /// caller's object, and the value the caller's result binding receives is
+    /// the very buffer its fresh-temp argument holds. The caller's admission
+    /// gate (`call_arg_flows_into_return`) asked `fn_returns_param`, whose
+    /// return-site test matches the param's own NAME, so `return m` read as
+    /// "does not hand it back" and the temp was registered as an owner beside
+    /// the result binding.
+    ///
+    /// The tell is that the `Drop` BODY was already right: `escapes_frame`, in
+    /// the same call-site block, ORs in `callee_hands_arg_off` — which IS
+    /// `fn_always_returns_param` and DOES follow the rebind — so the registrar
+    /// ran in its memory-only mode. One body, two frees. Measured on the parent
+    /// as `free(): double free detected in tcache 2` under `karac run` and at
+    /// `KARAC_OPT_LEVEL=0`, and at the default `-O2` as a surviving
+    /// use-after-free that still printed every line correctly (76 valgrind
+    /// errors at -O2, 79 at -O0 for this fixture; 0 after).
+    ///
+    /// The cells are the spellings that were red: the plain `top`, the chained
+    /// `two` (whose second `let` sees a LOCAL), the tail-expression `tail` with
+    /// no `return` keyword at all, the second-param `pair`, the
+    /// aggregate-literal `bx` and tuple `tp`, the `Option` ctor `op`, the
+    /// read-then-return `rd`, the DISCARDED result (`top(mk(49))`, which has no
+    /// result binding and still double-freed), the loop, and `qq` — a `Map`
+    /// field, which on the parent did not merely abort but SEGFAULTED silently.
+    ///
+    /// `ctl` and `ret` are the controls the fix must not disturb. `ctl` is
+    /// copy-supported, so the callee entry-copies and hands back an INDEPENDENT
+    /// object whose original the caller must still drop — that case is re-admitted
+    /// by `arg_is_entry_copied_heap_struct`, and it is the reason this widening
+    /// is safe at all. `ret` is the same function without the rebind, which was
+    /// always clean; one binding was the whole difference.
+    fn test_e2e_param_handed_back_through_a_rebind_leaves_one_owner() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct Box2 { r: R }
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkP(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+struct Q { id: i64, t: Map[String, i64] }
+impl Drop for Q { fn drop(mut ref self) { println(f"dQ{self.id}") } }
+fn mkQ(i: i64) -> Q { let mut t = Map.new(); t.insert(f"k{i}", i); return Q { id: i, t: t }; }
+
+fn top(r: R) -> R { let m = r; return m; }
+fn two(r: R) -> R { let m = r; let n = m; return n; }
+fn tail(r: R) -> R { let m = r; m }
+fn pair(a: i64, r: R) -> R { let m = r; return m; }
+fn bx(r: R) -> Box2 { let m = r; return Box2 { r: m }; }
+fn tp(r: R) -> (R, i64) { let m = r; return (m, 9); }
+fn op(r: R) -> Option[R] { let m = r; return Option.Some(m); }
+fn rd(r: R) -> R { let m = r; println(f"in={m.name}"); return m; }
+fn qq(q: Q) -> Q { let m = q; return m; }
+fn ctl(p: P) -> P { let m = p; return m; }
+fn ret(r: R) -> R { return r; }
+
+fn main() {
+  let a = top(mk(41)); println(f"top={a.inner.v}");
+  let b = two(mk(42)); println(f"two={b.inner.v}");
+  let c = tail(mk(43)); println(f"tail={c.inner.v}");
+  let d = pair(7, mk(44)); println(f"pair={d.inner.v}");
+  let e = bx(mk(45)); println(f"bx={e.r.inner.v}");
+  let g = tp(mk(46)); println(f"tp={g.0.inner.v}");
+  match op(mk(47)) { Option.Some(v) => println(f"op={v.inner.v}"), Option.None => println("none") }
+  let h = rd(mk(48)); println(f"rd={h.name}");
+  top(mk(49));
+  let mut i = 0;
+  while i < 2 { let z = top(mk(50)); println(f"lp={z.inner.v}"); i = i + 1; }
+  let q = qq(mkQ(51)); println(f"qq={q.t.len()}");
+  let p = ctl(mkP(52)); println(f"ctl={p.name}");
+  let r = ret(mk(53)); println(f"ret={r.inner.v}");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "top=41\ndR41\ntwo=42\ndR42\ntail=43\ndR43\npair=44\ndR44\nbx=45\ndR45\ntp=46\ndR46\nop=47\ndR47\nin=h48\nrd=h48\ndR48\ndR49\nlp=50\ndR50\nlp=50\ndR50\nqq=1\ndQ51\nctl=p52\ndP52\nret=53\ndR53\nend\n",
+                "a callee that returns a REBIND of its by-value param hands the \
+                 caller's object back, so the argument temp must not stay an \
+                 owner beside the result binding; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-05-37 — a whole rebind of a by-value `Drop` param NESTED in a
     /// branch frees the callee's entry copy on the path that never rebound.
     ///

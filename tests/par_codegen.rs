@@ -13232,6 +13232,72 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-61, auto-par twin of
+    /// `test_e2e_param_handed_back_through_a_rebind_leaves_one_owner`.
+    ///
+    /// The caller-side admission gate this fixes is shared by the sequential and
+    /// auto-par lowerings, but the argument temp it registers is materialized
+    /// per call site — so an outlined parallel region reaches the same registrar
+    /// through a different block. Pinned here for the same reason every drop
+    /// fix in this file is: effect-analysis and ownership bugs diverge only
+    /// under auto-par, and a caller-side stand-down is exactly the shape that
+    /// can be right in one lowering and wrong in the other.
+    fn test_e2e_auto_par_param_handed_back_through_a_rebind_leaves_one_owner() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct Box2 { r: R }
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkP(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+struct Q { id: i64, t: Map[String, i64] }
+impl Drop for Q { fn drop(mut ref self) { println(f"dQ{self.id}") } }
+fn mkQ(i: i64) -> Q { let mut t = Map.new(); t.insert(f"k{i}", i); return Q { id: i, t: t }; }
+
+fn top(r: R) -> R { let m = r; return m; }
+fn two(r: R) -> R { let m = r; let n = m; return n; }
+fn tail(r: R) -> R { let m = r; m }
+fn pair(a: i64, r: R) -> R { let m = r; return m; }
+fn bx(r: R) -> Box2 { let m = r; return Box2 { r: m }; }
+fn tp(r: R) -> (R, i64) { let m = r; return (m, 9); }
+fn op(r: R) -> Option[R] { let m = r; return Option.Some(m); }
+fn rd(r: R) -> R { let m = r; println(f"in={m.name}"); return m; }
+fn qq(q: Q) -> Q { let m = q; return m; }
+fn ctl(p: P) -> P { let m = p; return m; }
+fn ret(r: R) -> R { return r; }
+
+fn main() {
+  let a = top(mk(41)); println(f"top={a.inner.v}");
+  let b = two(mk(42)); println(f"two={b.inner.v}");
+  let c = tail(mk(43)); println(f"tail={c.inner.v}");
+  let d = pair(7, mk(44)); println(f"pair={d.inner.v}");
+  let e = bx(mk(45)); println(f"bx={e.r.inner.v}");
+  let g = tp(mk(46)); println(f"tp={g.0.inner.v}");
+  match op(mk(47)) { Option.Some(v) => println(f"op={v.inner.v}"), Option.None => println("none") }
+  let h = rd(mk(48)); println(f"rd={h.name}");
+  top(mk(49));
+  let mut i = 0;
+  while i < 2 { let z = top(mk(50)); println(f"lp={z.inner.v}"); i = i + 1; }
+  let q = qq(mkQ(51)); println(f"qq={q.t.len()}");
+  let p = ctl(mkP(52)); println(f"ctl={p.name}");
+  let r = ret(mk(53)); println(f"ret={r.inner.v}");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "top=41\ndR41\ntwo=42\ndR42\ntail=43\ndR43\npair=44\ndR44\nbx=45\ndR45\ntp=46\ndR46\nop=47\ndR47\nin=h48\nrd=h48\ndR48\ndR49\nlp=50\ndR50\nlp=50\ndR50\nqq=1\ndQ51\nctl=p52\ndP52\nret=53\ndR53\nend\n",
+                "the rebind hand-back stand-down must hold under auto-par too; \
+                 got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_e2e_auto_par_branch_nested_param_rebind_frees_the_entry_copy() {
         let out = run_program(
             r#"
