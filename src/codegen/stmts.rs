@@ -3276,7 +3276,33 @@ impl<'ctx> super::Codegen<'ctx> {
                 if matches!(&object.kind, ExprKind::Identifier(p)
                     if self.payload_vars.shared_enum_payload_view_vars.contains_key(p.as_str()))
         );
-        if !is_param_field && !is_view_field {
+        // B-2026-09-07-23 — the RC-FALLBACK-PROMOTED root is the third source
+        // that RETAINS the field buffer, and it retains it for the same reason
+        // the two above do: the box frees the field at its own teardown, so a
+        // field moved into a fresh local must own an independent copy.
+        //
+        // Promotion is what makes this shape distinct from an ordinary local
+        // projection, which transfers: the disarms all reach the source field
+        // by GEP-ing the binding's slot, and a promoted slot holds a
+        // `{i64 rc, T}` box HANDLE rather than the struct, so every one of them
+        // bails on its shape test and the cap is never zeroed. Both sides then
+        // free one buffer — inside a LOOP once per iteration, so it scales with
+        // the trip count (measured 1 / 3 / 5 extra frees at 1 / 3 / 5 trips,
+        // `free(): double free detected in tcache 2` on every compiled backend).
+        // The never-entered sibling is B-2026-09-07-19, clean and closed.
+        //
+        // COPYING RATHER THAN DECLINING THE DESTINATION'S OWNERSHIP is the half
+        // worth recording, because declining looks equivalent and is not. The
+        // binding may be MUTATED (`let mut s = t.a; s.push_str("XY")`), and a
+        // push reallocs into a fresh buffer the binding then owns alone; with
+        // its registration declined that buffer has no owner at all. Measured:
+        // the decline traded 3 invalid frees for 228 B definitely lost in 3
+        // blocks, and left the 2 invalid frees in place. The copy is also what
+        // the interpreter does — `p.a.len()` reads 38 on EVERY iteration, not
+        // 38 once and 0 after, so the box keeps a live value and the
+        // destination needs one of its own.
+        let is_rc_boxed_field = self.projection_root_is_rc_boxed(value);
+        if !is_param_field && !is_view_field && !is_rc_boxed_field {
             return;
         }
         let slot_ptr = match self.variables.get(var_name) {

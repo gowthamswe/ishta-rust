@@ -3748,6 +3748,19 @@ impl<'ctx> super::Codegen<'ctx> {
                     Some(fty) => self.widen_niche_option_ptr_to_field(fty, is_opt_shared, val),
                     None => val,
                 };
+                // B-2026-09-07-23 — a field projecting off an RC-FALLBACK-PROMOTED
+                // root is the box's own buffer, which the box goes on owning
+                // (the disarms below cannot neutralize a box HANDLE), so the
+                // literal has to carry an independent copy or the two free one
+                // pointer. See `rc_boxed_projection_field_copy`.
+                let field_fte = self
+                    .type_decls
+                    .struct_field_type_exprs
+                    .get(name)
+                    .and_then(|tes| tes.get(idx))
+                    .cloned();
+                let val =
+                    self.rc_boxed_projection_field_copy(&field_init.value, field_fte.as_ref(), val);
                 agg = self
                     .builder
                     .build_insert_value(agg, val, idx as u32, "field")

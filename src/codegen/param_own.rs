@@ -4342,6 +4342,48 @@ impl<'ctx> super::Codegen<'ctx> {
         self.suppress_struct_field_move_by_name(s, field);
     }
 
+    /// True iff `e` PROJECTS off a binding the ownership pass RC-FALLBACK
+    /// PROMOTED, which is exactly when the source disarm cannot neutralize the
+    /// projected field and the BOX goes on owning it.
+    ///
+    /// The disarms all reach the source field by GEP-ing the binding's slot
+    /// (`suppress_struct_field_move_by_name` and its place-shaped peers). A
+    /// promoted binding's slot holds a `{i64 rc, T}` box HANDLE rather than the
+    /// struct, so every one of them bails on the `slot.ty` shape test and the
+    /// field's cap is never zeroed. The destination then takes ownership of a
+    /// buffer the box has not given up, and both free it.
+    ///
+    /// B-2026-09-07-23 — inside a LOOP this is once per iteration, so the
+    /// damage scales with the trip count: measured 1 / 3 / 5 extra frees at 1 /
+    /// 3 / 5 trips. Its never-entered sibling (B-2026-09-07-19) is clean for
+    /// the obvious reason — the body does not run — and was closed separately
+    /// as fixed in passing by `9a50182`.
+    ///
+    /// GEP-ING THROUGH THE HANDLE INSTEAD IS NOT THE FIX, and it is the first
+    /// thing that suggests itself. Zeroing the box's own field would neutralize
+    /// the source, but the box is the surviving owner precisely because the
+    /// binding is re-used after the consume: the SECOND iteration's projection
+    /// would then read a zeroed String. The interpreter is the oracle and
+    /// disagrees — `let p = P { a: t.a, b: 1 }; p.a.len()` is 38 on every
+    /// iteration, not 38 once and 0 after. So the value stays in the box and
+    /// the DESTINATION is the side that has to change.
+    ///
+    /// It changes by COPYING, not by declining its registration — see
+    /// `deep_copy_owned_struct_param_field_move`, where the RC-boxed root joins
+    /// the two other retaining sources. A declined destination leaks as soon as
+    /// it is mutated, because the realloc a `push` performs hands it a fresh
+    /// buffer nobody owns.
+    pub(super) fn projection_root_is_rc_boxed(&self, e: &Expr) -> bool {
+        if !matches!(
+            e.kind,
+            ExprKind::FieldAccess { .. } | ExprKind::TupleIndex { .. } | ExprKind::Index { .. }
+        ) {
+            return false;
+        }
+        Self::place_root_ident(e)
+            .is_some_and(|r| self.drop_rc.rc_fallback_heap_types.contains_key(r))
+    }
+
     /// [`Self::suppress_struct_field_move_into_literal`] addressed by NAME
     /// rather than by a `FieldAccess` expression (B-2026-08-28-10).
     ///

@@ -36018,6 +36018,117 @@ end
         );
     }
 
+    /// B-2026-09-07-23 — a heap field PROJECTED out of an RC-FALLBACK-PROMOTED
+    /// local shared one buffer with the box, and both freed it once per loop
+    /// iteration. (Its never-entered sibling, B-2026-09-07-19, is clean and was
+    /// closed as fixed in passing by `9a50182`.)
+    ///
+    /// The disarms all reach the source field by GEP-ing the binding's slot,
+    /// and a promoted slot holds a `{i64 rc, T}` box HANDLE rather than the
+    /// struct, so every one of them bails and the cap is never zeroed. The
+    /// destination takes ownership the box has not given up; inside a loop that
+    /// is once per TRIP, so it scales with the trip count and aborts
+    /// `free(): double free detected in tcache 2` on every compiled backend.
+    ///
+    /// THIS TEST ASSERTS THE EXIT STATUS, NOT ONLY STDOUT, and that is the
+    /// whole reason it is written with `run_program_capturing`. The double free
+    /// fires at scope-exit drop, AFTER the program has printed — so an
+    /// stdout-only assertion passes against the defect. Same shape as
+    /// B-2026-06-09-1, which is why `CapturedRun::status` exists.
+    ///
+    /// The OUTPUT half still earns its place: it rules out the fix that looks
+    /// equivalent. Disarming the box's OWN field would neutralize the source,
+    /// but the box is the surviving owner exactly because the binding is
+    /// re-used after the consume — so the second trip would read a ZEROED
+    /// string. Cell 2 reads the projected field's length on every trip and
+    /// would print `0` under that fix rather than `38`; cell 3 mutates its copy
+    /// and would see a short string. The interpreter prints what is pinned
+    /// here, on all three columns.
+    #[test]
+    fn e2e_rc_boxed_projection_copies_instead_of_sharing_an_owner() {
+        // The payload must be HEAP-allocated. A string LITERAL does not
+        // allocate, so a literal-payload fixture cannot reproduce this defect
+        // at all: an earlier draft used one, measured 9 allocations against the
+        // 17 here, and PASSED against the parent commit — pinning nothing. The
+        // f-string is what gives the box a buffer for a second owner to free.
+        const PRE: &str = r#"struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+"#;
+        // (source tail, expected stdout, cell name)
+        let cells: [(&str, &str, &str); 5] = [
+            // 1 — the row's spelling with the loop ENTERED, plus the source
+            // read afterwards (which is what drives the promotion at all).
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64;
+  while i < 3i64 { let p = P { a: t.a, b: 1 }; i = i + p.b; }
+  return t.b; }
+fn main() { println(go()); }
+"#,
+                "9",
+                "literal_loop_entered",
+            ),
+            // 2 — READS the projected field on every trip. 38 chars each time,
+            // so `i` advances by 1 per trip and the loop terminates at 3.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let p = P { a: t.a, b: 1 }; n = p.a.len(); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "38",
+                "field_read_each_trip",
+            ),
+            // 3 — the projected binding is MUTATED, so its copy must be
+            // INDEPENDENT of the box's buffer: 38 + 2 every trip, not growing.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let mut s = t.a; s.push_str("XY"); n = s.len(); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "40",
+                "mutated_destination",
+            ),
+            // 4 — the BARE projection, no literal anywhere: the literal in the
+            // row's title is incidental to the defect.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let s = t.a; n = n + s.len(); i = i + 1; }
+  return n; }
+fn main() { println(go()); }
+"#,
+                "114",
+                "bare_projection_no_literal",
+            ),
+            // 5 — CONTROL: no loop, so no promotion. The disarm works and the
+            // destination legitimately owns; nothing may change here.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let p = P { a: t.a, b: 1 };
+  return p.a.len() + p.b; }
+fn main() { println(go()); }
+"#,
+                "39",
+                "no_promotion_control",
+            ),
+        ];
+        for (tail, want, name) in cells {
+            let Some(cap) = run_program_capturing(&format!("{PRE}{tail}")) else {
+                return;
+            };
+            assert_eq!(cap.stdout.trim(), want, "cell {name}: stdout");
+            // The defect is a scope-exit double free, which lands after the
+            // print — so this, not the line above, is what fails on the parent.
+            assert!(
+                cap.status.success(),
+                "cell {name}: exited {:?}; stderr={:?}",
+                cap.status,
+                cap.stderr
+            );
+        }
+    }
+
     /// B-2026-09-07-10 — `let a = mk(1); let z = via(a);` over
     /// `fn via(r: R) -> R { return f(r); }` and `fn f(r: R) -> R { return r; }`
     /// aborted `free(): double free detected in tcache 2` on every compiled backend

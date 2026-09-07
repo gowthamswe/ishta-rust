@@ -13399,6 +13399,57 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-23, auto-par twin of
+    /// `e2e_rc_boxed_projection_copies_instead_of_sharing_an_owner`.
+    ///
+    /// A heap field projected out of an RC-FALLBACK-PROMOTED local was owned by
+    /// both the destination and the box, once per loop trip. Auto-par is a
+    /// distinct surface here because a fan-out statement is compiled TWICE (a
+    /// `__par_branch_*` worker and the sequential lane), and the copy has to
+    /// land in whichever lane actually runs — a per-destination retraction
+    /// would not have.
+    ///
+    /// The payload is an f-string rather than a literal because a string
+    /// LITERAL does not heap-allocate, and a literal-payload fixture cannot
+    /// reproduce the defect at all — an earlier draft used one and passed
+    /// against the parent commit. On the parent this program aborts inside
+    /// `lit()` before printing, so the stdout assertion is what fails there.
+    fn test_e2e_auto_par_rc_boxed_projection_copies_instead_of_sharing_an_owner() {
+        let out = run_program(
+            r#"
+struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn lit() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let p = P { a: t.a, b: 1 }; n = p.a.len(); i = i + p.b; }
+  return n + t.b; }
+fn bare() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let s = t.a; n = n + s.len(); i = i + 1; }
+  return n; }
+fn mutated() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let mut s = t.a; s.push_str("XY"); n = s.len(); i = i + 1; }
+  return n; }
+fn nopromo() -> i64 { let t = mkp(9); let p = P { a: t.a, b: 1 };
+  return p.a.len() + p.b; }
+fn main() {
+  println(lit());
+  println(bare());
+  println(mutated());
+  println(nopromo());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "47\n114\n40\n39\n",
+                "the RC-boxed projection's copy must hold under auto-par too; \
+                 got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-07-2, auto-par twin of
     /// `test_e2e_discarded_assoc_fn_call_owns_its_result`.
     fn test_e2e_auto_par_discarded_assoc_fn_call_owns_its_result() {

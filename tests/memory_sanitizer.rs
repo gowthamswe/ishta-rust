@@ -65081,6 +65081,179 @@ fn main() { println(go()); }
         );
     }
 
+    /// B-2026-09-07-23 — a heap field PROJECTED out of an RC-FALLBACK-PROMOTED
+    /// local was freed by the destination AND by the box, once per loop
+    /// iteration.
+    ///
+    /// Every disarm reaches the source field by GEP-ing the binding's slot
+    /// (`suppress_struct_field_move_by_name` and its place-shaped peers). A
+    /// promoted binding's slot holds a `{i64 rc, T}` box HANDLE rather than the
+    /// struct, so each one bails on its shape test and the cap is never zeroed;
+    /// the destination then takes ownership the box has not given up. Inside a
+    /// loop that is once per ITERATION, so the damage scales with the trip
+    /// count — measured 1 / 3 / 5 extra frees at 1 / 3 / 5 trips, and
+    /// `free(): double free detected in tcache 2` on every compiled backend.
+    ///
+    /// THE TRIP COUNT IS THE AXIS, which is why five of these cells differ only
+    /// in it. The parent row B-2026-09-07-19 was filed against a NEVER-ENTERED
+    /// loop and reported 17 allocations against 22 frees; the never-entered
+    /// program is in fact 17/17 clean (at `9a50182` and at `b7626d6` alike, so
+    /// nothing fixed it in between) and the 17/22 is the FIVE-trip program,
+    /// reproduced exactly by the fifth cell below. That row closed as fixed in
+    /// passing; this one is its executing-loop sibling, and the never-entered
+    /// cell is kept here as a CONTROL rather than as the defect.
+    ///
+    /// THE STRUCT LITERAL IN BOTH ROWS' TITLES IS INCIDENTAL. The bare
+    /// projection `let s = t.a`, with no literal anywhere in the program,
+    /// measures identically, and is the second cell here for that reason.
+    ///
+    /// THE FIX COPIES; IT DOES NOT RETRACT THE DESTINATION'S OWNERSHIP, and
+    /// both rejected alternatives are worth keeping because each looks right:
+    ///
+    ///   * Zeroing the box's own field through the handle would neutralize the
+    ///     source, but the box is the surviving owner precisely because the
+    ///     binding is re-used after the consume — the SECOND iteration would
+    ///     read a zeroed String. The interpreter is the oracle and reads the
+    ///     field's full 38 bytes on every iteration (cell 6 asserts it).
+    ///   * Declining the destination's registration — which B-2026-09-07-23's
+    ///     own prose prescribes as "the field-view direction" — leaks as soon
+    ///     as the binding is MUTATED: `push_str` reallocs into a fresh buffer
+    ///     that then has no owner at all. Measured on the way through: 228 B
+    ///     definitely lost in 3 blocks, with the 2 invalid frees still in
+    ///     place. Cell 7 is that shape and is why the copy is the answer.
+    #[test]
+    fn asan_rc_boxed_projection_copies_instead_of_sharing_an_owner() {
+        const OWN: &str = "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn takep(p: P) -> i64 { return p.b; }\n\
+             fn main() { println(go()); }\n";
+        // 1 — the row's own spelling, with the loop ENTERED. Three trips, three
+        // extra frees on the parent.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let p = P {{ a: t.a, b: 1 }}; i = i + p.b; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_literal_loop_entered",
+            10,
+        );
+        // 2 — NO LITERAL. The defect is the projection, not the literal.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let s = t.a; i = i + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_bare_no_literal",
+            10,
+        );
+        // 3 — ONE trip. The smallest cell that is dirty on the parent, and the
+        // one that shows the damage is per-iteration rather than per-loop.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 1i64 {{ let p = P {{ a: t.a, b: 1 }}; i = i + p.b; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_one_trip",
+            10,
+        );
+        // 4 — the `for` spelling, a different loop lowering onto the same
+        // promotion.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut n = 0i64;\n\
+                 \x20 for k in 0..3 {{ let p = P {{ a: t.a, b: 1 }}; n = n + p.b; }}\n\
+                 \x20 return n; }}\n"
+            ),
+            &["3"],
+            "rc_boxed_proj_for_loop",
+            10,
+        );
+        // 5 — FIVE trips: the 17-allocs-against-22-frees B-2026-09-07-19 was
+        // filed with, which is how those numbers were traced to a running loop
+        // rather than the never-entered one its prose quotes.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 5i64 {{ let p = P {{ a: t.a, b: 1 }}; i = i + p.b; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_five_trips",
+            10,
+        );
+        // 6 — READS the projected field on every iteration. This is the cell
+        // that rules out disarming the box's own field: the length has to be 38
+        // every trip, so `i` reaches 3 and the program prints 1. Zero the box's
+        // field on trip one and this prints something else.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let p = P {{ a: t.a, b: 1 }}; i = i + p.a.len() - 37; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_field_read_each_trip",
+            10,
+        );
+        // 7 — the projected binding is MUTATED. The copy must be independent:
+        // `push_str` reallocs, and with the destination's registration declined
+        // instead of copied that fresh buffer leaked (228 B in 3 blocks).
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64; let mut n = 0i64;\n\
+                 \x20 while i < 3i64 {{ let mut s = t.a; s.push_str(\"XY\"); n = s.len(); i = i + 1; }}\n\
+                 \x20 return n; }}\n"
+            ),
+            &["40"],
+            "rc_boxed_proj_mutated_destination",
+            10,
+        );
+        // 8 — CONTROL: the loop is never entered (B-2026-09-07-19's own cell).
+        // Clean on the parent and must stay clean.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ let p = P {{ a: t.a, b: 1 }}; i = i + p.b; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_never_entered_control",
+            10,
+        );
+        // 9 — CONTROL: no loop, so no promotion. The disarm works and the
+        // destination legitimately OWNS; the copy must not fire here.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let p = P {{ a: t.a, b: 1 }};\n\
+                 \x20 return p.b; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_no_promotion_control",
+            10,
+        );
+        // 10 — CONTROL: the projection as a CALL ARGUMENT was already clean
+        // before this fix and must stay so.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn takes(s: String) -> i64 {{ return s.len(); }}\n\
+                 fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ takes(t.a); i = i + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["1"],
+            "rc_boxed_proj_call_argument_control",
+            10,
+        );
+    }
+
     /// B-2026-09-01-5 — a DISCARDED aggregate literal whose field PROJECTS off
     /// a named local (`P { a: t.a, b: 1 }`) disarmed the source and registered
     /// no owner, stranding the buffer.

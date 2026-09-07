@@ -5835,6 +5835,65 @@ impl<'ctx> super::Codegen<'ctx> {
         Some(copied)
     }
 
+    /// B-2026-09-07-23 — the struct-literal-field peer of
+    /// [`Self::deep_copy_owned_struct_param_field_move`], for a field
+    /// initializer that PROJECTS off an RC-FALLBACK-PROMOTED root.
+    ///
+    /// `let p = P { a: t.a, b: 1 }` over a promoted `t` inserts the box's own
+    /// `{ptr,len,cap}` into the literal, so `p`'s struct-drop and the box both
+    /// free one buffer. Inside a loop that is once per iteration: 2 invalid
+    /// frees at 3 trips and `free(): double free detected in tcache 2` on every
+    /// compiled backend, scaling with the trip count.
+    ///
+    /// The `let`-bound BARE projection (`let s = t.a`) reaches the sibling
+    /// helper through the let site's `vec_elem_types` path and is fixed there;
+    /// this is the same defect one destination over, and the literal the row's
+    /// title names is incidental to it rather than its cause — the bare
+    /// projection, with no literal in the program, measures identically.
+    ///
+    /// Copying rather than retracting the literal's ownership, for the reason
+    /// recorded on `projection_root_is_rc_boxed`: the box keeps a LIVE value
+    /// (the interpreter reads the field's full length on every iteration), and
+    /// a destination whose registration is declined leaks the moment it is
+    /// mutated.
+    ///
+    /// The element type comes off the FIELD's declared type rather than any
+    /// binding table, exactly as `uam_defensive_copy_field` resolves it: at the
+    /// point a literal's field is compiled the destination's tables are not
+    /// populated yet. Self-gating on the value's LLVM shape is left to
+    /// `emit_vecstr_defensive_copy`, so a non-heap field passes through.
+    pub(super) fn rc_boxed_projection_field_copy(
+        &mut self,
+        init: &Expr,
+        fte: Option<&TypeExpr>,
+        val: BasicValueEnum<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        if !self.projection_root_is_rc_boxed(init) {
+            return val;
+        }
+        if val.get_type() != self.vec_struct_type().into() {
+            return val;
+        }
+        let elem_te = fte.and_then(|fte| match &fte.kind {
+            TypeKind::Path(pa)
+                if matches!(
+                    pa.segments.last().map(|s| s.as_str()),
+                    Some("Vec") | Some("VecDeque")
+                ) =>
+            {
+                pa.generic_args.as_ref().and_then(|a| match a.first() {
+                    Some(crate::ast::GenericArg::Type(t)) => Some(t.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        let elem_ty = fte
+            .and_then(|fte| self.extract_vec_elem_type(fte))
+            .unwrap_or_else(|| self.context.i8_type().into());
+        self.emit_vecstr_defensive_copy(val, elem_ty, elem_te.as_ref())
+    }
+
     /// B-2026-08-15-10 — the CALL-ARGUMENT half of the same defensive copy,
     /// taken from the SOURCE side because that is the only side an argument
     /// position still has.
