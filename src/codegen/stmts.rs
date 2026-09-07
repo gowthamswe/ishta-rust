@@ -6891,7 +6891,26 @@ impl<'ctx> super::Codegen<'ctx> {
                         // the box free at rc==0 recurses into those buffers
                         // instead of leaking them (B-2026-06-10-8). No-op for
                         // scalar / heap-free boxed values.
-                        self.register_rc_fallback_box_drop(heap_type);
+                        //
+                        // B-2026-09-07-17 — name the boxed STRUCT so the box
+                        // can also carry its user `Drop` (or its field-bodies
+                        // walk). The binding's own slot cannot: it holds the
+                        // box handle from here on, which is why the cleanup
+                        // registration further down declines for it. Resolved
+                        // by LLVM type rather than through `var_type_names`,
+                        // whose entry for a shadowing `let` is mid-dance at
+                        // this point; struct types are named and interned, so
+                        // the reverse lookup is exact.
+                        let boxed_struct_name = self
+                            .type_decls
+                            .struct_types
+                            .iter()
+                            .find(|(n, st)| {
+                                BasicTypeEnum::StructType(**st) == val_ty
+                                    && !self.type_decls.shared_types.contains_key(n.as_str())
+                            })
+                            .map(|(n, _)| n.clone());
+                        self.register_rc_fallback_box_drop(heap_type, boxed_struct_name.as_deref());
                         self.track_rc_var(var_name, heap_ptr, heap_type);
                         heap_ptr.into()
                     } else {
@@ -10040,7 +10059,35 @@ impl<'ctx> super::Codegen<'ctx> {
                                     .param_view_locals
                                     .insert(var_name.to_string());
                             }
-                            if struct_borrow_elided {
+                            if self
+                                .drop_rc
+                                .rc_fallback_heap_types
+                                .contains_key(var_name.as_str())
+                            {
+                                // B-2026-09-07-17 — the binding was RC-BOXED a
+                                // few hundred lines up, so `alloca` no longer
+                                // holds the struct: it holds the box handle,
+                                // and every registration below would hand that
+                                // 8-byte pointer slot to a drop fn expecting a
+                                // `T`. Exactly the shared-struct case the
+                                // comment above already refuses, one promotion
+                                // mechanism over — and `track_rc_var` has
+                                // already registered the box, whose rc==0 path
+                                // now carries the user body and the memory
+                                // together (`register_rc_fallback_box_drop`).
+                                //
+                                // Measured on `let t = mkp(9); while i < 0 {
+                                // takep(t); }` over a `Drop`-bearing struct,
+                                // whose loop body NEVER RUNS: the compiled
+                                // backends printed `drop P 0` where the
+                                // interpreter prints `drop P 38`, then freed
+                                // the box a second time — 19 allocs / 20
+                                // frees, three invalid reads and an invalid
+                                // write into the released box. The trigger is
+                                // the ownership pass's loop-of-consume RC
+                                // fallback, so any consume of the binding
+                                // inside a loop reaches it.
+                            } else if struct_borrow_elided {
                                 // Borrow alias: no owned drop (see comment above).
                             } else if rhs_is_param_view {
                                 // B-2026-09-06-52 — ONLY when a copy actually
@@ -10913,7 +10960,19 @@ impl<'ctx> super::Codegen<'ctx> {
                 if tail.is_some() || literal_tail.is_some() {
                     self.drop_rc.scope_cleanup_actions.push(Vec::new());
                 }
-                let val = self.compile_expr(expr)?;
+                // B-2026-09-01-5 — arm the discarded-statement window for the
+                // place-shaped disarms that run inside `compile_struct_init`'s
+                // field loop. `P { a: t.a, b: 1 };` cap-zeroed `t.a` for a
+                // literal nobody owns; see `Codegen::discarded_stmt_literal_span`
+                // for why only the place peers read it. Saved and restored so a
+                // nested statement answers for itself.
+                let saved_discarded_stmt = self.discarded_stmt_literal_span.take();
+                if let Some(lit) = Self::discarded_stmt_aggregate_literal(expr) {
+                    self.discarded_stmt_literal_span = Some((lit.span.offset, lit.span.length));
+                }
+                let val = self.compile_expr(expr);
+                self.discarded_stmt_literal_span = saved_discarded_stmt;
+                let val = val?;
                 // B-2026-08-28-53 — the argument/result boundary on this
                 // discard frame. Everything pushed while `compile_expr` ran is
                 // an ARGUMENT temporary whose live range ended at the call;
@@ -21167,6 +21226,36 @@ impl<'ctx> super::Codegen<'ctx> {
     /// Only the two statement-discard sites, which do retract, may use this.
     pub(super) fn discarded_movable_literal_tail<'e>(&self, expr: &'e Expr) -> Option<&'e Expr> {
         self.discarded_literal_tail_inner(expr, true)
+    }
+
+    /// B-2026-09-01-5 — the aggregate literal of a DISCARDED EXPRESSION
+    /// STATEMENT, found syntactically.
+    ///
+    /// Deliberately NOT `discarded_movable_literal_tail`: that predicate asks
+    /// whether every field is FRESH (or a movable struct place), because it
+    /// gates a REGISTRAR that would own the value. This asks only "is the
+    /// discarded statement an aggregate literal", because it arms a window that
+    /// makes place-shaped sources KEEP their own cleanup — and the fields that
+    /// need it are exactly the ones the freshness predicate turns away. Using
+    /// the registrar's predicate here is what left `P { a: t.a, b: 1 };`
+    /// stranding its buffer after the window existed: a projection is not
+    /// fresh, so the window never armed for the one shape it was for.
+    ///
+    /// Block wrappers are followed (`{ P { a: t.a, b: 1 }; }`) for the same
+    /// reason the registrar follows them. A branch or `match` is NOT: its arms
+    /// carry their own window, armed by `compile_block_with_frame`.
+    fn discarded_stmt_aggregate_literal(expr: &Expr) -> Option<&Expr> {
+        match &expr.kind {
+            ExprKind::StructLiteral { .. } | ExprKind::Tuple(_) => Some(expr),
+            ExprKind::Block(block)
+            | ExprKind::Seq(block)
+            | ExprKind::Unsafe(block)
+            | ExprKind::LabeledBlock { body: block, .. } => block
+                .final_expr
+                .as_deref()
+                .and_then(Self::discarded_stmt_aggregate_literal),
+            _ => None,
+        }
     }
 
     /// Shared body of the two predicates above. `allow_movable_place` admits a

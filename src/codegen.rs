@@ -1805,6 +1805,23 @@ pub(super) struct Codegen<'ctx> {
     /// exactly the containment test `suppress_source_vec_cleanup_for_arg_ex`
     /// runs.
     pub(crate) discarded_arm_tail_span: Option<(usize, usize)>,
+    /// B-2026-09-01-5 — the SPAN of a DISCARDED STATEMENT's aggregate literal
+    /// (`P { a: t.a, b: 1 };`), live only while that statement compiles.
+    ///
+    /// The sibling above covers a discarded branch ARM's tail. The bare
+    /// statement spelling reaches no such hook — `compile_block_with_frame`
+    /// never runs for it — so its literal's field sources were disarmed with
+    /// nothing consuming them, the same 38 B strand one construct over.
+    ///
+    /// DELIBERATELY read only by the four PLACE-shaped disarms
+    /// (`in_discarded_aggregate_tail`), never by the identifier one. A whole
+    /// binding moved into a discarded statement literal (`S2 { r: t, .. };`)
+    /// DOES get an owner here — `discarded_movable_literal_tail` registers the
+    /// literal and `discarded_literal_moved_place_sources` retracts the
+    /// source's body — so declining its disarm too would leave two owners of
+    /// one buffer. A projection has no such registrar, which is the whole
+    /// asymmetry this window exists to express.
+    pub(crate) discarded_stmt_literal_span: Option<(usize, usize)>,
     /// B-2026-08-28-44 — merge-point owner slots, keyed by the branch
     /// EXPRESSION's span (not the condition/scrutinee's), so a consuming
     /// destination takes the merged value over through the usual funnel and
@@ -6276,6 +6293,7 @@ impl<'ctx> Codegen<'ctx> {
             branch_arm_clone_taken: None,
             branch_arm_value_discarded: false,
             discarded_arm_tail_span: None,
+            discarded_stmt_literal_span: None,
             branch_tail_owner_slots: std::collections::HashMap::new(),
             current_branch_expr_span: None,
             container_elem_struct_clone_slots: std::collections::HashMap::new(),
@@ -7332,7 +7350,7 @@ impl<'ctx> Codegen<'ctx> {
     /// consumes this in `compile_function_body` to decide whether to emit
     /// `karac_par_run` for compiler-inferred parallel groups outside
     /// explicit `par {}` blocks.
-    fn parallel_groups_for_current_fn(&self) -> Option<&FunctionConcurrency> {
+    pub(crate) fn parallel_groups_for_current_fn(&self) -> Option<&FunctionConcurrency> {
         if self.conc.concurrency_decisions.is_empty() {
             return None;
         }

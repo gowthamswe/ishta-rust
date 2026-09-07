@@ -158,7 +158,32 @@
 # (the last measurement, at 225a4553) and 2026-09-01 several hundred commits
 # landed against a gate nobody turned. Two of the three were real codegen leaks
 # and are fixed rather than listed; this is the third.
-memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_local_declines  # B-2026-09-01-5
+# B-2026-09-01-5's entry
+# (asan_discarded_branch_literal_field_over_a_loop_outer_local_declines) was
+# REMOVED 2026-09-07, and THE LIST IS EMPTY AGAIN, so any -O0 failure from here
+# on is a new failure.
+#
+# The line below is kept as the record of what it said, because the reasoning in
+# it was wrong in a way worth not repeating. It called the fixture's 38 B
+# "DELIBERATE" and the decline safe -- "a decline and not a corruption, no
+# double free, no use-after-free". Measured on `main` the day it came off, that
+# program was 42 allocs / 43 frees with three invalid reads, an invalid write
+# and an invalid free at -O0, and at -O2 a leak beside two invalid reads. So the
+# quarantine was holding a USE-AFTER-FREE, not a leak, and the sentence that
+# justified keeping it had never been re-measured.
+#
+# Neither half was the discarded literal's. The corruption was the ownership
+# pass's loop-of-consume RC FALLBACK on the projected source (B-2026-09-07-17):
+# the binding's alloca holds a `{i64 rc, T}` box handle from that point on,
+# while the let site went on registering the value-typed drop against it. It
+# reproduces with no literal anywhere in the program, on a loop whose body never
+# runs. The leak was an unpaired disarm: the field is an ALIAS, the source was
+# cap-zeroed for it, and the registration was declined -- so nothing owned it.
+# Counted, `let t = mkp(9); P { a: t.a, b: 1 };` allocates exactly what `let t =
+# mkp(9);` alone does, 16 in both, and freed one fewer.
+#
+# The fixture is clean at BOTH opt levels now: 42/42 at -O0 and 41/41 at -O2,
+# zero errors either way.
 #
 # It is quarantined rather than fixed because its 38 B is DELIBERATE and its
 # owning row says why: the projection `P { a: t.a, b: 1 }` cannot take the
@@ -193,3 +218,15 @@ memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_lo
 #
 # The predicate now also admits a heap-carrying struct. It was answering the
 # BODIES question at a caller that needed the MEMORY one.
+
+# ── 2026-09-07: the list goes NON-EMPTY again, with one entry. ──
+memory_sanitizer_tests::asan_stored_argument_is_owned_by_its_new_home_not_the_caller  # B-2026-09-07-20
+#
+# Found by running this leg for the first time since `d971ad5` (B-2026-09-07-5)
+# added the fixture. Its `[b0907-5-outliving-store-admission]` cell leaks 35 B in
+# 3 allocations at -O0 and is clean at the default -O2 — the classic shape this
+# file exists for, and invisible to every session because nothing runs this leg
+# automatically.
+#
+# PRE-EXISTING, measured rather than assumed: the same test fails identically on
+# a tree with the in-flight fix stashed, i.e. on unmodified `main`.

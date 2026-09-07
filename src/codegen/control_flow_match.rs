@@ -9399,6 +9399,11 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::TupleIndex { object, index } = &value.kind else {
             return;
         };
+        // B-2026-09-01-5 — the tuple-index peer of the field-projection
+        // decline; see `in_discarded_aggregate_tail`.
+        if self.in_discarded_aggregate_tail(value) {
+            return;
+        }
         match Self::place_root_ident(value) {
             Some(root) if self.borrow_vars.owned_struct_params.contains(root) => return,
             Some(_) => {}

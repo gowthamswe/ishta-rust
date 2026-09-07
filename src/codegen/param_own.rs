@@ -4241,10 +4241,66 @@ impl<'ctx> super::Codegen<'ctx> {
             .then_some(resolved)
     }
 
+    /// B-2026-09-01-5 — is `value` a source nested inside a DISCARDED aggregate
+    /// literal's tail?
+    ///
+    /// The window is `discarded_arm_tail_span`, armed by
+    /// `compile_block_with_frame` for a discarded branch arm whose tail is a
+    /// struct/tuple literal (B-2026-09-07-14) and by the bare discarded
+    /// expression statement for the same shape. Sources of such a literal keep
+    /// their cleanup: the literal is built and thrown away, so nothing consumes
+    /// what a disarm would hand over.
+    ///
+    /// Shared by the four place-shaped disarms `compile_struct_init`'s field
+    /// loop calls after the identifier one — field access, tuple index, array
+    /// element, and the deeper place — so a widening of the window reaches all
+    /// of them at once rather than one spelling at a time, which is how this
+    /// family has been arriving.
+    pub(super) fn in_discarded_aggregate_tail(&self, value: &Expr) -> bool {
+        let s = value.span.offset;
+        [
+            self.discarded_arm_tail_span,
+            self.discarded_stmt_literal_span,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|(off, len)| s >= off && s < off.saturating_add(len))
+    }
+
     pub(super) fn suppress_struct_field_move_into_literal(&self, value: &Expr) {
         let ExprKind::FieldAccess { object, field } = &value.kind else {
             return;
         };
+        // B-2026-09-01-5 — a DISCARDED aggregate literal takes nothing over, so
+        // the field it projects keeps its owner.
+        //
+        // B-2026-09-07-14 established this for the field whose initializer NAMES
+        // a binding (`D { s: s }`) by teaching
+        // `suppress_source_vec_cleanup_for_arg_ex` the discarded tail's span.
+        // The PROJECTION spelling (`P { a: t.a, b: 1 }`) disarms through this
+        // helper instead — the field-access peer called one line below that one
+        // in `compile_struct_init`'s field loop — and it never learned the
+        // window, so `t.a`'s cap went to zero for a literal nobody owns.
+        //
+        // MEASURED, and the measurement is what settles the shape of the fix.
+        // The row this closes prescribes extending the fresh-temp field-move
+        // TAKEOVER to named locals; that is the wrong half. Counting
+        // allocations shows no takeover is owed, because no second buffer
+        // exists: `let t = mkp(9); P { a: t.a, b: 1 };` allocates exactly what
+        // `let t = mkp(9);` alone allocates — 16 in both — and frees one fewer,
+        // 16 / 15 against 16 / 16. The field is an ALIAS of `t.a`, not a clone
+        // and not a fresh mint, so there is nothing to hand over and the only
+        // defect is that the disarm ran with no consumer to hand it TO. Its
+        // sibling row's reading ("a CLONE with no owner") is refuted by the
+        // same count.
+        //
+        // That also retires the double-free hazard the row records as the
+        // reason it could not be closed at the discard site: with no takeover
+        // there is no static one-shot retraction to go wrong when the source is
+        // declared outside a loop and projected on each iteration.
+        if self.in_discarded_aggregate_tail(value) {
+            return;
+        }
         // B-2026-08-13-14 — the disarm half of the `UseAfterMove` defensive
         // copy, for the field-bind site. `uam_defensive_copy_field` handed the
         // destination an independent buffer, so the SOURCE still owns (and must
@@ -4556,6 +4612,11 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::FieldAccess { object, field } = &value.kind else {
             return;
         };
+        // B-2026-09-01-5 — the deeper-place peer of the field-projection
+        // decline; see `in_discarded_aggregate_tail`.
+        if self.in_discarded_aggregate_tail(value) {
+            return;
+        }
         if matches!(object.kind, ExprKind::Identifier(_) | ExprKind::SelfValue) {
             return;
         }
@@ -4703,6 +4764,11 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::Index { object, index } = &value.kind else {
             return;
         };
+        // B-2026-09-01-5 — the array-element peer of the field-projection
+        // decline; see `in_discarded_aggregate_tail`.
+        if self.in_discarded_aggregate_tail(value) {
+            return;
+        }
         let ExprKind::Integer(k, _) = &index.kind else {
             return;
         };

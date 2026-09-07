@@ -64424,6 +64424,238 @@ fn main() { println(go()); }
             10,
         );
     }
+
+    /// B-2026-09-07-17 — an RC-FALLBACK-PROMOTED local's user `Drop` ran over
+    /// the box after it had already been released, and freed it a second time.
+    ///
+    /// The ownership pass's loop-of-consume rule promotes a binding consumed
+    /// inside a loop, so its alloca stops holding the value and starts holding
+    /// a `{i64 rc, T}` box handle. The `let` site went on registering the
+    /// value-typed `karac_drop_<T>` against that 8-byte pointer slot — exactly
+    /// the hazard the gate three lines above it spells out for a `shared`
+    /// struct ("pass `alloca` — the slot holding the heap *pointer* — to
+    /// `<T>.drop`"), which RC-fallback promotion had no equivalent of.
+    ///
+    /// THE LOOP BODY NEVER RUNS in the first cell, which is what makes the
+    /// shape worth pinning: the promotion is a static decision, so the defect
+    /// does not need the consume to execute. Measured on the parent: `drop P 0`
+    /// against the interpreter's `drop P 38`, 19 allocations against 20 frees,
+    /// three invalid reads and an invalid write into the released box, and an
+    /// invalid free of the box itself.
+    ///
+    /// Cell 2 is the same shape with the loop running, cell 3 a struct that
+    /// merely CARRIES a Drop-bearing field (whose bodies-only walk had the same
+    /// slot problem), and cell 4 the FIELD-projection consume, whose body was
+    /// lost outright on the compiled backends rather than merely misread. Cell
+    /// 5 is the control that must stay clean: no `Drop` anywhere, so the box's
+    /// own field-free walk is still the right answer.
+    #[test]
+    fn asan_rc_fallback_boxed_local_drops_through_its_box() {
+        const OWN: &str = "struct P { a: String, b: i64 }\n\
+             impl Drop for P { fn drop(mut ref self) { println(f\"drop P {self.a.len()}\"); } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn takep(p: P) -> i64 { return p.b; }\n\
+             fn main() { println(go()); }\n";
+        // The loop-of-consume promotion fires on the CONSUME's presence, not on
+        // the trip count, so the never-entered loop is the sharpest cell.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop P 38", "1"],
+            "rc_fb_own_drop_loop_never_entered",
+            10,
+        );
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let k = takep(t); i = i + k - k + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop P 38", "1"],
+            "rc_fb_own_drop_loop_entered",
+            10,
+        );
+        // A struct with NO `Drop` of its own but a Drop-BEARING FIELD: the
+        // bodies-only walk is registered on the same slot and had the same
+        // pointer-to-pointer confusion.
+        const FIELD: &str = "struct S { v: String }\n\
+             impl Drop for S { fn drop(mut ref self) { println(f\"drop S {self.v.len()}\"); } }\n\
+             struct P { a: S, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: S { v: payload() }, b: n }; }\n\
+             fn takep(p: P) -> i64 { return p.b; }\n\
+             fn takes(s: S) -> i64 { return s.v.len(); }\n\
+             fn main() { println(go()); }\n";
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{FIELD}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop S 38", "1"],
+            "rc_fb_field_drop_whole_consume",
+            10,
+        );
+        // The FIELD-projection consume. On the parent this printed NOTHING at
+        // all on the compiled backends — the body was lost, not merely misread.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{FIELD}fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ let s = t.a; i = i + s.v.len(); }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop S 38", "1"],
+            "rc_fb_field_drop_projection_consume",
+            10,
+        );
+        // CONTROL — no `Drop` anywhere, so the box's own heap-field walk is
+        // still the whole answer and nothing may change for it.
+        assert_clean_asan_run_min_allocs(
+            "struct S { v: String }\n\
+             struct P { a: S, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: S { v: payload() }, b: n }; }\n\
+             fn takep(p: P) -> i64 { return p.b; }\n\
+             fn go() -> i64 { let t = mkp(9); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { takep(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["1"],
+            "rc_fb_no_drop_anywhere_control",
+            10,
+        );
+    }
+
+    /// B-2026-09-01-5 — a DISCARDED aggregate literal whose field PROJECTS off
+    /// a named local (`P { a: t.a, b: 1 }`) disarmed the source and registered
+    /// no owner, stranding the buffer.
+    ///
+    /// The measurement that fixes the shape of the fix: the projected field is
+    /// an ALIAS, not a clone and not a mint. `let t = mkp(9); P { a: t.a, b: 1
+    /// };` allocates exactly what `let t = mkp(9);` alone allocates — 16 in
+    /// both — and frees one fewer. So nothing is owed a takeover; the disarm
+    /// simply ran with no consumer to hand the buffer to, and declining it is
+    /// the whole fix. That retires the double-free hazard the row records
+    /// (a static one-shot retraction against a per-iteration move), because
+    /// with no retraction there is nothing to fire once.
+    ///
+    /// Both discard spellings, because they reach DIFFERENT windows: the branch
+    /// arm's tail (B-2026-09-07-14's) and the bare statement's own.
+    #[test]
+    fn asan_discarded_literal_projected_field_keeps_its_owner() {
+        const H: &str = "struct P { a: String, b: i64 }\n\
+             struct N { inner: P }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn mkn(n: i64) -> N { return N { inner: mkp(n) }; }\n\
+             fn main() { println(go()); }\n";
+        let rows: &[(&str, &str)] = &[
+            (
+                "branch arm, projecting arm taken",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20 1 }\n",
+            ),
+            // The projecting arm is NOT taken here, and the row records the
+            // sharpest half of the defect: the mere PRESENCE of a projecting
+            // arm cost the sibling arm its owner, so the decline was
+            // per-construct rather than per-path.
+            (
+                "branch arm, projecting arm NOT taken",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 if seed() > 99i64 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20 1 }\n",
+            ),
+            (
+                "branch arm, no else",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 if seed() > 0 { P { a: t.a, b: 1 } };\n\
+                 \x20 1 }\n",
+            ),
+            (
+                "branch arm, a statement follows",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20 let z = payload();\n\
+                 \x20 z.len() - z.len() + 1 }\n",
+            ),
+            (
+                "NESTED projection off a named local",
+                "fn go() -> i64 { let n = mkn(9);\n\
+                 \x20 if seed() > 0 { P { a: n.inner.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20 1 }\n",
+            ),
+            // The bare STATEMENT spelling — a different window from the arm's.
+            (
+                "bare statement literal",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 P { a: t.a, b: 1 };\n\
+                 \x20 1 }\n",
+            ),
+            (
+                "bare statement literal inside a block",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 { P { a: t.a, b: 1 }; }\n\
+                 \x20 1 }\n",
+            ),
+            // The LOOP cells. `t` inside the loop is a fresh value per
+            // iteration; `t` OUTSIDE it is the cell the row could not close and
+            // the one `tests/asan-o0-known-failures.txt` quarantined.
+            (
+                "loop, source declared INSIDE",
+                "fn go() -> i64 { let mut i = 0i64;\n\
+                 \x20 while i < 5i64 { let t = mkp(9);\n\
+                 \x20   if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20   i = i + 1; }\n\
+                 \x20 1 }\n",
+            ),
+            (
+                "loop, source declared OUTSIDE",
+                "fn go() -> i64 { let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 5i64 {\n\
+                 \x20   if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20   i = i + 1; }\n\
+                 \x20 1 }\n",
+            ),
+            // ── guards: a second owner here would be a DOUBLE FREE ────────
+            (
+                "guard: the source is READ after the discard",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20 t.a.len() - t.a.len() + 1 }\n",
+            ),
+            (
+                "guard: the literal is BOUND, so the binding owns it",
+                "fn go() -> i64 { let t = mkp(9);\n\
+                 \x20 let p = P { a: t.a, b: 1 };\n\
+                 \x20 p.a.len() - p.a.len() + 1 }\n",
+            ),
+            // ── controls, clean before and after ──────────────────────────
+            (
+                "control: a BARE BINDING field, not a projection",
+                "fn go() -> i64 { let s = payload();\n\
+                 \x20 if seed() > 0 { P { a: s, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20 1 }\n",
+            ),
+            (
+                "control: both arms MINT",
+                "fn go() -> i64 {\n\
+                 \x20 if seed() > 0 { P { a: payload(), b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20 1 }\n",
+            ),
+        ];
+        for (label, body) in rows {
+            assert_clean_asan_run(&format!("{H}{body}"), &["1"], label);
+        }
+    }
     /// B-2026-09-01-21 — a DISCARDED struct literal MIXING a live-local source
     /// with a minted sibling now registers an owner on the compiled backends,
     /// where one non-fresh field used to decline the whole literal.

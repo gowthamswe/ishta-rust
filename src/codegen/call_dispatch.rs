@@ -4177,10 +4177,105 @@ impl<'ctx> super::Codegen<'ctx> {
         // zeroes the field in the temp's slot, so the literal IS the sole owner
         // and declining it leaks (measured: 32 B on
         // `asan_discarded_branch_of_body_less_heap_literals_frees_once`).
-        match &e.kind {
-            ExprKind::FieldAccess { object, .. } => !self.expr_yields_fresh_owned_temp(object),
-            _ => false,
+        //
+        // B-2026-09-01-5 — THE FIELD-PROJECTION DECLINE IS RETIRED. What it was
+        // guarding against does not happen: the projected field is an ALIAS of
+        // the source's buffer, and the source is DISARMED for it one level down
+        // in `compile_struct_init`'s field loop, so declining the registration
+        // left the buffer with no owner at all rather than protecting a second
+        // one. Counted rather than argued: `let t = mkp(9); P { a: t.a, b: 1
+        // };` allocates exactly what `let t = mkp(9);` alone allocates — 16 in
+        // both — and frees one fewer.
+        //
+        // The loop shape the guard's history describes is answered by the same
+        // arithmetic: with the disarm running there is no takeover, hence no
+        // static one-shot retraction to fire against a per-iteration move. The
+        // `double-free` that spelling really did produce belonged to the RC
+        // FALLBACK promotion the loop-of-consume rule applies to the source
+        // (B-2026-09-07-17), reproduces with no literal anywhere in the
+        // program, and is fixed separately.
+        //
+        // The population where the source KEEPS its buffer — a discarded arm
+        // tail, a discarded statement literal — never reaches here: those
+        // decline the disarm instead (`in_discarded_aggregate_tail`), and their
+        // registration is the arm-level owner rather than this one.
+        //
+        // WHAT REMAINS DECLINED, and it is a different question from the one
+        // the guard used to ask. The source keeps its buffer exactly when the
+        // disarm could not neutralize it, and for a projection that is when the
+        // root binding was RC-FALLBACK PROMOTED: its alloca then holds a
+        // `{i64 rc, T}` box handle rather than the struct, so
+        // `zero_struct_field_move_cap_inst`'s "the slot must hold the struct
+        // INLINE" gate declines and the box goes on owning the field. Register
+        // here as well and the two free it — measured as an `Invalid free()` in
+        // all three cells that reach it, and only in those three: the source
+        // read again after the discard, the loop-outer projection, and its
+        // one-iteration sibling. Every one of them carries a
+        // `perf[rc-fallback]` note, and no cell without one regressed.
+        //
+        // That is why the guard's history reads as it does. It was tuned by
+        // spelling — bare binding, projection, following statement, loop — and
+        // each of those correlates with RC promotion rather than causing
+        // anything: a consume inside a loop, or in one arm with a use after the
+        // merge, is what the ownership pass promotes on.
+        let ExprKind::FieldAccess { object, .. } = &e.kind else {
+            return false;
+        };
+        if self.expr_yields_fresh_owned_temp(object) {
+            return false;
         }
+        if Self::place_root_ident(e)
+            .is_some_and(|r| self.drop_rc.rc_fallback_heap_types.contains_key(r))
+        {
+            return true;
+        }
+        // AND a statement AUTO-PAR fans out, for a structurally different
+        // reason with the same consequence.
+        //
+        // A fan-out statement is compiled TWICE — into a `__par_branch_*`
+        // worker and into the in-main sequential lane — so a registration made
+        // here lands on the caller's frame while the worker's own cleanup
+        // already frees the value. Measured on
+        // `let t = mkp(9); if c { P { a: t.a, b: 1 } } else { .. }; let z =
+        // payload();`, where the trailing statement is what gives the analyzer
+        // a second group to fan out: ASAN aborts with `attempting double-free`,
+        // freed once in `__par_branch_0_0` and once in `main`, while the same
+        // program with the trailing statement removed is clean.
+        //
+        // The same shape `functions.rs` excludes fan-out-mentioned names from
+        // the deque-head optimization for (B-2026-07-31-35), and detected the
+        // same way: the analyzer's own statement spans, so nothing is
+        // re-derived by counting statements.
+        //
+        // Worth stating plainly: this cell is NOT a leak at baseline. Under
+        // auto-par the buffer is already freed exactly once (`definitely lost:
+        // 0`), and it is only the sequential lane that strands it, which is why
+        // a probe run at `KARAC_AUTO_PAR=0` cannot see the difference between
+        // the two and the shipped suite can.
+        self.expr_in_fanned_out_stmt(e)
+    }
+
+    /// B-2026-09-01-5 — does `e` sit inside a top-level statement the auto-par
+    /// analyzer fans out in the current function?
+    ///
+    /// Mirrors the fan-out index computation in `functions.rs`'s deque-head
+    /// gate: parallel groups with no captured-container mutation (those run
+    /// sequentially anyway), plus recognized loop reductions and disjoint-write
+    /// loops. Answers `false` whenever no concurrency analysis was threaded in,
+    /// so a `KARAC_AUTO_PAR=0` build is byte-identical to not having this.
+    fn expr_in_fanned_out_stmt(&self, e: &Expr) -> bool {
+        let Some(dec) = self.parallel_groups_for_current_fn() else {
+            return false;
+        };
+        let off = e.span.offset;
+        dec.parallel_groups
+            .iter()
+            .filter(|g| g.captured_container_mutations.is_empty())
+            .flat_map(|g| g.statement_indices.iter().copied())
+            .chain(dec.loop_reductions.iter().map(|r| r.stmt_index))
+            .chain(dec.disjoint_write_loops.iter().map(|d| d.stmt_index))
+            .filter_map(|i| dec.statement_spans.get(i))
+            .any(|sp| off >= sp.offset && off < sp.offset.saturating_add(sp.length))
     }
 
     /// The head segment of a `Path` type, or `None` for any other shape.
@@ -11613,6 +11708,19 @@ impl<'ctx> super::Codegen<'ctx> {
         // corrupt the caller. Shared (RC) structs are left to the refcount
         // machinery.
         if let ExprKind::FieldAccess { object, field } = &arg_expr.kind {
+            // B-2026-09-01-5 — this arm cap-zeroes a PROJECTION, so it answers
+            // to the discarded-statement window as well as the arm one checked
+            // at the top of this function. It runs one line BEFORE
+            // `suppress_struct_field_move_into_literal` in
+            // `compile_struct_init`'s field loop, so teaching only that helper
+            // left `P { a: t.a, b: 1 };` still disarmed and still stranded.
+            //
+            // Scoped to the FieldAccess arm deliberately: the identifier arm
+            // above must keep disarming for a discarded STATEMENT literal,
+            // whose registrar does own a whole moved binding.
+            if self.in_discarded_aggregate_tail(arg_expr) {
+                return;
+            }
             // The receiver is an owned struct binding — a named `Identifier`
             // OR an owned `self` receiver (`fn get(self) -> String { self.v }`),
             // which parses as `SelfValue`, not `Identifier("self")`. Both bind an

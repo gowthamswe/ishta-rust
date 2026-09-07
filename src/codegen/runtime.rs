@@ -853,7 +853,17 @@ impl<'ctx> super::Codegen<'ctx> {
     /// Closes B-2026-06-10-8: a let-bound tuple/struct routed to RC-fallback
     /// boxing leaked its String/Vec field buffers at scope exit, because the
     /// box free (`emit_rc_dec`'s fallback `free`) never recursed into them.
-    pub(super) fn register_rc_fallback_box_drop(&mut self, box_heap_type: StructType<'ctx>) {
+    ///
+    /// `value_type_name` names the boxed value's Kāra struct when there is one
+    /// (`None` for a tuple, which has no name). It is what lets the box carry
+    /// the value's USER `Drop` as well as its memory — see the wrapper arm
+    /// below, and B-2026-09-07-17 for why leaving it to the let site was a
+    /// use-after-free.
+    pub(super) fn register_rc_fallback_box_drop(
+        &mut self,
+        box_heap_type: StructType<'ctx>,
+        value_type_name: Option<&str>,
+    ) {
         if self
             .drop_rc
             .rc_fallback_box_drop_fns
@@ -866,7 +876,36 @@ impl<'ctx> super::Codegen<'ctx> {
         else {
             return;
         };
-        if !self.aggregate_has_heap_field(value_ty) {
+        // B-2026-09-07-17 — the boxed value's own `Drop` body, and the
+        // field-bodies walk of a type that merely CARRIES a Drop-bearing
+        // field, both belong HERE rather than at the binding's let site.
+        //
+        // An RC-promoted binding's alloca holds the box HANDLE, not the value:
+        // the let site's `track_user_drop_var` therefore handed an 8-byte
+        // pointer slot to `karac_drop_<T>`, which read it as a `T` — the same
+        // pointer-to-pointer confusion the shared-struct gate one arm over
+        // already spells out ("Registering `track_user_drop_var` here too would
+        // (a) fire the body twice and (b) pass `alloca` — the slot holding the
+        // heap *pointer* — to `<T>.drop`"). Measured on a ten-line program
+        // whose loop body never runs: `drop P 0` against the interpreter's
+        // `drop P 38`, three invalid reads, an invalid write, and an invalid
+        // free of the box itself — 19 allocs / 20 frees.
+        //
+        // The wrapper is ONE action, body and memory together, so taking it
+        // here replaces the field-free walk rather than adding to it. That is
+        // the same contract `emit_rc_dec`'s shared-struct arm above keeps with
+        // `rc_drop_fns`, and this is its RC-fallback peer.
+        let wrapper =
+            value_type_name.and_then(|n| self.drop_rc.user_drop_wrapper_fns.get(n).copied());
+        // No own `Drop`, but a Drop-bearing FIELD: the bodies-only walk runs
+        // BEFORE the memory frees, so a body still reads its own buffers.
+        let field_bodies = match (wrapper, value_type_name) {
+            (None, Some(n)) if self.type_runs_user_drop(n, &mut Vec::new()) => {
+                self.emit_struct_user_drop_bodies_only_fn(n)
+            }
+            _ => None,
+        };
+        if wrapper.is_none() && field_bodies.is_none() && !self.aggregate_has_heap_field(value_ty) {
             return;
         }
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -897,7 +936,20 @@ impl<'ctx> super::Codegen<'ctx> {
             .builder
             .build_struct_gep(box_heap_type, box_ptr, 1, "rcfb.value")
             .unwrap();
-        self.emit_aggregate_heap_field_frees(value_ptr, value_ty);
+        match wrapper {
+            // Body + memory in one call; no field-free walk beside it.
+            Some(w) => {
+                self.builder.build_call(w, &[value_ptr.into()], "").unwrap();
+            }
+            None => {
+                if let Some(bodies) = field_bodies {
+                    self.builder
+                        .build_call(bodies, &[value_ptr.into()], "")
+                        .unwrap();
+                }
+                self.emit_aggregate_heap_field_frees(value_ptr, value_ty);
+            }
+        }
         self.builder.build_return(None).unwrap();
 
         self.current_fn = saved_fn;
