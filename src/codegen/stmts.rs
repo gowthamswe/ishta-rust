@@ -869,7 +869,35 @@ impl<'ctx> super::Codegen<'ctx> {
         // consumer and nobody else compensates. See the call site below.
         let tail_ret_armed = self.fn_ctx.tail_ret_inner.is_some();
         self.drop_rc.scope_cleanup_actions.push(Vec::new());
-        let result = self.compile_block(block)?;
+        // B-2026-09-07-7 — arm the tail-span window for the disarm sites that
+        // run BELOW the tail hook. The gate a few lines down
+        // (`if !arm_value_discarded { self.suppress_block_tail_cleanup(tail) }`)
+        // covers a tail that NAMES its source, because that suppression is
+        // performed here; an aggregate-literal tail disarms its sources inside
+        // `compile_struct_init`'s field loop instead, long before control gets
+        // back here. Saved and restored so a nested discarded branch inside
+        // this block answers for itself.
+        let saved_discarded_tail = self.discarded_arm_tail_span.take();
+        if arm_value_discarded {
+            // AGGREGATE LITERALS only. The window says "nothing below here takes
+            // a source over", which is true of a literal built and thrown away
+            // and false of a tail that hands its value somewhere else: a
+            // `break v` gives it to the loop's value and a `return v` to the
+            // caller, both of which DO consume it, and declining their disarms
+            // leaves two owners (measured: the `loop_break_*` and
+            // `aggregate_literal_at_explicit_return` fixtures).
+            if let Some(tail) = block.final_expr.as_deref() {
+                if matches!(
+                    tail.kind,
+                    crate::ast::ExprKind::StructLiteral { .. } | crate::ast::ExprKind::Tuple(_)
+                ) {
+                    self.discarded_arm_tail_span = Some((tail.span.offset, tail.span.length));
+                }
+            }
+        }
+        let result = self.compile_block(block);
+        self.discarded_arm_tail_span = saved_discarded_tail;
+        let result = result?;
         let body_has_terminator = self
             .builder
             .get_insert_block()

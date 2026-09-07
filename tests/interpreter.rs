@@ -57444,6 +57444,40 @@ end
     );
 }
 
+/// B-2026-09-07-7 — the interpreter never disarms a discarded arm's source,
+/// so it was correct on every cell; the twin holds the compiled string to it.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_discarded_arm_literal_over_a_named_local`, pinned to the same string.
+#[test]
+fn test_discarded_arm_literal_over_a_named_local() {
+    assert_eq!(
+        run(r#"struct D { s: String }
+struct R { id: i64, s: String }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"p{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn main() {
+  let n = seed();
+  println("named_field"); let b = payload(); let _ = if n >= 0 { D { s: b } };
+  println("stmt_in_arm"); let c = payload(); if n >= 0 { let q = D { s: c }; println(f"  q={q.s.len()}"); }
+  println("mint_field"); let _ = if n >= 0 { R { id: 2, s: payload() } };
+  println("bare_stmt_named"); let d = payload(); if n >= 0 { D { s: d } };
+  println("not_taken"); let e = payload(); let _ = if n > 900 { D { s: e } };
+  println("end");
+}
+"#),
+        r#"named_field
+stmt_in_arm
+  q=31
+mint_field
+  dR2
+bare_stmt_named
+not_taken
+end
+"#
+    );
+}
+
 /// B-2026-09-06-71 — the interpreter was correct on every cell of this row; the
 /// twin holds the compiled string to it.
 ///

@@ -35312,6 +35312,59 @@ end
         );
     }
 
+    /// B-2026-09-07-7 — a DISCARDED arm whose tail is an aggregate literal over a
+    /// NAMED LOCAL stranded that local's buffer: `let s = payload(); let _ = if
+    /// n == 1 { D { s: s } };` lost 38 B per evaluation on every compiled backend.
+    ///
+    /// B-2026-08-29-5 established the rule — suppression hands a tail's buffer from
+    /// its source to whatever consumes the branch's value, and a discarded branch
+    /// has no consumer, so the source keeps its cleanup. That gate sits at the tail
+    /// hook in `compile_block_with_frame`, which covers a tail that IS an
+    /// identifier. A literal tail disarms its sources one level down, in
+    /// `compile_struct_init`'s field loop, and never reached it.
+    ///
+    /// Cells: the named local into a discarded literal (`let _ =` and bare-statement
+    /// spellings), a `let`-bound literal STATEMENT inside the same arm — which must
+    /// keep its disarm, because there the binding owns the buffer and freeing it
+    /// twice is the failure this family exists to avoid — a minted field, and an
+    /// arm that is never taken.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_discarded_arm_literal_over_a_named_local`, pinned to the same string.
+    #[test]
+    fn e2e_discarded_arm_literal_over_a_named_local() {
+        let Some(out) = run_program(
+            r#"struct D { s: String }
+struct R { id: i64, s: String }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"p{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn main() {
+  let n = seed();
+  println("named_field"); let b = payload(); let _ = if n >= 0 { D { s: b } };
+  println("stmt_in_arm"); let c = payload(); if n >= 0 { let q = D { s: c }; println(f"  q={q.s.len()}"); }
+  println("mint_field"); let _ = if n >= 0 { R { id: 2, s: payload() } };
+  println("bare_stmt_named"); let d = payload(); if n >= 0 { D { s: d } };
+  println("not_taken"); let e = payload(); let _ = if n > 900 { D { s: e } };
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"named_field
+stmt_in_arm
+  q=31
+mint_field
+  dR2
+bare_stmt_named
+not_taken
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-71 — `let a = mk(1); let z = pass(a);` over
     /// `fn pass(r: R) -> R { return r; }` and a struct with a `shared` field aborted
     /// `free(): double free detected in tcache 2` under `karac run` and at both opt

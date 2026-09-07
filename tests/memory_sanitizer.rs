@@ -4134,6 +4134,41 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-7 — the MEMORY half, which IS this row: the same program
+    /// under ASAN + LSan. Pre-fix it lost 93 B in 3 blocks (one per discarded
+    /// literal over a named local); the buffer now has exactly one owner in
+    /// every cell, and the `let`-bound literal inside the arm still has its own.
+    #[test]
+    fn asan_discarded_arm_literal_over_a_named_local() {
+        assert_clean_asan_run(
+            "struct D { s: String }\n\
+             struct R { id: i64, s: String }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"p{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn main() {\n\
+               let n = seed();\n\
+               println(\"named_field\"); let b = payload(); let _ = if n >= 0 { D { s: b } };\n\
+               println(\"stmt_in_arm\"); let c = payload(); if n >= 0 { let q = D { s: c }; println(f\"  q={q.s.len()}\"); }\n\
+               println(\"mint_field\"); let _ = if n >= 0 { R { id: 2, s: payload() } };\n\
+               println(\"bare_stmt_named\"); let d = payload(); if n >= 0 { D { s: d } };\n\
+               println(\"not_taken\"); let e = payload(); let _ = if n > 900 { D { s: e } };\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "named_field",
+                "stmt_in_arm",
+                "  q=31",
+                "mint_field",
+                "  dR2",
+                "bare_stmt_named",
+                "not_taken",
+                "end"
+            ],
+            "discarded_arm_literal_over_a_named_local",
+        );
+    }
+
     /// B-2026-09-06-71 — the MEMORY half, which is the row: the same program
     /// under ASAN + LSan, where the pre-fix build double-freed the object the
     /// callee handed back. One owner and one free per object on every argument

@@ -1788,6 +1788,23 @@ pub(super) struct Codegen<'ctx> {
     /// entry, before it compiles anything: only the block the flag was set for
     /// may read it, never a nested one.
     pub(crate) branch_arm_value_discarded: bool,
+    /// B-2026-09-07-7 — the SPAN of a discarded arm's tail expression, live
+    /// only while that tail is being compiled.
+    ///
+    /// `branch_arm_value_discarded` above is `take`n at
+    /// `compile_block_with_frame`'s entry, so it is already gone by the time
+    /// the tail's own sub-expressions compile — and an AGGREGATE LITERAL tail
+    /// disarms its sources down there, in `compile_struct_init`'s field loop,
+    /// not at the tail hook. `let _ = if n == 1 { D { s: s } };` therefore
+    /// zeroed `s`'s cap for a literal nobody owns and stranded the buffer.
+    ///
+    /// A span rather than a flag because the scope has to be the TAIL, not the
+    /// arm: a `let q = D { s: s };` STATEMENT inside the same arm must keep its
+    /// disarm (`q` owns the buffer and frees it), and its span lies outside the
+    /// tail's. Sub-expressions of the tail are spans nested inside it, which is
+    /// exactly the containment test `suppress_source_vec_cleanup_for_arg_ex`
+    /// runs.
+    pub(crate) discarded_arm_tail_span: Option<(usize, usize)>,
     /// B-2026-08-28-44 — merge-point owner slots, keyed by the branch
     /// EXPRESSION's span (not the condition/scrutinee's), so a consuming
     /// destination takes the merged value over through the usual funnel and
@@ -6258,6 +6275,7 @@ impl<'ctx> Codegen<'ctx> {
             vec_elem_field_clone_elem_ty: std::collections::HashMap::new(),
             branch_arm_clone_taken: None,
             branch_arm_value_discarded: false,
+            discarded_arm_tail_span: None,
             branch_tail_owner_slots: std::collections::HashMap::new(),
             current_branch_expr_span: None,
             container_elem_struct_clone_slots: std::collections::HashMap::new(),

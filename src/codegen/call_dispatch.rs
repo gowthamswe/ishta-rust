@@ -11358,6 +11358,30 @@ impl<'ctx> super::Codegen<'ctx> {
         // B-2026-08-30-2 — same contract, Vec/String tier. See
         // `Codegen::vecstr_source_disarmed`.
         self.vecstr_source_disarmed = None;
+        // B-2026-09-07-7 — a DISCARDED arm's tail takes nothing over, so its
+        // sources keep their cleanup.
+        //
+        // This is B-2026-08-29-5's rule ("leaving the source armed is the
+        // entire fix for the population whose tail NAMES something") reaching
+        // the population whose tail is an aggregate LITERAL over a named local:
+        // `let s = payload(); let _ = if n == 1 { D { s: s } };`. That
+        // literal's field loop disarms `s` here, below the tail hook that
+        // implements the rule, so `s`'s cap went to zero for a value with no
+        // consumer and the buffer was stranded — 38 B per evaluation, and the
+        // two shipped fixtures `asan_no_else_if_arm_owns_the_value_it_mints`
+        // and `asan_discarded_branch_literal_field_over_a_loop_outer_local_declines`
+        // assert exactly this cell.
+        //
+        // Scoped to the tail's own span so a `let q = D { s: s };` STATEMENT
+        // inside the same arm still disarms: `q` owns the buffer there and
+        // frees it, and leaving the source armed would be the double free this
+        // whole family exists to avoid.
+        if let Some((off, len)) = self.discarded_arm_tail_span {
+            let s = arg_expr.span.offset;
+            if s >= off && s < off.saturating_add(len) {
+                return;
+            }
+        }
         // B-2026-08-10-21 — the source of a `UseAfterMove` keeps its cleanup.
         //
         // Every one of this helper's ~87 call sites funnels here, which is why
