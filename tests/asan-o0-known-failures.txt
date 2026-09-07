@@ -230,3 +230,28 @@ memory_sanitizer_tests::asan_stored_argument_is_owned_by_its_new_home_not_the_ca
 #
 # PRE-EXISTING, measured rather than assumed: the same test fails identically on
 # a tree with the in-flight fix stashed, i.e. on unmodified `main`.
+
+# ── 2026-09-07 (second entry of the day): two IF/ELSE spellings, one row. ──
+memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_local_declines  # B-2026-09-07-43
+memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_after_declines    # B-2026-09-07-43
+#
+# Both are the same defect at two sizes: a DISCARDED aggregate literal whose
+# tail is an `if/else` never reaches the owner registrar, so the COPY that
+# B-2026-09-07-23 (afe5abfbe) now makes for a projection off an
+# RC-fallback-promoted root is stranded — 190 B in 5 blocks over a five-trip
+# loop, and 38 B in 1 where reading the source afterwards is what promotes it.
+#
+# PRE-EXISTING, and measured rather than assumed in BOTH directions: they fail
+# with 8f3751b15's `src/` hunks reverse-applied, and they fail at 0e881224f —
+# the tree B-2026-09-07-38 named as its last clean measurement, which is the
+# baseline that row's elimination rested on. Every spelling that DOES reach the
+# registrar (no `else`, bare statement, read-after-loop) is closed by 8f3751b15
+# and stays on this leg.
+#
+# The second line was never visible until 8f3751b15. It was a CELL of
+# `asan_discarded_literal_projected_field_keeps_its_owner`, sitting after the
+# loop cell that was already failing — and `assert_clean_asan_run` panics at
+# the first bad cell, so it had never executed. Two failing cells, one
+# observable. It is split into its own `#[test]` here for the reason this file
+# keeps repeating: quarantining the function it lived in would have taken that
+# fixture's twelve SOUND cells off the leg with it.
