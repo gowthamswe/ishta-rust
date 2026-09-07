@@ -468,6 +468,50 @@ impl<'ctx> super::Codegen<'ctx> {
             if !any_heap {
                 return false;
             }
+            // B-2026-09-07-16 — OWN BY TRANSFER when the entry copy cannot
+            // duplicate what the param carries.
+            //
+            // `deep_copy_enum_heap_payload_in_place` declines a
+            // `NestedOwnedStruct` payload that owns heap of its own, by
+            // construction and not by omission: a PARTIAL copy would alias
+            // exactly the fields the walk skipped, which the drop then frees
+            // twice. So the copy below duplicates nothing for that variant, the
+            // callee's slot and the caller's temp are ONE buffer, and
+            // `track_enum_var` right after it made the callee a second owner —
+            // `free(): double free detected in tcache 2` on
+            // `sink(W.T(X1 { a: Option.Some(1), s: "…" }))` at both opt levels,
+            // where `--interp` printed `ok`.
+            //
+            // Take the struct twin's bargain instead (B-2026-08-05-33): skip the
+            // copy, keep the registration, and let the CALLER retract. A copy
+            // was never the point — it exists to leave the caller's original
+            // intact, and there is no original to protect once ownership
+            // transferred. Held in LOCKSTEP with the three caller-side
+            // retractions, which is the whole safety argument; the type-level
+            // predicate is what lets both frames reach the same answer without
+            // the caller reading this prologue.
+            //
+            // The PAYLOAD BODIES move with the memory, and they must. Off this
+            // path the caller's `__karac_dropelems_enum_<E>` walker is the
+            // payload bodies' single owner and reads through the caller's own
+            // independent copy; under transfer that copy is the callee's buffer,
+            // which the callee frees before the caller's scope exit ever runs —
+            // a use-after-free rather than the double free it replaced. Memory
+            // FIRST so the frame's LIFO drain runs the bodies before the free
+            // they read through (the B-2026-08-01-2 rule).
+            if self.enum_param_owned_by_transfer(type_name) {
+                self.track_enum_var(type_name, slot);
+                if let Some(w) = self.emit_enum_payload_user_drop_bodies_fn(type_name) {
+                    self.track_user_drop_var_with_fn(
+                        "",
+                        param_name,
+                        slot,
+                        w,
+                        crate::codegen::state::UserDropKind::ContainerElemBodies,
+                    );
+                }
+                return true;
+            }
             self.deep_copy_enum_heap_payload_in_place(type_name, slot, &layout);
             self.track_enum_var(type_name, slot);
             return true;
@@ -2196,6 +2240,121 @@ impl<'ctx> super::Codegen<'ctx> {
         !self.aggregate_param_copy_supported_struct(struct_name, &mut Vec::new())
             && !self.struct_owns_shared_field(struct_name, &mut Vec::new())
             && !self.struct_is_self_referential(struct_name)
+    }
+
+    /// B-2026-09-07-16 — does the entry copy DECLINE this enum payload field,
+    /// leaving the callee's slot aliasing the caller's buffers?
+    ///
+    /// The one per-field question behind both halves of that row, asked in one
+    /// place so the copy switch and the transfer predicate cannot drift. Read
+    /// it against `deep_copy_enum_heap_payload_in_place`'s nested-struct arm,
+    /// which is the code this describes:
+    ///
+    ///   * `NestedStruct` is copy-supported — envelope AND contents are
+    ///     duplicated (boxed) or the contents are (inline). Never declined.
+    ///   * `NestedOwnedStruct` owning NO drop-heap of its own is the
+    ///     B-2026-09-06-4 class: the box IS the whole cleanup, the envelope
+    ///     alone is a complete copy, and it is duplicated. Never declined.
+    ///   * `NestedOwnedStruct` that DOES own heap below it is this row: the
+    ///     copy paths decline its contents by construction (a partial copy
+    ///     would alias exactly the fields the walk skipped, which the drop
+    ///     then frees twice), so nothing is duplicated — not the contents,
+    ///     and not the envelope either, since duplicating that alone would
+    ///     hand the two frames one set of contents under two boxes.
+    ///
+    /// `owns_heap` is asked with the same pair the boxed arm uses
+    /// (`type_expr_has_drop_heap` / `option_field_te_has_drop_heap`), so the
+    /// `Option`-only-heap class is not read as heapless.
+    pub(super) fn enum_payload_struct_copy_declined(
+        &self,
+        kind: EnumDropKind,
+        struct_name: &str,
+    ) -> bool {
+        if kind != EnumDropKind::NestedOwnedStruct {
+            return false;
+        }
+        self.type_decls
+            .struct_field_type_exprs
+            .get(struct_name)
+            .is_some_and(|ftes| {
+                ftes.iter().any(|f| {
+                    self.type_expr_has_drop_heap(f) || self.option_field_te_has_drop_heap(f)
+                })
+            })
+    }
+
+    /// B-2026-09-07-16 — must a by-value ENUM param be owned by TRANSFER,
+    /// because its prologue's entry copy cannot duplicate what it carries?
+    ///
+    /// The enum sibling of [`Self::struct_param_owned_by_transfer`], and it
+    /// exists for the same reason: the CALLER cannot read the callee's
+    /// prologue, so a decision both frames must agree on has to be derivable
+    /// from the TYPE alone. Unlike the struct twin there is no prepass and no
+    /// call-site-shape half — the enum layout answers it outright.
+    ///
+    /// True when any variant carries a payload
+    /// [`Self::enum_payload_struct_copy_declined`] turns away. The entry copy
+    /// then duplicates NOTHING for that variant, so the callee's slot and the
+    /// caller's temp are one buffer and both frames free it:
+    /// `sink(W.T(X1 { a: Option.Some(1), s: "…" }))` aborted `free(): double
+    /// free detected in tcache 2` at `-O0` and `-O2` (valgrind: two frees of
+    /// one 56-byte block) while `--interp` printed `ok`.
+    ///
+    /// Transfer rather than caller-retains, matching the struct precedent
+    /// (B-2026-08-05-33): the callee's INTERNAL ownership story is then
+    /// identical to the entry-copied case it replaces — only the provenance of
+    /// the buffer differs — so a `match w { W.T(x) => … }` arm that consumes
+    /// the payload keeps working through the move-suppression it already uses.
+    /// Caller-retains would need the enum sibling of the by-value param VIEW
+    /// rule before a consuming arm was safe, which is a far larger change for
+    /// the same outcome.
+    ///
+    /// Conservative in the direction that matters, exactly as the struct twin
+    /// is: a type this DECLINES keeps today's behaviour byte-for-byte, while
+    /// one it wrongly ADMITS would stand the caller down for memory the callee
+    /// never took — a leak. So `shared` enums and the type-erased
+    /// `Option`/`Result` (whose payloads have their own machinery) are refused
+    /// outright rather than reasoned about.
+    pub(super) fn enum_param_owned_by_transfer(&self, enum_name: &str) -> bool {
+        if enum_name == "Option"
+            || enum_name == "Result"
+            || self.type_decls.shared_types.contains_key(enum_name)
+        {
+            return false;
+        }
+        let Some(layout) = self.type_decls.enum_layouts.get(enum_name) else {
+            return false;
+        };
+        if layout.is_shared {
+            return false;
+        }
+        let variant_tes: HashMap<String, Vec<TypeExpr>> = self
+            .enum_variant_field_type_exprs(enum_name)
+            .into_iter()
+            .map(|(_tag, name, tes)| (name, tes))
+            .collect();
+        layout.field_drop_kinds.iter().any(|(vname, kinds)| {
+            kinds.iter().enumerate().any(|(fi, kind)| {
+                variant_tes
+                    .get(vname)
+                    .and_then(|tes| tes.get(fi))
+                    .and_then(|te| match &te.kind {
+                        TypeKind::Path(p) => p.segments.first().cloned(),
+                        _ => None,
+                    })
+                    .is_some_and(|sname| {
+                        // Self-reference is refused for the struct twin's
+                        // reason (B-2026-07-28-3): the callee may store the
+                        // alias into an owning container, so a param drop could
+                        // free what the container now owns. A `shared`-owning
+                        // payload cannot arrive here at all — such a struct is
+                        // classified `NestedStruct` by the drop classifier's
+                        // shared-field arm, never `NestedOwnedStruct`.
+                        !self.struct_is_self_referential(&sname)
+                            && self.enum_payload_struct_copy_declined(*kind, &sname)
+                    })
+            })
+        })
     }
 
     /// B-2026-09-06-69 — is a by-value struct param one the callee's prologue

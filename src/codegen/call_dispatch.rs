@@ -6408,6 +6408,32 @@ impl<'ctx> super::Codegen<'ctx> {
             // let-path produces (`karac_drop_E` + `__karac_drop_E` on
             // the same slot). Coroutine-compiled callees never reach
             // this helper (early return upstream), so no double-drop.
+            // B-2026-09-07-16 — …unless the callee OWNS this temp outright.
+            //
+            // The enum twin of the struct arm's own-`Drop` stand-down a few
+            // hundred lines up, and it answers the same question the same way:
+            // every registration below rests on the callee ENTRY-COPYING, so
+            // that this temp is an independent buffer whose drop frees a
+            // distinct heap. For an enum carrying a payload the copy declines
+            // there is no copy and the two buffers are the same one, so the
+            // memory registration is a second owner and the payload-bodies
+            // walker reads through a buffer the callee has already freed.
+            //
+            // Register NOTHING and return, on BOTH routes — the escape route
+            // below included, whose whole premise ("the callee returns the COPY,
+            // so the ORIGINAL is orphaned") is false when no copy was made.
+            // The callee's half lands in the same commit
+            // (`make_aggregate_param_callee_owned_transfer`'s enum arm now
+            // registers the memory AND the payload bodies off its own param
+            // slot), so the two sides move together.
+            //
+            // Measured on `sink(W.T(X1 { a: Option.Some(1), s: "…" }))`:
+            // `free(): double free detected in tcache 2` at `-O0` and `-O2`,
+            // valgrind reporting two frees of one 56-byte block at 9 allocs /
+            // 10 frees, against `--interp`'s clean `ok`.
+            if self.enum_param_owned_by_transfer(&enum_name) {
+                return;
+            }
             let has_user_drop = self
                 .program_snapshot
                 .as_deref()
@@ -7299,6 +7325,13 @@ impl<'ctx> super::Codegen<'ctx> {
                 && en != "Result"
                 && !self.type_decls.shared_types.contains_key(en.as_str())
                 && self.enum_has_heap_payload(&en)
+                // B-2026-09-07-16 — an enum the callee owns BY TRANSFER is not
+                // entry-copied, and this predicate's whole job is to say that
+                // it is. The premise break is the row's third caller-side site:
+                // admitting it here sends the registrar down a route whose
+                // reasoning ("the callee returns the COPY, so free the
+                // orphaned ORIGINAL") describes a copy that never happened.
+                && !self.enum_param_owned_by_transfer(&en)
         })
     }
 
@@ -7347,6 +7380,10 @@ impl<'ctx> super::Codegen<'ctx> {
             && en != "Result"
             && !self.type_decls.shared_types.contains_key(en.as_str())
             && self.enum_has_heap_payload(en)
+            // B-2026-09-07-16 — kept in lockstep with the sibling above, which
+            // asks the same four type-level questions in the same order; a
+            // transfer-owned enum is not entry-copied on this route either.
+            && !self.enum_param_owned_by_transfer(en)
     }
 
     /// B-2026-08-27-44 — the element `TypeExpr`s of a TUPLE-shaped argument,
@@ -10015,6 +10052,9 @@ impl<'ctx> super::Codegen<'ctx> {
         // shared by-value-owned-arg choke point so every call-arg site is
         // covered. No-op for a temporary or non-owning root.
         self.suppress_array_binding_move_arg(arg);
+        // B-2026-09-07-16 — the ENUM leg of the same rule, hooked at the same
+        // choke point so every call-arg site is covered by one call.
+        self.move_declined_copy_enum_arg(arg);
         let ExprKind::Identifier(var) = &arg.kind else {
             return;
         };
@@ -10092,6 +10132,56 @@ impl<'ctx> super::Codegen<'ctx> {
         // `__karac_drop_struct_Nouter(ptr %h)` in the callee, over two allocas
         // holding the same pointers — `free(): double free detected in tcache
         // 2`, identical to the fresh-temp spelling.
+        self.suppress_user_drop_for_var(&var);
+    }
+
+    /// B-2026-09-07-16 — the ENUM sibling of
+    /// [`Self::move_declined_copy_struct_arg`]: retract a NAMED LOCAL's
+    /// cleanup when it is passed by value into a callee that owns it by
+    /// transfer.
+    ///
+    /// The third of the row's three caller-side sites, and the one no existing
+    /// retraction reached. The fresh-temp spelling stands down inside the
+    /// registrar and the escape routes stand down through the entry-copy
+    /// predicates, but a `let a = W.T(X1 { .. }); sink(a);` argument registers
+    /// nothing at any of those — its cleanup belongs to the BINDING, queued at
+    /// the `let`. With the callee now owning the buffer, that binding is a
+    /// second owner and the pair double-frees exactly as the temp did.
+    ///
+    /// Retracts BOTH halves, because a `let`-bound enum registers a pair
+    /// against one slot (`track_enum_var`'s memory switch and the payload
+    /// bodies walker, plus an own-`Drop` wrapper when the enum has one).
+    /// `suppress_user_drop_for_var` takes the walker and the wrapper together
+    /// as a unit — its own doc says why a dual registration must not be split —
+    /// and the `EnumDrop` sweep below takes the memory. Leaving either half
+    /// behind is the same double free one channel over.
+    ///
+    /// Type-driven and slot-keyed, never name-keyed across frames: the sweep
+    /// matches the binding's own alloca, so a shadowed generation with a
+    /// different slot keeps its cleanup.
+    pub(super) fn move_declined_copy_enum_arg(&mut self, arg: &Expr) {
+        let ExprKind::Identifier(var) = &arg.kind else {
+            return;
+        };
+        let Some(type_name) = self.var_types.var_type_names.get(var.as_str()).cloned() else {
+            return;
+        };
+        if !self.enum_param_owned_by_transfer(&type_name) {
+            return;
+        }
+        let Some(slot_ptr) = self.variables.get(var.as_str()).map(|s| s.ptr) else {
+            return;
+        };
+        for frame in self.drop_rc.scope_cleanup_actions.iter_mut() {
+            frame.retain(|action| {
+                !matches!(
+                    action,
+                    crate::codegen::state::CleanupAction::EnumDrop { enum_alloca, .. }
+                        if *enum_alloca == slot_ptr
+                )
+            });
+        }
+        let var = var.clone();
         self.suppress_user_drop_for_var(&var);
     }
 

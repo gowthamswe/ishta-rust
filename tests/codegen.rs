@@ -18863,6 +18863,111 @@ done
         assert_eq!(out, "dR101\ndR1\none\nn\ndR102\ndR2\ntwo\nin\ndR103\ndR3\nthree\ndR104\ndR4\nfour\nn\ndR105\ndR5\nfive\nin\ndR106\ndR6\nsix\ndR107\ndR7\nin\nseven\nin\ndR8\neight\ndR9\nnine\nn\nten\nend\n");
     }
 
+    /// B-2026-09-07-16 — a by-value ENUM param whose payload struct owns heap
+    /// the entry copy CANNOT duplicate is owned by TRANSFER, not by copy.
+    ///
+    /// `EnumDropKind::NestedOwnedStruct` exists (B-2026-09-05-26) for a payload
+    /// struct the two `NestedStruct` admissions decline — not copy-supported (a
+    /// `Drop`-bearing or `Map` field, an `Option` field whose payload is not
+    /// itself copyable) — yet reachable by the drop switch. When such a payload
+    /// owns heap BELOW it, `deep_copy_enum_heap_payload_in_place` duplicates
+    /// nothing for it, and that refusal is deliberate: a PARTIAL copy would
+    /// alias exactly the fields the walk skipped, which the drop then frees
+    /// twice. So the callee's slot and the caller's temp were ONE buffer and
+    /// both frames registered a drop over it.
+    ///
+    /// B-2026-09-06-4 fixed the neighbouring class — a `NestedOwnedStruct`
+    /// owning NO heap, where the box IS the whole cleanup and duplicating the
+    /// envelope alone is a complete copy. This is the half that fix
+    /// deliberately did not reach, and extending the copy is not the fix it
+    /// looks like. The callee takes the caller's buffers instead
+    /// (`enum_param_owned_by_transfer`, the enum sibling of B-2026-08-05-33's
+    /// struct bargain) and the caller retracts at all three of its sites.
+    ///
+    /// Every payload class in the row's table is here, because the failure
+    /// MODE differed across them and a fixture carrying only the abort would
+    /// not have covered the rest: `X1 { Option[i64], String }` and
+    /// `Xd { Option[i64], R2 }` (a `Drop` field that owns heap) aborted
+    /// `free(): double free detected in tcache 2` at both opt levels;
+    /// `X3 { Option[i64], Map }` aborted at `-O2` and SEGV'd at `-O0`; the
+    /// INLINE `M { Map, i64 }` SEGV'd at both. `--interp` was right on every
+    /// one of them.
+    ///
+    /// Ten call shapes, because the caller-side registration differs across
+    /// them and each stands down through a different site: a fresh ctor temp
+    /// (`c1`), a NAMED LOCAL (`c2` — the binding's own cleanup, which no
+    /// existing retraction reached), a MATCH-CONSUMING callee over both
+    /// spellings (`c3`/`c4`), a HAND-BACK (`c5`), a two-hop pass-through
+    /// (`c6`), and the METHOD and ASSOC twins over both spellings
+    /// (`c7`–`c10`). `c10` is the one that needed a second fix: `Type.f(a)`
+    /// never called the declined-copy retraction at all.
+    ///
+    /// `dR215`/`dR216` pin that a `Drop` body fires exactly ONCE and inside
+    /// the callee, where the memory now lives — the payload-bodies walker
+    /// moves with the memory, or it would read a buffer the callee has freed.
+    /// `dC17`/`dC18` are the CONTROL: `Ctl { String }` is copy-supported, so it
+    /// classifies `NestedStruct`, stays entry-copied, and must be untouched.
+    #[test]
+    fn test_e2e_by_value_enum_param_with_owning_struct_payload_transfers() {
+        let Some(out) = run_program(
+            r#"struct X1 { a: Option[i64], s: String }
+struct X3 { a: Option[i64], m: Map[i64, String] }
+struct M  { m: Map[i64, String], n: i64 }
+struct R2 { id: i64, s: String }
+impl Drop for R2 { fn drop(mut ref self) { println(f"dR2{self.id}") } }
+struct Xd { a: Option[i64], r: R2 }
+struct Ctl { s: String }
+impl Drop for Ctl { fn drop(mut ref self) { println(f"dC{self.s}") } }
+enum W { T(X1), U(i64) }
+enum V { T(X3), U(i64) }
+enum Y { T(M), U(i64) }
+enum D { T(Xd), U(i64) }
+enum C { T(Ctl), U(i64) }
+struct H { n: i64 }
+fn sink(w: W) {}
+fn eat(w: W) -> i64 { return match w { W.T(x) => x.a.unwrap_or(0), W.U(n) => n } }
+fn hand(w: W) -> W { return w; }
+fn hop(w: W) { sink(w); }
+fn sinkv(v: V) {}
+fn sinky(y: Y) {}
+fn sinkd(d: D) {}
+fn sinkc(c: C) {}
+impl H { fn pv(ref self, w: W) {} }
+impl W { fn av(w: W) {} }
+fn mkx(i: i64) -> X1 { return X1 { a: Option.Some(i), s: f"s{i}" }; }
+fn mkm(i: i64) -> Map[i64, String] { let mut m: Map[i64, String] = Map.new(); m.insert(i, f"v{i}"); return m; }
+fn main() {
+  sink(W.T(mkx(1)));                       println("c1")
+  let a = W.T(mkx(2)); sink(a);            println("c2")
+  println(f"c3={eat(W.T(mkx(3)))}")
+  let b = W.T(mkx(4)); println(f"c4={eat(b)}")
+  let z = hand(W.T(mkx(5))); println(f"c5={eat(z)}")
+  hop(W.T(mkx(6)));                        println("c6")
+  let h = H { n: 1 };
+  h.pv(W.T(mkx(7)));                       println("c7")
+  let c = W.T(mkx(8)); h.pv(c);            println("c8")
+  W.av(W.T(mkx(9)));                       println("c9")
+  let d = W.T(mkx(10)); W.av(d);           println("c10")
+  sinkv(V.T(X3 { a: Option.Some(11), m: mkm(11) })); println("c11")
+  let e = V.T(X3 { a: Option.Some(12), m: mkm(12) }); sinkv(e); println("c12")
+  sinky(Y.T(M { m: mkm(13), n: 13 }));     println("c13")
+  let f = Y.T(M { m: mkm(14), n: 14 }); sinky(f); println("c14")
+  sinkd(D.T(Xd { a: Option.Some(15), r: R2 { id: 15, s: "h15" } })); println("c15")
+  let g = D.T(Xd { a: Option.Some(16), r: R2 { id: 16, s: "h16" } }); sinkd(g); println("c16")
+  sinkc(C.T(Ctl { s: "17" }));             println("c17")
+  let i = C.T(Ctl { s: "18" }); sinkc(i);  println("c18")
+  println("end")
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "c1\nc2\nc3=3\nc4=4\nc5=5\nc6\nc7\nc8\nc9\nc10\nc11\nc12\nc13\nc14\ndR215\nc15\ndR216\nc16\ndC17\nc17\ndC18\nc18\nend\n"
+        );
+    }
+
     /// B-2026-09-05-27 — a match arm handing a bare-tuple ELEMENT out of its
     /// arm frees each buffer once. The arm's binding is a bit-copy of the
     /// scrutinee's element; the hand-out zeroed the BINDING's caps and left

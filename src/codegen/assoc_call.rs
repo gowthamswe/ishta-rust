@@ -3200,6 +3200,32 @@ impl<'ctx> super::Codegen<'ctx> {
                     // pre-existing on the conventional ABI).
                     self.share_option_shared_ref_for_arg(&a.value);
                     self.share_option_shared_field_ref_for_arg(&a.value, val);
+                    // B-2026-09-07-16 — the DECLINED-COPY retraction, which
+                    // this arm never called at all. `Type.f(a)` was the third
+                    // dispatch leg here exactly as it was for the registrar
+                    // right below (B-2026-08-29-54): the free-function path
+                    // (`compile_call`) and the instance-method path
+                    // (`compile_method_call`) have both called this for a
+                    // by-value argument for years, and a static call did not —
+                    // so a NAMED LOCAL whose param the callee's prologue owns
+                    // by TRANSFER kept its binding's cleanup alongside the
+                    // callee's, and both frames freed one buffer.
+                    //
+                    // The STRUCT half of that is pre-existing and independent
+                    // of the enum row this landed with: `struct Sd { m:
+                    // Map[i64, String], n: i64 }` — copy-declined for its `Map`
+                    // field — as `let a = Sd { .. }; Z.av(a);` SEGV'd at both
+                    // opt levels while `--interp` printed `ok`, and the FREE and
+                    // METHOD spellings of that same program were clean. One
+                    // missing call, two type classes; filed as its own row.
+                    //
+                    // Placed ahead of the `Identifier` arm below rather than
+                    // inside it because the helper takes the whole argument
+                    // expression (its array leg reaches a non-`Identifier`
+                    // root), matching the method leg's placement.
+                    if !is_ref {
+                        self.move_declined_copy_struct_arg(&a.value);
+                    }
                     // B-2026-08-30-23 — the BINDING-argument body retraction,
                     // which this arm never performed. `compile_call` and
                     // `compile_method_call` both run it; `Type.f(args)` was the

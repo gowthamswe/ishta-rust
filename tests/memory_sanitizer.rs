@@ -78364,6 +78364,92 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-16 — the memory half of
+    /// `test_e2e_by_value_enum_param_with_owning_struct_payload_transfers`.
+    ///
+    /// One free per buffer across all ten call shapes and all four payload
+    /// classes. The E2E twin pins the OUTPUT, which a double free does not
+    /// always disturb — `X3`'s `-O2` cell aborted while printing the right
+    /// answer first — so the abort-and-leak surface needs its own gate; on
+    /// Linux CI this is also the LSan gate for the class.
+    ///
+    /// RED pre-fix on every non-control cell, in three different ways:
+    /// `free(): double free detected in tcache 2` (`X1`, `Xd`, and `X3` at
+    /// `-O2`), and a SEGV (`X3` at `-O0`, and the inline `M` at both levels,
+    /// whose valgrind trace is four invalid reads inside
+    /// `karac_map_free_with_drop_vec` over a 72-byte block freed twice).
+    ///
+    /// FLOOR, not a ceiling: the payloads are the point. Every cell allocates
+    /// a `String` or a `Map` the callee must end up owning exactly once, and a
+    /// fixture whose payloads the optimizer folded away would pass this
+    /// vacuously — the callees are empty, which is exactly the shape LLVM
+    /// likes to delete.
+    #[test]
+    fn asan_by_value_enum_param_with_owning_struct_payload_transfers() {
+        assert_clean_asan_run_min_allocs(
+            "struct X1 { a: Option[i64], s: String }\n\
+struct X3 { a: Option[i64], m: Map[i64, String] }\n\
+struct M  { m: Map[i64, String], n: i64 }\n\
+struct R2 { id: i64, s: String }\n\
+impl Drop for R2 { fn drop(mut ref self) { println(f\"dR2{self.id}\") } }\n\
+struct Xd { a: Option[i64], r: R2 }\n\
+struct Ctl { s: String }\n\
+impl Drop for Ctl { fn drop(mut ref self) { println(f\"dC{self.s}\") } }\n\
+enum W  { T(X1), U(i64) }\n\
+enum V  { T(X3), U(i64) }\n\
+enum Y  { T(M),  U(i64) }\n\
+enum D  { T(Xd), U(i64) }\n\
+enum C  { T(Ctl), U(i64) }\n\
+struct H { n: i64 }\n\
+fn sink(w: W) {}\n\
+fn eat(w: W) -> i64 { return match w { W.T(x) => x.a.unwrap_or(0), W.U(n) => n } }\n\
+fn hand(w: W) -> W { return w; }\n\
+fn hop(w: W) { sink(w); }\n\
+fn sinkv(v: V) {}\n\
+fn sinky(y: Y) {}\n\
+fn sinkd(d: D) {}\n\
+fn sinkc(c: C) {}\n\
+impl H { fn pv(ref self, w: W) {} }\n\
+impl W { fn av(w: W) {} }\n\
+fn mkx(i: i64) -> X1 { return X1 { a: Option.Some(i), s: f\"s{i}\" }; }\n\
+fn mkm(i: i64) -> Map[i64, String] { let mut m: Map[i64, String] = Map.new(); m.insert(i, f\"v{i}\"); return m; }\n\
+fn main() {\n\
+  // boxed, owns heap -- fresh temp / named local / match-consuming / hand-back / two-hop\n\
+  sink(W.T(mkx(1)));                       println(\"c1\")\n\
+  let a = W.T(mkx(2)); sink(a);            println(\"c2\")\n\
+  println(f\"c3={eat(W.T(mkx(3)))}\")\n\
+  let b = W.T(mkx(4)); println(f\"c4={eat(b)}\")\n\
+  let z = hand(W.T(mkx(5))); println(f\"c5={eat(z)}\")\n\
+  hop(W.T(mkx(6)));                        println(\"c6\")\n\
+  // method and assoc, fresh temp and named local (the assoc named-local leg)\n\
+  let h = H { n: 1 };\n\
+  h.pv(W.T(mkx(7)));                       println(\"c7\")\n\
+  let c = W.T(mkx(8)); h.pv(c);            println(\"c8\")\n\
+  W.av(W.T(mkx(9)));                       println(\"c9\")\n\
+  let d = W.T(mkx(10)); W.av(d);           println(\"c10\")\n\
+  // boxed with a Map field, and the INLINE Map payload\n\
+  sinkv(V.T(X3 { a: Option.Some(11), m: mkm(11) })); println(\"c11\")\n\
+  let e = V.T(X3 { a: Option.Some(12), m: mkm(12) }); sinkv(e); println(\"c12\")\n\
+  sinky(Y.T(M { m: mkm(13), n: 13 }));     println(\"c13\")\n\
+  let f = Y.T(M { m: mkm(14), n: 14 }); sinky(f); println(\"c14\")\n\
+  // a Drop-bearing payload field that owns heap -- the body must fire exactly once\n\
+  sinkd(D.T(Xd { a: Option.Some(15), r: R2 { id: 15, s: \"h15\" } })); println(\"c15\")\n\
+  let g = D.T(Xd { a: Option.Some(16), r: R2 { id: 16, s: \"h16\" } }); sinkd(g); println(\"c16\")\n\
+  // CONTROL: a copy-supported (NestedStruct) payload stays entry-copied\n\
+  sinkc(C.T(Ctl { s: \"17\" }));             println(\"c17\")\n\
+  let i = C.T(Ctl { s: \"18\" }); sinkc(i);  println(\"c18\")\n\
+  println(\"end\")\n\
+}\n\
+",
+            &[
+                "c1", "c2", "c3=3", "c4=4", "c5=5", "c6", "c7", "c8", "c9", "c10", "c11", "c12",
+                "c13", "c14", "dR215", "c15", "dR216", "c16", "dC17", "c17", "dC18", "c18", "end",
+            ],
+            "by_value_enum_param_owning_struct_payload_transfers",
+            26,
+        );
+    }
+
     /// B-2026-09-05-26 — the memory half of
     /// `e2e_user_enum_struct_payload_owns_its_heap`: every cell is one free
     /// per buffer (valgrind: every block freed at -O0 and -O2), including the
