@@ -94,13 +94,13 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 394 |
 | run-vs-build | 369 |
-| leak | 292 |
+| leak | 293 |
 | double-free | 212 |
 | missing-feature | 194 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
 | false-positive | 106 |
-| perf | 97 |
+| perf | 98 |
 | soundness | 95 |
 | other | 80 |
 | crash | 77 |
@@ -110,11 +110,11 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1579 |
+| codegen | 1580 |
 | interp | 403 |
 | typecheck | 295 |
+| other | 74 |
 | ownership | 74 |
-| other | 73 |
 | cli | 71 |
 | autopar | 56 |
 | parser | 46 |
@@ -169,6 +169,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-33 | 2026-09-07 | codegen | high | A CALLEE HANDING A BOXED PAYLOAD OUT OF A `match` ARM WRITES INTO THE ENVELOPE IT JUST FREED -- `fn payout(w: W) -> X1 { return match w { W.T(x) => x, .. } }` prints the right answer and leaves 3 `Invalid write of size 8` into a freed 56-byte block, because the param's envelope free runs BEFORE the moved-from zeroing; PRE-EXISTING and previously masked by B-2026-09-07-16's abort | — |
 | B-2026-09-07-35 | 2026-09-07 | interp | medium | A SPEC'D 128-BIT f-STRING HOLE PANICS THE INTERPRETER -- `f"{big:44}"` on a `u128` aborts with "128-bit value reached an i64-only consumer" while both compiled backends now render it correctly; the UNSPEC'D `f"{big}"` is fine on all three | none |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
+| B-2026-09-07-38 | 2026-09-07 | codegen | medium | THE -O0 ASAN RATCHET IS RED ON `main`, WITH THREE UNLISTED LEAK FAILURES THAT ARRIVED WITH 6a4a86c78 -- one is that commit's OWN new fixture (`asan_by_value_enum_param_with_owning_struct_payload_transfers`, 6 B in 3 allocs) and the other two are 190 B in 5 allocs each; all three pass at the default -O2, 6a4a86c78 is the ONLY `src/` commit between the last clean measurement and its arrival, and the leg is still red two drop fixes later | none |
 
 ### Relocated
 
@@ -2375,6 +2376,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-31 | codegen | low | AN RC-BOXED TUPLE WITH AN ENUM OR `Option` ELEMENT LOSES ITS PAYLOAD MEMORY -- the box's memory step was the enum-blind `emit_aggregate_heap_field_fr… | 0e881224f |
 | B-2026-09-07-32 | codegen | high | AN ASSOC CALL NEVER RETRACTS A NAMED LOCAL'S CLEANUP FOR A DECLINED-COPY BY-VALUE ARGUMENT -- `Type.f(a)` was the third dispatch leg with no `move_de… | FIXED by hooking `move_declined_copy_struct_arg` into the a… |
 | B-2026-09-07-34 | codegen | high | A SPEC'D 128-BIT f-STRING HOLE FAILED LLVM MODULE VERIFICATION -- `f"{x:44}"` on an `i128` did not compile at all after B-2026-09-07-25 routed spec'd… | f5f86c16e |
+| B-2026-09-07-37 | other | medium | RUNNING THE GATE SUITE REPLACES THE CANONICAL RUNTIME ARCHIVE WITH A NON-DCE'D ONE -- `tests/par_codegen.rs` built it with the forbidden `cargo build… | 4bd617d8e |
 
 </details>
 
