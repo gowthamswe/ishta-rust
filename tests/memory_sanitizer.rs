@@ -3957,6 +3957,62 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-60 — the MEMORY half, and the row's own symptom: the same
+    /// program under ASAN + LSan, where the pre-fix build double-freed the `Map`
+    /// handle and the `String`. One owner and one free per object on every
+    /// spelling, `Drop`-free struct included.
+    #[test]
+    fn asan_map_field_param_by_transfer() {
+        assert_clean_asan_run(
+            "struct Q { id: i64, name: String, tbl: Map[i64, i64] }\n\
+             impl Drop for Q { fn drop(mut ref self) { println(f\"  dQ{self.id}\") } }\n\
+             struct QNoDrop { id: i64, name: String, tbl: Map[i64, i64] }\n\
+             struct P { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for P { fn drop(mut ref self) { println(f\"  dP{self.id}\") } }\n\
+             \n\
+             fn mkq(i: i64) -> Q { let mut t = Map[i64, i64].new(); t.insert(i, i); return Q { id: i, name: f\"h{i}\", tbl: t }; }\n\
+             fn mkqn(i: i64) -> QNoDrop { let mut t = Map[i64, i64].new(); t.insert(i, i); return QNoDrop { id: i, name: f\"h{i}\", tbl: t }; }\n\
+             fn mkp(i: i64) -> P { return P { id: i, name: f\"p{i}\", xs: [i] }; }\n\
+             \n\
+             fn norebind(q: Q) -> i64 { return q.id; }\n\
+             fn readmap(q: Q) -> i64 { return q.tbl.len(); }\n\
+             fn rebind(q: Q) -> i64 { let m = q; return m.id; }\n\
+             fn nodrop(q: QNoDrop) -> i64 { return q.id; }\n\
+             fn copyable(p: P) -> i64 { let m = p; return m.id; }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"temp_arg\"); println(f\"  v={norebind(mkq(1))}\");\n\
+             \x20   println(\"temp_arg_reads_map\"); println(f\"  v={readmap(mkq(2))}\");\n\
+             \x20   println(\"temp_arg_rebind\"); println(f\"  v={rebind(mkq(3))}\");\n\
+             \x20   println(\"no_drop_struct\"); println(f\"  v={nodrop(mkqn(4))}\");\n\
+             \x20   println(\"copy_supported\"); println(f\"  v={copyable(mkp(5))}\");\n\
+             \x20   println(\"no_call\"); let a = mkq(6); println(f\"  v={a.id}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "temp_arg",
+                "  dQ1",
+                "  v=1",
+                "temp_arg_reads_map",
+                "  dQ2",
+                "  v=1",
+                "temp_arg_rebind",
+                "  dQ3",
+                "  v=3",
+                "no_drop_struct",
+                "  v=4",
+                "copy_supported",
+                "  dP5",
+                "  v=5",
+                "no_call",
+                "  v=6",
+                "  dQ6",
+                "end"
+            ],
+            "map_field_param_by_transfer",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

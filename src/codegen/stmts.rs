@@ -10017,6 +10017,27 @@ impl<'ctx> super::Codegen<'ctx> {
                                     self.drop_rc
                                         .caller_retained_aggregate_memory
                                         .insert(var_name.to_string());
+                                } else if self.struct_param_owned_by_transfer(&struct_name, false)
+                                    && self
+                                        .drop_rc
+                                        .user_drop_wrapper_fns
+                                        .contains_key(&struct_name)
+                                {
+                                    // B-2026-09-06-60 — under OWN BY TRANSFER the
+                                    // callee owns the value outright
+                                    // (B-2026-08-05-33), so a rebind of that
+                                    // param carries the BODY as well as the
+                                    // memory. The memory-only registration below
+                                    // is the caller-retains answer, and it left
+                                    // `fn reb(q: Q) -> i64 { let m = q; .. }`
+                                    // over a `Map`-bearing struct printing no
+                                    // body at all on the compiled backends
+                                    // against the interpreter's one — a lost
+                                    // body traded in for the double free this
+                                    // row's other half removed. The wrapper is
+                                    // one action, body and memory together, so
+                                    // the count stays one of each.
+                                    self.track_user_drop_var(&struct_name, var_name, alloca);
                                 } else {
                                     // Memory only — the deep copy the rebind
                                     // received still frees at scope exit.

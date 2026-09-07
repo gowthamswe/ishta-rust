@@ -34719,6 +34719,91 @@ end
         );
     }
 
+    /// B-2026-09-06-60 — a by-value param whose struct has a direct `Map` field
+    /// double-freed with NO rebind at all: `fn norebind(q: Q) -> i64 { return
+    /// q.id; }` over `struct Q { id: i64, name: String, tbl: Map[i64, i64] }`
+    /// aborted under the JIT and at -O0 and SEGFAULTED at -O2, while `--interp`
+    /// was correct.
+    ///
+    /// A `Map` field declines copy support (an entry copy cannot duplicate a
+    /// side-table handle) but is neither `shared` nor self-referential, so the
+    /// callee takes the param BY TRANSFER (B-2026-08-05-33) and owns it. That
+    /// arm's safety argument is a caller-side retraction held in lockstep — and
+    /// the retraction, `move_declined_copy_struct_arg`, reads an `Identifier`,
+    /// so it covers a NAMED argument only. A fresh temp went to the
+    /// argument-temp registrar instead, which registered the caller's own
+    /// wrapper beside the callee's. Both of that registrar's struct arms now
+    /// stand down under the same `struct_param_owned_by_transfer` predicate its
+    /// struct-literal sibling already consulted — the `Drop`-bearing arm and the
+    /// no-`Drop` one, which is the row's third cell.
+    ///
+    /// The rebind spelling needed the other half: under transfer the callee owns
+    /// the value, so `let m = q;` carries the BODY as well as the memory, where
+    /// the param-view path would have registered memory alone (measured as no
+    /// body at all once the double free was gone).
+    ///
+    /// Cells: the bare temp argument, one that reads the `Map`, the rebind, the
+    /// same struct with no `impl Drop`, a copy-supported struct as the control
+    /// that must keep its caller-side temp drop, and the same value never passed
+    /// to a callee.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_map_field_param_by_transfer`, pinned to the same string.
+    #[test]
+    fn e2e_map_field_param_by_transfer() {
+        let Some(out) = run_program(
+            r#"struct Q { id: i64, name: String, tbl: Map[i64, i64] }
+impl Drop for Q { fn drop(mut ref self) { println(f"  dQ{self.id}") } }
+struct QNoDrop { id: i64, name: String, tbl: Map[i64, i64] }
+struct P { id: i64, name: String, xs: Vec[i64] }
+impl Drop for P { fn drop(mut ref self) { println(f"  dP{self.id}") } }
+
+fn mkq(i: i64) -> Q { let mut t = Map[i64, i64].new(); t.insert(i, i); return Q { id: i, name: f"h{i}", tbl: t }; }
+fn mkqn(i: i64) -> QNoDrop { let mut t = Map[i64, i64].new(); t.insert(i, i); return QNoDrop { id: i, name: f"h{i}", tbl: t }; }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}", xs: [i] }; }
+
+fn norebind(q: Q) -> i64 { return q.id; }
+fn readmap(q: Q) -> i64 { return q.tbl.len(); }
+fn rebind(q: Q) -> i64 { let m = q; return m.id; }
+fn nodrop(q: QNoDrop) -> i64 { return q.id; }
+fn copyable(p: P) -> i64 { let m = p; return m.id; }
+
+fn main() {
+    println("temp_arg"); println(f"  v={norebind(mkq(1))}");
+    println("temp_arg_reads_map"); println(f"  v={readmap(mkq(2))}");
+    println("temp_arg_rebind"); println(f"  v={rebind(mkq(3))}");
+    println("no_drop_struct"); println(f"  v={nodrop(mkqn(4))}");
+    println("copy_supported"); println(f"  v={copyable(mkp(5))}");
+    println("no_call"); let a = mkq(6); println(f"  v={a.id}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"temp_arg
+  dQ1
+  v=1
+temp_arg_reads_map
+  dQ2
+  v=1
+temp_arg_rebind
+  dQ3
+  v=3
+no_drop_struct
+  v=4
+copy_supported
+  dP5
+  v=5
+no_call
+  v=6
+  dQ6
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value

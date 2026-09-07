@@ -5718,6 +5718,30 @@ impl<'ctx> super::Codegen<'ctx> {
                     if has_user_drop && !self.type_decls.shared_types.contains_key(&ret_ty_name) {
                         let is_enum = self.type_decls.enum_layouts.contains_key(&ret_ty_name);
                         let is_struct = self.type_decls.struct_types.contains_key(&ret_ty_name);
+                        // B-2026-09-06-60 — nothing here when the CALLEE owns the
+                        // value by transfer. A struct whose copy support declines
+                        // for a reason that is not a `shared` field and not
+                        // self-reference — a direct `Map`/`Set` field is the
+                        // shape this row reports — is taken by transfer at the
+                        // prologue (B-2026-08-05-33), whose safety argument is a
+                        // caller-side retraction held in lockstep. That
+                        // retraction is `move_declined_copy_struct_arg`, which
+                        // reads an `Identifier` and so covers a NAMED argument
+                        // only; a fresh temp reached this arm instead and
+                        // registered the caller's own wrapper beside the
+                        // callee's, freeing the `Map` handle and the `String`
+                        // twice: `free(): double free detected in tcache 2`
+                        // under the JIT and at -O0, a SEGFAULT at -O2. The
+                        // sibling arm below (a struct literal handed straight to
+                        // the callee) already declines on this very predicate.
+                        if is_struct
+                            && self.struct_param_owned_by_transfer(
+                                &ret_ty_name,
+                                callee_entry_copies_mono,
+                            )
+                        {
+                            return;
+                        }
                         if is_enum || is_struct {
                             let slot =
                                 self.create_entry_alloca(cur_fn, "__owned_agg_tmp", agg_ty.into());
@@ -5825,6 +5849,21 @@ impl<'ctx> super::Codegen<'ctx> {
                     // the struct-literal sibling below uses. Struct-shaped only:
                     // the walk GEPs the parent's fields, and an enum payload is
                     // SHAPE 1 (out of scope, still leaks).
+                    // B-2026-09-06-60, no-`Drop` leg — the same stand-down the
+                    // arm above makes. A `Map`-bearing struct with no `impl
+                    // Drop` at all is still taken BY TRANSFER at the callee's
+                    // prologue, so registering the caller temp's field walk and
+                    // memory here freed the handle twice: a SEGFAULT at -O2 and
+                    // `free(): double free detected in tcache 2` at -O0, on the
+                    // row's third cell.
+                    if !has_user_drop
+                        && !arg_escapes_frame
+                        && self.type_decls.struct_types.contains_key(&ret_ty_name)
+                        && self
+                            .struct_param_owned_by_transfer(&ret_ty_name, callee_entry_copies_mono)
+                    {
+                        return;
+                    }
                     if !has_user_drop
                         && !arg_escapes_frame
                         && self.type_decls.struct_types.contains_key(&ret_ty_name)
