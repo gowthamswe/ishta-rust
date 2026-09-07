@@ -57293,6 +57293,60 @@ end
     );
 }
 
+/// B-2026-09-06-64 — the interpreter always ran this program; the row was a
+/// COMPILER crash on it. Pinned here so the string the compiled twin now
+/// produces is held to the backend that was right.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_self_referential_struct_compiles`, pinned to the same string.
+#[test]
+fn test_self_referential_struct_compiles() {
+    assert_eq!(
+        run(r#"struct Node { id: i64, next: Option[Node], tag: String }
+impl Drop for Node { fn drop(mut ref self) { println(f"  dN{self.id}") } }
+struct Plain { id: i64, next: Option[Plain], tag: String }
+struct Env { id: i64, inner: Option[Option[i64]] }
+fn mkn(i: i64) -> Node { return Node { id: i, next: Option.None, tag: f"t{i}" }; }
+fn mkp(i: i64) -> Plain { return Plain { id: i, next: Option.None, tag: f"p{i}" }; }
+fn top(n: Node) -> i64 { let m = n; return m.id; }
+fn read(n: Node) -> i64 { return n.id; }
+fn topp(p: Plain) -> i64 { let m = p; return m.id; }
+fn enve(e: Env) -> i64 { return e.id; }
+impl Node { fn take(self) -> i64 { let m = self; return m.id; } }
+
+fn main() {
+    println("bare_local"); let a = mkp(1); println(f"  v={a.id}");
+    println("drop_local"); let b = mkn(2); println(f"  v={b.id}");
+    println("free_fn_rebind"); println(f"  v={top(mkn(3))}");
+    println("free_fn_read"); println(f"  v={read(mkn(4))}");
+    println("plain_struct_rebind"); println(f"  v={topp(mkp(5))}");
+    println("owned_self_rebind"); println(f"  v={mkn(6).take()}");
+    println("boxed_envelope"); println(f"  v={enve(Env { id: 7, inner: Option.Some(Option.Some(8)) })}");
+    println("end");
+}
+"#),
+        r#"bare_local
+  v=1
+drop_local
+  v=2
+  dN2
+free_fn_rebind
+  dN3
+  v=3
+free_fn_read
+  dN4
+  v=4
+plain_struct_rebind
+  v=5
+owned_self_rebind
+  dN6
+  v=6
+boxed_envelope
+  v=7
+end
+"#
+    );
+}
+
 /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
 /// field's and its payload's `Drop` bodies twice for a named-local receiver
 /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value

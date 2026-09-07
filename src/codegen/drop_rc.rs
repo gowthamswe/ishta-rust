@@ -359,6 +359,24 @@ pub(crate) struct DropRc<'ctx> {
     /// with no heap-owning fields don't get an entry (the synthesis fn returns
     /// `None`) and don't reach `CleanupAction::StructDrop`.
     pub(crate) struct_drop_fns: HashMap<String, FunctionValue<'ctx>>,
+    /// B-2026-09-06-64 — the struct-drop cache keys whose synthesis is CURRENTLY
+    /// RUNNING, so a self-referential type terminates.
+    ///
+    /// `emit_struct_drop_synthesis_impl` caches its function only after it has
+    /// classified every field, and classifying a field recurses: a
+    /// `Option[Node]` field of `Node` reaches `emit_option_drop_fn` ->
+    /// `emit_drop_fn_for_type_expr(Node)` -> the same synthesis, with the cache
+    /// still empty. That cycle overflowed the COMPILER's stack on a ten-line
+    /// program with no `Drop` impl and no method in it — `struct Node { id:
+    /// i64, next: Option[Node], tag: String }` plus a `main` that builds one —
+    /// while `karac run --interp` ran the same program correctly.
+    ///
+    /// A re-entry gets a FORWARD DECLARATION of the same symbol instead: the
+    /// outer call fills in its body, and the recursive caller only ever needed
+    /// something to call. The set is not a memo — it is emptied as soon as the
+    /// real registration lands, so a later synthesis of the same type takes the
+    /// ordinary cache path.
+    pub(crate) struct_drop_in_progress: std::collections::HashSet<String>,
     /// B-2026-08-29-15 — the bare-identifier TARGET of the assignment
     /// statement currently being compiled, if any (`e = pass(e);` records
     /// `"e"`). Reset at the top of every `compile_stmt`, so it never outlives

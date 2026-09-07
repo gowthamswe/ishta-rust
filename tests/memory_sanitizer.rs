@@ -3904,6 +3904,59 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-64 — the same program under ASAN + LSan. The row was a
+    /// compiler crash, so this pins that what now compiles is also memory-clean:
+    /// one owner and one free per object, envelope included.
+    #[test]
+    fn asan_self_referential_struct_compiles() {
+        assert_clean_asan_run(
+            "struct Node { id: i64, next: Option[Node], tag: String }\n\
+             impl Drop for Node { fn drop(mut ref self) { println(f\"  dN{self.id}\") } }\n\
+             struct Plain { id: i64, next: Option[Plain], tag: String }\n\
+             struct Env { id: i64, inner: Option[Option[i64]] }\n\
+             fn mkn(i: i64) -> Node { return Node { id: i, next: Option.None, tag: f\"t{i}\" }; }\n\
+             fn mkp(i: i64) -> Plain { return Plain { id: i, next: Option.None, tag: f\"p{i}\" }; }\n\
+             fn top(n: Node) -> i64 { let m = n; return m.id; }\n\
+             fn read(n: Node) -> i64 { return n.id; }\n\
+             fn topp(p: Plain) -> i64 { let m = p; return m.id; }\n\
+             fn enve(e: Env) -> i64 { return e.id; }\n\
+             impl Node { fn take(self) -> i64 { let m = self; return m.id; } }\n\
+             \n\
+             fn main() {\n\
+             \x20   println(\"bare_local\"); let a = mkp(1); println(f\"  v={a.id}\");\n\
+             \x20   println(\"drop_local\"); let b = mkn(2); println(f\"  v={b.id}\");\n\
+             \x20   println(\"free_fn_rebind\"); println(f\"  v={top(mkn(3))}\");\n\
+             \x20   println(\"free_fn_read\"); println(f\"  v={read(mkn(4))}\");\n\
+             \x20   println(\"plain_struct_rebind\"); println(f\"  v={topp(mkp(5))}\");\n\
+             \x20   println(\"owned_self_rebind\"); println(f\"  v={mkn(6).take()}\");\n\
+             \x20   println(\"boxed_envelope\"); println(f\"  v={enve(Env { id: 7, inner: Option.Some(Option.Some(8)) })}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &[
+                "bare_local",
+                "  v=1",
+                "drop_local",
+                "  v=2",
+                "  dN2",
+                "free_fn_rebind",
+                "  dN3",
+                "  v=3",
+                "free_fn_read",
+                "  dN4",
+                "  v=4",
+                "plain_struct_rebind",
+                "  v=5",
+                "owned_self_rebind",
+                "  dN6",
+                "  v=6",
+                "boxed_envelope",
+                "  v=7",
+                "end"
+            ],
+            "self_referential_struct_compiles",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

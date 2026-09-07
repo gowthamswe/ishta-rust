@@ -1342,6 +1342,18 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-06-64 — is `te`'s head type one the copy-support walk is
+    /// already inside? The cycle test the emitter's recursion needs, spelled
+    /// once for the arms that admit a payload the entry copy descends into.
+    fn type_expr_head_on_stack(te: &TypeExpr, stack: &[String]) -> bool {
+        let TypeKind::Path(p) = &te.kind else {
+            return false;
+        };
+        p.segments
+            .first()
+            .is_some_and(|h| stack.iter().any(|s| s == h))
+    }
+
     pub(super) fn field_copy_supported(&self, fte: &TypeExpr, stack: &mut Vec<String>) -> bool {
         match &fte.kind {
             TypeKind::Tuple(elems) => elems.iter().all(|e| self.field_copy_supported(e, stack)),
@@ -1498,8 +1510,25 @@ impl<'ctx> super::Codegen<'ctx> {
                             // drop side frees exactly that box (nothing inside it to
                             // free). Both sides consult the SAME predicate so they
                             // cannot drift apart.
+                            // B-2026-09-06-64 — but never for a payload naming a
+                            // type this walk is already inside. The envelope
+                            // admission asks nothing about the payload's own
+                            // heap, so a SELF-REFERENTIAL struct (`struct Node {
+                            // id: i64, next: Option[Node], tag: String }`) came
+                            // through it as copy-supported, and the entry copy —
+                            // which unrolls the payload copy INLINE — then
+                            // recursed struct -> Option payload -> struct until
+                            // the COMPILER's stack overflowed, on a ten-line
+                            // program `--interp` runs correctly. The cycle stack
+                            // is the same one the `Vec` arm consults for the same
+                            // reason (B-2026-07-28-3): no finite emission exists,
+                            // so the analysis must decline exactly where the
+                            // emitter would not terminate.
                             || Self::option_payload_te(fte)
-                                .map(|pt| self.option_payload_boxed_envelope_only(&pt))
+                                .map(|pt| {
+                                    !Self::type_expr_head_on_stack(&pt, stack)
+                                        && self.option_payload_boxed_envelope_only(&pt)
+                                })
                                 .unwrap_or(false)
                     }
                     // B-2026-07-21-15 — a `Result` field in the DIRECT

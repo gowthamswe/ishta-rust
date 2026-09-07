@@ -6231,6 +6231,7 @@ impl<'ctx> Codegen<'ctx> {
                 deep_copy_rc_inc_bare_shared: false,
                 enum_drop_fns: HashMap::new(),
                 struct_drop_fns: HashMap::new(),
+                struct_drop_in_progress: HashSet::new(),
                 user_drop_wrapper_fns: HashMap::new(),
                 rc_drop_fns: HashMap::new(),
                 owned_temp_drops: HashMap::new(),
@@ -8754,6 +8755,34 @@ impl<'ctx> Codegen<'ctx> {
         // before handing the module to a backend that cannot select one.
         self.verify_no_native_bf16_ops()?;
 
+        // B-2026-09-06-64 — close any FORWARD DECLARATION a self-referential
+        // struct-drop synthesis handed to a recursive re-entry that the outer
+        // call then never defined (it found nothing to drop, or bailed before
+        // its field walk). An internal function with no body fails the verifier
+        // outright — `Global is external, but doesn't have external or weak
+        // linkage!` — and a no-op body is what "nothing to drop" means at the
+        // call the re-entry already emitted. Nothing else can reach these
+        // symbols: they are internal and named by the synthesis alone.
+        {
+            let mut empty: Vec<inkwell::values::FunctionValue<'ctx>> = Vec::new();
+            let mut f = self.module.get_first_function();
+            while let Some(func) = f {
+                let name = func.get_name().to_string_lossy().to_string();
+                if name.starts_with("__karac_drop_struct_") && func.count_basic_blocks() == 0 {
+                    empty.push(func);
+                }
+                f = func.get_next_function();
+            }
+            let saved = self.builder.get_insert_block();
+            for func in empty {
+                let bb = self.context.append_basic_block(func, "entry");
+                self.builder.position_at_end(bb);
+                let _ = self.builder.build_return(None);
+            }
+            if let Some(b) = saved {
+                self.builder.position_at_end(b);
+            }
+        }
         self.module.verify().map_err(|e| {
             // A verifier failure is otherwise a one-line ICE with no module to
             // inspect. `KARAC_DUMP_IR_ON_VERIFY_FAIL=<path>` writes the full

@@ -2097,6 +2097,35 @@ impl<'ctx> super::Codegen<'ctx> {
         // this gate inherit -17's widening into a path -17 never measured, so
         // the generic case stays out until it is measured on its own; the
         // non-generic answer is the one leg 1 verified.
+        // B-2026-09-06-64 — a SELF-REFERENTIAL struct re-enters this synthesis
+        // while its own fields are still being classified (`Option[Node]` on
+        // `Node` goes through `emit_option_drop_fn` ->
+        // `emit_drop_fn_for_type_expr(Node)` -> here), and the cache below is
+        // not filled until that classification finishes. The cycle overflowed
+        // the compiler's stack outright, on a program with no `Drop` impl and
+        // no method in it, which `--interp` ran correctly.
+        //
+        // Hand the re-entry a FORWARD DECLARATION of the very symbol this call
+        // is about to define. The body is emitted once, by the outer call, into
+        // the same function — the emission below reuses an existing declaration
+        // rather than returning it — and the recursive caller only ever needed
+        // something to call.
+        if !self
+            .drop_rc
+            .struct_drop_in_progress
+            .insert(cache_key.clone())
+        {
+            let fn_name = format!("__karac_drop_struct_{cache_key}");
+            let f = self.module.get_function(&fn_name).unwrap_or_else(|| {
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                self.module.add_function(
+                    &fn_name,
+                    self.context.void_type().fn_type(&[ptr_ty.into()], false),
+                    Some(Linkage::Internal),
+                )
+            });
+            return Some(f);
+        }
         let mut option_drops: Vec<Option<FunctionValue<'ctx>>> = vec![None; kinds.len()];
         // B-2026-08-27-32 — the `ArrayField` element type + extent, parallel to
         // `option_drops` and for the same reason: the local `FieldDrop` enum
@@ -2450,14 +2479,43 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
             }
         }
+        let fn_name = format!("__karac_drop_struct_{cache_key}");
         if kinds.iter().all(|k| *k == FieldDrop::None) {
+            self.drop_rc.struct_drop_in_progress.remove(&cache_key);
+            // B-2026-09-06-64 — a recursive re-entry may already have taken a
+            // FORWARD DECLARATION of this symbol and emitted a call to it. This
+            // call is the one that would have defined it, and it has just found
+            // nothing to drop, so give the declaration an empty body: an
+            // internal function with no body fails the module verifier
+            // (`Global is external, but doesn't have external or weak
+            // linkage!`), and a no-op is exactly what "nothing to drop" means
+            // at the call the re-entry emitted. Callers still get `None`, so no
+            // NEW call is emitted anywhere.
+            if let Some(f) = self.module.get_function(&fn_name) {
+                if f.count_basic_blocks() == 0 {
+                    let saved = self.builder.get_insert_block();
+                    let bb = self.context.append_basic_block(f, "entry");
+                    self.builder.position_at_end(bb);
+                    let _ = self.builder.build_return(None);
+                    if let Some(b) = saved {
+                        self.builder.position_at_end(b);
+                    }
+                }
+            }
             return None;
         }
 
-        let fn_name = format!("__karac_drop_struct_{cache_key}");
-        if let Some(f) = self.module.get_function(&fn_name) {
-            self.drop_rc.struct_drop_fns.insert(cache_key.clone(), f);
-            return Some(f);
+        // An EXISTING declaration with no body is the forward declaration a
+        // recursive re-entry took above (B-2026-09-06-64); this call is the one
+        // that defines it, so fall through and emit into it rather than handing
+        // back a bodiless function.
+        let existing = self.module.get_function(&fn_name);
+        if let Some(f) = existing {
+            if f.count_basic_blocks() > 0 {
+                self.drop_rc.struct_drop_fns.insert(cache_key.clone(), f);
+                self.drop_rc.struct_drop_in_progress.remove(&cache_key);
+                return Some(f);
+            }
         }
 
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -2469,12 +2527,16 @@ impl<'ctx> super::Codegen<'ctx> {
         let saved_bb = self.builder.get_insert_block();
 
         let drop_fn_ty = void_ty.fn_type(&[ptr_ty.into()], false);
-        let drop_fn = self
-            .module
-            .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal));
+        let drop_fn = existing.unwrap_or_else(|| {
+            self.module
+                .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal))
+        });
         self.drop_rc
             .struct_drop_fns
             .insert(cache_key.clone(), drop_fn);
+        // The real registration is in place, so a later synthesis of this type
+        // takes the cache path and the guard above is no longer needed.
+        self.drop_rc.struct_drop_in_progress.remove(&cache_key);
 
         let entry_bb = self.context.append_basic_block(drop_fn, "entry");
         self.builder.position_at_end(entry_bb);

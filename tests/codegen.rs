@@ -34639,6 +34639,86 @@ end
         );
     }
 
+    /// B-2026-09-06-64 — a SELF-REFERENTIAL struct crashed `karac build` with a
+    /// COMPILER stack overflow. Ten lines, no `Drop` impl, no method, no
+    /// rebind: `struct Node { id: i64, next: Option[Node], tag: String }` plus a
+    /// `main` that builds one. `karac run --interp` ran the same program
+    /// correctly, so a program could be developed under the interpreter and
+    /// then fail to compile at all — and a node with an `Option[Self]` field is
+    /// the canonical linked structure.
+    ///
+    /// Two unbounded recursions, each closed the way its own family already
+    /// closes one. The copy-support walk admitted the type through the
+    /// boxed-envelope disjunct, which asks nothing about the payload, so the
+    /// entry copy — unrolled INLINE — recursed struct -> `Option` payload ->
+    /// struct forever; it now consults the same cycle stack the `Vec` arm has
+    /// consulted since B-2026-07-28-3. And `emit_struct_drop_synthesis` caches
+    /// its function only after classifying every field, while classifying an
+    /// `Option[Node]` field re-enters that synthesis, so the re-entry now takes
+    /// a forward declaration of the symbol the outer call is about to define.
+    ///
+    /// Cells: the bare local (no `Drop`), a `Drop`-bearing local, a free
+    /// function that rebinds the param, one that only reads it, the
+    /// `Drop`-free struct's rebind, an owned-`self` rebind, and
+    /// `Option[Option[i64]]` as the boxed-envelope control that must stay
+    /// copy-supported (B-2026-08-07-2 shape 3 — an earlier attempt at this fix
+    /// declined it and leaked its 32-byte envelope at -O0).
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_self_referential_struct_compiles`, pinned to the same string.
+    #[test]
+    fn e2e_self_referential_struct_compiles() {
+        let Some(out) = run_program(
+            r#"struct Node { id: i64, next: Option[Node], tag: String }
+impl Drop for Node { fn drop(mut ref self) { println(f"  dN{self.id}") } }
+struct Plain { id: i64, next: Option[Plain], tag: String }
+struct Env { id: i64, inner: Option[Option[i64]] }
+fn mkn(i: i64) -> Node { return Node { id: i, next: Option.None, tag: f"t{i}" }; }
+fn mkp(i: i64) -> Plain { return Plain { id: i, next: Option.None, tag: f"p{i}" }; }
+fn top(n: Node) -> i64 { let m = n; return m.id; }
+fn read(n: Node) -> i64 { return n.id; }
+fn topp(p: Plain) -> i64 { let m = p; return m.id; }
+fn enve(e: Env) -> i64 { return e.id; }
+impl Node { fn take(self) -> i64 { let m = self; return m.id; } }
+
+fn main() {
+    println("bare_local"); let a = mkp(1); println(f"  v={a.id}");
+    println("drop_local"); let b = mkn(2); println(f"  v={b.id}");
+    println("free_fn_rebind"); println(f"  v={top(mkn(3))}");
+    println("free_fn_read"); println(f"  v={read(mkn(4))}");
+    println("plain_struct_rebind"); println(f"  v={topp(mkp(5))}");
+    println("owned_self_rebind"); println(f"  v={mkn(6).take()}");
+    println("boxed_envelope"); println(f"  v={enve(Env { id: 7, inner: Option.Some(Option.Some(8)) })}");
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"bare_local
+  v=1
+drop_local
+  v=2
+  dN2
+free_fn_rebind
+  dN3
+  v=3
+free_fn_read
+  dN4
+  v=4
+plain_struct_rebind
+  v=5
+owned_self_rebind
+  dN6
+  v=6
+boxed_envelope
+  v=7
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value
