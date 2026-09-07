@@ -844,6 +844,55 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// Name the value an RC-fallback box is about to wrap, for
+    /// [`Self::rc_fallback_box_type`] and [`Self::register_rc_fallback_box_drop`].
+    ///
+    /// B-2026-09-07-17 named it by reverse lookup over `struct_types`, on the
+    /// stated premise that "struct types are named and interned, so the reverse
+    /// lookup is exact". Both halves are false: `declare_structs` builds every
+    /// struct with `context.struct_type(..)`, a LITERAL type LLVM interns
+    /// STRUCTURALLY, so two same-shaped structs are ONE `StructType` and the
+    /// `find` chose between their names by HashMap iteration order. Measured on
+    /// `struct P { s: String, n: i64 }` and an identical `Q`, each with its own
+    /// `Drop`: eight identical compiles of one RC-promoted `P` printed `drop P`
+    /// six times and `drop Q` twice, and the four run/build legs of a single
+    /// probe disagreed with each other.
+    ///
+    /// The binding's own recorded name is strictly the better source. The
+    /// `ast_hint` fallback in the `let` path (`stmts.rs`, ~200 lines above the
+    /// boxing site) does this same reverse lookup and already knows the hazard:
+    /// it refuses an AMBIGUOUS match and excludes every `drop_method_keys` type
+    /// outright. It feeds `record_var_type_name`, which runs BEFORE the box is
+    /// built, so `var_types.var_type_names` holds that guarded answer — or the
+    /// exact AST hint, which is better still. It also carries ENUM names
+    /// (B-2026-08-26-23), which is what lets the enum arm below exist.
+    ///
+    /// VALIDATED against the boxed LLVM type rather than trusted: a shadowing
+    /// `let` can leave an outer binding's entry standing, and a stale name of a
+    /// DIFFERENT shape is exactly the wrong-body case above. A stale name of
+    /// the same shape is harmless by construction — it names a type whose
+    /// layout, drop glue and body all match what is in the box.
+    pub(super) fn rc_fallback_boxed_type_name(
+        &self,
+        var_name: &str,
+        val_ty: BasicTypeEnum<'ctx>,
+    ) -> Option<String> {
+        self.var_types
+            .var_type_names
+            .get(var_name)
+            .filter(|n| {
+                !self.type_decls.shared_types.contains_key(n.as_str())
+                    && (matches!(
+                        self.type_decls.struct_types.get(n.as_str()),
+                        Some(st) if BasicTypeEnum::StructType(*st) == val_ty
+                    ) || matches!(
+                        self.type_decls.enum_layouts.get(n.as_str()),
+                        Some(l) if BasicTypeEnum::StructType(l.llvm_type) == val_ty
+                    ))
+            })
+            .cloned()
+    }
+
     /// Synthesize (once per box heap type) the "free the boxed value's heap
     /// fields" fn for an RC-fallback box `{i64 rc, value}` whose `value` is
     /// an aggregate carrying String/Vec fields. Registered in
@@ -895,18 +944,74 @@ impl<'ctx> super::Codegen<'ctx> {
         // here replaces the field-free walk rather than adding to it. That is
         // the same contract `emit_rc_dec`'s shared-struct arm above keeps with
         // `rc_drop_fns`, and this is its RC-fallback peer.
-        let wrapper =
-            value_type_name.and_then(|n| self.drop_rc.user_drop_wrapper_fns.get(n).copied());
-        // No own `Drop`, but a Drop-bearing FIELD: the bodies-only walk runs
-        // BEFORE the memory frees, so a body still reads its own buffers.
-        let field_bodies = match (wrapper, value_type_name) {
-            (None, Some(n)) if self.type_runs_user_drop(n, &mut Vec::new()) => {
-                self.emit_struct_user_drop_bodies_only_fn(n)
+        //
+        // B-2026-09-07-18 — an ENUM takes three fns where a struct takes one,
+        // so it gets its own arm rather than a widened lookup. `karac_drop_<E>`
+        // is BODY-ONLY for an enum: its second and third steps are the struct
+        // field-bodies walk and `emit_struct_drop_synthesis`, both of which
+        // resolve to nothing for a name that is not in `struct_types`. The
+        // payload lives behind a tag, so its bodies and its memory each need
+        // the tag-switching walker built for them — the same trio, in the same
+        // order, that the enum `let` site registers as three separate cleanup
+        // actions (own body, payload bodies, payload memory; LIFO there,
+        // straight-line here).
+        //
+        // That is also why `-17` could not reach this by widening its name
+        // lookup to `enum_layouts`: the wrapper call would have restored the
+        // body and left `emit_aggregate_heap_field_frees` — a STRUCT-layout
+        // walk — as the memory answer, which for an enum frees nothing at all.
+        // Measured at -O0 (valgrind, x86_64): `let t = mke(); while i < 0 {
+        // take(t); }` over `enum E { A(String), B }` with `impl Drop for E`
+        // printed nothing against the interpreter's `drop E` and lost 34 B in
+        // 1 block; with NO `impl Drop` anywhere it lost the same 34 B, which is
+        // the half that says the memory walk was wrong independently of the
+        // body. A `Drop`-bearing STRUCT payload (`E.A(R)`) lost `drop R` the
+        // same way.
+        let enum_name = value_type_name
+            .filter(|n| matches!(self.type_decls.enum_layouts.get(*n), Some(l) if !l.is_shared));
+        // The call sequence, resolved before the fn is created — every emitter
+        // below may synthesize further functions, and each saves and restores
+        // the insert block, so none of this may run with the builder parked
+        // inside the half-built body.
+        let mut calls: Vec<FunctionValue<'ctx>> = Vec::new();
+        let mut walk_struct_heap_fields = false;
+        if let Some(en) = enum_name {
+            if let Some(w) = self.drop_rc.user_drop_wrapper_fns.get(en).copied() {
+                calls.push(w);
             }
-            _ => None,
-        };
-        if wrapper.is_none() && field_bodies.is_none() && !self.aggregate_has_heap_field(value_ty) {
-            return;
+            if let Some(bodies) = self.emit_enum_payload_user_drop_bodies_fn(en) {
+                calls.push(bodies);
+            }
+            if let Some(mem) = self.emit_enum_drop_switch(en) {
+                calls.push(mem);
+            }
+            if calls.is_empty() {
+                return;
+            }
+        } else {
+            let wrapper =
+                value_type_name.and_then(|n| self.drop_rc.user_drop_wrapper_fns.get(n).copied());
+            // No own `Drop`, but a Drop-bearing FIELD: the bodies-only walk runs
+            // BEFORE the memory frees, so a body still reads its own buffers.
+            let field_bodies = match (wrapper, value_type_name) {
+                (None, Some(n)) if self.type_runs_user_drop(n, &mut Vec::new()) => {
+                    self.emit_struct_user_drop_bodies_only_fn(n)
+                }
+                _ => None,
+            };
+            match wrapper {
+                // Body + memory in one call; no field-free walk beside it.
+                Some(w) => calls.push(w),
+                None => {
+                    if let Some(bodies) = field_bodies {
+                        calls.push(bodies);
+                    }
+                    walk_struct_heap_fields = self.aggregate_has_heap_field(value_ty);
+                }
+            }
+            if calls.is_empty() && !walk_struct_heap_fields {
+                return;
+            }
         }
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let saved_bb = self.builder.get_insert_block();
@@ -936,19 +1041,11 @@ impl<'ctx> super::Codegen<'ctx> {
             .builder
             .build_struct_gep(box_heap_type, box_ptr, 1, "rcfb.value")
             .unwrap();
-        match wrapper {
-            // Body + memory in one call; no field-free walk beside it.
-            Some(w) => {
-                self.builder.build_call(w, &[value_ptr.into()], "").unwrap();
-            }
-            None => {
-                if let Some(bodies) = field_bodies {
-                    self.builder
-                        .build_call(bodies, &[value_ptr.into()], "")
-                        .unwrap();
-                }
-                self.emit_aggregate_heap_field_frees(value_ptr, value_ty);
-            }
+        for f in calls {
+            self.builder.build_call(f, &[value_ptr.into()], "").unwrap();
+        }
+        if walk_struct_heap_fields {
+            self.emit_aggregate_heap_field_frees(value_ptr, value_ty);
         }
         self.builder.build_return(None).unwrap();
 

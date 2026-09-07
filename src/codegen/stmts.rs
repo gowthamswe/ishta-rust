@@ -6874,9 +6874,16 @@ impl<'ctx> super::Codegen<'ctx> {
                         && self.is_rc_fallback_binding(var_name)
                     {
                         let val_ty = val.get_type();
-                        let heap_type = self
-                            .context
-                            .struct_type(&[self.context.i64_type().into(), val_ty], false);
+                        // B-2026-09-07-18 — the box is NAMED after the boxed
+                        // value's type, so two same-shaped types get two box
+                        // types. `rc_fallback_box_drop_fns` is keyed on the box
+                        // type, so a shared one silently gave the second type
+                        // the first's value-drop fn. Resolved here, before the
+                        // box is minted, because the name is the box's identity
+                        // rather than an afterthought about it.
+                        let boxed_type_name = self.rc_fallback_boxed_type_name(var_name, val_ty);
+                        let heap_type =
+                            self.rc_fallback_box_type(boxed_type_name.as_deref(), val_ty);
                         let heap_ptr = self.emit_rc_alloc(heap_type);
                         let val_field = self
                             .builder
@@ -6891,26 +6898,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         // the box free at rc==0 recurses into those buffers
                         // instead of leaking them (B-2026-06-10-8). No-op for
                         // scalar / heap-free boxed values.
-                        //
-                        // B-2026-09-07-17 — name the boxed STRUCT so the box
-                        // can also carry its user `Drop` (or its field-bodies
-                        // walk). The binding's own slot cannot: it holds the
-                        // box handle from here on, which is why the cleanup
-                        // registration further down declines for it. Resolved
-                        // by LLVM type rather than through `var_type_names`,
-                        // whose entry for a shadowing `let` is mid-dance at
-                        // this point; struct types are named and interned, so
-                        // the reverse lookup is exact.
-                        let boxed_struct_name = self
-                            .type_decls
-                            .struct_types
-                            .iter()
-                            .find(|(n, st)| {
-                                BasicTypeEnum::StructType(**st) == val_ty
-                                    && !self.type_decls.shared_types.contains_key(n.as_str())
-                            })
-                            .map(|(n, _)| n.clone());
-                        self.register_rc_fallback_box_drop(heap_type, boxed_struct_name.as_deref());
+                        self.register_rc_fallback_box_drop(heap_type, boxed_type_name.as_deref());
                         self.track_rc_var(var_name, heap_ptr, heap_type);
                         heap_ptr.into()
                     } else {
@@ -8203,7 +8191,24 @@ impl<'ctx> super::Codegen<'ctx> {
                 // heap-bearing payload (returns early, no IR bloat).
                 if let PatternKind::Binding(var_name) = &pattern.kind {
                     let enum_name = self.enum_name_for_binding(var_name, value, ty.as_ref());
-                    if let Some(name) = enum_name {
+                    // B-2026-09-07-18 — the enum sibling of B-2026-09-07-17's
+                    // gate. An RC-fallback-promoted binding's slot holds the
+                    // BOX HANDLE, not the enum, so both registrations below
+                    // would hand an 8-byte pointer slot to a fn that reads it
+                    // as a tagged union. The memory one decoded the box address
+                    // as the discriminant and (on this layout) landed on a
+                    // heap-free variant, so it silently did nothing — which is
+                    // why the measured symptom was a plain 34 B leak rather
+                    // than a crash, and why it is worth gating rather than
+                    // leaving to luck: any enum whose garbage-tag arm DOES own
+                    // heap frees a pointer read out of the box handle.
+                    // `register_rc_fallback_box_drop` now carries all three
+                    // walks on the box itself, where the value actually lives.
+                    let rc_boxed = self
+                        .drop_rc
+                        .rc_fallback_heap_types
+                        .contains_key(var_name.as_str());
+                    if let Some(name) = enum_name.filter(|_| !rc_boxed) {
                         if let Some(slot) = self.variables.get(var_name.as_str()) {
                             let alloca = slot.ptr;
                             self.track_enum_var(&name, alloca);

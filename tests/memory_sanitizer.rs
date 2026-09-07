@@ -64904,6 +64904,183 @@ fn main() { println(go()); }
         );
     }
 
+    /// B-2026-09-07-18 — the ENUM sibling of the box above, on both of its
+    /// axes, plus the NAMING defect B-2026-09-07-17 introduced while fixing the
+    /// struct one.
+    ///
+    /// `karac_drop_<E>` is body-only for an enum name: the wrapper's other two
+    /// steps are a struct field-bodies walk and `emit_struct_drop_synthesis`,
+    /// and both resolve to nothing for a name that is not in `struct_types`.
+    /// So the box needs three fns where a struct needs one — own body, payload
+    /// bodies, payload memory — which is why widening `-17`'s name lookup to
+    /// `enum_layouts` would have restored the body and left the memory answer
+    /// (a STRUCT-layout field walk over a tagged union) freeing nothing.
+    ///
+    /// The no-`Drop`-anywhere cell is the one that proves the second axis is
+    /// not just the first one's gate missing an arm: with no user `Drop` in the
+    /// program at all, the RC-boxed enum still lost its payload.
+    #[test]
+    fn asan_rc_fallback_boxed_enum_local_drops_through_its_box() {
+        const OWN: &str = "enum E { A(String), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"drop E\"); } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mke() -> E { return E.A(payload()); }\n\
+             fn take(e: E) -> i64 { return 1; }\n\
+             fn main() { println(go()); }\n";
+        // As in the struct fixture, the promotion fires on the CONSUME's
+        // presence rather than the trip count, so the never-entered loop is the
+        // sharpest cell.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mke(); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ take(t); i = i + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop E", "1"],
+            "rc_fb_enum_own_drop_loop_never_entered",
+            9,
+        );
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mke(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let k = take(t); i = i + k - k + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop E", "1"],
+            "rc_fb_enum_own_drop_loop_entered",
+            9,
+        );
+        // A `Drop`-bearing STRUCT PAYLOAD under an enum that declares no `Drop`
+        // of its own: the payload-bodies walker is the piece that carries it,
+        // and it is a different fn from the enum's own wrapper.
+        const PAYLOAD: &str = "struct R { s: String }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"drop R {self.s.len()}\"); } }\n\
+             enum E { A(R), B }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mke() -> E { return E.A(R { s: payload() }); }\n\
+             fn take(e: E) -> i64 { return 1; }\n\
+             fn main() { println(go()); }\n";
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{PAYLOAD}fn go() -> i64 {{ let t = mke(); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ take(t); i = i + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop R 38", "1"],
+            "rc_fb_enum_payload_drop_body",
+            9,
+        );
+        // BOTH — the enum's own body first, then the payload's, which is the
+        // interpreter's order and the one the straight-line call sequence in
+        // `register_rc_fallback_box_drop` has to reproduce.
+        assert_clean_asan_run_min_allocs(
+            "struct R { s: String }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"drop R {self.s.len()}\"); } }\n\
+             enum E { A(R), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"drop E\"); } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mke() -> E { return E.A(R { s: payload() }); }\n\
+             fn take(e: E) -> i64 { return 1; }\n\
+             fn go() -> i64 { let t = mke(); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { take(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["drop E", "drop R 38", "1"],
+            "rc_fb_enum_own_and_payload_drop",
+            9,
+        );
+        // The second axis on its own: NO user `Drop` anywhere in the program,
+        // so nothing here is about a body. The RC-boxed enum still leaked its
+        // payload, because the box's memory step was a struct-layout walk.
+        assert_clean_asan_run_min_allocs(
+            "enum E { A(String), B }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mke() -> E { return E.A(payload()); }\n\
+             fn take(e: E) -> i64 { return 1; }\n\
+             fn go() -> i64 { let t = mke(); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { take(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["1"],
+            "rc_fb_enum_no_drop_payload_memory",
+            9,
+        );
+        // CONTROL — the same enum NOT promoted (no consume, so no loop-of-
+        // consume rule). This was already correct and must stay byte-identical.
+        assert_clean_asan_run_min_allocs(
+            &format!("{OWN}fn go() -> i64 {{ let t = mke(); return 1; }}\n"),
+            &["drop E", "1"],
+            "rc_fb_enum_unpromoted_control",
+            9,
+        );
+    }
+
+    /// B-2026-09-07-18 — the box runs the BINDING's own `Drop`, not that of a
+    /// same-shaped twin.
+    ///
+    /// B-2026-09-07-17 named the boxed value by reverse lookup over
+    /// `struct_types`, on the premise that "struct types are named and interned,
+    /// so the reverse lookup is exact". `declare_structs` builds every struct
+    /// with `context.struct_type(..)` — a LITERAL type, interned STRUCTURALLY —
+    /// so `P` and `Q` below are one `StructType` and the lookup chose between
+    /// their names by HashMap iteration order. Eight identical compiles of this
+    /// program printed `drop P` six times and `drop Q` twice.
+    ///
+    /// The fixture pins the two halves that make the answer stable: the name is
+    /// read off the BINDING (`var_type_names`, which the `ast_hint` lookup ~200
+    /// lines above already fills in with an ambiguity-refusing,
+    /// `drop_method_keys`-excluding answer), and it is validated against the
+    /// boxed LLVM type before use so a shadowing `let`'s stale entry cannot
+    /// stand in.
+    #[test]
+    fn asan_rc_fallback_box_runs_its_own_types_drop_not_a_twins() {
+        const TWINS: &str = "struct P { s: String, n: i64 }\n\
+             impl Drop for P { fn drop(mut ref self) { println(f\"drop P {self.s.len()}\"); } }\n\
+             struct Q { s: String, n: i64 }\n\
+             impl Drop for Q { fn drop(mut ref self) { println(f\"drop Q {self.s.len()}\"); } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp() -> P { return P { s: payload(), n: 1i64 }; }\n\
+             fn mkq() -> Q { return Q { s: payload(), n: 2i64 }; }\n\
+             fn takep(p: P) -> i64 { return p.n; }\n\
+             fn takeq(q: Q) -> i64 { return q.n; }\n";
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{TWINS}fn go() -> i64 {{ let t = mkp(); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return 1; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["drop P 38", "1"],
+            "rc_fb_twin_shape_single_box",
+            9,
+        );
+        // BOTH twins promoted in one module. The box heap type is
+        // `{i64, <value>}`, and it is interned structurally too, so the two
+        // boxes are ONE LLVM type — which is what the per-box-type memo in
+        // `register_rc_fallback_box_drop` is keyed on. Naming the value
+        // correctly is necessary but not sufficient if the memo then hands the
+        // second box the first one's fn.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{TWINS}fn gop() -> i64 {{ let t = mkp(); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return 1; }}\n\
+                 fn goq() -> i64 {{ let u = mkq(); let mut j = 0i64;\n\
+                 \x20 while j < 0i64 {{ takeq(u); j = j + 1; }}\n\
+                 \x20 return 2; }}\n\
+                 fn main() {{ println(gop()); println(goq()); }}\n"
+            ),
+            &["drop P 38", "1", "drop Q 38", "2"],
+            "rc_fb_twin_shape_both_boxed",
+            9,
+        );
+    }
+
     /// B-2026-09-01-5 — a DISCARDED aggregate literal whose field PROJECTS off
     /// a named local (`P { a: t.a, b: 1 }`) disarmed the source and registered
     /// no owner, stranding the buffer.

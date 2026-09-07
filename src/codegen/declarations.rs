@@ -583,11 +583,47 @@ impl<'ctx> super::Codegen<'ctx> {
         type_name: &str,
         fields: &[BasicTypeEnum<'ctx>],
     ) -> StructType<'ctx> {
-        let sym = format!("karac.shared.{type_name}");
-        if let Some(existing) = self.module.get_struct_type(&sym) {
+        self.named_heap_type(&format!("karac.shared.{type_name}"), fields)
+    }
+
+    /// The RC-FALLBACK box's `{i64 rc, value}` heap type, named after the
+    /// boxed value's Kāra type for exactly the reason above.
+    ///
+    /// B-2026-09-07-18 — the fallback box was built with
+    /// `context.struct_type(..)`, a literal type LLVM interns STRUCTURALLY, so
+    /// two same-shaped values shared one box type. `rc_fallback_box_drop_fns`
+    /// is keyed on that type (it is all `emit_rc_dec` has at the release site),
+    /// and its "already registered" memo therefore handed the SECOND boxed type
+    /// the FIRST one's value-drop fn. Measured: `struct P` and an identically
+    /// shaped `struct Q`, each with its own `Drop`, both RC-promoted in one
+    /// module, printed `drop P` twice on every backend and at both opt levels
+    /// where the interpreter prints `drop P` then `drop Q`; the same held for
+    /// two same-shaped enums. Naming the box restores the identity the
+    /// `shared` sibling has had all along.
+    ///
+    /// `None` keeps the literal type: an unnamed value (a tuple) has no
+    /// identity to preserve, and its registered fn is a purely structural
+    /// heap-field walk, so sharing one is correct rather than merely harmless.
+    pub(super) fn rc_fallback_box_type(
+        &self,
+        value_type_name: Option<&str>,
+        value_ty: BasicTypeEnum<'ctx>,
+    ) -> StructType<'ctx> {
+        let fields = [self.context.i64_type().into(), value_ty];
+        match value_type_name {
+            Some(n) => self.named_heap_type(&format!("karac.rcfb.{n}"), &fields),
+            None => self.context.struct_type(&fields, false),
+        }
+    }
+
+    /// Mint (or reuse) a NAMED LLVM struct type for `sym`. Idempotent: a
+    /// re-declaration reuses the existing named type rather than minting a
+    /// `.1`-suffixed twin, which would defeat the identity it exists to give.
+    fn named_heap_type(&self, sym: &str, fields: &[BasicTypeEnum<'ctx>]) -> StructType<'ctx> {
+        if let Some(existing) = self.module.get_struct_type(sym) {
             return existing;
         }
-        let ty = self.context.opaque_struct_type(&sym);
+        let ty = self.context.opaque_struct_type(sym);
         ty.set_body(fields, false);
         ty
     }
