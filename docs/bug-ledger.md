@@ -103,15 +103,15 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | perf | 97 |
 | soundness | 95 |
 | other | 80 |
-| crash | 75 |
+| crash | 77 |
 | use-after-free | 33 |
 
 ### By surface
 
 | surface | total |
 |---|---|
-| codegen | 1577 |
-| interp | 402 |
+| codegen | 1578 |
+| interp | 403 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -164,11 +164,11 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-13 | 2026-09-07 | codegen | medium | A STORED ENUM ARGUMENT RUNS ITS `Drop` BODY TWICE ON EVERY COMPILED BACKEND, IN THE FN-CALL SPELLING ONLY -- `b.put(mke(60))` over `fn put(mut ref self, e: Ev) { self.xs.push(e); }` prints `dEv len=1 dEv` on `karac run` and at both opt levels against `len=1 dEv` under `--interp`, while the CTOR spelling `b.put(Ev.A(77, In2 { v: 1 }))` and the GENERIC leg `stashg(mut v, mkes(75))` are correct everywhere; memory is balanced, only the body is doubled | src/codegen/call_dispatch.rs (track_inline_owned_aggregate_arg_inst enum arm, payload_skip); arg_is_entry_copied_heap_enum resolution |
 | B-2026-09-07-20 | 2026-09-07 | codegen | medium | `asan_stored_argument_is_owned_by_its_new_home_not_the_caller` LEAKS 35 B AT -O0 AND HAS SINCE THE DAY IT LANDED -- its `[b0907-5-outliving-store-admission]` cell loses 32 B in 2 objects plus 3 B in 1, clean at the default -O2, and nothing has run the -O0 leg since `d971ad5` added the fixture | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
-| B-2026-09-07-24 | 2026-09-07 | interp | medium | A `u64` ABOVE `i64::MAX` IN A WIDTH-SPEC'D f-STRING HOLE RENDERS NEGATIVE UNDER `--interp` AND UNSIGNED ON BOTH COMPILED BACKENDS -- `f"{ubig:22}"` for 18446744073709551615 prints `                    -1` interpreted and `  18446744073709551615` compiled; the compiled column is the correct one, and the UNSPEC'D spelling `f"{ubig}"` is correct on all three | none |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
 | B-2026-09-07-29 | 2026-09-07 | codegen | high | A WHOLE CONSUME INSIDE A LOOP THAT ACTUALLY RUNS DOUBLE-FREES AN RC-PROMOTED LOCAL, with no projection anywhere in the program -- `while i < 3i64 { takep(t); i = i + 1; }` over a loop-outer `t` measures 25 allocs against 28 frees with 2 invalid frees at -O0, which is B-2026-09-07-17's own shape above trip count ZERO | — |
 | B-2026-09-07-30 | 2026-09-07 | codegen | medium | A PROJECTION OFF AN RC-PROMOTED LOCAL STRANDS 40 B WHEN ITS DESTINATION IS A `Vec.push` OR AN EXISTING BINDING -- `v.push(t.a)` also invalid-frees once, `s = t.a` leaks silently, and both survive B-2026-09-07-19's copy because neither destination routes through the let-binding or struct-literal registrars | — |
 | B-2026-09-07-33 | 2026-09-07 | codegen | high | A CALLEE HANDING A BOXED PAYLOAD OUT OF A `match` ARM WRITES INTO THE ENVELOPE IT JUST FREED -- `fn payout(w: W) -> X1 { return match w { W.T(x) => x, .. } }` prints the right answer and leaves 3 `Invalid write of size 8` into a freed 56-byte block, because the param's envelope free runs BEFORE the moved-from zeroing; PRE-EXISTING and previously masked by B-2026-09-07-16's abort | — |
+| B-2026-09-07-35 | 2026-09-07 | interp | medium | A SPEC'D 128-BIT f-STRING HOLE PANICS THE INTERPRETER -- `f"{big:44}"` on a `u128` aborts with "128-bit value reached an i64-only consumer" while both compiled backends now render it correctly; the UNSPEC'D `f"{big}"` is fine on all three | none |
 
 ### Relocated
 
@@ -2367,11 +2367,13 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-19 | codegen | high | A `let`-BOUND STRUCT LITERAL WHOSE FIELD PROJECTS AN RC-PROMOTED LOCAL FREES FIVE BUFFERS IT DOES NOT OWN -- `while i < 0 { let p = P { a: t.a, b: 1… | 9a50182 |
 | B-2026-09-07-22 | codegen | high | A METHOD OR ASSOC-FN ARGUMENT ON A MIXED-PATH CALLEE THAT HANDS IT BACK THROUGH ONE FURTHER CALL STILL DOUBLE-FREES -- `impl Hold { fn pick2(ref self… | 99bd72d |
 | B-2026-09-07-23 | codegen | high | A `let`-BOUND STRUCT LITERAL PROJECTING A LOOP-OUTER LOCAL FREES THE ALIASED BUFFER ONCE PER ITERATION -- `while i < 2 { let p = P { a: t.a, b: 1 };… | afe5abf |
+| B-2026-09-07-24 | interp | medium | A `u64` ABOVE `i64::MAX` IN A WIDTH-SPEC'D f-STRING HOLE RENDERS NEGATIVE UNDER `--interp` AND UNSIGNED ON BOTH COMPILED BACKENDS -- `f"{ubig:22}"` f… | f5f86c16e |
 | B-2026-09-07-25 | codegen | medium | B-2026-09-05-23 LEFT THE SPEC'D f-STRING INTEGER PATH ON libc `snprintf` -- `f"{n}"` was fast and `f"{n:5}"` was ~23x slower inside a parallel loop (… | c5982d963 |
 | B-2026-09-07-27 | codegen | high | AN RC-FALLBACK BOX HAS NO TYPE IDENTITY, so it runs a SAME-SHAPED TWIN'S `Drop` body -- B-2026-09-07-17 named the boxed value by reverse lookup over… | f37af501e |
 | B-2026-09-07-28 | codegen | medium | AN RC-BOXED TUPLE LOSES ITS ELEMENT'S `Drop` BODY -- `let t = (S { . | 0e881224f |
 | B-2026-09-07-31 | codegen | low | AN RC-BOXED TUPLE WITH AN ENUM OR `Option` ELEMENT LOSES ITS PAYLOAD MEMORY -- the box's memory step was the enum-blind `emit_aggregate_heap_field_fr… | 0e881224f |
 | B-2026-09-07-32 | codegen | high | AN ASSOC CALL NEVER RETRACTS A NAMED LOCAL'S CLEANUP FOR A DECLINED-COPY BY-VALUE ARGUMENT -- `Type.f(a)` was the third dispatch leg with no `move_de… | FIXED by hooking `move_declined_copy_struct_arg` into the a… |
+| B-2026-09-07-34 | codegen | high | A SPEC'D 128-BIT f-STRING HOLE FAILED LLVM MODULE VERIFICATION -- `f"{x:44}"` on an `i128` did not compile at all after B-2026-09-07-25 routed spec'd… | f5f86c16e |
 
 </details>
 
