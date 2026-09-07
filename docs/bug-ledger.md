@@ -93,9 +93,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 393 |
-| run-vs-build | 362 |
-| leak | 283 |
-| double-free | 200 |
+| run-vs-build | 364 |
+| leak | 285 |
+| double-free | 202 |
 | missing-feature | 194 |
 | codegen-gap | 166 |
 | diagnostics | 125 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1547 |
-| interp | 397 |
+| codegen | 1553 |
+| interp | 398 |
 | typecheck | 295 |
 | ownership | 74 |
 | other | 73 |
@@ -163,11 +163,15 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-67 | 2026-09-06 | codegen | low | A BOXED USER *ENUM* PAYLOAD OF A BY-VALUE PARAM IS STILL UNOWNED, ON BOTH SEEDED ENUMS -- `fn show(x: Result[K, i64])` matched `Ok(K.A(r))` leaks 240 B in 3 blocks plus 81 B indirect, and the `Option` spelling measures identically, because both caller-side arms filter the payload name through `struct_types` | — |
 | B-2026-09-06-68 | 2026-09-06 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER GATE IS RED ON `main` -- `asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy` measures 320 malloc calls against its 180 ceiling, and 320 is HIGHER than the 251 that row recorded for the transfer fully OFF, so this is not simply `param_transfer` declining the callee | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
 | B-2026-09-06-69 | 2026-09-06 | codegen | high | A CONDITIONAL HAND-BACK OF A REBOUND BY-VALUE PARAM DOUBLE-FREES -- `fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(9); }` over a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at both opt levels (3 valgrind errors from 3 contexts) when the hand-back path is taken; the SAME function without the rebind (`if c { return r; }`) is clean on every surface, and so is the same rebound function when only the dies-inside path runs. `--interp` is correct. The obvious extension of B-2026-09-06-61's fix was MEASURED AND REJECTED: it buys this at the price of an 18 B leak on the dies-inside path | — |
-| B-2026-09-06-70 | 2026-09-06 | codegen | high | THE METHOD AND ASSOC-FN ARGUMENT REGISTRARS HAVE NO ADMISSION GATE AT ALL, so a fresh-temp argument a passthrough callee hands straight back double-frees with NO REBIND ANYWHERE -- `impl R { fn passa(r: R) -> R { return r; } }` called as `R.passa(mk(16))`, and the method twin `h.thru(mk(17))` over `fn thru(ref self, r: R) -> R { return r; }`, both abort `free(): double free detected in tcache 2` under `karac run` and at both opt levels (3 valgrind errors from 3 contexts) over a struct with a `shared` field; the IDENTICAL free function is clean. `--interp` is correct on both | — |
 | B-2026-09-06-71 | 2026-09-06 | codegen | high | A NAMED-LOCAL ARGUMENT TO A PASSTHROUGH FREE FUNCTION DOUBLE-FREES -- `let a = mk(15); let z = f(a);` over `fn f(r: R) -> R { return r; }` and a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at both opt levels (3 valgrind errors from 3 contexts), while the FRESH-TEMP spelling of the same call (`f(mk(15))`) is clean on every surface; `--interp` is correct. The caller's binding and the result binding both own the forwarded object because the arg-pass move-suppression does not retract a declined-copy param's source | — |
 | B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
 | B-2026-09-06-66 | 2026-09-07 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Option[Node], tag: String }` loses 67 bytes (64 direct, 3 indirect) in 1 block at both opt levels, while every EMPTY-`next` spelling of the same type is clean; both `Drop` bodies run, so it is the boxed payload's memory alone | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
+| B-2026-09-07-3 | 2026-09-07 | codegen | medium | THE FREE-FUNCTION ARGUMENT ADMISSION GATE STANDS THE CALLER DOWN ON A MIXED-PATH CALLEE AND LEAKS THE DIES-INSIDE LEG -- `fn pick3(r: R, k: bool) -> R { if k { return mk(96); } return r; }` called at `k = true` prints correctly and loses 19 B in 2 blocks (2 valgrind errors) on every compiled surface, because `call_arg_flows_into_return` admits on the UNION `fn_returns_param`, which is true for a param that escapes on one path and dies on another; the `return fwd(r)` spelling loses the same 19 B through `fn_returns_param_via_call` | src/codegen/call_dispatch.rs (compile_call's argument loop; the admission gate built on `call_arg_flows_into_return`) |
+| B-2026-09-07-4 | 2026-09-07 | codegen | high | A METHOD OR ASSOC-FN ARGUMENT ON A MIXED-PATH CALLEE STILL DOUBLE-FREES ON ITS ESCAPING LEG -- `impl Hold { fn pick(ref self, r: R, k: bool) -> R { if k { return mk(98); } return r; } }` at `k = false`, and its `return fwd(r)` sibling, abort `free(): double free detected in tcache 2` (3 valgrind errors) while the DIES-INSIDE leg of the same method is clean; B-2026-09-06-70's admission gate is deliberately ALL-PATHS and cannot reach these | src/codegen/method_call.rs and src/codegen/assoc_call.rs (the `always_handed_back` admission gate and its `handed_off` sibling); crate::ast::fn_conditionally_returns_param_bare |
+| B-2026-09-07-5 | 2026-09-07 | codegen | high | A METHOD THAT STORES ITS BY-VALUE ARGUMENT INTO `self` DOUBLE-FREES A DECLINED-COPY STRUCT -- `impl Box2 { fn push(mut ref self, r: R) { self.xs.push(r); } }` under `b.push(mk(27))` over a struct with a `shared` field aborts `free(): double free detected in tcache 2` on `karac run` and at BOTH opt levels (3 valgrind errors from 3 contexts) while `--interp` prints `m8=1 dR27` correctly | src/codegen/method_call.rs (the `escapes_frame` binding); call_arg_moves_into_outliving_place; struct_type_is_entry_copied_heap |
+| B-2026-09-07-6 | 2026-09-07 | interp+codegen | medium | A WHOLE-TUPLE ARGUMENT TO A PASSTHROUGH METHOD OR ASSOC FN LOSES ITS ELEMENT'S `Drop` BODY ON EVERY COMPILED BACKEND -- `impl Hold { fn thrut(ref self, t: (Q, i64)) -> (Q, i64) { return t; } }` under `h.thrut((mkq(31), 7))` prints `m11=7 dQ31` under `--interp` and `m11=7` alone under `karac run` and at both opt levels, and the assoc twin `Q.passt` the same; the FREE-FUNCTION twin `fn passt(t: (Q, i64)) -> (Q, i64)` is correct on all five surfaces, so this is the method and assoc legs alone | src/codegen/method_call.rs (track_inline_owned_aggregate_arg_parts' `declared_elem_tes` argument, passed None) and src/codegen/assoc_call.rs (track_inline_owned_aggregate_arg, which has no such channel); callee_tuple_param_elem_type_exprs |
+| B-2026-09-07-7 | 2026-09-07 | codegen | medium | TWO SHIPPED ASAN FIXTURES FAIL AT THE DEFAULT -O2 ON `main`, AND A STALE RUNTIME ARCHIVE HAD BEEN MASKING THEM -- `asan_no_else_if_arm_owns_the_value_it_mints` and `asan_discarded_branch_literal_field_over_a_loop_outer_local_declines` each leak 38 B in 1 object on their `[control: field-is-a-place]` cell, which is B-2026-09-01-5's documented shape; both are red at `a3d6390`, at `9b686d4` and on a working tree, byte-identical, once the lean/full/unicode archives are rebuilt against current `runtime/src` | tests/memory_sanitizer.rs (asan_no_else_if_arm_owns_the_value_it_mints, asan_discarded_branch_literal_field_over_a_loop_outer_local_declines); tests/asan-o0-known-failures.txt; B-2026-09-01-5 owns the leak |
 
 ### Relocated
 
@@ -2341,6 +2345,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-61 | codegen | high | RETURNING A WHOLE REBIND OF A DECLINED-COPY PARAM DOUBLE-FREES -- `fn rebret(r: R) -> R { let m = r; return m; }` over a struct with a `shared` field… | b8c2a02 |
 | B-2026-09-06-62 | codegen | high | THE OWNED-`self` RECEIVER SPELLING OF B-2026-09-06-52 IS STILL RED -- `impl R { fn take(self) -> i64 { let m = self; return m.inner.v; } }` over a st… | 96efdca |
 | B-2026-09-06-64 | codegen | high | A SELF-REFERENTIAL STRUCT CRASHES `karac build` WITH A COMPILER STACK OVERFLOW -- `struct Node { id: i64, next: Option[Node], tag: String }` plus a `… | ed5335c |
+| B-2026-09-06-70 | codegen | high | THE METHOD AND ASSOC-FN ARGUMENT REGISTRARS HAVE NO ADMISSION GATE AT ALL, so a fresh-temp argument a passthrough callee hands straight back double-f… | c76f658 |
+| B-2026-09-07-2 | codegen | medium | A DISCARDED ASSOCIATED-FUNCTION CALL REGISTERS NO OWNER AT ALL, so its returned value's `Drop` body runs on NO compiled backend and its heap leaks --… | c76f658 |
 
 </details>
 
