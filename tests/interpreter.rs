@@ -57444,6 +57444,47 @@ end
     );
 }
 
+/// B-2026-09-07-8 — the interpreter ran the doubled body too, on the same cell,
+/// which is what made this row invisible to the A/B rule: both backends agreed on
+/// the wrong answer. A fix pin on both sides.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_rebound_param_into_a_mixed_path_callee`, pinned to the same string.
+#[test]
+fn test_rebound_param_into_a_mixed_path_callee() {
+    assert_eq!(
+        run(r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(99); }
+fn direct(a: R, c: bool) { f(a, c); }
+fn rebound(a: R, c: bool) { let q = a; f(q, c); println("  in"); }
+fn rebound_bound(a: R, c: bool) -> i64 { let q = a; let w = f(q, c); return w.id; }
+fn rebound_only(a: R) { let q = a; println("  only"); }
+fn main() {
+  println("direct_handback"); direct(mk(1), true);
+  println("rebound_handback"); rebound(mk(2), true);
+  println("rebound_bound"); println(f"  v={rebound_bound(mk(3), true)}");
+  println("rebound_no_call"); rebound_only(mk(4));
+  println("end");
+}
+"#),
+        r#"direct_handback
+  dR1
+rebound_handback
+  dR2
+  in
+rebound_bound
+  dR3
+  v=3
+rebound_no_call
+  only
+  dR4
+end
+"#
+    );
+}
+
 /// B-2026-09-07-22 — the interpreter was correct on this row's cells throughout;
 /// the twin holds the compiled string to it.
 ///

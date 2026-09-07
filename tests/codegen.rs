@@ -35312,6 +35312,72 @@ end
         );
     }
 
+    /// B-2026-09-07-8 — a mixed-path callee reached with the ENCLOSING frame's own
+    /// declined-copy param, through a rebind. `fn g(a: R, c: bool) { let q = a;
+    /// f(q, c); }` over `fn f(r: R, c: bool) -> R { let m = r; if c { return m; }
+    /// return mk(99); }` aborted `free(): double free detected in tcache 2` on
+    /// every compiled surface on the hand-back path, and ran the `Drop` body TWICE
+    /// for one object on the interpreter AND the compiled backends alike — a
+    /// uniform wrong answer, which is why no A/B gate and no sanitizer reported it.
+    /// The same call WITHOUT the rebind (`f(a, c)`) was correct throughout.
+    ///
+    /// One predicate decided both. `fn_conditionally_hands_param_to_flip_callee` is
+    /// what tells the outer caller that some other frame takes the body per path
+    /// (B-2026-09-06-13); it matched the parameter's own name only, so the rebound
+    /// spelling answered false and the caller registered a full owner for its temp
+    /// alongside the callee's per-path one. It now follows the param's whole
+    /// aliases — and the rebind that CREATES an alias no longer counts as an
+    /// "other move" of the param, which is what had disqualified the very function
+    /// whose alias set it seeded.
+    ///
+    /// Cells: the direct hand-back control, the rebound spelling, the rebound
+    /// spelling whose result is `let`-bound, and a rebind with no call at all.
+    /// The DIES-INSIDE legs are deliberately not here: they inherit the -O0 leak
+    /// B-2026-09-07-3 owns, which the un-rebound spelling has on `main` today and
+    /// which this fix neither causes nor cures.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_rebound_param_into_a_mixed_path_callee`, pinned to the same string.
+    #[test]
+    fn e2e_rebound_param_into_a_mixed_path_callee() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(99); }
+fn direct(a: R, c: bool) { f(a, c); }
+fn rebound(a: R, c: bool) { let q = a; f(q, c); println("  in"); }
+fn rebound_bound(a: R, c: bool) -> i64 { let q = a; let w = f(q, c); return w.id; }
+fn rebound_only(a: R) { let q = a; println("  only"); }
+fn main() {
+  println("direct_handback"); direct(mk(1), true);
+  println("rebound_handback"); rebound(mk(2), true);
+  println("rebound_bound"); println(f"  v={rebound_bound(mk(3), true)}");
+  println("rebound_no_call"); rebound_only(mk(4));
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"direct_handback
+  dR1
+rebound_handback
+  dR2
+  in
+rebound_bound
+  dR3
+  v=3
+rebound_no_call
+  only
+  dR4
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-22 — the METHOD and ASSOC-FN spelling of B-2026-09-07-15's
     /// shape: `h.pick2(mk(1), false)` over
     /// `impl Hold { fn pick2(ref self, r: R, k: bool) -> R { if k { return mk(90); }

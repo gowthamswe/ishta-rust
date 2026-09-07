@@ -5220,13 +5220,23 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
     let PatternKind::Binding(name) = &param.pattern.kind else {
         return false;
     };
+    // B-2026-09-07-8 — under every name the param is rebound to WHOLE
+    // (`let q = a; f(q, c);`), which is the same act as handing `a` over: a
+    // rebind of a by-value param is a view onto the same object, and this
+    // predicate's whole question is whether some other frame takes the body
+    // per path. Without the aliases the rebound spelling answered `false`
+    // here, the caller registered a full owner for its temp, and the callee's
+    // per-path body fired alongside it — `dR1 g dR1`, two bodies for one
+    // object, agreed by every backend and so invisible to the A/B gate and to
+    // every sanitizer. See `param_whole_aliases` for what qualifies.
+    let alias_names = param_whole_aliases(Some(program), f, name);
     struct Tally {
         clearable: usize,
         other: bool,
     }
-    /// Is `e` a direct call handing `name` bare to a flip callee? The index
-    /// of that argument, if so.
-    fn flip_call(e: &Expr, name: &str, program: &crate::Program) -> Option<usize> {
+    /// Is `e` a direct call handing `name` (or one of its whole aliases) bare
+    /// to a flip callee? The index of that argument, if so.
+    fn flip_call(e: &Expr, name: &[String], program: &crate::Program) -> Option<usize> {
         let ExprKind::Call { callee, args } = &e.kind else {
             return None;
         };
@@ -5237,20 +5247,18 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
         };
         let gf = resolve_free_or_assoc_fn(program, &key)?;
         args.iter().enumerate().find_map(|(j, a)| {
-            (matches!(&a.value.kind, ExprKind::Identifier(n) if n == name)
+            (matches!(&a.value.kind, ExprKind::Identifier(n) if name.iter().any(|al| al == n))
                 && fn_conditionally_returns_param_bare(Some(program), gf, j))
             .then_some(j)
         })
     }
-    fn classify(e: &Expr, name: &str, program: &crate::Program, t: &mut Tally) {
+    fn classify(e: &Expr, name: &[String], program: &crate::Program, t: &mut Tally) {
         if let Some(j) = flip_call(e, name, program) {
             t.clearable += 1;
             if let ExprKind::Call { args, .. } = &e.kind {
-                if args
-                    .iter()
-                    .enumerate()
-                    .any(|(k, a)| k != j && outliving_store::moves(&a.value, name))
-                {
+                if args.iter().enumerate().any(|(k, a)| {
+                    k != j && name.iter().any(|al| outliving_store::moves(&a.value, al))
+                }) {
                     t.other = true;
                 }
             }
@@ -5267,7 +5275,7 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
                 then_block,
                 else_branch,
             } => {
-                if outliving_store::moves(condition, name) {
+                if name.iter().any(|al| outliving_store::moves(condition, al)) {
                     t.other = true;
                 }
                 walk_block(then_block, name, program, t);
@@ -5281,7 +5289,7 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
                 else_branch,
                 ..
             } => {
-                if outliving_store::moves(value, name) {
+                if name.iter().any(|al| outliving_store::moves(value, al)) {
                     t.other = true;
                 }
                 walk_block(then_block, name, program, t);
@@ -5290,7 +5298,7 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                if outliving_store::moves(scrutinee, name) {
+                if name.iter().any(|al| outliving_store::moves(scrutinee, al)) {
                     t.other = true;
                 }
                 for a in arms {
@@ -5300,19 +5308,19 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
             ExprKind::While {
                 condition, body, ..
             } => {
-                if outliving_store::moves(condition, name) {
+                if name.iter().any(|al| outliving_store::moves(condition, al)) {
                     t.other = true;
                 }
                 walk_block(body, name, program, t);
             }
             ExprKind::WhileLet { value, body, .. } => {
-                if outliving_store::moves(value, name) {
+                if name.iter().any(|al| outliving_store::moves(value, al)) {
                     t.other = true;
                 }
                 walk_block(body, name, program, t);
             }
             ExprKind::For { iterable, body, .. } => {
-                if outliving_store::moves(iterable, name) {
+                if name.iter().any(|al| outliving_store::moves(iterable, al)) {
                     t.other = true;
                 }
                 walk_block(body, name, program, t);
@@ -5322,15 +5330,29 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
             }
             ExprKind::Return(Some(inner)) => classify(inner, name, program, t),
             _ => {
-                if outliving_store::moves(e, name) {
+                if name.iter().any(|al| outliving_store::moves(e, al)) {
                     t.other = true;
                 }
             }
         }
     }
-    fn walk_block(b: &Block, name: &str, program: &crate::Program, t: &mut Tally) {
+    fn walk_block(b: &Block, name: &[String], program: &crate::Program, t: &mut Tally) {
         for st in &b.stmts {
             match &st.kind {
+                // B-2026-09-07-8 — the rebind that CREATES an alias is not an
+                // "other move" of the parameter. `let q = a;` reaches the
+                // catch-all below as a bare identifier and sets `other`, which
+                // disqualified the very function whose alias set it seeded:
+                // `fn g(a: R, c: bool) { let q = a; f(q, c); }` answered false
+                // where the un-rebound `f(a, c)` answered true, so the caller
+                // registered a full owner for its temp and the callee's
+                // per-path body fired alongside it — `dR1 g dR1`, two bodies
+                // for one object on every backend at once.
+                StmtKind::Let { pattern, value, .. }
+                    if matches!(&pattern.kind, PatternKind::Binding(b)
+                        if name.iter().any(|al| al == b))
+                        && matches!(&value.kind, ExprKind::Identifier(src)
+                            if name.iter().any(|al| al == src)) => {}
                 StmtKind::Let { value, .. } | StmtKind::Assign { value, .. } => {
                     classify(value, name, program, t)
                 }
@@ -5352,7 +5374,7 @@ pub fn fn_conditionally_hands_param_to_flip_callee(
         clearable: 0,
         other: false,
     };
-    walk_block(&f.body, name, program, &mut t);
+    walk_block(&f.body, &alias_names, program, &mut t);
     t.clearable > 0 && !t.other
 }
 

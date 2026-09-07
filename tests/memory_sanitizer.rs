@@ -4134,6 +4134,46 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-8 — the MEMORY half: the same program under ASAN + LSan,
+    /// where the pre-fix build double-freed the object on the hand-back path.
+    /// One owner and one free per object, with the rebind in place.
+    #[test]
+    fn asan_rebound_param_into_a_mixed_path_callee() {
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(99); }\n\
+             fn direct(a: R, c: bool) { f(a, c); }\n\
+             fn rebound(a: R, c: bool) { let q = a; f(q, c); println(\"  in\"); }\n\
+             fn rebound_bound(a: R, c: bool) -> i64 { let q = a; let w = f(q, c); return w.id; }\n\
+             fn rebound_only(a: R) { let q = a; println(\"  only\"); }\n\
+             fn main() {\n\
+               println(\"direct_handback\"); direct(mk(1), true);\n\
+               println(\"rebound_handback\"); rebound(mk(2), true);\n\
+               println(\"rebound_bound\"); println(f\"  v={rebound_bound(mk(3), true)}\");\n\
+               println(\"rebound_no_call\"); rebound_only(mk(4));\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "direct_handback",
+                "  dR1",
+                "rebound_handback",
+                "  dR2",
+                "  in",
+                "rebound_bound",
+                "  dR3",
+                "  v=3",
+                "rebound_no_call",
+                "  only",
+                "  dR4",
+                "end",
+            ],
+            "rebound_param_into_a_mixed_path_callee",
+        );
+    }
+
     /// B-2026-09-07-22 — the MEMORY half of the method and assoc spellings:
     /// one owner and one free per object on both legs of the branch, on both
     /// call legs.
