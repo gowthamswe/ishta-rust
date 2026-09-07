@@ -567,6 +567,102 @@ mod tests {
         }
     }
 
+    /// ORACLE AGREEMENT for the allocation-free spec'd FLOAT path.
+    ///
+    /// `karac_runtime_f64_fmt` reproduces `FormatSpec::apply_float` from
+    /// pre-decoded constants, and that pair is the interpreter's path, so the
+    /// fast path is only correct insofar as it matches byte for byte. The
+    /// failure mode is silent -- a wrong pad or a dropped sign still prints
+    /// something plausible -- so this asserts a cross product.
+    ///
+    /// The float arm had NO codegen coverage at all before B-2026-09-07-39,
+    /// which is how the `snprintf` over-read of B-2026-09-07-46 survived.
+    ///
+    /// Specs `needs_runtime_formatter()` diverts (center align, non-space fill)
+    /// are excluded: codegen never routes them here.
+    #[test]
+    fn f64_fmt_matches_apply_float_over_a_matrix() {
+        unsafe fn fast(fs: &FormatSpec, v: f64) -> String {
+            unsafe {
+                let mut buf = [0u8; 1024];
+                let n = crate::karac_runtime_f64_fmt(
+                    v,
+                    fs.precision.map_or(-1i64, |p| p as i64),
+                    fs.zero_pad as i32,
+                    fs.width.unwrap_or(0) as i64,
+                    fs.numeric_align_left() as i32,
+                    buf.as_mut_ptr(),
+                    buf.len() as i64,
+                );
+                String::from_utf8(buf[..n as usize].to_vec()).unwrap()
+            }
+        }
+        let specs = [
+            ".0", ".1", ".2", ".5", "8.2", "12.2", "<8.2", ">8.2", "08.2", "012.3", "1.2", "20.6",
+        ];
+        let vals: [f64; 14] = [
+            0.0,
+            1.5,
+            -1.5,
+            3.0,
+            -3.0,
+            1.23456,
+            -1.23456,
+            1234567.891,
+            -0.0,
+            0.5,
+            -0.5,
+            1e-7,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for raw in specs {
+            let fs = FormatSpec::parse(raw).unwrap();
+            for v in vals {
+                assert_eq!(
+                    unsafe { fast(&fs, v) },
+                    fs.apply_float(v),
+                    "spec {raw:?} value {v}"
+                );
+            }
+        }
+        // The WIDE case, which is the one that used to read past the buffer:
+        // `f64::MAX` at `.2` is 312 bytes. Codegen sizes the buffer from the
+        // spec now, and this asserts the renderer fills it correctly rather
+        // than reporting a length it did not write.
+        let fs = FormatSpec::parse(".2").unwrap();
+        let got = unsafe { fast(&fs, f64::MAX) };
+        assert_eq!(got, fs.apply_float(f64::MAX));
+        assert_eq!(got.len(), 312, "f64::MAX at .2 is 312 bytes");
+        assert!(got.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    }
+
+    /// The float fast path must TRUNCATE rather than write past a short buffer,
+    /// AND must report the truncated length -- the exact contract C's
+    /// `snprintf` does not honour, which is what made B-2026-09-07-46 an
+    /// out-of-bounds read rather than merely a wrong string.
+    #[test]
+    fn f64_fmt_reports_the_truncated_length_not_the_would_be_length() {
+        unsafe {
+            let mut buf = [0xAAu8; 16];
+            // `f64::MAX` at `.2` wants 312 bytes; only 8 are available.
+            let n = crate::karac_runtime_f64_fmt(f64::MAX, 2, 0, 0, 0, buf.as_mut_ptr(), 8);
+            assert_eq!(n, 8, "must report what it WROTE, not what it wanted");
+            assert_eq!(&buf[..8], b"17976931");
+            assert_eq!(&buf[8..], &[0xAA; 8], "must not write past buf_len");
+
+            // null / non-positive cap write nothing.
+            assert_eq!(
+                crate::karac_runtime_f64_fmt(1.5, 2, 0, 0, 0, std::ptr::null_mut(), 8),
+                0
+            );
+            assert_eq!(
+                crate::karac_runtime_f64_fmt(1.5, 2, 0, 0, 0, buf.as_mut_ptr(), 0),
+                0
+            );
+        }
+    }
+
     /// The fast path must TRUNCATE rather than write past a short buffer.
     /// Codegen sizes the buffer as `max(64, width + 2)` so this is a guard, not
     /// an expected path — but it is the one bug in a hand-rolled renderer that

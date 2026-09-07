@@ -74257,6 +74257,59 @@ fn main() {
         }
     }
 
+    /// SPEC'D FLOAT HOLES: the whole arm, and the WIDE case that used to read
+    /// past its buffer.
+    ///
+    /// There was no codegen coverage of spec'd float rendering at all before
+    /// this, which is how B-2026-09-07-46 survived: codegen called `snprintf`
+    /// and used its return value as the rendered length, but C returns the
+    /// length it WOULD have written. `f"{x:.2}"` on `f64::MAX` is 312 bytes
+    /// against what was then a 64-byte buffer, so the `String` ran ~245 bytes
+    /// past the written region and the program printed uninitialized STACK --
+    /// different bytes on every run, which is also why no fixed expected value
+    /// could have caught it by accident.
+    ///
+    /// The `H[...]` line is therefore the load-bearing one, and it asserts
+    /// CONTENT rather than length: the length was already 312 before the fix.
+    /// That is the whole defect -- a correct length over a buffer that never
+    /// held that many bytes.
+    ///
+    /// The rest is the ordinary matrix, which pins that moving the arm off
+    /// `snprintf` (B-2026-09-07-39) changed cost and not output: precision,
+    /// width, align, zero-pad between sign and digits, and the two shapes
+    /// `needs_runtime_formatter()` diverts.
+    #[test]
+    fn e2e_spec_float_holes_render_exactly_and_never_past_the_buffer() {
+        if let Some(out) = run_program(
+            r#"
+fn main() {
+    let x: f64 = 1.5;
+    let y: f64 = 3.0;
+    let z: f64 = 1.23456;
+    let n: f64 = -2.5;
+    let b: f64 = 1234567.891;
+    let huge: f64 = 1.7976931348623157e308;
+    println(f"[{z:.2}][{z:.0}][{z:.5}]");
+    println(f"[{z:10.2}][{z:<10.2}][{z:010.2}]");
+    println(f"[{n:.2}][{n:08.2}][{n:<8.2}]");
+    println(f"[{y:.1}][{y:.3}][{b:.2}]");
+    println(f"[{x}][{y}][{z}][{n}]");
+    println(f"[{z:^10.2}][{z:*>10.2}]");
+    println(f"H[{huge:.2}]");
+}
+"#,
+        ) {
+            let want = "[1.23][1][1.23456]\n\
+                        [      1.23][1.23      ][0000001.23]\n\
+                        [-2.50][-0002.50][-2.50   ]\n\
+                        [3.0][3.000][1234567.89]\n\
+                        [1.5][3][1.23456][-2.5]\n\
+                        [   1.23   ][******1.23]\n\
+                        H[179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.00]\n";
+            assert_eq!(out, want, "spec'd float rendering drifted");
+        }
+    }
+
     /// The SPEC'D integer path must render exactly what `snprintf` did.
     ///
     /// Verified byte-identical against the pre-change compiler over these

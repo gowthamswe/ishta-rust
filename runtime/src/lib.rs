@@ -536,6 +536,7 @@ pub fn __preserve_no_mangle_symbols() -> usize {
         karac_secret_ct_eq,
         karac_float_cmp,
         karac_runtime_f64_to_str,
+        karac_runtime_f64_fmt,
         karac_runtime_i128_to_str,
         karac_runtime_i64_to_str,
         karac_runtime_int_fmt,
@@ -9354,19 +9355,67 @@ pub extern "C" fn karac_float_cmp(a: f64, b: f64) -> i64 {
 /// length (the `%.*s` / append-raw convention).
 #[no_mangle]
 pub unsafe extern "C" fn karac_runtime_f64_to_str(val: f64, buf: *mut u8, buf_len: i64) -> i64 {
-    unsafe {
-        let s = format!("{val}");
-        let bytes = s.as_bytes();
-        let n = (bytes.len() as i64).min(buf_len.max(0));
-        if !buf.is_null() && n > 0 {
-            // SAFETY: caller guarantees `buf_len` writable bytes; `n <= buf_len`
-            // and `n <= bytes.len()`, and the regions don't overlap (distinct
-            // allocations — a fresh `String` vs the caller's buffer). `unsafe fn`
-            // body is itself an unsafe context (edition 2021).
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n as usize);
+    unsafe { write_display_into(buf, buf_len, format_args!("{val}")) }
+}
+
+/// A `core::fmt::Write` sink over a caller-supplied RAW buffer.
+///
+/// This is what lets the `*_to_str` / `*_fmt` helpers render with Rust's own
+/// `Display` — the formatting both backends are required to agree on — while
+/// allocating NOTHING. They previously built a `String` via `format!` and then
+/// copied it into the caller's buffer, so every interpolation of a float or a
+/// 128-bit integer took a heap allocation and a free (B-2026-09-07-39).
+/// `karac_runtime_i64_to_str` and `karac_runtime_int_fmt` already avoid that by
+/// rendering into a stack scratch; these are the two that were left behind.
+///
+/// Writes past `cap` are DROPPED rather than counted, so `n` is the truncated
+/// length actually written — the contract every caller here wants, and the one
+/// C's `snprintf` notably does not provide (it returns the length it WOULD have
+/// written, which is how a caller ends up reading past its own buffer).
+struct RawBufSink {
+    buf: *mut u8,
+    cap: usize,
+    n: usize,
+}
+
+impl core::fmt::Write for RawBufSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let take = self.cap.saturating_sub(self.n).min(s.len());
+        if take > 0 {
+            // SAFETY: `take` bytes fit between `n` and `cap`, the caller
+            // guarantees `cap` writable bytes, and `s` is a distinct borrow.
+            unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), self.buf.add(self.n), take) };
         }
-        n
+        self.n += take;
+        Ok(())
     }
+}
+
+/// Render `args` into `buf` with no heap allocation, returning the number of
+/// bytes actually written (never more than `buf_len`).
+///
+/// # Safety
+/// `buf` must point to at least `buf_len` writable bytes. A null `buf` or a
+/// non-positive `buf_len` writes nothing and returns 0 -- which is what these
+/// helpers' docs always promised, though the `format!`-based versions in fact
+/// returned the would-be length for a null buffer.
+unsafe fn write_display_into(buf: *mut u8, buf_len: i64, args: std::fmt::Arguments) -> i64 {
+    // No `unsafe` block here on purpose: every operation in this body is safe.
+    // The pointer write lives in `RawBufSink::write_str`, which carries its own
+    // block and its own SAFETY note; the `unsafe fn` marker is about the
+    // CONTRACT the caller must uphold (`buf` valid for `buf_len` bytes), not
+    // about anything this body does.
+    if buf.is_null() || buf_len <= 0 {
+        return 0;
+    }
+    let mut sink = RawBufSink {
+        buf,
+        cap: buf_len as usize,
+        n: 0,
+    };
+    // `write_fmt` cannot fail here: `RawBufSink::write_str` is infallible.
+    let _ = core::fmt::Write::write_fmt(&mut sink, args);
+    sink.n as i64
 }
 
 /// Format a 128-bit integer the way Rust's `{}` does, into a caller-supplied
@@ -9399,20 +9448,95 @@ pub unsafe extern "C" fn karac_runtime_i128_to_str(
 ) -> i64 {
     unsafe {
         let raw: u128 = (u128::from(hi) << 64) | u128::from(lo);
-        let s = if is_signed != 0 {
-            format!("{}", raw as i128)
+        // Renders through the same allocation-free sink as
+        // `karac_runtime_f64_to_str`; this used to build a `String` per call.
+        if is_signed != 0 {
+            write_display_into(buf, buf_len, format_args!("{}", raw as i128))
         } else {
-            format!("{raw}")
-        };
-        let bytes = s.as_bytes();
-        let n = (bytes.len() as i64).min(buf_len.max(0));
-        if !buf.is_null() && n > 0 {
-            // SAFETY: as `karac_runtime_f64_to_str` — caller guarantees
-            // `buf_len` writable bytes, `n` is bounded by both lengths, and the
-            // regions are distinct allocations.
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n as usize);
+            write_display_into(buf, buf_len, format_args!("{raw}"))
         }
-        n
+    }
+}
+
+/// Format an `f64` under a `f"{x:spec}"` specifier into a caller-supplied
+/// buffer, with NO heap allocation and no libc. Returns the bytes written.
+///
+/// The float sibling of [`karac_runtime_int_fmt`], and it exists for two
+/// reasons at once.
+///
+/// **It takes the spec'd float path off `snprintf`** (B-2026-09-07-39). The
+/// integer arms moved off libc in B-2026-09-05-23 and B-2026-09-07-25; floats
+/// were left behind, so `f"{x:.2}"` still went through a formatter that
+/// serializes on locale and lock state.
+///
+/// **And it removes a stack BUFFER OVER-READ** (B-2026-09-07-46). C's
+/// `snprintf` returns the length it WOULD have written, not the length it did.
+/// Codegen used that return value as the rendered string's length, so a body
+/// wider than the buffer -- `f"{x:.2}"` on `f64::MAX` is 312 bytes against a
+/// 64-byte buffer -- produced a `String` whose length ran 245 bytes past the
+/// written region, printing uninitialized stack into program output (different
+/// bytes on every run). This returns the TRUNCATED length, so the same
+/// arithmetic is safe by construction; codegen also now sizes the buffer from
+/// the spec so the truncation branch is unreachable for a finite `f64`.
+///
+/// **This must agree with `FormatSpec::apply_float` byte for byte** -- that is
+/// the interpreter's path. `precision` is the spec's precision, or NEGATIVE for
+/// none; `width` of 0 means no width; `align_left` selects Left, anything else
+/// Right (the numeric default). Center align and non-space fill never arrive
+/// here -- `needs_runtime_formatter()` diverts them -- so fill is always a
+/// space.
+///
+/// # Safety
+/// `buf` must point to at least `buf_len` writable bytes. A null `buf` or
+/// non-positive `buf_len` writes nothing and returns 0. Output is NOT
+/// NUL-terminated; the caller uses the returned length.
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_f64_fmt(
+    val: f64,
+    precision: i64,
+    zero_pad: i32,
+    width: i64,
+    align_left: i32,
+    buf: *mut u8,
+    buf_len: i64,
+) -> i64 {
+    unsafe {
+        if buf.is_null() || buf_len <= 0 {
+            return 0;
+        }
+        let cap = buf_len as usize;
+        // Phase 1 -- render the BODY at the start of the caller's buffer,
+        // matching `FormatSpec::apply_float`'s three cases exactly. The `None`
+        // arms are defensive: the typechecker requires a precision on a float
+        // spec, so `precision < 0` is unreachable from a well-formed program.
+        let n = if precision >= 0 {
+            write_display_into(buf, buf_len, format_args!("{:.*}", precision as usize, val))
+        } else if val.fract() == 0.0 && val.is_finite() {
+            write_display_into(buf, buf_len, format_args!("{val:.1}"))
+        } else {
+            write_display_into(buf, buf_len, format_args!("{val}"))
+        } as usize;
+
+        // Phase 2 -- pad IN PLACE. `apply_float` zero-pads between the sign and
+        // the digits (`{-7.5:08.2}` -> `-0007.50`), and otherwise pads the whole
+        // body per align.
+        let w = if width > 0 { width as usize } else { 0 };
+        if n >= w || w > cap {
+            return n as i64;
+        }
+        let pad = w - n;
+        if zero_pad != 0 {
+            let sign = usize::from(n > 0 && (*buf == b'-' || *buf == b'+'));
+            // `copy`, not `copy_nonoverlapping`: the shift overlaps itself.
+            std::ptr::copy(buf.add(sign), buf.add(sign + pad), n - sign);
+            std::ptr::write_bytes(buf.add(sign), b'0', pad);
+        } else if align_left != 0 {
+            std::ptr::write_bytes(buf.add(n), b' ', pad);
+        } else {
+            std::ptr::copy(buf, buf.add(pad), n);
+            std::ptr::write_bytes(buf, b' ', pad);
+        }
+        w as i64
     }
 }
 

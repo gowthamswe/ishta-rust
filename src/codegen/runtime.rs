@@ -16042,7 +16042,17 @@ impl<'ctx> super::Codegen<'ctx> {
             _ => {
                 let is_float = matches!(val, BasicValueEnum::FloatValue(_));
                 let width = fs.width.unwrap_or(0);
-                let cap = std::cmp::max(64u64, width as u64 + 2);
+                // 64 covers every integer rendering; a FLOAT can be far wider.
+                // `f64::MAX` is 309 integer digits, and the spec's precision
+                // adds to that, so size from the spec rather than from a
+                // constant -- otherwise the body truncates, which is what
+                // B-2026-09-07-46 turned into a stack over-read.
+                let float_cap = if is_float {
+                    320u64 + fs.precision.unwrap_or(0) as u64 + 4
+                } else {
+                    0
+                };
+                let cap = std::cmp::max(std::cmp::max(64u64, width as u64 + 2), float_cap);
                 let buf = self.create_entry_alloca(
                     fn_val,
                     "fss.nbuf",
@@ -16148,32 +16158,54 @@ impl<'ctx> super::Codegen<'ctx> {
                         .into_int_value();
                     return Ok((buf_ptr, len));
                 }
-                let (fmt, arg): (String, BasicValueEnum<'ctx>) = (fs.to_printf("", 'f', true), val);
-                let fmt_g = self
-                    .builder
-                    .build_global_string_ptr(&fmt, "fss.nfmt")
-                    .unwrap()
-                    .as_pointer_value();
-                let written = self
+                // Float holes take the allocation-free runtime formatter too.
+                // This used to build a printf conversion and call `snprintf`,
+                // which was wrong twice over.
+                //
+                // PERFORMANCE (B-2026-09-07-39): `snprintf` serializes on
+                // locale and lock state, which is the pathology B-2026-09-05-23
+                // removed from the integer paths; floats were simply left
+                // behind when B-2026-09-07-25 moved the spec'd integer arm.
+                //
+                // CORRECTNESS (B-2026-09-07-46): C's `snprintf` returns the
+                // length it WOULD have written, not the length it did. Using
+                // that as the rendered length made a body wider than the buffer
+                // -- `f"{x:.2}"` on `f64::MAX` is 312 bytes -- produce a
+                // `String` running past the written region, so the program
+                // printed uninitialized STACK into its output, different bytes
+                // on every run. `karac_runtime_f64_fmt` returns the truncated
+                // length, so the same arithmetic is safe by construction.
+                //
+                // The buffer is also sized FROM THE SPEC below, so the
+                // truncation branch is unreachable for any finite `f64`: 309
+                // integer digits is the widest `f64::MAX` can render, plus a
+                // sign, a point, and the spec's own precision.
+                // NEGATIVE precision means "none", matching
+                // `FormatSpec::apply_float`'s `None` arm. Unreachable from a
+                // well-formed program -- the typechecker requires a precision
+                // on a float spec -- but the two sides agree on it anyway.
+                let prec_v = i64_t.const_int(fs.precision.map_or(-1i64, |p| p as i64) as u64, true);
+                let len = self
                     .builder
                     .build_call(
-                        self.runtime_fns.snprintf_fn,
+                        self.f64_fmt_fn(),
                         &[
+                            val.into(),
+                            prec_v.into(),
+                            i32_t.const_int(u64::from(fs.zero_pad), false).into(),
+                            i64_t.const_int(width as u64, false).into(),
+                            i32_t
+                                .const_int(u64::from(fs.numeric_align_left()), false)
+                                .into(),
                             buf_ptr.into(),
-                            size_of(self, cap).into(),
-                            fmt_g.into(),
-                            arg.into(),
+                            i64_t.const_int(cap, false).into(),
                         ],
-                        "fss.nw",
+                        "fss.ffmt",
                     )
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_basic()
                     .into_int_value();
-                let len = self
-                    .builder
-                    .build_int_z_extend(written, i64_t, "fss.nlen")
-                    .unwrap();
                 Ok((buf_ptr, len))
             }
         }
@@ -16474,6 +16506,40 @@ impl<'ctx> super::Codegen<'ctx> {
         );
         self.module
             .add_function("karac_runtime_i64_to_str", fn_ty, None)
+    }
+
+    /// Lazily declare
+    /// `karac_runtime_f64_fmt(val: double, precision: i64, zero_pad: i32,
+    /// width: i64, align_left: i32, buf: ptr, buf_len: i64) -> i64` -- the
+    /// allocation-free spec'd FLOAT formatter, float sibling of
+    /// [`Self::int_fmt_fn`].
+    ///
+    /// Replaces the `snprintf` call this arm used to make: see the call site
+    /// for why that was both slow (B-2026-09-07-39) and unsafe
+    /// (B-2026-09-07-46 -- `snprintf` reports the length it would have written,
+    /// which codegen then used as a real string length).
+    pub(super) fn f64_fmt_fn(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("karac_runtime_f64_fmt") {
+            return f;
+        }
+        let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+        let f64_t = self.context.f64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let fn_ty = i64_t.fn_type(
+            &[
+                f64_t.into(),
+                i64_t.into(),
+                i32_t.into(),
+                i64_t.into(),
+                i32_t.into(),
+                ptr_t.into(),
+                i64_t.into(),
+            ],
+            false,
+        );
+        self.module
+            .add_function("karac_runtime_f64_fmt", fn_ty, None)
     }
 
     /// Lazily declare `karac_runtime_int_fmt(lo: i64, hi: i64, is_signed: i32,
