@@ -46605,6 +46605,47 @@ fn test_deep_chain_field_move_then_reassign() {
     );
 }
 
+/// B-2026-09-06-55 — the MULTI-FIELD spelling of
+/// `test_deep_chain_field_move_then_reassign`, and its interpreter/codegen
+/// agreement is the whole point of the row.
+///
+/// `H7` above has ONE field, so masking the moved leaf empties the hop's
+/// walker and codegen fell back to deleting the root's action outright —
+/// which is what made its displacement gate decline and the two backends
+/// agree by accident. Give the hop a SIBLING (`q`) and a top-level sibling
+/// (`k`) and the masked walker survives, so the accident stops: the compiled
+/// backends ran the displaced value's body over the husk `x` already owns,
+/// printing `drop 9 ` with an EMPTY name against this backend's silence.
+/// Measured on `main` before the fix, all three compiled surfaces.
+///
+/// Both siblings' bodies are the recovery this row is named for (`drop 8 z8`
+/// and `drop 7 z7`, one each). The re-filled slot's own body is still absent,
+/// exactly as in the one-field pin above — a move-out mask is permanent for
+/// the binding, which is that pin's documented behaviour and not this row's
+/// subject.
+#[test]
+fn test_deep_chain_field_move_then_reassign_with_siblings() {
+    assert_eq!(
+        run("struct Res { id: i64, name: String }\n\
+             impl Drop for Res {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"drop {self.id} {self.name}\")\n\
+                 }\n\
+             }\n\
+             struct H8 { r: Res, q: Res }\n\
+             struct O8 { h: H8, k: Res }\n\
+             fn main() {\n\
+                 println(\"a\");\n\
+                 let mut o = O8 { h: H8 { r: Res { id: 9, name: f\"z{9}\" }, q: Res { id: 8, name: f\"z{8}\" } }, k: Res { id: 7, name: f\"z{7}\" } };\n\
+                 let x = o.h.r;\n\
+                 o.h.r = Res { id: 5, name: f\"y{5}\" };\n\
+                 println(f\"x {x.name} new {o.h.r.name}\");\n\
+                 println(\"end\");\n\
+             }\n"),
+        "a\nx z9 new y5\ndrop 9 z9\ndrop 7 z7\ndrop 8 z8\nend\n"
+    );
+}
+
 /// B-2026-08-01-19 — interpreter twin of `tests/codegen.rs`'s
 /// `e2e_param_field_store_single_caller_fire`, same source and expected
 /// string. Pre-fix the base binding's Drop slot fired the caller-retained
@@ -60792,15 +60833,32 @@ fn let_bound_scalar_field_read_runs_sibling_body_once() {
 /// was: moving the LAST field appears correct only because the surviving field
 /// there is the param view, whose body another owner already runs.
 ///
-/// `deep-chain` narrowed with B-2026-09-06-46: the record is now the moved HOP
-/// (`h`), not the whole root, so `k` -- a top-level sibling that never moved --
-/// keeps its body and the row reads `dR1 dR3`. Codegen arrived at the same
-/// place from the other side, its whole-walker delete becoming a mask of the
-/// same hop, and the two moved together as this row requires. What is still
-/// under-dropped is `q`, the moved hop's sibling one level DOWN, which the
-/// root-level record masks out with `h`; both backends lose it together, which
-/// remains the documented trade and needs `moved_out_nested_field_bodies` plus
-/// a codegen twin it does not have yet.
+/// `deep-chain` narrowed twice. B-2026-09-06-46 took the record from the whole
+/// binding to the moved HOP, recovering `k`, a top-level sibling that never
+/// moved. B-2026-09-06-55 took it the rest of the way, to the LEAF the chain
+/// actually names: `moved_out_nested_field_bodies` keyed by the full path
+/// `["h", "r"]`, so `q` -- the moved hop's sibling one level DOWN, which a
+/// root-level mask took out along with `h` -- keeps its body too. The row reads
+/// `dR1 dR3 dR2`, one body per object.
+///
+/// Both narrowings moved the two backends in ONE commit, which is what this
+/// row and its compiled twin are pinned to force: each is a mask on one side
+/// and a walker mask on the other, and landing either alone shows up here as a
+/// divergence rather than as silence.
+///
+/// `three-hops` is the generalization the second narrowing makes possible and
+/// the depth-1 record could not express at all: at `o.b.c.r` there is a sibling
+/// to lose at EVERY level (`q` beside the leaf, `d` one up), and before the
+/// path record both were dropped on the floor -- `dR4` alone, where four bodies
+/// are due.
+///
+/// `discard-the-hop` is the shape that says the mask is a mask and not a
+/// deletion. `let Outer { k, h: _ } = o` throws `h` away after `o.h.r` moved
+/// out, so the discard still owes `q`'s body and must NOT re-run `r`'s, which
+/// `x` already owns. The interpreter ran it twice the moment the path record
+/// stopped declining the whole field, against the compiled backends' single
+/// fire -- caught here, fixed by masking the leaf out of the discarded value
+/// rather than skipping the field.
 ///
 /// `enum-source` is the leg the row flagged as needing measurement before
 /// narrowing, because the enum branch of the walker sits behind the same early
@@ -60814,6 +60872,9 @@ fn moving_one_field_out_leaves_the_others_their_drop_bodies() {
          struct S3 { a: R, b: R }\n\
          struct Inner { r: R, q: R }\n\
          struct Outer { h: Inner, k: R }\n\
+         struct L3 { r: R, q: R }\n\
+         struct L2 { c: L3, d: R }\n\
+         struct L1 { b: L2, e: R }\n\
          enum E { A(R), Nil }\n\
          struct HasE { e: E, r: R }\n\
          fn mk(i: i64) -> R { return R { id: i }; }\n";
@@ -60843,10 +60904,22 @@ fn moving_one_field_out_leaves_the_others_their_drop_bodies() {
             "dR4\ndR3\n7\n",
         ),
         (
-            "deep chain masks the moved HOP, not the whole root",
+            "deep chain masks the moved LEAF, not the whole hop",
             "fn f() -> i64 { let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r; return 7; }\n\
              fn main() { println(f()) }",
-            "dR1\ndR3\n7\n",
+            "dR1\ndR3\ndR2\n7\n",
+        ),
+        (
+            "deep chain, three hops: every sibling on the way keeps its body",
+            "fn f() -> i64 { let o = L1 { b: L2 { c: L3 { r: mk(1), q: mk(2) }, d: mk(3) }, e: mk(4) }; let x = o.b.c.r; return 7; }\n\
+             fn main() { println(f()) }",
+            "dR1\ndR4\ndR3\ndR2\n7\n",
+        ),
+        (
+            "deep chain then DISCARD the hop: the moved leaf runs once",
+            "fn f() -> i64 { let o = Outer { h: Inner { r: mk(1), q: mk(2) }, k: mk(3) }; let x = o.h.r; let Outer { k, h: _ } = o; return k.id; }\n\
+             fn main() { println(f()) }",
+            "dR1\ndR2\ndR3\n3\n",
         ),
         (
             "enum-valued source field",

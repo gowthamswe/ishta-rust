@@ -9522,12 +9522,67 @@ impl<'ctx> super::Codegen<'ctx> {
                                         .place_chain_leaf_runs_user_drop(&src_type, &segs)
                                         .unwrap_or(true);
                                     if leaf_moves {
-                                        self.disarm_user_drop_fields_for_moved_field(
-                                            src,
-                                            src_slot.ptr,
-                                            &src_type,
-                                            &disarm_field,
-                                        );
+                                        // B-2026-09-06-55 — a DEEP chain names a
+                                        // leaf INSIDE a hop, and the flat mask
+                                        // below can only say "the whole hop
+                                        // moved". `let x = o.h.r` therefore
+                                        // silenced `h`'s other field `q` along
+                                        // with `r`: masking `h` at the root
+                                        // stops the root's walker descending
+                                        // into `Inner` at all, so `q`'s body ran
+                                        // nowhere on any compiled surface (and
+                                        // its interpreter twin did the same, one
+                                        // record over). B-2026-09-06-46 narrowed
+                                        // this from "the whole binding" to "the
+                                        // first hop"; this narrows it the rest of
+                                        // the way, to the leaf the chain actually
+                                        // names.
+                                        //
+                                        // `struct_moved_nested_field_bodies` is
+                                        // the record that expresses it —
+                                        // `field_skip_tree_for_var` descends one
+                                        // `nested` level per path hop, and
+                                        // `emit_user_drop_field_bodies_fn_skipping`
+                                        // has consumed that tree since
+                                        // B-2026-08-28-23 — so this is a routing
+                                        // change, not new machinery. The
+                                        // projection destructure
+                                        // (`let Ho { a, b } = w.inner;`) already
+                                        // reaches it through the same helper.
+                                        //
+                                        // GATED ON THE BINDING OWNING ITS WALK,
+                                        // exactly as the flat mask is
+                                        // (`mask_moved_field_in_bodies_walk`'s
+                                        // first line, B-2026-09-06-44): a
+                                        // by-value param's field bodies are the
+                                        // CALLER's, so a source with no walk of
+                                        // its own keeps the whole-walker
+                                        // retraction it had.
+                                        let nested_path = if segs.len() >= 2
+                                            && self.var_owns_struct_field_bodies(src)
+                                        {
+                                            self.projection_field_index_path(value).filter(
+                                                |(root, path)| root == src && path.len() >= 2,
+                                            )
+                                        } else {
+                                            None
+                                        };
+                                        match nested_path {
+                                            Some((_, path)) => {
+                                                let (hops, leaf) = path.split_at(path.len() - 1);
+                                                let only: std::collections::HashSet<u32> =
+                                                    std::iter::once(leaf[0] as u32).collect();
+                                                self.disarm_struct_field_tuple_elem_bodies_at(
+                                                    src, hops, &only,
+                                                );
+                                            }
+                                            None => self.disarm_user_drop_fields_for_moved_field(
+                                                src,
+                                                src_slot.ptr,
+                                                &src_type,
+                                                &disarm_field,
+                                            ),
+                                        }
                                     }
                                     // B-2026-09-02-27 — and, when the source is
                                     // a bare-tuple ELEMENT binding, zero the
@@ -19913,6 +19968,10 @@ impl<'ctx> super::Codegen<'ctx> {
         // non-generic struct field so the GEP chain stays offset-correct.
         let mut base_tn = root_tn.clone();
         let mut base_ptr = slot.ptr;
+        // B-2026-09-06-55 — the hop INDICES alongside the GEP walk, so the
+        // move-out gate below can name the assigned place the way the mask
+        // maps key it.
+        let mut hop_idxs: Vec<usize> = Vec::new();
         for mid in &middles {
             let Some(mid_idx) = self
                 .type_decls
@@ -19922,6 +19981,7 @@ impl<'ctx> super::Codegen<'ctx> {
             else {
                 return;
             };
+            hop_idxs.push(mid_idx);
             let Some(Some(mid_tn)) = self
                 .type_decls
                 .struct_field_type_names
@@ -19992,6 +20052,48 @@ impl<'ctx> super::Codegen<'ctx> {
         }
         if !self.type_runs_user_drop(&ftn, &mut Vec::new()) {
             return;
+        }
+        // B-2026-09-06-55 — DECLINE when the assigned PLACE, or any prefix of
+        // it, already moved out. The `full_action` gate below asks only
+        // whether the root still carries an armed UserDrop, and since
+        // B-2026-09-06-46 a move-out REPLACES that action with a masked walker
+        // instead of deleting it — so the action stays armed and the gate stops
+        // discriminating. It happened to keep answering for the one shape whose
+        // masked walker came out EMPTY (the whole-walker delete was the
+        // fallback there); this row's path mask made even that shape keep an
+        // armed walker, and `let x = o.h.r; o.h.r = <new>;` then ran the
+        // displaced value's body over the husk `x` already owns —
+        // `a / drop 9 <empty name> / x z9 new y5 / drop 9 z9` against the
+        // interpreter's and the pin's single `drop 9 z9`
+        // (`e2e_deep_chain_field_move_then_reassign`).
+        //
+        // The interpreter's twin gate asks exactly this question and has since
+        // B-2026-08-30-54 (flat) and this row (paths), so the two now decline
+        // the same places. DEEP CHAINS ONLY: a depth-1 target keeps whatever
+        // the `full_action` gate answered for it, because that is a separate
+        // question with its own pins and no measurement here.
+        if !hop_idxs.is_empty() {
+            let mut place: Vec<usize> = hop_idxs.clone();
+            place.push(idx);
+            let flat_masked = self
+                .type_decls
+                .struct_moved_field_bodies
+                .get(base.as_str())
+                .is_some_and(|s| s.contains(&place[0]));
+            let nested_masked = self
+                .type_decls
+                .struct_moved_nested_field_bodies
+                .get(base.as_str())
+                .is_some_and(|m| {
+                    m.iter().any(|(hops, leaves)| {
+                        hops.len() < place.len()
+                            && place.starts_with(hops)
+                            && leaves.contains(&place[hops.len()])
+                    })
+                });
+            if flat_masked || nested_masked {
+                return;
+            }
         }
         // Full-action gate: the ROOT's UserDrop must be armed and must not
         // be the without-field-bodies replacement a field move-out left.

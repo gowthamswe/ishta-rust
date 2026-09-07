@@ -2130,15 +2130,26 @@ impl<'a> super::Interpreter<'a> {
             // `moving_one_field_out_leaves_the_others_their_drop_bodies` and
             // its compiled twin pin.
             //
-            // Still ROOT-LEVEL, so `q` — the moved hop's sibling one level
-            // DOWN — is masked out with it and keeps losing its body on both
-            // backends. `moved_out_nested_field_bodies` is the record that
-            // could express that, and codegen has no twin for it at this site
-            // yet; closing it is one change on each backend, tracked as its
-            // own row rather than half-done here.
-            if let Some(first_hop) = middles.first() {
-                self.moved_out_struct_field_bodies
-                    .insert((src.clone(), (*first_hop).to_string()));
+            // B-2026-09-06-55 — and PRECISE all the way down now: the whole
+            // chain as a PATH, not its first hop. A root-level record cannot
+            // name a leaf INSIDE the hop, so masking the hop took the hop's
+            // OTHER field with it — `q` in `Outer { h: Inner { r, q }, k }`
+            // after `let x = o.h.r` ran its body nowhere, on this backend and
+            // on every compiled one. `moved_out_nested_field_bodies` is keyed
+            // by exactly this path and `drop_user_drop_fields_of_binding`
+            // already applies it beside the flat set (B-2026-09-03-11), so the
+            // walk now finds `r` missing and every other field of every struct
+            // on the way still dies here. Codegen's twin routes the same path
+            // into `struct_moved_nested_field_bodies`.
+            //
+            // The discard spelling (`let _ = o.h.r;`) has recorded the full
+            // path since B-2026-09-03-11; this is the bound spelling catching
+            // up to it.
+            if !middles.is_empty() {
+                let mut path: Vec<String> = middles.iter().map(|m| (*m).to_string()).collect();
+                path.push(field.clone());
+                self.moved_out_nested_field_bodies
+                    .insert((src.clone(), path));
             }
         }
     }
@@ -3591,6 +3602,37 @@ impl<'a> super::Interpreter<'a> {
                             || this.moved_out_struct_field_bodies.contains(&key)
                     })
                 };
+                // B-2026-09-06-55 — a discarded field one of whose SUBFIELDS
+                // moved out earlier (`let x = o.h.r; let Outer { k, h: _ } = o;`)
+                // is NOT a view: `h` itself never moved, so it still owes `q`'s
+                // body. Only the moved leaf has an owner already, and running
+                // the whole subtree here fired `r`'s body a second time —
+                // `dR1 dR2 dR1` against the compiled backends' `dR1 dR2`, a
+                // divergence the flat record used to hide by declining the
+                // field outright (and losing `q` with it).
+                //
+                // Masking is removal from the cloned value, exactly as
+                // `drop_user_drop_fields_of_binding` applies the same paths:
+                // the walk resolves each field through a `get` and skips a
+                // missing one. Codegen needs no peer — its nested skip tree
+                // already reaches the destructure's residual walk.
+                let nested_under: Vec<Vec<String>> = src_name
+                    .as_ref()
+                    .map(|n| {
+                        self.moved_out_nested_field_bodies
+                            .iter()
+                            .filter(|(m, p)| m == n && p.len() >= 2)
+                            .map(|(_, p)| p.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mask_leaves = |fname: &str, v: &Value| -> Value {
+                    let mut v = v.clone();
+                    for p in nested_under.iter().filter(|p| p[0] == fname) {
+                        Self::remove_field_at_path(&mut v, &p[1..]);
+                    }
+                    v
+                };
                 for fp in fields {
                     // `W { r: _, n }` — only the RENAMED form can carry a
                     // wildcard; the shorthand `W { r, n }` is a binding.
@@ -3604,7 +3646,7 @@ impl<'a> super::Interpreter<'a> {
                                 .as_ref()
                                 .and_then(|o| o.get(&fp.name).copied())
                                 .unwrap_or(picked.len() as u32);
-                            picked.push((idx, v.clone()));
+                            picked.push((idx, mask_leaves(&fp.name, v)));
                         }
                     }
                 }
@@ -3625,7 +3667,7 @@ impl<'a> super::Interpreter<'a> {
                             .as_ref()
                             .and_then(|o| o.get(fname).copied())
                             .unwrap_or(picked.len() as u32);
-                        picked.push((idx, v.clone()));
+                        picked.push((idx, mask_leaves(fname, v)));
                     }
                 }
                 picked.sort_by(|a, b| b.0.cmp(&a.0));
@@ -7892,12 +7934,28 @@ impl<'a> super::Interpreter<'a> {
                         // `drop 9 z9` twice under `--interp` against every
                         // compiled backend's one (`test_deep_chain_field_move_then_reassign`).
                         //
-                        // The hop, not the assigned field: `field` here is `r`,
-                        // one level below what the record keys.
-                        let gate_field = chain_middles.first().unwrap_or(field);
-                        let field_is_view = self
-                            .moved_out_struct_field_bodies
-                            .contains(&(base.clone(), gate_field.clone()));
+                        // B-2026-09-06-55 — and the record is now the FULL
+                        // PATH for a deep chain, so the gate asks about every
+                        // PREFIX of the assigned place: `o.h.r = <new>` must
+                        // decline both when `o.h.r` itself moved out
+                        // (`moved_out_nested_field_bodies`, the exact place)
+                        // and when the whole hop `o.h` did (the flat set, one
+                        // level up) — either way the old value has an owner
+                        // already and firing here would run its body twice.
+                        // A depth-1 target keeps the flat single lookup.
+                        let field_is_view = if chain_middles.is_empty() {
+                            self.moved_out_struct_field_bodies
+                                .contains(&(base.clone(), field.clone()))
+                        } else {
+                            let mut full: Vec<String> = chain_middles.clone();
+                            full.push(field.clone());
+                            self.moved_out_struct_field_bodies
+                                .contains(&(base.clone(), full[0].clone()))
+                                || (2..=full.len()).any(|n| {
+                                    self.moved_out_nested_field_bodies
+                                        .contains(&(base.clone(), full[..n].to_vec()))
+                                })
+                        };
                         if !field_is_view
                             && !self.moved_out_user_drop_bindings.contains(base.as_str())
                             && !self.moved_out_drop_field_bindings.contains(base.as_str())

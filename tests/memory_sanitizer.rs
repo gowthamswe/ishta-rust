@@ -77935,4 +77935,63 @@ fn main() {
             "[{label}] unexpected stdout (ASAN passed, output mismatched)"
         );
     }
+
+    /// B-2026-09-06-55 — ASAN twin of the `deep-chain` / `three-hops` /
+    /// `discard-the-hop` rows in `tests/codegen.rs`'s
+    /// `test_e2e_moving_one_field_out_leaves_the_others_their_drop_bodies`.
+    ///
+    /// Same reason the B-2026-09-06-46 pin above exists, one level deeper. The
+    /// defect was a lost BODY over an intact free set — valgrind measured
+    /// `24 allocs, 24 frees, 0 errors` before and after the fix — so ASAN was
+    /// green on it and would be green on it again. What ASAN DOES cover is the
+    /// direction the fix could have gone wrong in: the mask moved from the hop
+    /// to the leaf, so `Inner`'s walker now runs against a slot one of whose
+    /// fields moved out, and getting that split wrong frees `r`'s buffer twice
+    /// or leaks `q`'s. The line vector is asserted alongside, because the body
+    /// count is the half ASAN cannot see.
+    #[test]
+    fn asan_deep_chain_field_move_out_keeps_every_sibling_body() {
+        let label = "deep_chain_field_move_out_keeps_every_sibling_body";
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, status)) = run_under_asan(
+            r#"struct R { id: i64, name: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"n{i}" }; }
+struct Inner { r: R, q: R }
+struct Outer { h: Inner, k: R }
+struct L3 { r: R, q: R }
+struct L2 { c: L3, d: R }
+struct L1 { b: L2, e: R }
+fn p_deep(z: R) -> i64 { let o: Outer = Outer { h: Inner { r: mk(2), q: mk(3) }, k: mk(4) }; let x: R = o.h.r; println("mid"); return x.id; }
+fn p_three(z: R) -> i64 { let o: L1 = L1 { b: L2 { c: L3 { r: mk(6), q: mk(7) }, d: mk(8) }, e: mk(9) }; let x: R = o.b.c.r; println("mid"); return x.id; }
+fn p_discard(z: R) -> i64 { let o: Outer = Outer { h: Inner { r: mk(11), q: mk(12) }, k: mk(13) }; let x: R = o.h.r; let Outer { k, h: _ } = o; println("mid"); return k.id + x.id; }
+fn main() {
+    { let v: i64 = p_deep(mk(1)); println(f"v={v}"); println("one") }
+    { let v: i64 = p_three(mk(5)); println(f"v={v}"); println("two") }
+    { let v: i64 = p_discard(mk(10)); println(f"v={v}"); println("three") }
+    println("end")
+}
+"#,
+            label,
+        ) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported an error (exit {:?}); stdout:\n{stdout}",
+            status.code()
+        );
+        assert_eq!(
+            stdout.trim().lines().collect::<Vec<_>>(),
+            vec![
+                "dR4", "dR3", "mid", "dR2", "dR1", "v=2", "one", "dR9", "dR8", "dR7", "mid", "dR6",
+                "dR5", "v=6", "two", "dR12", "mid", "dR13", "dR11", "dR10", "v=24", "three", "end"
+            ],
+            "[{label}] unexpected stdout (ASAN passed, output mismatched)"
+        );
+    }
 }
