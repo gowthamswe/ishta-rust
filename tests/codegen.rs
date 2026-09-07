@@ -35312,6 +35312,99 @@ end
         );
     }
 
+    /// B-2026-09-07-15 — a MIXED-PATH callee that hands its argument back THROUGH
+    /// one further call (`fn mvia(r: R, c: bool) -> R { if c { return f(r); }
+    /// return mk(90); }`) double-freed on its hand-back leg: `free(): double free
+    /// detected in tcache 2` on every compiled surface, with `--interp` running the
+    /// body twice for one object. The same callee with NO hop and the same hop with
+    /// no branch were both already correct — the intersection of B-2026-09-06-69
+    /// and B-2026-09-07-10 was claimed by neither.
+    ///
+    /// Two halves, and they have to move together.
+    /// `fn_conditionally_returns_param_bare`'s leaf test now recognises the one-hop
+    /// hand-back (asking the INNER callee the all-paths question, so a chain cannot
+    /// launder a mixed-path callee through a passthrough), which is what admits the
+    /// function to the per-path mechanism at all. And the hand-off INSIDE that
+    /// callee now disarms per path instead of statically: `f(r)` sits in a branch,
+    /// so retracting `r`'s registration outright took the body away from the exit
+    /// where the value never reached the call. Clearing the per-path flag in the
+    /// branch's own block is the disarm `arm_conditional_store_flag` performs for a
+    /// conditional store.
+    ///
+    /// The per-path disarm sits ABOVE the copy-class split for the same reason in
+    /// both classes: measured, a declined-copy param lost its dies-inside body and
+    /// leaked 2 blocks at -O0, and a COPY-SUPPORTED one ran the callee's guarded
+    /// body on top of the result binding's on the hand-back leg (`dP7 v=7 dP7`).
+    ///
+    /// Cells: both legs of the hop, named and fresh-temp, both legs of the no-hop
+    /// control, and both legs of a copy-supported hop.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_mixed_path_hand_back_through_a_hop`, pinned to the same string.
+    #[test]
+    fn e2e_mixed_path_hand_back_through_a_hop() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct P { id: i64, name: String, xs: Vec[i64] }
+impl Drop for P { fn drop(mut ref self) { println(f"  dP{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}", xs: [i] }; }
+fn f(r: R) -> R { return r; }
+fn pf(p: P) -> P { return p; }
+fn mvia(r: R, c: bool) -> R { if c { return f(r); } return mk(90); }
+fn cvia(r: R, c: bool) -> R { if c { return r; } return mk(91); }
+fn pvia(p: P, c: bool) -> P { if c { return pf(p); } return mkp(92); }
+fn main() {
+  println("hop_handback"); let a = mk(1); let z = mvia(a, true); println(f"  v={z.inner.v}");
+  println("hop_dies_inside"); let b = mk(2); let y = mvia(b, false); println(f"  v={y.id}");
+  println("hop_handback_fresh"); let w = mvia(mk(3), true); println(f"  v={w.inner.v}");
+  println("hop_dies_fresh"); let x = mvia(mk(4), false); println(f"  v={x.id}");
+  println("nohop_handback"); let c = mk(5); let u = cvia(c, true); println(f"  v={u.inner.v}");
+  println("nohop_dies_inside"); let d = mk(6); let t = cvia(d, false); println(f"  v={t.id}");
+  println("copyable_hop_handback"); let e = mkp(7); let s = pvia(e, true); println(f"  v={s.id}");
+  println("copyable_hop_dies"); let g = mkp(8); let r = pvia(g, false); println(f"  v={r.id}");
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"hop_handback
+  v=1
+  dR1
+hop_dies_inside
+  dR2
+  v=90
+  dR90
+hop_handback_fresh
+  v=3
+  dR3
+hop_dies_fresh
+  dR4
+  v=90
+  dR90
+nohop_handback
+  v=5
+  dR5
+nohop_dies_inside
+  dR6
+  v=91
+  dR91
+copyable_hop_handback
+  v=7
+  dP7
+copyable_hop_dies
+  dP8
+  v=92
+  dP92
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-6 — a whole-tuple argument handed back by a METHOD or ASSOC fn
     /// lost its element's `Drop` body on every compiled backend:
     /// `h.thrut((mkq(1), 7))` over

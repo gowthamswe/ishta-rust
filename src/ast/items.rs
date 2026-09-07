@@ -3215,11 +3215,12 @@ pub fn fn_conditionally_returns_param_bare(
     /// it left `fn f(r: R, k: bool) -> Box2 { if k { return Box2 { r: mk() };
     /// } return Box2 { r: r }; }` with no owner on the dies-inside path for a
     /// fresh temp and two on the hand-back path for a named one.
-    fn yields_wrapped(
+    fn yields_wrapped_named(
         e: &Expr,
         name: &[String],
         wraps: &[(String, ParamPath)],
         program: Option<&crate::Program>,
+        f_self_name: &str,
     ) -> bool {
         match &e.kind {
             ExprKind::Identifier(_) => is_bare(e, name),
@@ -3229,18 +3230,50 @@ pub fn fn_conditionally_returns_param_bare(
             }
             ExprKind::StructLiteral { fields, .. } => fields
                 .iter()
-                .any(|f| yields_wrapped(&f.value, name, wraps, program)),
+                .any(|f| yields_wrapped_named(&f.value, name, wraps, program, f_self_name)),
             ExprKind::Tuple(elems) => elems
                 .iter()
-                .any(|el| yields_wrapped(el, name, wraps, program)),
+                .any(|el| yields_wrapped_named(el, name, wraps, program, f_self_name)),
             ExprKind::Call { callee, args }
                 if program.is_some_and(|p| is_user_variant_ctor(p, callee)) =>
             {
                 args.iter()
-                    .any(|a| yields_wrapped(&a.value, name, wraps, program))
+                    .any(|a| yields_wrapped_named(&a.value, name, wraps, program, f_self_name))
+            }
+            // B-2026-09-07-15 — the ONE-HOP hand-back leaf
+            // (`if c { return f(r); } return mk(99);`). Without it `may_mention`
+            // answers `true` for this leaf — correctly, it does mention `r` —
+            // and condition 3 declines the whole function, so a MIXED-path
+            // callee that hands its param back through one call was admitted by
+            // no predicate at all: the caller kept its cleanup and the result
+            // binding took a second one.
+            //
+            // The inner callee is asked the ALL-paths question
+            // (`fn_always_returns_param`), the same test
+            // `fn_always_returns_param_via_call` uses, so a chain cannot
+            // launder a mixed-path callee through a passthrough wrapper. One
+            // hop, and the argument must be the param (or one of its whole
+            // aliases) BARE — the conservative direction this family runs on.
+            ExprKind::Call { callee, args } => {
+                if let (Some(p), ExprKind::Identifier(g)) = (program, &callee.kind) {
+                    if g.as_str() != f_self_name {
+                        if let Some(gf) = p.items.iter().find_map(|item| match item {
+                            Item::Function(gf) if &gf.name == g => Some(gf),
+                            _ => None,
+                        }) {
+                            if args.iter().enumerate().any(|(j, a)| {
+                                is_bare(&a.value, name) && fn_always_returns_param(Some(p), gf, j)
+                            }) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                option_result_ctor_payload(e)
+                    .is_some_and(|pl| yields_wrapped_named(pl, name, wraps, program, f_self_name))
             }
             _ => option_result_ctor_payload(e)
-                .is_some_and(|p| yields_wrapped(p, name, wraps, program)),
+                .is_some_and(|p| yields_wrapped_named(p, name, wraps, program, f_self_name)),
         }
     }
     /// The leaf tails of an escaping tail position, following exactly the
@@ -3359,7 +3392,7 @@ pub fn fn_conditionally_returns_param_bare(
         // per-path flag clears it through the same source walk.
         // B-2026-09-02-4 — and the param moved into a returned aggregate
         // literal; see `yields_wrapped`.
-        if yields_wrapped(leaf, name, wraps, program) {
+        if yields_wrapped_named(leaf, name, wraps, program, f.name.as_str()) {
             yields_bare = true;
         } else if may_mention(leaf, name) {
             // Condition 3 — an escape route the flag cannot clear.

@@ -57444,6 +57444,71 @@ end
     );
 }
 
+/// B-2026-09-07-15 — the interpreter ran the body twice for the mixed-path hop's
+/// hand-back leg (it reads the same predicate the compiled backends do), so this
+/// is a fix pin on both sides.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_mixed_path_hand_back_through_a_hop`, pinned to the same string.
+#[test]
+fn test_mixed_path_hand_back_through_a_hop() {
+    assert_eq!(
+        run(r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct P { id: i64, name: String, xs: Vec[i64] }
+impl Drop for P { fn drop(mut ref self) { println(f"  dP{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}", xs: [i] }; }
+fn f(r: R) -> R { return r; }
+fn pf(p: P) -> P { return p; }
+fn mvia(r: R, c: bool) -> R { if c { return f(r); } return mk(90); }
+fn cvia(r: R, c: bool) -> R { if c { return r; } return mk(91); }
+fn pvia(p: P, c: bool) -> P { if c { return pf(p); } return mkp(92); }
+fn main() {
+  println("hop_handback"); let a = mk(1); let z = mvia(a, true); println(f"  v={z.inner.v}");
+  println("hop_dies_inside"); let b = mk(2); let y = mvia(b, false); println(f"  v={y.id}");
+  println("hop_handback_fresh"); let w = mvia(mk(3), true); println(f"  v={w.inner.v}");
+  println("hop_dies_fresh"); let x = mvia(mk(4), false); println(f"  v={x.id}");
+  println("nohop_handback"); let c = mk(5); let u = cvia(c, true); println(f"  v={u.inner.v}");
+  println("nohop_dies_inside"); let d = mk(6); let t = cvia(d, false); println(f"  v={t.id}");
+  println("copyable_hop_handback"); let e = mkp(7); let s = pvia(e, true); println(f"  v={s.id}");
+  println("copyable_hop_dies"); let g = mkp(8); let r = pvia(g, false); println(f"  v={r.id}");
+  println("end");
+}
+"#),
+        r#"hop_handback
+  v=1
+  dR1
+hop_dies_inside
+  dR2
+  v=90
+  dR90
+hop_handback_fresh
+  v=3
+  dR3
+hop_dies_fresh
+  dR4
+  v=90
+  dR90
+nohop_handback
+  v=5
+  dR5
+nohop_dies_inside
+  dR6
+  v=91
+  dR91
+copyable_hop_handback
+  v=7
+  dP7
+copyable_hop_dies
+  dP8
+  v=92
+  dP92
+end
+"#
+    );
+}
+
 /// B-2026-09-07-6 — the interpreter was right on every cell of this row (its
 /// tuple walk is value-driven, so it never needed the callee's declared types);
 /// the twin holds the compiled string to it.

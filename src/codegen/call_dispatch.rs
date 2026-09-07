@@ -2505,7 +2505,28 @@ impl<'ctx> super::Codegen<'ctx> {
                         // here, so the copy-supported case still keeps its
                         // memory and the 3-byte leak the paragraph above records
                         // stays fixed.
-                        if self.arg_var_is_forwarded_not_copied(&var_name) {
+                        // B-2026-09-07-15 — PER PATH when this binding's own
+                        // registration is itself conditional, and BEFORE the
+                        // copy-class split, because the reason is the same in
+                        // both classes. Inside a mixed-path callee the hand-off
+                        // can be the one in a branch
+                        // (`fn mvia(r: R, c: bool) -> R { if c { return f(r); }
+                        // return mk(99); }`), and a STATIC retraction there
+                        // disarms the exit where the value never reached the
+                        // call: measured, the dies-inside leg lost its body and
+                        // leaked 2 blocks at -O0 for a declined-copy param, and
+                        // the hand-back leg ran the callee's guarded body on top
+                        // of the result binding's for a copy-supported one.
+                        // Clearing the per-path flag in THIS basic block is the
+                        // disarm `arm_conditional_store_flag` performs for a
+                        // conditional store, and it leaves the other exit's
+                        // registration standing.
+                        if self.drop_rc.cond_returned_body_params.contains(&var_name) {
+                            if let Some(flag) = self.cond_move_drop_flag_for(&var_name) {
+                                let bool_t = self.context.bool_type();
+                                let _ = self.builder.build_store(flag, bool_t.const_int(0, false));
+                            }
+                        } else if self.arg_var_is_forwarded_not_copied(&var_name) {
                             self.suppress_user_drop_for_var(&var_name);
                         } else {
                             self.suppress_user_drop_body_keeping_memory(&var_name);
