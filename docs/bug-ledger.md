@@ -170,7 +170,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-19 | 2026-09-07 | codegen | high | A `let`-BOUND STRUCT LITERAL WHOSE FIELD PROJECTS AN RC-PROMOTED LOCAL FREES FIVE BUFFERS IT DOES NOT OWN -- `while i < 0 { let p = P { a: t.a, b: 1 }; }` over a loop-outer `t` measures 17 allocs against 22 frees with three invalid frees, on a loop whose body NEVER RUNS | — |
 | B-2026-09-07-20 | 2026-09-07 | codegen | medium | `asan_stored_argument_is_owned_by_its_new_home_not_the_caller` LEAKS 35 B AT -O0 AND HAS SINCE THE DAY IT LANDED -- its `[b0907-5-outliving-store-admission]` cell loses 32 B in 2 objects plus 3 B in 1, clean at the default -O2, and nothing has run the -O0 leg since `d971ad5` added the fixture | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
-| B-2026-09-07-22 | 2026-09-07 | codegen | high | A METHOD OR ASSOC-FN ARGUMENT ON A MIXED-PATH CALLEE THAT HANDS IT BACK THROUGH ONE FURTHER CALL STILL DOUBLE-FREES -- `impl Hold { fn pick2(ref self, r: R, k: bool) -> R { if k { return mk(95); } return fwd(r); } }` at `k = false`, and its assoc twin `R.picka2(mk(35), false)`, abort `free(): double free detected in tcache 2` on all four compiled surfaces (3 valgrind errors from 2 contexts at -O2, 3 from 3 at -O0) while `--interp` is correct; B-2026-09-07-4 closed the BARE mixed-path and the ALL-PATHS via-call spellings on these legs and cannot reach this intersection, because the conditional flip's admission predicate is BARE by design -- the per-path flag clearers key on `ExprKind::Identifier`, so a `return fwd(r)` tail is an escape neither backend can see | src/ast/items.rs (fn_conditionally_returns_param_bare condition 1); src/codegen/functions.rs (arm_conditional_move_tail_flag); src/interpreter (record_conditional_move_tail); shares B-2026-09-07-3 |
 
 ### Relocated
 
@@ -2362,6 +2361,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-14 | codegen | medium | A DISCARDED ARM WHOSE TAIL IS AN AGGREGATE LITERAL OVER A NAMED LOCAL STRANDS THAT LOCAL'S BUFFER -- `let s = payload(); let _ = if n >= 0 { D { s: s… | 58e6a5b |
 | B-2026-09-07-15 | codegen+interp | high | A MIXED-PATH CALLEE THAT HANDS ITS ARGUMENT BACK THROUGH ONE FURTHER CALL DOUBLE-FREES ON ITS HAND-BACK LEG -- `fn mvia(r: R, c: bool) -> R { if c {… | 99bd72d |
 | B-2026-09-07-17 | codegen | high | AN RC-FALLBACK-PROMOTED LOCAL'S USER `Drop` RUNS OVER THE RELEASED BOX AND FREES IT A SECOND TIME -- the binding's alloca holds a `{i64 rc, T}` box H… | 9a50182d5 |
+| B-2026-09-07-22 | codegen | high | A METHOD OR ASSOC-FN ARGUMENT ON A MIXED-PATH CALLEE THAT HANDS IT BACK THROUGH ONE FURTHER CALL STILL DOUBLE-FREES -- `impl Hold { fn pick2(ref self… | 99bd72d |
 
 </details>
 
