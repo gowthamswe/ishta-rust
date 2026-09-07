@@ -675,6 +675,41 @@ impl<'ctx> super::Codegen<'ctx> {
                     .borrow_vars
                     .ref_params
                     .contains_key(outer_name.as_str());
+                // B-2026-09-07-48 — an RC-FALLBACK-PROMOTED binding is the
+                // FOURTH slot shape reaching this GEP, and the only one that
+                // had no arm. Its slot holds a `{i64 rc, T}` box HANDLE, not
+                // the aggregate, so the `slot.ptr` fall-through below indexed
+                // the 8-byte alloca as if it were the struct and read whatever
+                // followed it — exactly the junk-read the `ref T` comment
+                // above describes, one slot shape over.
+                //
+                // SILENT, and wrong in three different ways at once, because
+                // the garbage depends on which word the field's offset lands
+                // on: `t.a.len()` off a promoted `P { a: String, b: i64 }`
+                // returned the box's REFCOUNT (1), a stale interior pointer,
+                // or 16, against the interpreter's 38 — a different answer on
+                // the interpreter, the JIT and AOT, with no abort anywhere.
+                //
+                // The value itself was never damaged: `let q = t.a; q.len()`
+                // reads 38 on every backend, and `f"{t.a}"` prints correctly,
+                // because both resolve through `load_variable` / the box. Only
+                // the direct `t.a.method()` receiver GEP skipped it, which is
+                // why the row that found this read the defect as positional
+                // ("post-loop") — the loop is merely what PROMOTES the
+                // binding, and promotion is a whole-function property, so the
+                // same read is equally wrong BEFORE the loop.
+                //
+                // Resolving through the box is correct HERE specifically
+                // because this is a pure READ. `projection_root_is_rc_boxed`
+                // records that GEP-ing through the handle is NOT the fix for
+                // the DISARM callers — zeroing the box's field would blank a
+                // value the next iteration still reads — but that argument is
+                // about neutralizing a source, not about loading from it. The
+                // box holds the live value; a reader must look where it lives.
+                let is_rc_promoted = self
+                    .drop_rc
+                    .rc_fallback_heap_types
+                    .contains_key(outer_name.as_str());
                 let recv_ptr = if is_shared {
                     // Shared receiver: the heap pointer is whatever
                     // `load_variable` yields — a single load for an owned
@@ -690,6 +725,17 @@ impl<'ctx> super::Codegen<'ctx> {
                     // Mirrors `compile_field_store`'s shared branch, which
                     // resolves `self.field = v` the same way.
                     self.compile_expr(inner)?.into_pointer_value()
+                } else if is_rc_promoted {
+                    // `get_data_ptr` already resolves exactly this pointer —
+                    // one load to the box, then a GEP to field 1 (the value,
+                    // 8 bytes past the refcount). Reusing it keeps this arm in
+                    // step with `load_variable`'s RC-aware read and with
+                    // `move_suppression_value_ptr`, rather than open-coding a
+                    // third copy of the same two instructions.
+                    match self.get_data_ptr(outer_name.as_str()) {
+                        Some(p) => p,
+                        None => slot.ptr,
+                    }
                 } else if is_ref_param {
                     // Plain (non-shared) `ref T` receiver: slot holds a
                     // pointer-to-struct (the caller's struct); a single deref

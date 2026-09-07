@@ -36487,6 +36487,123 @@ fn main() { println(go()); }
         }
     }
 
+    /// B-2026-09-07-48 — a method called DIRECTLY on a field projected off an
+    /// RC-FALLBACK-PROMOTED local (`t.a.len()`) read through the box HANDLE
+    /// instead of the box, and silently returned garbage.
+    ///
+    /// `lower_field_access_ptr` recognised three receiver slot shapes — a
+    /// `shared` handle, a `ref T` param, a module global — and fell through to
+    /// the raw `slot.ptr` for everything else. A promoted binding is the
+    /// FOURTH, and its slot holds a `{i64 rc, T}` box handle, so the field GEP
+    /// indexed an 8-byte alloca as if it were the struct.
+    ///
+    /// THE ROW READ THE DEFECT AS POSITIONAL and it is not. It reported a sharp
+    /// "post-loop" boundary, because the loop is what PROMOTES the binding and
+    /// its other cells happened to read through a local. Promotion is a
+    /// whole-function property, so cell 2 — the SAME read placed BEFORE the
+    /// loop — is equally wrong on the parent (16, not 38). That is why this
+    /// test is not written as a post-loop fixture.
+    ///
+    /// SILENT AND THREE-WAY, because the garbage depends on which word the
+    /// field's offset lands on: the row measured 152 / -1 / 117 for cell 1
+    /// across interpreter / AOT / JIT, and no backend aborted. Cells 4-6 are
+    /// the controls that localise it to the receiver GEP — the VALUE is intact
+    /// on the parent (a `let` hop or a non-heap field reads correctly), so a
+    /// fix that touched the box's contents rather than the read would pass
+    /// cell 1 and break these.
+    #[test]
+    fn e2e_rc_promoted_projection_method_receiver_resolves_through_the_box() {
+        const PRE: &str = r#"struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+"#;
+        // (source tail, expected stdout, cell name)
+        let cells: [(&str, &str, &str); 6] = [
+            // 1 — the row's own repro: 3 trips through the loop (114) plus the
+            // post-loop read (38). Parent printed -1 compiled, 117 on the JIT.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let s = t.a; n = n + s.len(); i = i + 1; }
+  return n + t.a.len(); }
+fn main() { println(go()); }
+"#,
+                "152",
+                "post_loop_projection_read",
+            ),
+            // 2 — THE SAME READ, BEFORE THE LOOP. This is the cell that refutes
+            // the row's positional framing: the binding is promoted for the
+            // whole function, so the parent is wrong here too (16).
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let pre = t.a.len(); let mut i = 0i64;
+  while i < 2i64 { let s = t.a; i = i + 1; }
+  return pre; }
+fn main() { println(go()); }
+"#,
+                "38",
+                "pre_loop_projection_read",
+            ),
+            // 3 — the row's second shape: the consume is a `push` argument
+            // rather than a `let`. Parent printed 17825792 compiled, 0 on JIT.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;
+  while i < 3i64 { v.push(t.a); i = i + 1; }
+  return t.a.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "push_consume_then_projection_read",
+            ),
+            // 4 — CONTROL: the same read routed through a `let` hop. Correct on
+            // the parent, which is what proves the box's CONTENTS were never
+            // damaged and localises the defect to the receiver GEP.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64;
+  while i < 2i64 { let s = t.a; i = i + 1; }
+  let q = t.a; return q.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "control_read_via_let_hop",
+            ),
+            // 5 — CONTROL: a NON-HEAP field off the same promoted binding. It
+            // reads correctly on the parent (9) because an i64 field's offset
+            // lands on a word that survives the bad GEP; keeping it pins that
+            // the fix did not shift the base for the whole struct.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64;
+  while i < 2i64 { let s = t.a; i = i + 1; }
+  return t.b; }
+fn main() { println(go()); }
+"#,
+                "9",
+                "control_non_heap_field_unchanged",
+            ),
+            // 6 — CONTROL: no loop, so no promotion and no box. The plain
+            // `slot.ptr` fall-through is the correct answer here, and the new
+            // arm must not divert it.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); return t.a.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "control_no_promotion",
+            ),
+        ];
+        for (tail, want, name) in cells {
+            let Some(cap) = run_program_capturing(&format!("{PRE}{tail}")) else {
+                return;
+            };
+            assert_eq!(cap.stdout.trim(), want, "cell {name}: stdout");
+            assert!(
+                cap.status.success(),
+                "cell {name}: exited {:?}; stderr={:?}",
+                cap.status,
+                cap.stderr
+            );
+        }
+    }
+
     /// B-2026-09-07-29 — a WHOLE consume inside a loop that actually RUNS
     /// double-frees an RC-fallback-promoted local. No projection is involved:
     /// `takep(t)` takes the entire binding and there is no `t.a` in the
