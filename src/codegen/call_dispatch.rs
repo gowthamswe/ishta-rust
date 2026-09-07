@@ -2417,7 +2417,43 @@ impl<'ctx> super::Codegen<'ctx> {
                     if self.conditional_handback_memory_moves_to_callee(&name, i) {
                         self.suppress_user_drop_for_var(&var_name);
                     } else if self.callee_takes_over_arg_drop_body(&name, i) {
-                        self.suppress_user_drop_body_keeping_memory(&var_name);
+                        // B-2026-09-06-71 — and the MEMORY goes with the body in
+                        // the ALL-paths case too, whenever nothing was
+                        // duplicated. Keeping it is right for the ENTRY-COPIED
+                        // param the paragraph above measures: the callee owns
+                        // its own copy, the caller's slot owns the original, and
+                        // only the body moves. A struct that DECLINES copy
+                        // support — a direct `shared` field is this row's shape
+                        // — is FORWARDED instead, so the object the callee hands
+                        // back IS this binding's, and leaving a memory action
+                        // here gave it two owners: `let a = mk(15); let z =
+                        // f(a);` over `fn f(r: R) -> R { return r; }` aborted
+                        // `free(): double free detected in tcache 2` under
+                        // `karac run` and at both opt levels, while the
+                        // FRESH-TEMP spelling of the same call was clean — the
+                        // argument's spelling was the whole difference.
+                        //
+                        // The branch above is the same correction for a callee
+                        // that hands the param back on only SOME exits;
+                        // `aggregate_param_copy_supported_struct` is the split
+                        // here, so the copy-supported case still keeps its
+                        // memory and the 3-byte leak the paragraph above records
+                        // stays fixed.
+                        let forwarded_not_copied = self
+                            .var_types
+                            .var_type_names
+                            .get(var_name.as_str())
+                            .is_some_and(|tn| {
+                                self.type_decls.struct_types.contains_key(tn.as_str())
+                                    && !self.type_decls.shared_types.contains_key(tn.as_str())
+                                    && !self
+                                        .aggregate_param_copy_supported_struct(tn, &mut Vec::new())
+                            });
+                        if forwarded_not_copied {
+                            self.suppress_user_drop_for_var(&var_name);
+                        } else {
+                            self.suppress_user_drop_body_keeping_memory(&var_name);
+                        }
                     }
                 }
             }

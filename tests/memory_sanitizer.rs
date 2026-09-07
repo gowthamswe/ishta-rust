@@ -4134,6 +4134,59 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-71 — the MEMORY half, which is the row: the same program
+    /// under ASAN + LSan, where the pre-fix build double-freed the object the
+    /// callee handed back. One owner and one free per object on every argument
+    /// spelling, and the copy-supported cell still frees the caller's own copy.
+    #[test]
+    fn asan_named_local_argument_to_a_passthrough_callee() {
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             struct P { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for P { fn drop(mut ref self) { println(f\"  dP{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn mkp(i: i64) -> P { return P { id: i, name: f\"p{i}\", xs: [i] }; }\n\
+             fn pass(r: R) -> R { return r; }\n\
+             fn rebpass(r: R) -> R { let m = r; return m; }\n\
+             fn ppass(p: P) -> P { return p; }\n\
+             fn dies(r: R) -> i64 { return r.id; }\n\
+             fn main() {\n\
+               println(\"named\"); let a = mk(1); let z = pass(a); println(f\"  v={z.inner.v}\");\n\
+               println(\"named_rebind\"); let b = mk(2); let y = rebpass(b); println(f\"  v={y.inner.v}\");\n\
+               println(\"fresh_temp\"); let w = pass(mk(3)); println(f\"  v={w.inner.v}\");\n\
+               println(\"copyable\"); let c = mkp(4); let d = ppass(c); println(f\"  v={d.id}\");\n\
+               println(\"dies_inside\"); let e = mk(5); println(f\"  v={dies(e)}\");\n\
+               println(\"two_in_a_row\"); let g = mk(6); let h = pass(g); let n = mk(7); let q = rebpass(n); println(f\"  v={h.inner.v}{q.inner.v}\");\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "named",
+                "  v=1",
+                "  dR1",
+                "named_rebind",
+                "  v=2",
+                "  dR2",
+                "fresh_temp",
+                "  v=3",
+                "  dR3",
+                "copyable",
+                "  v=4",
+                "  dP4",
+                "dies_inside",
+                "  v=5",
+                "  dR5",
+                "two_in_a_row",
+                "  v=67",
+                "  dR7",
+                "  dR6",
+                "end"
+            ],
+            "named_local_argument_to_a_passthrough_callee",
+        );
+    }
+
     /// B-2026-09-06-16 — the MEMORY half of
     /// `tests/codegen.rs`'s `e2e_owned_self_field_let_runs_one_body`: the same
     /// program under ASAN + LSan. `let e = self.e` is now a VIEW of the

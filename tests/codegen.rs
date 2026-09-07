@@ -35193,6 +35193,80 @@ end
         );
     }
 
+    /// B-2026-09-06-71 — `let a = mk(1); let z = pass(a);` over
+    /// `fn pass(r: R) -> R { return r; }` and a struct with a `shared` field aborted
+    /// `free(): double free detected in tcache 2` under `karac run` and at both opt
+    /// levels, while the FRESH-TEMP spelling of the same call (`pass(mk(3))`) was
+    /// clean on every surface — the argument's spelling, not the callee, was the
+    /// whole difference.
+    ///
+    /// The named-argument stand-down retracted the binding's Drop BODY and kept its
+    /// MEMORY. That split is the entry-copy contract: the callee deep-copies at
+    /// entry, so the caller's slot still owns an object of its own. A struct that
+    /// DECLINES copy support is forwarded rather than copied, so the object the
+    /// callee hands back IS this binding's, and the result binding became its second
+    /// owner. `aggregate_param_copy_supported_struct` is now the split, which is
+    /// what keeps the copy-supported cell's memory where it belongs.
+    ///
+    /// Cells: a named local into a direct passthrough, into a rebinding passthrough,
+    /// the fresh-temp control, a copy-supported struct (whose caller slot must KEEP
+    /// its memory), a callee where the value dies inside, and two named locals in a
+    /// row.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_named_local_argument_to_a_passthrough_callee`, pinned to the same string.
+    #[test]
+    fn e2e_named_local_argument_to_a_passthrough_callee() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct P { id: i64, name: String, xs: Vec[i64] }
+impl Drop for P { fn drop(mut ref self) { println(f"  dP{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}", xs: [i] }; }
+fn pass(r: R) -> R { return r; }
+fn rebpass(r: R) -> R { let m = r; return m; }
+fn ppass(p: P) -> P { return p; }
+fn dies(r: R) -> i64 { return r.id; }
+fn main() {
+  println("named"); let a = mk(1); let z = pass(a); println(f"  v={z.inner.v}");
+  println("named_rebind"); let b = mk(2); let y = rebpass(b); println(f"  v={y.inner.v}");
+  println("fresh_temp"); let w = pass(mk(3)); println(f"  v={w.inner.v}");
+  println("copyable"); let c = mkp(4); let d = ppass(c); println(f"  v={d.id}");
+  println("dies_inside"); let e = mk(5); println(f"  v={dies(e)}");
+  println("two_in_a_row"); let g = mk(6); let h = pass(g); let n = mk(7); let q = rebpass(n); println(f"  v={h.inner.v}{q.inner.v}");
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"named
+  v=1
+  dR1
+named_rebind
+  v=2
+  dR2
+fresh_temp
+  v=3
+  dR3
+copyable
+  v=4
+  dP4
+dies_inside
+  v=5
+  dR5
+two_in_a_row
+  v=67
+  dR7
+  dR6
+end
+"#
+        );
+    }
+
     /// B-2026-09-06-16 — `let e = self.e` inside an OWNED receiver ran both the
     /// field's and its payload's `Drop` bodies twice for a named-local receiver
     /// (`dR51 dE dE dR51`) on every surface, while `let e = h.e` off a by-value
