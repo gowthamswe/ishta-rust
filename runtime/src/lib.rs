@@ -537,6 +537,7 @@ pub fn __preserve_no_mangle_symbols() -> usize {
         karac_float_cmp,
         karac_runtime_f64_to_str,
         karac_runtime_i128_to_str,
+        karac_runtime_i64_to_str,
         karac_vec_sort_by,
         karac_vec_sort_i64_8,
         karac_vec_reverse,
@@ -9408,6 +9409,80 @@ pub unsafe extern "C" fn karac_runtime_i128_to_str(
             // SAFETY: as `karac_runtime_f64_to_str` — caller guarantees
             // `buf_len` writable bytes, `n` is bounded by both lengths, and the
             // regions are distinct allocations.
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n as usize);
+        }
+        n
+    }
+}
+
+/// Format a 64-bit integer the way Rust's `{}` does, into a caller-supplied
+/// buffer. Returns the byte length written.
+///
+/// This exists to keep libc's `snprintf` out of parallel code
+/// (B-2026-09-05-23). `snprintf` serializes on locale and lock state, so an
+/// f-string inside a parallel loop degenerates into `os_unfair_lock`
+/// contention and futex traffic. Measured on a uniform 18-worker reduction
+/// where the ONLY difference was building the String with `f"n{acc}-{k}"`
+/// instead of `substring` + concat: system time 0.78 ms → 579.80 ms, with page
+/// faults flat (so it was never allocator page churn), and `sample` showing
+/// `__vfprintf` / `__ultoa` / `localeconv_l` / `_os_unfair_lock_lock_slow`.
+///
+/// Unlike its `f64` and `i128` siblings above, this does NOT route through
+/// `format!` — that allocates a `String` per interpolation, and allocation
+/// under parallel load is the other half of the same problem
+/// (B-2026-09-05-22). Digits are produced into a stack scratch and copied out,
+/// so the path is both lock-free and allocation-free.
+///
+/// The value arrives as raw bits with a separate `is_signed` flag, matching
+/// `karac_runtime_i128_to_str`'s arrangement, so codegen does not have to pick
+/// a different entry point per signedness.
+///
+/// # Safety
+/// `buf` must point to at least `buf_len` writable bytes (a stack buffer at
+/// the call site). A null `buf` or non-positive `buf_len` writes nothing and
+/// returns 0. The output is NOT NUL-terminated; the caller uses the returned
+/// length, matching the two formatters above.
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_i64_to_str(
+    val: u64,
+    is_signed: i32,
+    buf: *mut u8,
+    buf_len: i64,
+) -> i64 {
+    unsafe {
+        // `u64::MAX` is 20 digits and `i64::MIN` is 19 plus a sign, so 24 is
+        // ample and never needs a bounds check inside the digit loop.
+        let mut scratch = [0u8; 24];
+        let mut i = scratch.len();
+
+        let negative = is_signed != 0 && (val as i64) < 0;
+        // `unsigned_abs` is what makes `i64::MIN` correct: negating it as an
+        // `i64` overflows, and in release that wraps straight back to itself.
+        let mut mag: u64 = if negative {
+            (val as i64).unsigned_abs()
+        } else {
+            val
+        };
+
+        loop {
+            i -= 1;
+            scratch[i] = b'0' + (mag % 10) as u8;
+            mag /= 10;
+            if mag == 0 {
+                break;
+            }
+        }
+        if negative {
+            i -= 1;
+            scratch[i] = b'-';
+        }
+
+        let bytes = &scratch[i..];
+        let n = (bytes.len() as i64).min(buf_len.max(0));
+        if !buf.is_null() && n > 0 {
+            // SAFETY: as the two formatters above — the caller guarantees
+            // `buf_len` writable bytes, `n` is bounded by both lengths, and
+            // the stack scratch and the caller's buffer never overlap.
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n as usize);
         }
         n

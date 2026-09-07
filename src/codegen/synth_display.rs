@@ -176,10 +176,10 @@ impl<'ctx> super::Codegen<'ctx> {
 
     /// Render a scalar via `snprintf` into a 64-byte stack buffer and append it
     /// to `acc`. `self.current_fn` must be the Display fn being emitted.
-    pub(super) fn disp_append_snprintf(
+    pub(super) fn disp_append_int(
         &mut self,
         acc: PointerValue<'ctx>,
-        fmt: &str,
+        is_signed: bool,
         arg: BasicMetadataValueEnum<'ctx>,
     ) {
         let i64_t = self.context.i64_type();
@@ -191,23 +191,27 @@ impl<'ctx> super::Codegen<'ctx> {
             .builder
             .build_pointer_cast(buf, ptr_ty, "dbufp")
             .unwrap();
-        // snprintf's `size_t n` FIXED param is i32 on wasm32 / i64 natively;
-        // match that width or the call mismatches the decl (B-2026-06-14-15).
-        let size = if crate::target::active_target_is_wasm() {
-            self.context.i32_type().const_int(64, false)
-        } else {
-            i64_t.const_int(64, false)
-        };
-        let fmt_g = self.builder.build_global_string_ptr(fmt, "dfmt").unwrap();
-        let written = self
+        // B-2026-09-05-23: was `snprintf(buf, 64, "%lld"/"%llu", v)` — every
+        // caller of this helper passed one of those two conversions, so it was
+        // only ever an integer path. libc's `snprintf` takes locale and lock
+        // state, which serialized derived `Display` across threads and is
+        // slower even single-threaded. `karac_runtime_i64_to_str` is lock-free
+        // and allocation-free and returns an `i64` length, so the old
+        // `i32 → i64` widening and the wasm32 `size_t`-width dance
+        // (B-2026-06-14-15) both go away — its `buf_len` is `i64` everywhere.
+        let is_signed_flag = self
+            .context
+            .i32_type()
+            .const_int(u64::from(is_signed), false);
+        let len = self
             .builder
             .build_call(
-                self.runtime_fns.snprintf_fn,
+                self.i64_to_str_fn(),
                 &[
-                    buf_ptr.into(),
-                    size.into(),
-                    fmt_g.as_pointer_value().into(),
                     arg,
+                    is_signed_flag.into(),
+                    buf_ptr.into(),
+                    i64_t.const_int(64, false).into(),
                 ],
                 "dwr",
             )
@@ -215,10 +219,6 @@ impl<'ctx> super::Codegen<'ctx> {
             .try_as_basic_value()
             .unwrap_basic()
             .into_int_value();
-        let len = self
-            .builder
-            .build_int_z_extend(written, i64_t, "dwr64")
-            .unwrap();
         self.emit_string_append_raw(acc, buf_ptr, len);
     }
 
@@ -270,7 +270,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     .unwrap()
                     .into_int_value();
                 let v64 = self.builder.build_int_s_extend(v, i64_t, "v64").unwrap();
-                self.disp_append_snprintf(acc, "%lld", v64.into());
+                self.disp_append_int(acc, true, v64.into());
             }
             "u8" | "u16" | "u32" | "u64" | "usize" => {
                 let v = self
@@ -279,7 +279,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     .unwrap()
                     .into_int_value();
                 let v64 = self.builder.build_int_z_extend(v, i64_t, "v64").unwrap();
-                self.disp_append_snprintf(acc, "%llu", v64.into());
+                self.disp_append_int(acc, false, v64.into());
             }
             // The 128-bit widths cannot ride the `%lld` / `%llu` arms above:
             // both extend to i64 first, which truncates. They go through the
@@ -4833,13 +4833,13 @@ impl<'ctx> super::Codegen<'ctx> {
                             .builder
                             .build_int_z_extend_or_bit_cast(iv, i64_t, "vecd.z")
                             .unwrap();
-                        self.disp_append_snprintf(acc, "%llu", w.into());
+                        self.disp_append_int(acc, false, w.into());
                     } else {
                         let w = self
                             .builder
                             .build_int_s_extend_or_bit_cast(iv, i64_t, "vecd.s")
                             .unwrap();
-                        self.disp_append_snprintf(acc, "%lld", w.into());
+                        self.disp_append_int(acc, true, w.into());
                     }
                 }
                 BasicTypeEnum::FloatType(_) => {

@@ -2744,19 +2744,21 @@ impl<'ctx> super::Codegen<'ctx> {
                     self.emit_nul_safe_write(bp, blen, nl, to_stderr);
                     return Ok(self.context.i64_type().const_zero().into());
                 }
-                // Render into a stack buffer via `snprintf`, then route the
-                // exact bytes through the console chokepoint (capture-aware)
-                // instead of `printf` — so an int `println` inside a parallel
-                // branch is captured + flushed in order. 32 bytes covers any
-                // i64 (≤20 digits + sign + NUL). `nl` is appended by the write.
-                let spec = if is_unsigned { "%llu" } else { "%lld" };
-                let fmt = self.builder.build_global_string_ptr(spec, "fi").unwrap();
+                // Render into a stack buffer, then route the exact bytes
+                // through the console chokepoint (capture-aware) instead of
+                // `printf` — so an int `println` inside a parallel branch is
+                // captured + flushed in order. 32 bytes covers any i64
+                // (≤20 digits + sign). `nl` is appended by the write.
+                //
+                // B-2026-09-05-23: this rendered via `snprintf("%lld"/"%llu")`.
+                // libc's `snprintf` takes locale and lock state, so printing
+                // integers from parallel branches serialized on
+                // `os_unfair_lock` — and it is slower even single-threaded.
+                // `karac_runtime_i64_to_str` is lock-free, allocation-free,
+                // and returns the byte length as `i64`, which
+                // `emit_nul_safe_write` normalizes to `size_t` itself.
                 let ptr_t = self.context.ptr_type(inkwell::AddressSpace::default());
-                let size_t = if crate::target::active_target_is_wasm() {
-                    self.context.i32_type()
-                } else {
-                    self.context.i64_type()
-                };
+                let i64_t = self.context.i64_type();
                 let fn_val = self.current_fn.unwrap();
                 let buf = self.create_entry_alloca(
                     fn_val,
@@ -2767,15 +2769,19 @@ impl<'ctx> super::Codegen<'ctx> {
                     .builder
                     .build_pointer_cast(buf, ptr_t, "ibufp")
                     .unwrap();
+                let is_signed_flag = self
+                    .context
+                    .i32_type()
+                    .const_int(u64::from(!is_unsigned), false);
                 let written = self
                     .builder
                     .build_call(
-                        self.runtime_fns.snprintf_fn,
+                        self.i64_to_str_fn(),
                         &[
-                            buf_ptr.into(),
-                            size_t.const_int(32, false).into(),
-                            fmt.as_pointer_value().into(),
                             widened.into(),
+                            is_signed_flag.into(),
+                            buf_ptr.into(),
+                            i64_t.const_int(32, false).into(),
                         ],
                         "iwritten",
                     )

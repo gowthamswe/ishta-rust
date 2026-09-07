@@ -72167,11 +72167,114 @@ fn main() {
         );
         let main_body = ir.split("define i32 @main()").nth(1).expect("main fn body");
         assert!(
-            main_body.contains("printf") && main_body.contains("i64 %val"),
-            "main's printf should receive the loaded field value; not \
-             found in main body:\n{}",
+            main_body.contains("karac_runtime_i64_to_str") && main_body.contains("i64 %val"),
+            "main's integer print call should receive the loaded field value; \
+             not found in main body:\n{}",
             main_body
         );
+    }
+
+    /// B-2026-09-05-23 — EVERY INTEGER DISPLAY PATH MUST STAY OFF libc
+    /// `snprintf`.
+    ///
+    /// `snprintf` takes locale and lock state, so an f-string or an int
+    /// `println` inside a parallel region serialized on `os_unfair_lock`:
+    /// measured on a uniform 18-worker reduction whose only formatting was one
+    /// interpolation per iteration, system time was 579.80 ms against 1.57 ms
+    /// for the same probe built with `substring` + concat instead. Routing
+    /// through `karac_runtime_i64_to_str` (lock-free AND allocation-free) took
+    /// that probe from 47.60 ms to 2.12 ms at 18 workers, and from 23.20 ms to
+    /// 5.65 ms single-threaded — `snprintf` was the slower path either way.
+    ///
+    /// This is an IR gate rather than a timing test because the regression it
+    /// guards is invisible to output comparison: reverting to `snprintf` keeps
+    /// every byte identical and only costs speed.
+    #[test]
+    fn ir_integer_display_never_calls_snprintf() {
+        // Both spellings that used to reach `snprintf("%lld"/"%llu")`: the bare
+        // `println(int)` path (codegen/control_flow.rs) and plain f-string
+        // interpolation (codegen/runtime.rs). The third, the synthesized
+        // container Display (codegen/synth_display.rs), rides the Vec here.
+        let ir = ir_for(
+            r#"
+fn main() {
+    let a: i64 = -5;
+    let b: u64 = 7;
+    let v: Vec[i64] = [1, -2];
+    println(a);
+    println(b);
+    println(f"{a}{b}");
+    println(f"{v}");
+}
+"#,
+        );
+        // Bound the slice to `main`'s own body: the module carries a
+        // module-level `declare i32 @snprintf(...)` unconditionally, and a
+        // bare `split("define i32 @main()")` would sweep it in along with
+        // every function defined after `main`.
+        let after = ir.split("define i32 @main()").nth(1).expect("main fn body");
+        let main_body = after
+            .split("\ndefine ")
+            .next()
+            .unwrap()
+            .split("\ndeclare ")
+            .next()
+            .unwrap();
+        assert!(
+            main_body.contains("@karac_runtime_i64_to_str"),
+            "main should format integers through the runtime helper; \
+             not found in main body:\n{main_body}"
+        );
+        assert!(
+            !main_body.contains("@snprintf"),
+            "main must not CALL snprintf for integer display; found in:\n{main_body}"
+        );
+    }
+
+    /// B-2026-09-05-23 — the replacement formatter must agree with the old
+    /// `snprintf` bytes at the boundaries, on every integer display path.
+    ///
+    /// `i64::MIN` is the value a hand-rolled itoa gets wrong: negating it as an
+    /// `i64` overflows and wraps straight back to itself, so a naive `-v`
+    /// prints it as a positive number or loops. The upper half of `u64` is the
+    /// other side — read as signed it renders negative.
+    #[test]
+    fn e2e_i64_formatter_renders_the_boundaries() {
+        if let Some(out) = run_program(
+            r#"
+fn main() {
+    let min: i64 = -9223372036854775808;
+    let max: i64 = 9223372036854775807;
+    let ubig: u64 = 18446744073709551615u64;
+    let umid: u64 = 9223372036854775808u64;
+    println(min);
+    println(max);
+    println(ubig);
+    println(umid);
+    println(f"{min} {max} {ubig} {umid}");
+    let i8v: i8 = -128;
+    let i32v: i32 = -2147483648;
+    let u32v: u32 = 4294967295;
+    println(f"{i8v} {i32v} {u32v}");
+    println(0);
+    println(f"{0}");
+    let v: Vec[i64] = [0, -1, -9223372036854775808, 9223372036854775807];
+    println(f"{v}");
+}
+"#,
+        ) {
+            let want = "-9223372036854775808\n\
+                        9223372036854775807\n\
+                        18446744073709551615\n\
+                        9223372036854775808\n\
+                        -9223372036854775808 9223372036854775807 \
+                        18446744073709551615 9223372036854775808\n\
+                        -128 -2147483648 4294967295\n\
+                        0\n\
+                        0\n\
+                        [0, -1, -9223372036854775808, 9223372036854775807]\n";
+            assert_eq!(out, want, "integer boundary rendering drifted");
+        }
     }
 
     #[test]
@@ -72204,8 +72307,8 @@ fn main() {
         // field, not on a constant `i64 0`.
         let main_body = ir.split("define i32 @main()").nth(1).expect("main fn body");
         assert!(
-            main_body.contains("printf") && main_body.contains("i64 %val"),
-            "main's printf should receive the loaded field value"
+            main_body.contains("karac_runtime_i64_to_str") && main_body.contains("i64 %val"),
+            "main's integer print call should receive the loaded field value"
         );
     }
 

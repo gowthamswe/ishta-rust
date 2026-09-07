@@ -15554,15 +15554,12 @@ impl<'ctx> super::Codegen<'ctx> {
                 (ptr, len)
             }
             _ => {
-                // Integer or float: use snprintf into a 64-byte stack buffer.
-                // The buffer-size arg fills snprintf's `size_t n` FIXED param,
-                // which is i32 on wasm32 (wasi-libc) and i64 natively — match
-                // that width or the call mismatches the decl (B-2026-06-14-15).
-                let buf_size = if crate::target::active_target_is_wasm() {
-                    self.context.i32_type().const_int(64, false)
-                } else {
-                    i64_t.const_int(64, false)
-                };
+                // Integer or float: format into a 64-byte stack buffer. Every
+                // arm below now goes through a `karac_runtime_*_to_str`
+                // helper, so there is no longer a `size_t`-width buffer-size
+                // argument to match against a libc decl here — B-2026-06-14-15's
+                // wasm32 i32-vs-i64 discipline moved to the sites that still
+                // call `snprintf`.
                 let buf = self.create_entry_alloca(
                     fn_val,
                     "fst.buf",
@@ -15615,37 +15612,39 @@ impl<'ctx> super::Codegen<'ctx> {
                         return self.format_i128_to_stack_buf(iv, is_unsigned_int);
                     }
                 }
-                let fmt_str = if is_unsigned_int {
-                    self.builder
-                        .build_global_string_ptr("%llu", "fst.fmt_u")
-                        .unwrap()
-                        .as_pointer_value()
-                } else {
-                    self.builder
-                        .build_global_string_ptr("%lld", "fst.fmt_i")
-                        .unwrap()
-                        .as_pointer_value()
-                };
-                let written = self
+                // B-2026-09-05-23: this was `snprintf(buf, n, "%lld"/"%llu",
+                // v)`. libc's `snprintf` takes locale and lock state, so an
+                // f-string inside a parallel loop serialized on
+                // `os_unfair_lock` — measured at 579.80 ms of system time on
+                // an 18-worker reduction whose only formatting was one
+                // interpolation per iteration. `karac_runtime_i64_to_str` is
+                // lock-free and allocation-free, and returns the byte length
+                // as `i64` directly, so the old `i32 → i64` widening is gone.
+                //
+                // Its `buf_len` is `i64` on every target (like
+                // `karac_runtime_i128_to_str`), so it does NOT reuse
+                // `buf_size` above — that one is deliberately i32 on wasm32 to
+                // match `snprintf`'s `size_t` fixed param (B-2026-06-14-15).
+                let is_signed_flag = self
+                    .context
+                    .i32_type()
+                    .const_int(u64::from(!is_unsigned_int), false);
+                let len = self
                     .builder
                     .build_call(
-                        self.runtime_fns.snprintf_fn,
+                        self.i64_to_str_fn(),
                         &[
-                            buf_ptr.into(),
-                            buf_size.into(),
-                            fmt_str.into(),
                             arg_val.into(),
+                            is_signed_flag.into(),
+                            buf_ptr.into(),
+                            i64_t.const_int(64, false).into(),
                         ],
-                        "fst.written",
+                        "fst.i2s",
                     )
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_basic()
                     .into_int_value();
-                let len = self
-                    .builder
-                    .build_int_z_extend(written, i64_t, "fst.len")
-                    .unwrap();
                 (buf_ptr, len)
             }
         }
@@ -16088,6 +16087,26 @@ impl<'ctx> super::Codegen<'ctx> {
         );
         self.module
             .add_function("karac_runtime_i128_to_str", fn_ty, None)
+    }
+
+    /// Lazily declare `karac_runtime_i64_to_str(val: i64, is_signed: i32,
+    /// buf: ptr, buf_len: i64) -> i64` — the 64-bit integer formatter that
+    /// replaces `snprintf("%lld"/"%llu")` on every integer display path
+    /// (B-2026-09-05-23). Sibling of `i128_to_str_fn`; see the runtime entry
+    /// point for why `snprintf` had to go.
+    pub(super) fn i64_to_str_fn(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("karac_runtime_i64_to_str") {
+            return f;
+        }
+        let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let fn_ty = i64_t.fn_type(
+            &[i64_t.into(), i32_t.into(), ptr_t.into(), i64_t.into()],
+            false,
+        );
+        self.module
+            .add_function("karac_runtime_i64_to_str", fn_ty, None)
     }
 
     /// Lazily declare `karac_runtime_gpu_map(wgsl_ptr: ptr, wgsl_len: i64,
