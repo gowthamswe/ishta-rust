@@ -4544,7 +4544,11 @@ impl<'ctx> super::Codegen<'ctx> {
     /// named non-shared struct → `__karac_drop_struct_<S>`; nested tuple →
     /// recurse. Reaches the enum leaves `emit_aggregate_heap_field_frees` misses.
     /// Appends cap-guard blocks to `current_fn` (the caller points it at the drop
-    /// fn). Shared / `Option` / `Result` leaves are skipped.
+    /// fn). Shared leaves take the null-checked release arm (B-2026-09-04-31)
+    /// and `Option` / `Result` leaves the tag-guarded `karac_drop_Option_<p>` /
+    /// `karac_drop_Result_<o>_<e>` (B-2026-08-03-3); this line claimed all three
+    /// were SKIPPED until B-2026-09-07-28 predicted a still-leaking `Option`
+    /// element from it and measured the opposite.
     pub(super) fn emit_tuple_elem_drops(
         &mut self,
         base_ptr: PointerValue<'ctx>,

@@ -65019,6 +65019,147 @@ fn main() { println(go()); }
         );
     }
 
+    /// B-2026-09-07-28 — the TUPLE sibling of the two boxes above, which the
+    /// enum row offered as its clean contrast and got half right.
+    ///
+    /// A tuple IS the struct-shaped layout `emit_aggregate_heap_field_frees`
+    /// assumes, so the box's MEMORY half really was correct for the common
+    /// shapes — that is what the enum row measured. What it did not measure is
+    /// the BODY: no element-bodies walk was ever armed on the box, so
+    /// `let t = (S { .. }, 7)` consumed in a loop printed nothing against the
+    /// interpreter's `drop S` while measuring allocation-balanced.
+    ///
+    /// The tuple needs its own arm rather than a widened name lookup because
+    /// the other two arms resolve everything from a type NAME and a tuple has
+    /// none; the element `TypeExpr`s are its substitute identity, and the `let`
+    /// site already resolves them for the non-boxed spelling of the same
+    /// binding.
+    ///
+    /// The memory half moved to the same `TypeExpr` walk in the process, which
+    /// is what the last two cells pin: with NO user `Drop` anywhere, an enum
+    /// element and an `Option` element each lost their payload to the
+    /// enum-blind aggregate walk (7 B in 1 block, pre-existing and unrelated to
+    /// any body).
+    #[test]
+    fn asan_rc_fallback_boxed_tuple_local_drops_through_its_box() {
+        const OWN: &str = "struct S { s: String }\n\
+             impl Drop for S { fn drop(mut ref self) { println(\"drop S\"); } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkt() -> (S, i64) { return (S { s: payload() }, 7); }\n\
+             fn take(t: (S, i64)) -> i64 { return 1; }\n\
+             fn main() { println(go()); }\n";
+        // As in the struct and enum fixtures, the promotion fires on the
+        // CONSUME's presence rather than the trip count.
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkt(); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ take(t); i = i + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop S", "1"],
+            "rc_fb_tuple_elem_drop_loop_never_entered",
+            9,
+        );
+        assert_clean_asan_run_min_allocs(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkt(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let k = take(t); i = i + k - k + 1; }}\n\
+                 \x20 return 1; }}\n"
+            ),
+            &["drop S", "1"],
+            "rc_fb_tuple_elem_drop_loop_entered",
+            9,
+        );
+        // The NESTED spelling the row flagged as untested: the element is a
+        // struct that CARRIES a `Drop`-bearing field rather than declaring
+        // `Drop` itself, so the body is reached one level down.
+        assert_clean_asan_run_min_allocs(
+            "struct R { s: String }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"drop R {self.s.len()}\"); } }\n\
+             struct W { r: R, n: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkt() -> (W, i64) { return (W { r: R { s: payload() }, n: 3 }, 7); }\n\
+             fn take(t: (W, i64)) -> i64 { return 1; }\n\
+             fn go() -> i64 { let t = mkt(); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { take(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["drop R 38", "1"],
+            "rc_fb_tuple_nested_field_drop_body",
+            9,
+        );
+        // An ENUM element with a `Drop` of its own — body through the tuple
+        // walk, and the payload memory the aggregate walk could not reach.
+        assert_clean_asan_run_min_allocs(
+            "enum E { A(String), B }\n\
+             impl Drop for E { fn drop(mut ref self) { println(\"drop E\"); } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkt() -> (E, i64) { return (E.A(payload()), 7); }\n\
+             fn take(t: (E, i64)) -> i64 { return 1; }\n\
+             fn go() -> i64 { let t = mkt(); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { take(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["drop E", "1"],
+            "rc_fb_tuple_enum_elem_own_drop",
+            9,
+        );
+        // MEMORY ONLY, no user `Drop` anywhere in either program: the enum
+        // element and the `Option` element each leaked their payload to the
+        // enum-blind aggregate walk before the `TypeExpr` walk replaced it.
+        assert_clean_asan_run_min_allocs(
+            "enum E { A(String), B }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkt() -> (E, i64) { return (E.A(payload()), 7); }\n\
+             fn take(t: (E, i64)) -> i64 { return 1; }\n\
+             fn go() -> i64 { let t = mkt(); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { take(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["1"],
+            "rc_fb_tuple_enum_elem_no_drop_memory",
+            9,
+        );
+        assert_clean_asan_run_min_allocs(
+            "fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkt() -> (Option[String], i64) { return (Option.Some(payload()), 7); }\n\
+             fn take(t: (Option[String], i64)) -> i64 { return 1; }\n\
+             fn go() -> i64 { let t = mkt(); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { take(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["1"],
+            "rc_fb_tuple_option_elem_no_drop_memory",
+            9,
+        );
+        // CONTROLS — the shapes both walks already covered, which must stay
+        // byte-identical, and the same tuple NOT promoted.
+        assert_clean_asan_run_min_allocs(
+            "fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkt() -> (String, i64) { return (payload(), 7); }\n\
+             fn take(t: (String, i64)) -> i64 { return 1; }\n\
+             fn go() -> i64 { let t = mkt(); let mut i = 0i64;\n\
+             \x20 while i < 0i64 { take(t); i = i + 1; }\n\
+             \x20 return 1; }\n\
+             fn main() { println(go()); }\n",
+            &["1"],
+            "rc_fb_tuple_string_elem_control",
+            9,
+        );
+        assert_clean_asan_run_min_allocs(
+            &format!("{OWN}fn go() -> i64 {{ let t = mkt(); return 1; }}\n"),
+            &["drop S", "1"],
+            "rc_fb_tuple_unpromoted_control",
+            9,
+        );
+    }
+
     /// B-2026-09-07-18 — the box runs the BINDING's own `Drop`, not that of a
     /// same-shaped twin.
     ///

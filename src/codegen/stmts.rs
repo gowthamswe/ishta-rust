@@ -6924,7 +6924,23 @@ impl<'ctx> super::Codegen<'ctx> {
                         // the box free at rc==0 recurses into those buffers
                         // instead of leaking them (B-2026-06-10-8). No-op for
                         // scalar / heap-free boxed values.
-                        self.register_rc_fallback_box_drop(heap_type, boxed_type_name.as_deref());
+                        // B-2026-09-07-28 — an UNNAMED boxed value may still
+                        // be a tuple whose elements run `Drop` bodies, and a
+                        // tuple's identity is its element `TypeExpr`s rather
+                        // than a name. They are resolvable right here, from the
+                        // same annotation/RHS this `let` already holds, which
+                        // is what the non-boxed spelling of this binding does
+                        // ~1700 lines below; only the box never asked.
+                        let tuple_elem_tes = if boxed_type_name.is_none() {
+                            self.tuple_binding_elem_tes(ty.as_ref(), value)
+                        } else {
+                            None
+                        };
+                        self.register_rc_fallback_box_drop(
+                            heap_type,
+                            boxed_type_name.as_deref(),
+                            tuple_elem_tes.as_deref(),
+                        );
                         self.track_rc_var(var_name, heap_ptr, heap_type);
                         heap_ptr.into()
                     } else {

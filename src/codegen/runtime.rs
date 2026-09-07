@@ -908,10 +908,15 @@ impl<'ctx> super::Codegen<'ctx> {
     /// the value's USER `Drop` as well as its memory — see the wrapper arm
     /// below, and B-2026-09-07-17 for why leaving it to the let site was a
     /// use-after-free.
+    ///
+    /// `tuple_elem_tes` carries the element `TypeExpr`s when the boxed value is
+    /// an UNNAMED tuple, which is the one shape `value_type_name` cannot
+    /// describe — see the tuple arm below and B-2026-09-07-28.
     pub(super) fn register_rc_fallback_box_drop(
         &mut self,
         box_heap_type: StructType<'ctx>,
         value_type_name: Option<&str>,
+        tuple_elem_tes: Option<&[TypeExpr]>,
     ) {
         if self
             .drop_rc
@@ -999,14 +1004,67 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
                 _ => None,
             };
+            // B-2026-09-07-28 — a TUPLE. Its memory half was already right
+            // (`emit_aggregate_heap_field_frees` walks a tuple correctly — that
+            // is the struct-shaped layout it assumes), but no element-BODIES
+            // walk was ever armed, so `let t = (S { .. }, 7)` consumed in a
+            // loop printed nothing against the interpreter's `drop S` on all
+            // four compiled legs while measuring 10 allocs / 10 frees.
+            //
+            // It needs its own arm rather than a widened name lookup for the
+            // reason B-2026-09-07-18 recorded when it deferred this: the other
+            // two arms resolve everything from a type NAME, and a tuple has
+            // none. The element `TypeExpr`s are the substitute identity, and
+            // they reach here from the `let` site, which already resolves them
+            // for the non-boxed spelling of the same binding.
+            //
+            // BODIES ONLY, ahead of the memory walk below — the walker's own
+            // contract (it frees nothing, so it cannot double-free the
+            // aggregate walk's frees) and the ordering every other site here
+            // keeps, so a body still reads its own buffers.
+            //
+            // The MEMORY half moves with it, to the same element-`TypeExpr`
+            // walk the destructure site pairs these two with. The box's
+            // standing answer, `emit_aggregate_heap_field_frees`, walks the
+            // LLVM type and is ENUM-BLIND, so a `(E, i64)` element's payload
+            // was never freed at all: measured 7 B definitely lost in 1 block,
+            // pre-existing and identical before this fix, since a bodies-only
+            // walker frees nothing. `emit_tuple_elem_drops` reaches that leaf.
+            //
+            // The swap frees a strict superset here, measured leaf by leaf at
+            // -O0 under valgrind rather than argued: `(E, i64)` 7 B lost ->
+            // 11/11, `(Option[String], i64)` 7 B lost -> 11/11, and the
+            // `(Vec[i64], i64)` / `(String, i64)` / nested-struct shapes both
+            // walks already covered stay 11/11. The `Option` cell is the one
+            // worth naming, because `emit_tuple_elem_drops`'s own doc comment
+            // still says `Option`/`Result` leaves are skipped and that has been
+            // false since B-2026-08-03-3 gave them a tag-guarded arm (shared
+            // leaves likewise, since B-2026-09-04-31) -- predicting from the
+            // comment said this cell would keep leaking, and the measurement
+            // said otherwise. When the `TypeExpr` walk finds no drop-bearing
+            // heap at all it returns `None`, and the aggregate walk stays as it
+            // was.
+            let (tuple_bodies, tuple_mem) = match (value_type_name, tuple_elem_tes) {
+                (None, Some(tes)) if tes.len() as u32 == value_ty.count_fields() => (
+                    self.emit_tuple_elem_user_drop_bodies_fn(value_ty, tes),
+                    self.synthesize_tuple_drop_fn_te(value_ty, tes),
+                ),
+                _ => (None, None),
+            };
             match wrapper {
                 // Body + memory in one call; no field-free walk beside it.
                 Some(w) => calls.push(w),
                 None => {
-                    if let Some(bodies) = field_bodies {
+                    if let Some(bodies) = field_bodies.or(tuple_bodies) {
                         calls.push(bodies);
                     }
-                    walk_struct_heap_fields = self.aggregate_has_heap_field(value_ty);
+                    // Bodies first, then memory — straight-line here, so the
+                    // push order IS the run order and a body still reads its
+                    // own buffers.
+                    match tuple_mem {
+                        Some(mem) => calls.push(mem),
+                        None => walk_struct_heap_fields = self.aggregate_has_heap_field(value_ty),
+                    }
                 }
             }
             if calls.is_empty() && !walk_struct_heap_fields {
