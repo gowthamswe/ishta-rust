@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 394 |
 | run-vs-build | 369 |
-| leak | 290 |
+| leak | 291 |
 | double-free | 211 |
 | missing-feature | 194 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1574 |
+| codegen | 1575 |
 | interp | 402 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -167,7 +167,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-24 | 2026-09-07 | interp | medium | A `u64` ABOVE `i64::MAX` IN A WIDTH-SPEC'D f-STRING HOLE RENDERS NEGATIVE UNDER `--interp` AND UNSIGNED ON BOTH COMPILED BACKENDS -- `f"{ubig:22}"` for 18446744073709551615 prints `                    -1` interpreted and `  18446744073709551615` compiled; the compiled column is the correct one, and the UNSPEC'D spelling `f"{ubig}"` is correct on all three | none |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
-| B-2026-09-07-28 | 2026-09-07 | codegen | medium | AN RC-BOXED TUPLE LOSES ITS ELEMENT'S `Drop` BODY -- `let t = (S { .. }, 7)` consumed in a loop is allocation-balanced but prints nothing against the interpreter's `drop S`, so B-2026-09-07-18's claim that "the tuple sibling is CLEAN" holds for memory only | — |
 | B-2026-09-07-29 | 2026-09-07 | codegen | high | A WHOLE CONSUME INSIDE A LOOP THAT ACTUALLY RUNS DOUBLE-FREES AN RC-PROMOTED LOCAL, with no projection anywhere in the program -- `while i < 3i64 { takep(t); i = i + 1; }` over a loop-outer `t` measures 25 allocs against 28 frees with 2 invalid frees at -O0, which is B-2026-09-07-17's own shape above trip count ZERO | — |
 | B-2026-09-07-30 | 2026-09-07 | codegen | medium | A PROJECTION OFF AN RC-PROMOTED LOCAL STRANDS 40 B WHEN ITS DESTINATION IS A `Vec.push` OR AN EXISTING BINDING -- `v.push(t.a)` also invalid-frees once, `s = t.a` leaks silently, and both survive B-2026-09-07-19's copy because neither destination routes through the let-binding or struct-literal registrars | — |
 
@@ -2369,6 +2368,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-23 | codegen | high | A `let`-BOUND STRUCT LITERAL PROJECTING A LOOP-OUTER LOCAL FREES THE ALIASED BUFFER ONCE PER ITERATION -- `while i < 2 { let p = P { a: t.a, b: 1 };… | afe5abf |
 | B-2026-09-07-25 | codegen | medium | B-2026-09-05-23 LEFT THE SPEC'D f-STRING INTEGER PATH ON libc `snprintf` -- `f"{n}"` was fast and `f"{n:5}"` was ~23x slower inside a parallel loop (… | c5982d963 |
 | B-2026-09-07-27 | codegen | high | AN RC-FALLBACK BOX HAS NO TYPE IDENTITY, so it runs a SAME-SHAPED TWIN'S `Drop` body -- B-2026-09-07-17 named the boxed value by reverse lookup over… | f37af501e |
+| B-2026-09-07-28 | codegen | medium | AN RC-BOXED TUPLE LOSES ITS ELEMENT'S `Drop` BODY -- `let t = (S { . | 0e881224f |
+| B-2026-09-07-31 | codegen | low | AN RC-BOXED TUPLE WITH AN ENUM OR `Option` ELEMENT LOSES ITS PAYLOAD MEMORY -- the box's memory step was the enum-blind `emit_aggregate_heap_field_fr… | 0e881224f |
 
 </details>
 
