@@ -2481,6 +2481,127 @@ fn main() {
         );
     }
 
+    /// B-2026-09-06-51 — a fresh tuple literal's `Option` / `Result` element
+    /// whose payload runs NO user `Drop`.
+    ///
+    /// Every owner the sibling fixtures exercise is reached through a payload
+    /// WALKER: the arm is entered on `emit_optres_payload_user_drop_bodies_fn`
+    /// returning something, and both of its memory registrations then ask
+    /// `option_payload_struct_or_enum_drop_ok`. So a payload that merely CARRIES
+    /// heap — a bare `String`, a `Vec`, or a struct with a heap field and no
+    /// `impl Drop` — got no owner at all and leaked outright. The BODIES
+    /// question standing in for the MEMORY one, which is the same predicate
+    /// mistake `tests/asan-o0-known-failures.txt` records for B-2026-09-01-25.
+    ///
+    /// Localized by two spellings of the SAME value that were always clean and
+    /// stay so: the struct-FIELD destructure (`let W { p } = w`) and the NAMED
+    /// tuple (`let t = (..); let (a, o) = t`). Only the literal destructured in
+    /// place is affected — bound or wildcarded, either slot, both heads.
+    ///
+    /// `ovec` / `vwild` CARRY A SECOND ROOT CAUSE and are not redundant with
+    /// `ostr` / `owild`: a bare `[4, 4, 4]` reaches
+    /// `refined_tuple_literal_elem_te` as a `PrefixCollectionLiteral`, which had
+    /// no arm, so the element came back as a bare `Option` and the ownership
+    /// predicate declined it on a missing generic argument rather than on its
+    /// payload. The two spellings that already carried the type —
+    /// `let xs = [..]; Option.Some(xs)` and `Option[Vec[i64]].Some([..])` — were
+    /// clean throughout, which is what separated the erasure from the predicate.
+    ///
+    /// `omove` / `oarm` / `rarm` PULL THE OTHER WAY and are why the owner is the
+    /// one `track_owned_destructure_field_cleanup` already installs for the
+    /// struct-field spelling rather than a fresh registration: its actions join
+    /// `inline_option_payload_vars` / `inline_result_payload_vars`, the sets a
+    /// whole-value move and a consuming arm retract. An owner outside those sets
+    /// balances every leaf that stays put and double-frees the one that moves.
+    ///
+    /// `odrop` is the user-`Drop` control (unchanged, one body), and `loops`
+    /// runs two iterations so a per-iteration imbalance shows as a multiple.
+    ///
+    /// MEASURED at the parent: 71 allocs / 62 frees, 56 bytes definitely lost
+    /// in 9 blocks from 8 contexts, against 71/71 and zero errors after — with
+    /// **byte-identical stdout both ways**, so no output oracle on any of the
+    /// four surfaces could have caught it and the balance is the whole pin.
+    #[test]
+    fn asan_fresh_tuple_optres_leaf_with_a_bodyless_heap_payload_is_balanced() {
+        assert_clean_asan_run(
+            r#"struct R { id: i64, s: String }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(n: i64) -> R { return R { id: n, s: f"s{n}" }; }
+struct Carrier { s: String }
+
+fn ostr()   { let (r, o) = (mk(1), Option.Some(f"p1")); println(f"  a{r.id}{o.is_some()}") }
+fn owild()  { let (r, _) = (mk(2), Option.Some(f"p2")); println(f"  b{r.id}") }
+fn rstr()   { let (r, o) = (mk(3), Result[String, i64].Ok(f"p3")); println(f"  c{r.id}{o.is_ok()}") }
+fn ovec()   { let (r, o) = (mk(4), Option.Some([4, 4, 4])); println(f"  d{r.id}{o.is_some()}") }
+fn vwild()  { let (r, _) = (mk(5), Option.Some([5, 5])); println(f"  e{r.id}") }
+fn ocarry() { let (r, o) = (mk(6), Option.Some(Carrier { s: f"p6" })); println(f"  f{r.id}{o.is_some()}") }
+fn omove()  { let (r, o) = (mk(7), Option.Some(f"p7")); let q = o; println(f"  g{r.id}{q.is_some()}") }
+fn oarm()   { let (r, o) = (mk(8), Option.Some(f"p8")); match o { Option.Some(s) => println(f"  h{s}"), Option.None => println("  hz") } println(f"  i{r.id}") }
+fn rarm()   { let (r, o) = (mk(9), Result[String, i64].Ok(f"p9")); match o { Result.Ok(s) => println(f"  j{s}"), Result.Err(e) => println(f"  jz{e}") } println(f"  k{r.id}") }
+fn odrop()  { let (r, o) = (mk(10), Option.Some(mk(110))); println(f"  l{r.id}{o.is_some()}") }
+fn loops()  { let mut i = 0; while i < 2 { let (r, o) = (mk(11), Option.Some(f"p11")); println(f"  m{r.id}{o.is_some()}"); i = i + 1; } println("  n") }
+
+fn main() {
+  println("ostr");   ostr()
+  println("owild");  owild()
+  println("rstr");   rstr()
+  println("ovec");   ovec()
+  println("vwild");  vwild()
+  println("ocarry"); ocarry()
+  println("omove");  omove()
+  println("oarm");   oarm()
+  println("rarm");   rarm()
+  println("odrop");  odrop()
+  println("loops");  loops()
+  println("done")
+}
+"#,
+            &[
+                "ostr",
+                "  a1true",
+                "dR1",
+                "owild",
+                "  b2",
+                "dR2",
+                "rstr",
+                "  c3true",
+                "dR3",
+                "ovec",
+                "  d4true",
+                "dR4",
+                "vwild",
+                "  e5",
+                "dR5",
+                "ocarry",
+                "  f6true",
+                "dR6",
+                "omove",
+                "  g7true",
+                "dR7",
+                "oarm",
+                "  hp8",
+                "  i8",
+                "dR8",
+                "rarm",
+                "  jp9",
+                "  k9",
+                "dR9",
+                "odrop",
+                "  l10true",
+                "dR110",
+                "dR10",
+                "loops",
+                "  m11true",
+                "dR11",
+                "  m11true",
+                "dR11",
+                "  n",
+                "done",
+            ],
+            "b51-bodyless-heap-payload-leaf",
+        );
+    }
+
     /// B-2026-09-04-10 — the BALANCE assertion for the disarm that
     /// `e2e_option_agg_destructure_leaf_move_disarms_its_source` pins as a
     /// transcript.

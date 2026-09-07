@@ -14013,6 +14013,17 @@ impl<'ctx> super::Codegen<'ctx> {
             _ => None,
         };
         let projection_leaf_owns = place_body_path.is_some() && !projection_root_runs_bodies;
+        // B-2026-09-06-51 — was the source read COPIED rather than moved?
+        // `uam_defensive_copy_field` copies at a flagged use-after-move site,
+        // i.e. exactly when the root is read again past this destructure. The
+        // `moved_projection_src` gate above already consults it for a LOCAL
+        // root; the callee-owned transfer below needs the same answer for a
+        // PARAM root, where `place_body_path` is `None` and that gate never
+        // runs. Measured on `fn f(w: W) { let P { a, c } = w.inner; .. }`: the
+        // spelling that reads `w` again allocates TWO MORE buffers than a
+        // matched control and frees the same number (20/18 against 18/18), so
+        // the copy is real and one owner per leaf was missing.
+        let src_read_is_copy = self.uam_consume_site_at_root(value);
 
         // B-2026-09-03-24 — does the SOURCE's own owner already run this
         // struct's field bodies, so a leaf registration below would fire them a
@@ -14594,7 +14605,20 @@ impl<'ctx> super::Codegen<'ctx> {
                     // (masked by the dead-chain deletion, exactly as the
                     // fresh-source case below was). The moved projection takes
                     // the callee-owned branch instead, with the cap-zero.
-                    || (leaf_is_optres && projection_leaf_owns && moved_projection_src.is_none()))
+                    // B-2026-09-06-51 — and so is EVERY OTHER LEAF of a copied
+                    // projection, not just the `Option`/`Result` ones. The
+                    // reasoning above never used `leaf_is_optres`: a defensive
+                    // copy is the leaf's own whatever its type, and the two
+                    // struct-leaf transfer blocks that would otherwise own it
+                    // both require `place_body_src` — an IDENTIFIER source — so
+                    // a projection's struct leaf reaches neither. On the MOVED
+                    // projection that is still right (the root kept the buffer
+                    // and only its body was masked); on the COPIED one the copy
+                    // had no owner at all and leaked, one buffer per leaf.
+                    // Measured on `let P { a } = w.inner;` with `w` read after:
+                    // 13 allocs / 12 frees against a matched-println control at
+                    // 12/12 — exactly the one copy, stranded.
+                    || (projection_leaf_owns && moved_projection_src.is_none()))
                     && (self.destructure_field_needs_cleanup(&field_te)
                         // B-2026-09-04-1's probe — the `Result` field of a FRESH
                         // source (a call or a struct literal) had no owner at
@@ -14716,13 +14740,27 @@ impl<'ctx> super::Codegen<'ctx> {
                             }
                             leaf_cleanup_registered = true;
                         }
-                        self.zero_struct_field_move_cap_inst(
-                            src_ptr,
-                            &struct_name,
-                            fname,
-                            Some(src_st),
-                            src_inst.as_ref(),
-                        );
+                        // B-2026-09-06-51 — the cap-zero is a MOVE's disarm: it
+                        // tells the source's `StructDrop` "this field went to
+                        // the leaf, skip it". When the read was a defensive
+                        // COPY the field went nowhere — the source still holds
+                        // its own buffer and the leaf holds a second one — so
+                        // retracting the source's owner strands the original,
+                        // one buffer per leaf. Keep both owners; the BODIES
+                        // stay single because they are masked separately, which
+                        // is why this cell printed the right output while
+                        // leaking (7 B over two leaves in the probe, and the
+                        // `rlive` / `olive` / `livecall` cells of
+                        // `asan_param_projection_optres_leaf_is_balanced`).
+                        if !src_read_is_copy {
+                            self.zero_struct_field_move_cap_inst(
+                                src_ptr,
+                                &struct_name,
+                                fname,
+                                Some(src_st),
+                                src_inst.as_ref(),
+                            );
+                        }
                     }
                 } else if view_src {
                     // B-2026-07-09-12 clone-on-extract — the source is a shared-enum
@@ -14890,7 +14928,16 @@ impl<'ctx> super::Codegen<'ctx> {
                         // moved-out payload — else it double-frees against this
                         // leaf's own `Option` drop (B-27/B-31 exit-133). A fresh-temp
                         // source has no lingering struct-drop, so nothing to disarm.
-                        if let Some(src_ptr) = optres_owned_src {
+                        // B-2026-09-06-51 — and not when the source read was a
+                        // defensive COPY, for the reason the `transferable`
+                        // arm's guard states: a tag-zero is a move's disarm,
+                        // and with a copy the source still owns its own boxed
+                        // payload. The `Option[R]` leaf of a live-rooted param
+                        // projection stranded exactly its envelope and its
+                        // payload's buffer — 36 B in 2 allocations, the last
+                        // cell of `asan_param_projection_optres_leaf_is_balanced`
+                        // after the struct-leaf half of this guard landed.
+                        if let (Some(src_ptr), false) = (optres_owned_src, src_read_is_copy) {
                             self.zero_struct_field_move_cap_inst(
                                 src_ptr,
                                 &struct_name,
@@ -16096,14 +16143,15 @@ impl<'ctx> super::Codegen<'ctx> {
                         // competing body, so the leaf always takes it.
                         self.track_destructure_leaf_cleanup(name, slot.ptr, true);
                         if let Some(te) = optres_te {
-                            if let Some(bodies) = self.emit_optres_payload_user_drop_bodies_fn(&te)
-                            {
-                                // MEMORY FIRST, then bodies — the frame drains
-                                // LIFO, so registering memory first is what
-                                // makes the body run BEFORE the payload it
-                                // reads is freed.
-                                let is_result = matches!(&te.kind, TypeKind::Path(p)
-                                    if p.segments.last().map(String::as_str) == Some("Result"));
+                            let bodies = self.emit_optres_payload_user_drop_bodies_fn(&te);
+                            // MEMORY FIRST, then bodies — the frame drains
+                            // LIFO, so registering memory first is what
+                            // makes the body run BEFORE the payload it
+                            // reads is freed.
+                            let is_result = matches!(&te.kind, TypeKind::Path(p)
+                                if p.segments.last().map(String::as_str) == Some("Result"));
+                            let mut mem_owned = false;
+                            if bodies.is_some() {
                                 if is_result {
                                     if Self::result_payload_tes(&te).is_some_and(|(ok, err)| {
                                         self.option_payload_struct_or_enum_drop_ok(&ok)
@@ -16112,12 +16160,60 @@ impl<'ctx> super::Codegen<'ctx> {
                                         self.track_inline_result_agg_payload_var(
                                             name, slot.ptr, &te,
                                         );
+                                        mem_owned = true;
                                     }
                                 } else if Self::option_payload_te(&te).is_some_and(|pt| {
                                     self.option_payload_struct_or_enum_drop_ok(&pt)
                                 }) {
                                     self.track_inline_option_agg_payload_var(name, slot.ptr, &te);
+                                    mem_owned = true;
                                 }
+                            }
+                            // B-2026-09-06-51 — the payload that runs NO user
+                            // `Drop`. Every owner above is reached only through
+                            // a walker this leaf has no reason to need: the
+                            // block was entered on `bodies.is_some()` and both
+                            // memory arms ask `..._struct_or_enum_drop_ok`. So
+                            // an `Option`/`Result` element whose payload merely
+                            // CARRIES heap — `String`, `Vec`, or a struct with
+                            // a heap field and no `impl Drop` — got no owner at
+                            // all and leaked the payload outright, bound or
+                            // wildcarded, in either slot, on both heads.
+                            //
+                            // This is the predicate mistake
+                            // `tests/asan-o0-known-failures.txt` already
+                            // records once, for B-2026-09-01-25: a walk that
+                            // answers the BODIES question standing in for the
+                            // MEMORY one. Nothing else owned it here — the
+                            // struct-FIELD destructure and the NAMED-tuple
+                            // destructure of the same value are both clean,
+                            // which is what localizes it to the literal
+                            // destructured in place.
+                            //
+                            // `track_owned_destructure_field_cleanup` is the
+                            // owner the struct-field spelling already uses, and
+                            // reusing it is what makes a later move or
+                            // consuming `match` retract this: its registrations
+                            // join `inline_option_payload_vars` /
+                            // `inline_result_payload_vars`, the sets the
+                            // move-disarm consults. Registered BEFORE the
+                            // bodies below for the LIFO reason above.
+                            // The `Result` disjuncts are the same three the
+                            // struct-FIELD chain admits beside
+                            // `destructure_field_needs_cleanup`, which has no
+                            // `Result` arm of its own — without them the
+                            // `Result` head kept leaking after the `Option` one
+                            // was owned (measured: `Result[String, i64].Ok`, 8
+                            // bytes).
+                            if !mem_owned
+                                && (self.destructure_field_needs_cleanup(&te)
+                                    || self.result_field_direct_vecstr_halves_ok(&te)
+                                    || self.result_field_struct_enum_payload_ok(&te)
+                                    || self.result_field_map_or_set_half_ok(&te).is_some())
+                            {
+                                self.track_owned_destructure_field_cleanup(name, slot.ptr, &te);
+                            }
+                            if let Some(bodies) = bodies {
                                 self.var_types
                                     .optres_var_payload_tes
                                     .insert(name.clone(), te.clone());
@@ -16144,7 +16240,8 @@ impl<'ctx> super::Codegen<'ctx> {
                         .builder
                         .build_extract_value(sv, idx as u32, "tuple.discard")
                         .unwrap();
-                    if elem.get_type() == self.vec_struct_type().into() {
+                    let vec_shaped_took_memory = if elem.get_type() == self.vec_struct_type().into()
+                    {
                         let fn_val = self.current_fn.unwrap();
                         let synth = format!("__tuple_discard_{}", self.indexed_elem_counter);
                         self.indexed_elem_counter += 1;
@@ -16152,7 +16249,10 @@ impl<'ctx> super::Codegen<'ctx> {
                         self.builder.build_store(alloca, elem).unwrap();
                         let i8t = self.context.i8_type().into();
                         self.track_vec_var(alloca, Some(i8t));
-                    }
+                        true
+                    } else {
+                        false
+                    };
                     // B-2026-08-28-12 — the BODY half, which this arm never had.
                     // The free above is the memory half and predates it; a
                     // discarded element whose type carries a user `Drop` ran no
@@ -16160,7 +16260,45 @@ impl<'ctx> super::Codegen<'ctx> {
                     // nothing where design.md § Drop requires exactly one.
                     if let Some(te) = elem_tes.and_then(|tes| tes.get(idx)) {
                         // FRESH source — nothing else owns this element.
-                        self.run_discarded_leaf_user_drop_bodies(te, elem, true);
+                        let te = te.clone();
+                        let leaf = self.run_discarded_leaf_user_drop_bodies(&te, elem, true);
+                        // B-2026-09-06-51 — the wildcard half of the binding
+                        // arm's fallback above, and it leaks for the mirrored
+                        // reason: `run_discarded_leaf_user_drop_bodies` resolves
+                        // a user STRUCT or ENUM name to build its walker, and an
+                        // `Option[String]` payload is neither, so it returns
+                        // `NOTHING` and takes no memory either. The `{ptr,len,
+                        // cap}` test above does not catch it — a tagged
+                        // `Option` element is not that shape.
+                        //
+                        // Register the same owner the binding leaf gets, on a
+                        // synthetic slot: a discarded element is dead at once,
+                        // so a scope-exit free is the earliest point anything
+                        // here uses, exactly as the `track_vec_var` above does
+                        // for the discarded String/Vec shape.
+                        // `vec_shaped_took_memory` is load-bearing, not
+                        // defensive: a discarded BARE `String` element satisfies
+                        // `destructure_field_needs_cleanup` too, and the
+                        // `{ptr,len,cap}` half above has already freed it — so
+                        // without this conjunct the two owners both fire and
+                        // `fn first(n) -> String { let (a, _) = pair(n); a }`
+                        // aborts on `double-free` at -O0, which is how the leg
+                        // caught it.
+                        if !leaf.took_memory
+                            && !vec_shaped_took_memory
+                            && (self.destructure_field_needs_cleanup(&te)
+                                || self.result_field_direct_vecstr_halves_ok(&te)
+                                || self.result_field_struct_enum_payload_ok(&te)
+                                || self.result_field_map_or_set_half_ok(&te).is_some())
+                        {
+                            let fn_val = self.current_fn.unwrap();
+                            let synth =
+                                format!("__tuple_discard_optres_{}", self.indexed_elem_counter);
+                            self.indexed_elem_counter += 1;
+                            let alloca = self.create_entry_alloca(fn_val, &synth, elem.get_type());
+                            self.builder.build_store(alloca, elem).unwrap();
+                            self.track_owned_destructure_field_cleanup(&synth, alloca, &te);
+                        }
                     }
                 }
                 // Nested tuple: recurse (the whole aggregate was already proven
@@ -17028,6 +17166,53 @@ impl<'ctx> super::Codegen<'ctx> {
                 ),
                 span: e.span,
             }),
+            // B-2026-09-06-51 — an ARRAY LITERAL, the one payload spelling the
+            // ctor arm above could not name. `Option.Some([1, 1, 1])` reached
+            // `infer_arg_elem_te`, which has no array arm, so the element came
+            // back as a bare `Option` and `option_inline_payload_elem` — which
+            // reads `generic_args` — declined it: the payload's buffer had no
+            // owner and leaked, 24 B for a three-element `Vec[i64]`. The two
+            // spellings that DO carry the type were already clean, which is
+            // what isolates this to the literal rather than to the ownership
+            // predicate beside it: `let xs = [..]; Option.Some(xs)` resolves
+            // through the `Identifier` arm and `Option[Vec[i64]].Some([..])`
+            // through the annotated-ctor arm.
+            //
+            // Typed from the FIRST element, the same head-name derivation every
+            // arm here uses, and `None` for an empty literal whose element type
+            // is genuinely unknowable from the expression — the fail-closed
+            // rule this function already follows.
+            ExprKind::ArrayLiteral(items) | ExprKind::PrefixCollectionLiteral { items, .. } => {
+                // A bare `[1, 1, 1]` reaches here as a
+                // `PrefixCollectionLiteral { type_name: "Vec", .. }`, not as an
+                // `ArrayLiteral` — checked rather than assumed, because
+                // matching only the obvious node left every cell still leaking
+                // and the arm silently never fired. `Array`/`Set`/`Map` heads
+                // are deliberately NOT rebuilt: `Array[T, N]` needs a length
+                // this expression does not carry and a `Map` item is a pair, so
+                // naming them from the element alone would assert a shape that
+                // is not there. `None` for those, which is the fallback every
+                // arm here uses.
+                let head = match &e.kind {
+                    ExprKind::PrefixCollectionLiteral { type_name, .. } => type_name.as_str(),
+                    _ => "Vec",
+                };
+                if head != "Vec" && head != "VecDeque" {
+                    return None;
+                }
+                let first = items.first()?;
+                let elem = self
+                    .refined_tuple_literal_elem_te(first)
+                    .unwrap_or_else(|| self.infer_arg_elem_te(first));
+                Some(TypeExpr {
+                    kind: TypeKind::Path(crate::ast::PathExpr {
+                        segments: vec![head.to_string()],
+                        generic_args: Some(vec![crate::ast::GenericArg::Type(elem)]),
+                        span: e.span,
+                    }),
+                    span: e.span,
+                })
+            }
             _ => None,
         }
     }
