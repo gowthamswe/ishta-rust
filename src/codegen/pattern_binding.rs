@@ -963,7 +963,46 @@ impl<'ctx> super::Codegen<'ctx> {
                                 && !self.pattern_state.pattern_binding_scrutinee_is_shared_enum
                                 && self.type_decls.struct_types.contains_key(tn)
                                 && !self.type_decls.shared_types.contains_key(tn)
-                                && self.aggregate_param_copy_supported_struct(tn, &mut Vec::new());
+                                && (self.aggregate_param_copy_supported_struct(tn, &mut Vec::new())
+                                    // B-2026-09-07-38 — the copy-supported test
+                                    // above is a PROXY for "the source is
+                                    // callee-owned", and the comment block over
+                                    // this gate says so outright: copy-supported
+                                    // is exactly when the source is callee-owned
+                                    // "or a local", while a non-copy-supported
+                                    // payload "makes the source *caller-retains*
+                                    // (no deep-copy)" — which is why registering
+                                    // an owner there would turn a leak into a
+                                    // use-after-free on `sink(e); use(e)`.
+                                    //
+                                    // B-2026-09-07-16's transfer path breaks that
+                                    // biconditional in the one direction the proxy
+                                    // cannot see. A payload the entry copy
+                                    // DECLINES is now callee-owned rather than
+                                    // caller-retains: the callee took the caller's
+                                    // buffer outright and the caller retracted, so
+                                    // there is no second owner for a use-after-free
+                                    // to race. The consuming arm then zeroes the
+                                    // param's payload words and frees the envelope
+                                    // (`suppress_destructured_enum_payload_cleanup_at`'s
+                                    // boxed-struct leg), leaving the CONTENTS to a
+                                    // binding this gate had refused to register —
+                                    // 2 B per call on `fn eat(w: W) -> i64 { match
+                                    // w { W.T(x) => x.a.unwrap_or(0), W.U(n) => n
+                                    // } }`, against a clean `W.T(_)` arm on the
+                                    // same program, which runs no suppression and
+                                    // leaves the param's own drop to do it all.
+                                    //
+                                    // Restoring the gate's INTENT (callee-owned)
+                                    // rather than widening its proxy: only the
+                                    // class whose caller-side retraction is
+                                    // already in lockstep with the callee's
+                                    // prologue is admitted, so every type the
+                                    // transfer predicate declines keeps today's
+                                    // conservative answer byte-for-byte.
+                                    || self
+                                        .pattern_state
+                                        .pattern_binding_scrutinee_is_transfer_owned_enum);
                             // B-2026-07-10-3: an `Option`/`Result` scrutinee whose
                             // INLINE struct payload (held as a value in the slot, not
                             // heap-boxed) is bound WHOLE as `e`. The dedicated inline

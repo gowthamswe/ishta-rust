@@ -461,6 +461,15 @@ impl<'ctx> super::Codegen<'ctx> {
         let saved_owned_param_flag = self.pattern_state.pattern_binding_scrutinee_is_owned_param;
         self.pattern_state.pattern_binding_scrutinee_is_owned_param =
             self.scrutinee_is_owned_param_binding(scrutinee);
+        // B-2026-09-07-38 — the TRANSFER-owned subset of that flag, derived
+        // here so `bind_pattern_values`'s copy-supported gate can tell a
+        // callee-owned source from the caller-retains one it assumes.
+        let saved_transfer_enum_flag = self
+            .pattern_state
+            .pattern_binding_scrutinee_is_transfer_owned_enum;
+        self.pattern_state
+            .pattern_binding_scrutinee_is_transfer_owned_enum =
+            self.scrutinee_is_transfer_owned_enum_param(scrutinee);
         // B-2026-09-06-20 — payload bindings out of the scrutinee binding's
         // MASKED slots (a param view a mixed wrap moved in) are views too.
         self.pattern_state.pattern_binding_masked_view_names = self.masked_payload_view_names_for(
@@ -1558,6 +1567,8 @@ impl<'ctx> super::Codegen<'ctx> {
         self.pattern_state
             .pattern_binding_scrutinee_is_fresh_owning_temp = saved_fresh_temp_flag;
         self.pattern_state.pattern_binding_scrutinee_is_owned_param = saved_owned_param_flag;
+        self.pattern_state
+            .pattern_binding_scrutinee_is_transfer_owned_enum = saved_transfer_enum_flag;
         // B-2026-09-06-20 — cleared rather than restored; see `compile_if_let`.
         self.pattern_state.pattern_binding_masked_view_names.clear();
         self.pattern_state

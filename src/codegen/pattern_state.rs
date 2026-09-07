@@ -131,6 +131,33 @@ pub(crate) struct PatternState<'ctx> {
     /// runs it twice.
     pub(crate) pattern_binding_arm_borrowed_only_names: std::collections::HashSet<String>,
     pub(crate) pattern_binding_scrutinee_is_owned_param: bool,
+    /// B-2026-09-07-38 — true while binding a pattern whose scrutinee is a
+    /// by-value ENUM param the callee owns BY TRANSFER
+    /// (`enum_param_owned_by_transfer`, B-2026-09-07-16).
+    ///
+    /// It exists to correct one premise of the user-struct arm's
+    /// COPY-SUPPORTED gate in `bind_pattern_values`. That gate reads
+    /// `aggregate_param_copy_supported_struct` as a PROXY for "the source is
+    /// callee-owned", and its own comment says so: copy-supported is exactly
+    /// when the source "is callee-OWNED (`make_aggregate_param_callee_owned`
+    /// deep-copies it on entry) or a local", while a non-copy-supported
+    /// payload "makes the source *caller-retains* (no deep-copy)" — so
+    /// registering an owner there would turn a leak into a use-after-free.
+    ///
+    /// The transfer path breaks that biconditional in the one direction the
+    /// proxy cannot see: a payload the entry copy DECLINES now makes the
+    /// source callee-owned rather than caller-retains, because the callee
+    /// took the caller's buffer outright and the caller retracted. The
+    /// consuming arm then zeroes the param's payload words and frees the
+    /// envelope, leaving the CONTENTS to a binding the gate had refused to
+    /// register — 2 B per call on
+    /// `fn eat(w: W) -> i64 { match w { W.T(x) => … } }`, and clean on the
+    /// same program's `W.T(_)` arm, which runs no suppression at all.
+    ///
+    /// Narrow on purpose: it admits ONLY the class whose caller-side
+    /// retraction is already in lockstep with the callee's prologue, so a
+    /// type this flag does not cover keeps the gate's conservative answer.
+    pub(crate) pattern_binding_scrutinee_is_transfer_owned_enum: bool,
     /// B-2026-09-06-20 — the binding names the pattern(s) being bound take
     /// out of payload slots that the scrutinee BINDING's own mask
     /// (`enum_ctor_moved_payload_slots`, a param VIEW moved in by the

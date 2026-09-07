@@ -1296,6 +1296,10 @@ impl<'ctx> super::Codegen<'ctx> {
         // B-2026-08-01-13 — see `compile_match`'s twin derivation.
         self.pattern_state.pattern_binding_scrutinee_is_owned_param =
             self.scrutinee_is_owned_param_binding(scrutinee);
+        // B-2026-09-07-38 — see `compile_match`'s twin derivation.
+        self.pattern_state
+            .pattern_binding_scrutinee_is_transfer_owned_enum =
+            self.scrutinee_is_transfer_owned_enum_param(scrutinee);
         // B-2026-09-06-20 — see `compile_match`'s twin derivation.
         self.pattern_state.pattern_binding_masked_view_names =
             self.masked_payload_view_names_for(scrutinee, &[pattern]);
@@ -1631,6 +1635,36 @@ impl<'ctx> super::Codegen<'ctx> {
                 && !self.borrow_vars.ref_params.contains_key(name))
                 || self.payload_vars.param_view_locals.contains(name);
         }
+    }
+
+    /// B-2026-09-07-38 — is this scrutinee a by-value ENUM param the callee
+    /// owns BY TRANSFER (B-2026-09-07-16)?
+    ///
+    /// Deliberately narrower than [`Self::scrutinee_is_owned_param_binding`]
+    /// beside which it is derived: a BARE param name (or an owned `self`
+    /// receiver) only, never a projection. Transfer ownership is a property of
+    /// the whole param slot — the prologue registered the enum's memory and
+    /// payload bodies against that slot — so a field hop off it names a place
+    /// the transfer says nothing about, and admitting one would hand a second
+    /// owner to a binding the enclosing value still owns.
+    ///
+    /// `param_view_locals` is excluded for the same reason: those are locals
+    /// masquerading as a param's view, whose buffers a live param still owns.
+    pub(super) fn scrutinee_is_transfer_owned_enum_param(&self, e: &Expr) -> bool {
+        let name: &str = match &e.kind {
+            ExprKind::Identifier(n) => n.as_str(),
+            ExprKind::SelfValue => "self",
+            _ => return false,
+        };
+        if !self.fn_ctx.current_fn_param_names.contains(name)
+            || self.borrow_vars.ref_params.contains_key(name)
+        {
+            return false;
+        }
+        self.var_types
+            .var_type_names
+            .get(name)
+            .is_some_and(|tn| self.enum_param_owned_by_transfer(tn))
     }
 
     /// B-2026-09-06-15 — is a bare `self` scrutinee an OWNED, plain-STRUCT

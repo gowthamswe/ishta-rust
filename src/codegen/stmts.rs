@@ -21361,10 +21361,31 @@ impl<'ctx> super::Codegen<'ctx> {
         allow_movable_place: bool,
     ) -> Option<&'e Expr> {
         match &expr.kind {
+            // B-2026-09-07-38 — an RC-boxed projection counts as FRESH here,
+            // and only here. `compile_struct_init`'s field loop hands this
+            // literal an independent copy of such a field
+            // (`rc_boxed_projection_field_copy`, B-2026-09-07-23), so the
+            // buffer the literal carries is its own and dies with it — which
+            // is what "fresh" means to this registrar. Left out, the whole
+            // literal is declined for that one field and NOTHING owns the
+            // copy: 190 B in 5 blocks for a five-trip loop over
+            // `P { a: t.a, b: 1 }` whose `t` is declared outside it, one per
+            // trip, and clean the moment `t` moves inside.
+            //
+            // The TUPLE arm below is deliberately NOT widened: the copy is
+            // performed in the struct-literal field loop and nowhere else, so
+            // a tuple element still aliases the box and an owner here would
+            // free what the box frees again.
+            //
+            // The source-side decline stays exactly as B-2026-09-01-5 left it
+            // — `suppress_struct_field_move_into_literal` still returns early
+            // inside a discarded tail — because the box goes on owning the
+            // ORIGINAL. Two buffers, two owners, one free each.
             ExprKind::StructLiteral { fields, spread, .. }
                 if spread.is_none()
                     && fields.iter().all(|f| {
                         self.discard_tuple_elem_is_fresh_expr(&f.value)
+                            || self.rc_boxed_projection_mints_copy(&f.value)
                             || (allow_movable_place
                                 && self.tuple_elem_is_movable_drop_struct_place(&f.value))
                     }) =>

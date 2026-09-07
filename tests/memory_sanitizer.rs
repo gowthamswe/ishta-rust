@@ -65766,21 +65766,40 @@ fn main() { println(go()); }
                  \x20   i = i + 1; }\n\
                  \x20 1 }\n",
             ),
+            // B-2026-09-07-38 — the two loop-outer-local spellings that this
+            // row's decline stranded once B-2026-09-07-23 taught the same
+            // projection to COPY. The decline was measured on an ALIAS ("16
+            // allocations in both, and one fewer free"); an RC-promoted root
+            // mints a fresh buffer per trip instead, so the literal has to own
+            // what it carries.
+            //
+            // The IF/ELSE spelling of this shape is deliberately NOT here. It
+            // still leaks, it already has a standalone test of its own
+            // (`asan_discarded_branch_literal_field_over_a_loop_outer_local_declines`),
+            // and that test carries the quarantine entry — which is the whole
+            // point of keeping these two out of it: quarantining the function
+            // they lived in would have taken them off the leg with it.
             (
-                "loop, source declared OUTSIDE",
+                "loop, source declared OUTSIDE, no else",
                 "fn go() -> i64 { let t = mkp(9); let mut i = 0i64;\n\
                  \x20 while i < 5i64 {\n\
-                 \x20   if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                 \x20   if seed() > 0 { P { a: t.a, b: 1 } };\n\
                  \x20   i = i + 1; }\n\
                  \x20 1 }\n",
             ),
-            // ── guards: a second owner here would be a DOUBLE FREE ────────
             (
-                "guard: the source is READ after the discard",
-                "fn go() -> i64 { let t = mkp(9);\n\
-                 \x20 if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+                "loop, source declared OUTSIDE, read after the loop",
+                "fn go() -> i64 { let t = mkp(9); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 { P { a: t.a, b: 1 }; i = i + 1; }\n\
                  \x20 t.a.len() - t.a.len() + 1 }\n",
             ),
+            // ── guards: a second owner here would be a DOUBLE FREE ────────
+            // The READ-AFTER guard moved out to its own `#[test]` below
+            // (B-2026-09-07-38): it is the IF/ELSE spelling, which still
+            // strands the copy, and it sat AFTER the loop cell in this array —
+            // so `assert_clean_asan_run` never reached it while that cell was
+            // failing. Two failing cells, one visible. Splitting it keeps the
+            // twelve sound cells here ON the -O0 leg.
             (
                 "guard: the literal is BOUND, so the binding owns it",
                 "fn go() -> i64 { let t = mkp(9);\n\
@@ -65804,6 +65823,41 @@ fn main() { println(go()); }
         for (label, body) in rows {
             assert_clean_asan_run(&format!("{H}{body}"), &["1"], label);
         }
+    }
+
+    /// B-2026-09-07-38 — the IF/ELSE spelling of
+    /// [`Self::asan_discarded_literal_projected_field_keeps_its_owner`]'s
+    /// projection, which still strands the copied buffer.
+    ///
+    /// QUARANTINED at -O0 with the row that owns it, alongside
+    /// `asan_discarded_branch_literal_field_over_a_loop_outer_local_declines`
+    /// — the same defect at a different size (that one 190 B in 5 blocks over
+    /// five trips, this one 38 B in 1).
+    ///
+    /// It was a CELL of the fixture above until this commit, and an invisible
+    /// one: it sits after the loop cell, which was already failing, so the
+    /// helper panicked before reaching it. Measured 38 B in 1 block both with
+    /// and without the fix that landed here, i.e. pre-existing and merely
+    /// uncovered.
+    ///
+    /// Reading `t.a` after the discard is what promotes `t`, so the projection
+    /// COPIES (B-2026-09-07-23) exactly as the loop spelling's does — and the
+    /// discarded literal's registrar is not reached through an `if/else`
+    /// construct, so nothing owns the copy.
+    #[test]
+    fn asan_discarded_literal_projected_field_if_else_read_after_declines() {
+        assert_clean_asan_run(
+            "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn main() { println(go()) }\n\
+             fn go() -> i64 { let t = mkp(9);\n\
+             \x20 if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+             \x20 t.a.len() - t.a.len() + 1 }\n",
+            &["1"],
+            "discarded_literal_projected_field_if_else_read_after",
+        );
     }
     /// B-2026-09-01-21 — a DISCARDED struct literal MIXING a live-local source
     /// with a minted sibling now registers an owner on the compiled backends,

@@ -4543,6 +4543,58 @@ impl<'ctx> super::Codegen<'ctx> {
             .is_some_and(|r| self.drop_rc.rc_fallback_heap_types.contains_key(r))
     }
 
+    /// B-2026-09-07-38 — does this struct-literal field initializer MINT an
+    /// independent buffer because its projection root is RC-boxed?
+    ///
+    /// The static twin of [`Self::rc_boxed_projection_field_copy`], which is
+    /// what actually performs the copy in `compile_struct_init`'s field loop.
+    /// It has to be answerable without an LLVM value because the discarded
+    /// literal's registrar decides ownership from the AST alone, so the two
+    /// admissions are kept deliberately in step: an RC-boxed projection whose
+    /// field is laid out `{ptr,len,cap}` — a `String`/`Vec`/`VecDeque` — and
+    /// nothing else. Every other field shape returns the value unchanged
+    /// there, so admitting one here would register an owner for a buffer the
+    /// box still holds.
+    ///
+    /// WHY THE QUESTION EXISTS. B-2026-09-01-5 declined an owner for a
+    /// projected field on a measurement — `let t = mkp(9); P { a: t.a, b: 1
+    /// };` allocates exactly what `let t = mkp(9);` alone does, 16 in both —
+    /// and concluded the field is an ALIAS with nothing to hand over. True as
+    /// measured, and it stopped being true one commit later: B-2026-09-07-23
+    /// (afe5abfbe) made the same projection COPY when its root is
+    /// RC-fallback-promoted, which is exactly what a loop-of-consume does to a
+    /// local declared outside the loop. The count that justified the decline
+    /// is then 5 allocations against 0 frees, one per trip.
+    pub(super) fn rc_boxed_projection_mints_copy(&self, e: &Expr) -> bool {
+        if !self.projection_root_is_rc_boxed(e) {
+            return false;
+        }
+        let ExprKind::FieldAccess { object, field } = &e.kind else {
+            return false;
+        };
+        let ExprKind::Identifier(root) = &object.kind else {
+            return false;
+        };
+        let Some(sname) = self.var_types.var_type_names.get(root.as_str()) else {
+            return false;
+        };
+        let Some(idx) = self
+            .type_decls
+            .struct_field_names
+            .get(sname)
+            .and_then(|ns| ns.iter().position(|n| n == field))
+        else {
+            return false;
+        };
+        self.type_decls
+            .struct_field_type_exprs
+            .get(sname)
+            .and_then(|tes| tes.get(idx))
+            .is_some_and(|te| {
+                self.is_string_type_expr(te) || self.extract_vec_elem_type(te).is_some()
+            })
+    }
+
     /// [`Self::suppress_struct_field_move_into_literal`] addressed by NAME
     /// rather than by a `FieldAccess` expression (B-2026-08-28-10).
     ///
