@@ -2276,17 +2276,31 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(program) = self.program_snapshot.as_deref() else {
             return false;
         };
-        // Resolved HERE, by name, through the same `Item::Function` lookup the
-        // caller-side gate uses — not handed in as a `&Function`. That is what
-        // keeps a METHOD out: `compile_function` compiles an impl method under
-        // its lowered `Type.method` key, which matches no top-level item, so
-        // the callee half cannot register a memory owner for a shape whose
-        // caller half (which only ever resolves free functions) never stood
-        // down. The two sides ask one question of one function or of none.
-        let Some(f) = program.items.iter().find_map(|item| match item {
-            crate::ast::Item::Function(f) if f.name == callee_name => Some(f),
-            _ => None,
-        }) else {
+        // Resolved HERE, by name, through the same lookup the caller-side gate
+        // uses — not handed in as a `&Function` — so the two sides ask one
+        // question of one function or of none. That coupling is the whole
+        // safety argument: the callee registers a memory owner only where the
+        // caller has provably stood down.
+        //
+        // B-2026-09-07-4 — METHODS AND ASSOC FNS INCLUDED. This used to be an
+        // `Item::Function` scan, which matched no impl method, and the doc here
+        // recorded that exclusion as deliberate: the caller half "only ever
+        // resolves free functions", so registering callee-side would have left
+        // a memory owner nobody retracted. Both halves move together now —
+        // `find_function_ast` resolves the lowered `Type.method` key on this
+        // side, and `method_call.rs` / `assoc_call.rs` consult this same
+        // predicate on theirs — which is what makes the extension sound rather
+        // than merely wider. Without it a mixed-path METHOD had no mechanism at
+        // all: `impl Hold { fn pick(ref self, r: R, k: bool) -> R { if k {
+        // return mk(98); } return r; } }` at `k = false` aborted `free():
+        // double free detected in tcache 2`, while the identical FREE function
+        // was clean on every surface.
+        //
+        // The index is the receiver-EXCLUDING one, the convention
+        // `find_function_ast` returns (`self` lives in `self_param`, not in
+        // `params`). `compile_function`'s call site converts, because the
+        // lowered function it holds counts the receiver as param 0.
+        let Some(f) = crate::codegen::declarations::find_function_ast(program, callee_name) else {
             return false;
         };
         if f.generic_params.is_some() || self.is_coroutine_compiled(&f.name) {

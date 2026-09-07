@@ -4251,6 +4251,115 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-4's MIXED-PATH half — the MEMORY question, under ASAN + LSan,
+    /// where the pre-fix build double-freed the object a mixed-path method or
+    /// assoc fn handed back on its escaping leg.
+    ///
+    /// Carries the WHOLE cell set including the DIES-INSIDE legs (`c`/`d`/`j`/
+    /// `l`/`n`), which matter more here than in the output pin: this fix's own
+    /// near-miss retracted their only memory owner and cost `d` 19 bytes in 2
+    /// blocks under valgrind. LSan is what catches that on Linux CI, so the leg
+    /// belongs in this file and not only in the A/B string.
+    ///
+    /// Floored at 60 allocations (76 measured at -O2) because this class hides
+    /// under DCE: an allocation whose only consumer is a callee that hands it
+    /// straight back is exactly what LLVM removes at -O2, and a collapsed
+    /// program reads clean with nothing left to free.
+    #[test]
+    fn asan_method_and_assoc_mixed_path_hand_back_owns_its_argument() {
+        assert_clean_asan_run_min_allocs(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn fwd(r: R) -> R { return r; }\n\
+             \n\
+             struct S { id: i64, name: String }\n\
+             impl Drop for S { fn drop(mut ref self) { println(f\"dS{self.id}\") } }\n\
+             fn mks(i: i64) -> S { return S { id: i, name: f\"s{i}\" }; }\n\
+             \n\
+             struct Hold { n: i64 }\n\
+             impl Hold {\n\
+                 fn pick(ref self, r: R, k: bool) -> R { if k { return mk(98); } return r; }\n\
+                 fn passmv(ref self, r: R) -> R { return fwd(r); }\n\
+                 fn passmb(ref self, r: R) -> R { return r; }\n\
+                 fn picks(ref self, s: S, k: bool) -> S { if k { return mks(96); } return s; }\n\
+             }\n\
+             impl R {\n\
+                 fn passb(r: R) -> R { return fwd(r); }\n\
+                 fn picka(r: R, k: bool) -> R { if k { return mk(92); } return r; }\n\
+             }\n\
+             fn pickf(r: R, k: bool) -> R { if k { return mk(97); } return r; }\n\
+             \n\
+             // method, MIXED-PATH bare, escaping leg, fresh temp\n\
+             fn a1() { let h = Hold { n: 1 }; let z = h.pick(mk(21), false); println(f\"a{z.id}\"); }\n\
+             // method, MIXED-PATH bare, escaping leg, NAMED LOCAL\n\
+             fn a2() { let h = Hold { n: 1 }; let a = mk(37); let z = h.pick(a, false); println(f\"b{z.id}\"); }\n\
+             // method, MIXED-PATH bare, DIES-INSIDE leg -- the leak control, both spellings\n\
+             fn a3() { let h = Hold { n: 1 }; let z = h.pick(mk(22), true); println(f\"c{z.id}\"); }\n\
+             fn a4() { let h = Hold { n: 1 }; let a = mk(38); let z = h.pick(a, true); println(f\"d{z.id}\"); }\n\
+             // method, ALL-PATHS via-call, both spellings\n\
+             fn a5() { let h = Hold { n: 1 }; let z = h.passmv(mk(26)); println(f\"e{z.id}\"); }\n\
+             fn a6() { let h = Hold { n: 1 }; let a = mk(36); let z = h.passmv(a); println(f\"f{z.id}\"); }\n\
+             // method, ALL-PATHS bare -- B-2026-09-06-70's fix, must stay clean\n\
+             fn a7() { let h = Hold { n: 1 }; let z = h.passmb(mk(25)); println(f\"g{z.id}\"); }\n\
+             // assoc, ALL-PATHS via-call\n\
+             fn a8() { let z = R.passb(mk(19)); println(f\"h{z.id}\"); }\n\
+             // assoc, MIXED-PATH bare, both legs\n\
+             fn a9() { let z = R.picka(mk(32), false); println(f\"i{z.id}\"); }\n\
+             fn a10() { let z = R.picka(mk(33), true); println(f\"j{z.id}\"); }\n\
+             // free-fn mixed-path -- B-2026-09-06-69's own shape, must stay clean\n\
+             fn a11() { let z = pickf(mk(23), false); println(f\"k{z.id}\"); }\n\
+             fn a12() { let z = pickf(mk(24), true); println(f\"l{z.id}\"); }\n\
+             // COPY-SUPPORTED class -- the -08-26-9 carve-out, must keep its memory\n\
+             fn a13() { let h = Hold { n: 1 }; let z = h.picks(mks(41), false); println(f\"m{z.id}\"); }\n\
+             fn a14() { let h = Hold { n: 1 }; let z = h.picks(mks(42), true); println(f\"n{z.id}\"); }\n\
+             \n\
+             fn main() {\n\
+                 a1(); a2(); a3(); a4(); a5(); a6(); a7(); a8(); a9(); a10(); a11(); a12(); a13(); a14();\n\
+                 println(\"end\");\n\
+             }\n",
+            &[
+                "a21",
+                "dR21",
+                "b37",
+                "dR37",
+                "dR22",
+                "c98",
+                "dR98",
+                "dR38",
+                "d98",
+                "dR98",
+                "e26",
+                "dR26",
+                "f36",
+                "dR36",
+                "g25",
+                "dR25",
+                "h19",
+                "dR19",
+                "i32",
+                "dR32",
+                "dR33",
+                "j92",
+                "dR92",
+                "k23",
+                "dR23",
+                "dR24",
+                "l97",
+                "dR97",
+                "m41",
+                "dS41",
+                "dS42",
+                "n96",
+                "dS96",
+                "end"
+            ],
+            "method_and_assoc_mixed_path_hand_back",
+            60,
+        );
+    }
+
     /// B-2026-09-07-10 — the MEMORY half: the same program under ASAN + LSan,
     /// where the pre-fix build double-freed the object handed back through the
     /// hop. One owner and one free per object on every spelling, including the

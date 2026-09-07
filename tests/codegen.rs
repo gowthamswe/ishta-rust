@@ -35476,6 +35476,136 @@ end
         );
     }
 
+    #[test]
+    /// B-2026-09-07-4, the MIXED-PATH half — the part `0164085` deliberately left
+    /// open. `impl Hold { fn pick(ref self, r: R, k: bool) -> R { if k { return
+    /// mk(98); } return r; } }` at `k = false` aborted `free(): double free
+    /// detected in tcache 2` under `karac run` and at -O0 (correct at -O2, where
+    /// the abort inlines away), and the assoc twin `R.picka(mk(32), false)` with
+    /// it, while the identical FREE FUNCTION was clean on every surface.
+    ///
+    /// The asymmetry was B-2026-09-06-69's conditional hand-back flip — a
+    /// mixed-path callee owning the MEMORY of a declined-copy param under the
+    /// per-path flag that already guards the body — being free-function-only BY
+    /// CONSTRUCTION: `conditional_handback_memory_moves_to_callee` resolved
+    /// through an `Item::Function` scan, and its whole-program gate
+    /// `compute_handback_safe_params` seeded `live` from `Item::Function` and
+    /// collected only `ExprKind::Call`. A mixed-path method had no mechanism at
+    /// all. Both halves move together, which is the safety argument and not an
+    /// implementation detail: the callee registers a memory owner only where the
+    /// caller provably stood down, and that coupling is what the predicate's own
+    /// doc said kept methods out.
+    ///
+    /// Cells `a`/`b`/`i` are that route (fresh-temp, named-local, assoc).
+    /// `e`/`h` are the via-call route `0164085` closed, carried as controls.
+    ///
+    /// `c`/`d`/`j`/`l`/`n` are the DIES-INSIDE controls and they are
+    /// load-bearing. Conditioning the memory retraction on
+    /// `callee_takes_over_arg_drop_body` — whose union includes the mixed-path
+    /// predicate — takes away the only memory owner those legs have and cost
+    /// `d` 19 bytes definitely lost in 2 blocks, B-2026-09-07-3's signature
+    /// reproduced on this leg. `m`/`n` are the copy-supported class, whose
+    /// caller slot keeps its own entry copy (B-2026-08-26-9's carve-out), and
+    /// `k`/`l` are the free-fn shape that was already correct.
+    ///
+    /// NOT covered and filed as B-2026-09-07-16: the mixed-path VIA-CALL
+    /// spelling (`if k { return mk(95); } return fwd(r);`), which needs the
+    /// per-path flag clearers to see a via-call tail before its callee may own
+    /// the memory — the same missing piece B-2026-09-07-3 needs on the free leg.
+    fn test_e2e_method_and_assoc_mixed_path_hand_back_owns_its_argument() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn fwd(r: R) -> R { return r; }
+
+struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"s{i}" }; }
+
+struct Hold { n: i64 }
+impl Hold {
+    fn pick(ref self, r: R, k: bool) -> R { if k { return mk(98); } return r; }
+    fn passmv(ref self, r: R) -> R { return fwd(r); }
+    fn passmb(ref self, r: R) -> R { return r; }
+    fn picks(ref self, s: S, k: bool) -> S { if k { return mks(96); } return s; }
+}
+impl R {
+    fn passb(r: R) -> R { return fwd(r); }
+    fn picka(r: R, k: bool) -> R { if k { return mk(92); } return r; }
+}
+fn pickf(r: R, k: bool) -> R { if k { return mk(97); } return r; }
+
+// method, MIXED-PATH bare, escaping leg, fresh temp
+fn a1() { let h = Hold { n: 1 }; let z = h.pick(mk(21), false); println(f"a{z.id}"); }
+// method, MIXED-PATH bare, escaping leg, NAMED LOCAL
+fn a2() { let h = Hold { n: 1 }; let a = mk(37); let z = h.pick(a, false); println(f"b{z.id}"); }
+// method, MIXED-PATH bare, DIES-INSIDE leg -- the leak control, both spellings
+fn a3() { let h = Hold { n: 1 }; let z = h.pick(mk(22), true); println(f"c{z.id}"); }
+fn a4() { let h = Hold { n: 1 }; let a = mk(38); let z = h.pick(a, true); println(f"d{z.id}"); }
+// method, ALL-PATHS via-call, both spellings
+fn a5() { let h = Hold { n: 1 }; let z = h.passmv(mk(26)); println(f"e{z.id}"); }
+// method, ALL-PATHS bare -- B-2026-09-06-70's fix, must stay clean
+fn a7() { let h = Hold { n: 1 }; let z = h.passmb(mk(25)); println(f"g{z.id}"); }
+// assoc, ALL-PATHS via-call
+fn a8() { let z = R.passb(mk(19)); println(f"h{z.id}"); }
+// assoc, MIXED-PATH bare, both legs
+fn a9() { let z = R.picka(mk(32), false); println(f"i{z.id}"); }
+fn a10() { let z = R.picka(mk(33), true); println(f"j{z.id}"); }
+// free-fn mixed-path -- B-2026-09-06-69's own shape, must stay clean
+fn a11() { let z = pickf(mk(23), false); println(f"k{z.id}"); }
+fn a12() { let z = pickf(mk(24), true); println(f"l{z.id}"); }
+// COPY-SUPPORTED class -- the -08-26-9 carve-out, must keep its memory
+fn a13() { let h = Hold { n: 1 }; let z = h.picks(mks(41), false); println(f"m{z.id}"); }
+fn a14() { let h = Hold { n: 1 }; let z = h.picks(mks(42), true); println(f"n{z.id}"); }
+
+fn main() {
+    a1(); a2(); a3(); a4(); a5(); a7(); a8(); a9(); a10(); a11(); a12(); a13(); a14();
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"a21
+dR21
+b37
+dR37
+dR22
+c98
+dR98
+dR38
+d98
+dR98
+e26
+dR26
+g25
+dR25
+h19
+dR19
+i32
+dR32
+dR33
+j92
+dR92
+k23
+dR23
+dR24
+l97
+dR97
+m41
+dS41
+dS42
+n96
+dS96
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-10 — `let a = mk(1); let z = via(a);` over
     /// `fn via(r: R) -> R { return f(r); }` and `fn f(r: R) -> R { return r; }`
     /// aborted `free(): double free detected in tcache 2` on every compiled backend

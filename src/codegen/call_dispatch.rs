@@ -2505,17 +2505,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         // here, so the copy-supported case still keeps its
                         // memory and the 3-byte leak the paragraph above records
                         // stays fixed.
-                        let forwarded_not_copied = self
-                            .var_types
-                            .var_type_names
-                            .get(var_name.as_str())
-                            .is_some_and(|tn| {
-                                self.type_decls.struct_types.contains_key(tn.as_str())
-                                    && !self.type_decls.shared_types.contains_key(tn.as_str())
-                                    && !self
-                                        .aggregate_param_copy_supported_struct(tn, &mut Vec::new())
-                            });
-                        if forwarded_not_copied {
+                        if self.arg_var_is_forwarded_not_copied(&var_name) {
                             self.suppress_user_drop_for_var(&var_name);
                         } else {
                             self.suppress_user_drop_body_keeping_memory(&var_name);
@@ -3893,6 +3883,33 @@ impl<'ctx> super::Codegen<'ctx> {
         };
         super::declarations::find_function_ast(program, callee_name)
             .is_some_and(|f| crate::ast::fn_always_returns_param_via_call(program, f, arg_index))
+    }
+
+    /// B-2026-09-06-71 — is `var_name` a struct the callee's prologue FORWARDS
+    /// rather than entry-copies, so that the object handed back IS this
+    /// binding's and a memory action left here would be a second owner?
+    ///
+    /// The split the three argument registrars share. A COPY-SUPPORTED param is
+    /// deep-copied at entry, so the caller's slot holds a distinct buffer and
+    /// only the BODY moves — retracting its memory is the 3-byte leak
+    /// B-2026-08-29-15/-50 records. A struct carrying a `shared` field declines
+    /// copy support, is forwarded, and needs the memory to move with the body.
+    ///
+    /// Factored out rather than repeated per leg because the free, method and
+    /// assoc registrars must answer it identically: the retraction here and the
+    /// callee's prologue are two halves of one ownership handover, and the
+    /// hazard `struct_param_transfer_eligible` names — "a condition that
+    /// drifted between the two sites would leave one frame freeing a buffer the
+    /// other had taken" — is the same hazard across the three legs.
+    pub(super) fn arg_var_is_forwarded_not_copied(&self, var_name: &str) -> bool {
+        self.var_types
+            .var_type_names
+            .get(var_name)
+            .is_some_and(|tn| {
+                self.type_decls.struct_types.contains_key(tn.as_str())
+                    && !self.type_decls.shared_types.contains_key(tn.as_str())
+                    && !self.aggregate_param_copy_supported_struct(tn, &mut Vec::new())
+            })
     }
 
     pub(super) fn callee_takes_over_arg_drop_body(

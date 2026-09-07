@@ -7789,7 +7789,24 @@ impl<'ctx> super::Codegen<'ctx> {
                         // `find_function_ast` hands back the raw AST method
                         // whose `params` exclude the receiver, the same key the
                         // `fn_always_returns_param` call below uses.
-                        if self.callee_takes_over_arg_drop_body(&qualified, i) {
+                        // B-2026-09-07-4 — the CONDITIONAL branch first, as on
+                        // the free leg: where the callee-side flip has taken the
+                        // memory PER PATH, body and memory stand down together.
+                        // This is the mixed-path shape, which the split below
+                        // must not try to serve — `callee_takes_over_arg_drop_-
+                        // body` is a union that includes
+                        // `fn_conditionally_returns_param_bare`, and retracting
+                        // the memory on that takes away the only owner the
+                        // dies-inside leg has: measured, `let a = mk(38); let z
+                        // = h.pick(a, true);` went from clean to 19 bytes
+                        // definitely lost in 2 blocks, B-2026-09-07-3's
+                        // signature reproduced on this leg.
+                        if self.conditional_handback_memory_moves_to_callee(&qualified, i) {
+                            if let ExprKind::Identifier(var_name) = &a.value.kind {
+                                let var_name = var_name.clone();
+                                self.suppress_user_drop_for_var(&var_name);
+                            }
+                        } else if self.callee_takes_over_arg_drop_body(&qualified, i) {
                             if let ExprKind::Identifier(var_name) = &a.value.kind {
                                 let var_name = var_name.clone();
                                 // B-2026-09-07-11 — the METHOD leg of
@@ -7815,22 +7832,16 @@ impl<'ctx> super::Codegen<'ctx> {
                                 // same split the free-fn arm uses, so the two
                                 // legs cannot drift on which params are
                                 // forwarded rather than copied.
-                                let forwarded_not_copied = self
-                                    .var_types
-                                    .var_type_names
-                                    .get(var_name.as_str())
-                                    .is_some_and(|tn| {
-                                        self.type_decls.struct_types.contains_key(tn.as_str())
-                                            && !self
-                                                .type_decls
-                                                .shared_types
-                                                .contains_key(tn.as_str())
-                                            && !self.aggregate_param_copy_supported_struct(
-                                                tn,
-                                                &mut Vec::new(),
-                                            )
-                                    });
-                                if forwarded_not_copied {
+                                // B-2026-09-07-4 — the same test the free and
+                                // assoc legs ask, factored into one helper
+                                // (`arg_var_is_forwarded_not_copied`) rather
+                                // than inlined a third time. The hazard
+                                // `struct_param_transfer_eligible` names — "a
+                                // condition that drifted between the two sites
+                                // would leave one frame freeing a buffer the
+                                // other had taken" — is the same hazard across
+                                // three registrars as across two sites.
+                                if self.arg_var_is_forwarded_not_copied(&var_name) {
                                     self.suppress_user_drop_for_var(&var_name);
                                 } else {
                                     self.suppress_user_drop_body_keeping_memory(&var_name);
@@ -8264,7 +8275,16 @@ impl<'ctx> super::Codegen<'ctx> {
                     // helper's doc says why the two are not merged.
                     let store_entry_copied =
                         arg_entry_copied || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
-                    if (!always_handed_back || arg_entry_copied)
+                    // B-2026-09-07-4 — the FRESH-TEMP half of the mixed-path
+                    // extension. A temp has no binding to retract, so it stands
+                    // down by having its registration DECLINED here, exactly as
+                    // the free leg's `call_arg_flows_into_return` declines it.
+                    // Admitted only where the callee-side flip provably owns the
+                    // memory on every path, which keeps this narrower than the
+                    // union the gate's note above warns against.
+                    let callee_owns_handback_memory =
+                        self.conditional_handback_memory_moves_to_callee(&qualified, i);
+                    if (!(always_handed_back || callee_owns_handback_memory) || arg_entry_copied)
                         && (!stored_in_outliving_place || store_entry_copied)
                     {
                         self.track_inline_owned_aggregate_arg_parts(

@@ -3224,7 +3224,15 @@ impl<'ctx> super::Codegen<'ctx> {
                     // free-function cell lost its body in the first place.
                     if let ExprKind::Identifier(var_name) = &a.value.kind {
                         let var_name = var_name.clone();
-                        if self.callee_takes_over_arg_drop_body(&qualified, i) {
+                        // B-2026-09-07-4 — the flip branch first, as on the
+                        // free and method legs: where the callee-side flip took
+                        // the memory PER PATH, body and memory stand down
+                        // together. See the method leg's note for why the split
+                        // below must not serve the mixed-path shape.
+                        if self.conditional_handback_memory_moves_to_callee(&qualified, i) {
+                            self.suppress_container_elem_bodies_for_var(&var_name);
+                            self.suppress_user_drop_for_var(&var_name);
+                        } else if self.callee_takes_over_arg_drop_body(&qualified, i) {
                             self.suppress_container_elem_bodies_for_var(&var_name);
                             // B-2026-09-07-4 — the ASSOC leg of
                             // B-2026-09-06-71's split, which the free arm got
@@ -3240,19 +3248,9 @@ impl<'ctx> super::Codegen<'ctx> {
                             // printed the right answer and left 2 valgrind
                             // errors (an invalid free and a read of the freed
                             // refcount block).
-                            let forwarded_not_copied = self
-                                .var_types
-                                .var_type_names
-                                .get(var_name.as_str())
-                                .is_some_and(|tn| {
-                                    self.type_decls.struct_types.contains_key(tn.as_str())
-                                        && !self.type_decls.shared_types.contains_key(tn.as_str())
-                                        && !self.aggregate_param_copy_supported_struct(
-                                            tn,
-                                            &mut Vec::new(),
-                                        )
-                                });
-                            if forwarded_not_copied {
+                            // B-2026-09-07-4 — the shared helper rather than a
+                            // fourth inline copy; see the method leg's note.
+                            if self.arg_var_is_forwarded_not_copied(&var_name) {
                                 self.suppress_user_drop_for_var(&var_name);
                             } else {
                                 self.suppress_user_drop_body_keeping_memory(&var_name);
@@ -3390,7 +3388,10 @@ impl<'ctx> super::Codegen<'ctx> {
                     // helper's doc says why the two are not merged.
                     let store_entry_copied =
                         arg_entry_copied || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
-                    if (!always_handed_back || arg_entry_copied)
+                    // B-2026-09-07-4 — the fresh-temp half; see the method leg.
+                    let callee_owns_handback_memory =
+                        self.conditional_handback_memory_moves_to_callee(&qualified, i);
+                    if (!(always_handed_back || callee_owns_handback_memory) || arg_entry_copied)
                         && (!stored_in_outliving_place || store_entry_copied)
                     {
                         self.track_inline_owned_aggregate_arg(val, &a.value, escapes_frame);

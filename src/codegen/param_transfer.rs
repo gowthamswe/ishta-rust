@@ -775,19 +775,71 @@ fn classify_call(f: &str, args: &[crate::ast::CallArg], fr: &FrameOwned, cx: &mu
 pub(crate) fn compute_handback_safe_params(program: &Program) -> FxHashSet<ParamKey> {
     let mut live: FxHashSet<ParamKey> = FxHashSet::default();
     let mut fns: FxHashMap<String, (usize, bool)> = FxHashMap::default();
-    for item in &program.items {
-        let Item::Function(f) = item else { continue };
-        // `pub` and `main`: same reason as the transfer gate — their call sites
-        // need not be in this program, so "every call site" is unanswerable.
-        if f.is_pub || f.name == "main" {
-            continue;
-        }
+    // B-2026-09-07-4 — impl-block methods and assoc fns are candidates too, and
+    // this map is what lets a `recv.m(..)` call site disqualify them: the AST
+    // walk below has no type information, so a METHOD call names only `m`. Every
+    // `Type.m` in the program is disqualified by any call site spelling `.m(`
+    // whose argument shape this fix cannot retract — over-broad across
+    // same-named methods of unrelated types, which costs the flip and never
+    // grants it. Assoc calls are spelled `Type.f(..)` and resolve exactly.
+    let mut by_method: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    // Methods reachable as `Type.m(recv, ..)`, where the receiver occupies an
+    // argument slot and this gate's indices would be off by one. Disqualified
+    // outright rather than shifted.
+    let mut has_receiver: FxHashSet<String> = FxHashSet::default();
+    let consider = |key: String,
+                    f: &crate::ast::Function,
+                    live: &mut FxHashSet<ParamKey>,
+                    fns: &mut FxHashMap<String, (usize, bool)>| {
         let has_default = f.params.iter().any(|p| p.default_value.is_some());
-        fns.insert(f.name.clone(), (f.params.len(), has_default));
+        fns.insert(key.clone(), (f.params.len(), has_default));
         for (i, p) in f.params.iter().enumerate() {
             if matches!(p.ty.kind, TypeKind::Path(_)) && p.name().is_some() {
-                live.insert((f.name.clone(), i));
+                live.insert((key.clone(), i));
             }
+        }
+    };
+    for item in &program.items {
+        match item {
+            Item::Function(f) => {
+                // `pub` and `main`: same reason as the transfer gate — their call
+                // sites need not be in this program, so "every call site" is
+                // unanswerable.
+                if f.is_pub || f.name == "main" {
+                    continue;
+                }
+                consider(f.name.clone(), f, &mut live, &mut fns);
+            }
+            Item::ImplBlock(b) => {
+                // A TRAIT impl is reachable through dispatch this walk cannot
+                // enumerate, and a GENERIC impl is compiled per monomorph, whose
+                // param loop is a different registrar. Both decline outright.
+                if b.trait_name.is_some() || b.generic_params.is_some() {
+                    continue;
+                }
+                let TypeKind::Path(tp) = &b.target_type.kind else {
+                    continue;
+                };
+                let Some(type_name) = tp.segments.last() else {
+                    continue;
+                };
+                for ii in &b.items {
+                    let ImplItem::Method(m) = ii else { continue };
+                    if m.is_pub || m.generic_params.is_some() {
+                        continue;
+                    }
+                    let key = format!("{type_name}.{}", m.name);
+                    if m.self_param.is_some() {
+                        has_receiver.insert(key.clone());
+                    }
+                    by_method
+                        .entry(m.name.clone())
+                        .or_default()
+                        .push(key.clone());
+                    consider(key, m, &mut live, &mut fns);
+                }
+            }
+            _ => {}
         }
     }
     if live.is_empty() {
@@ -816,6 +868,7 @@ pub(crate) fn compute_handback_safe_params(program: &Program) -> FxHashSet<Param
         let mut fresh: FxHashSet<String> = FxHashSet::default();
         let mut aliased: Vec<(String, String)> = Vec::new();
         let mut calls: Vec<(String, &[crate::ast::CallArg])> = Vec::new();
+        let mut mcalls: Vec<(String, &[crate::ast::CallArg])> = Vec::new();
         let mut callees: FxHashSet<*const Expr> = FxHashSet::default();
         let mut mentions: Vec<(String, *const Expr)> = Vec::new();
         let mut collect = |n| match n {
@@ -872,10 +925,33 @@ pub(crate) fn compute_handback_safe_params(program: &Program) -> FxHashSet<Param
                     }
                 }
                 ExprKind::Call { callee, args } => {
-                    if let ExprKind::Identifier(f) = &callee.kind {
-                        callees.insert(&**callee as *const Expr);
-                        calls.push((f.clone(), args.as_slice()));
+                    match &callee.kind {
+                        ExprKind::Identifier(f) => {
+                            callees.insert(&**callee as *const Expr);
+                            calls.push((f.clone(), args.as_slice()));
+                        }
+                        // B-2026-09-07-4 — `Type.f(..)`, the assoc-fn spelling.
+                        // Two segments resolve to exactly one candidate, so this
+                        // joins the precise list rather than the by-name one.
+                        //
+                        // Deliberately NOT added to `callees`. Doing so would
+                        // stop the `mentions` walk below poisoning the path's
+                        // LAST SEGMENT, which today disqualifies a same-named
+                        // FREE function — over-conservative, but pre-existing,
+                        // and widening the free-fn flip is not this row's
+                        // business. The method key is `Type.f`, so the bare-name
+                        // poisoning never reaches it.
+                        ExprKind::Path { segments, .. } if segments.len() == 2 => {
+                            calls.push((segments.join("."), args.as_slice()));
+                        }
+                        _ => {}
                     }
+                }
+                // B-2026-09-07-4 — a method call names no TYPE (this walk has no
+                // type information), so it is matched by method name against
+                // every `Type.m` candidate below.
+                ExprKind::MethodCall { method, args, .. } => {
+                    mcalls.push((method.clone(), args.as_slice()));
                 }
                 ExprKind::Identifier(n) => mentions.push((n.clone(), e as *const Expr)),
                 ExprKind::Path { segments, .. } => {
@@ -909,17 +985,17 @@ pub(crate) fn compute_handback_safe_params(program: &Program) -> FxHashSet<Param
                 break;
             }
         }
-        for (f, args) in calls {
-            let (nparams, has_default) = fns.get(&f).copied().unwrap_or((0, false));
+        let judge = |f: &str, args: &[crate::ast::CallArg], live: &mut FxHashSet<ParamKey>| {
+            let (nparams, has_default) = fns.get(f).copied().unwrap_or((0, false));
             if args.iter().any(|a| a.label.is_some()) {
                 for i in 0..nparams {
-                    live.remove(&(f.clone(), i));
+                    live.remove(&(f.to_string(), i));
                 }
-                continue;
+                return;
             }
             if has_default && args.len() < nparams {
                 for i in args.len()..nparams {
-                    live.remove(&(f.clone(), i));
+                    live.remove(&(f.to_string(), i));
                 }
             }
             for (i, a) in args.iter().enumerate() {
@@ -933,8 +1009,36 @@ pub(crate) fn compute_handback_safe_params(program: &Program) -> FxHashSet<Param
                     _ => false,
                 };
                 if !admit {
+                    live.remove(&(f.to_string(), i));
+                }
+            }
+        };
+        for (f, args) in calls {
+            // A method with a receiver, reached through the `Type.m(recv, ..)`
+            // spelling, puts the receiver in an ARGUMENT slot and shifts every
+            // index this gate computes. The caller-side registrars key on the
+            // receiver-EXCLUDING index, so decline the whole callee rather than
+            // reconcile two conventions here.
+            if has_receiver.contains(&f) {
+                let n = fns.get(&f).map(|(n, _)| *n).unwrap_or(0);
+                for i in 0..n {
                     live.remove(&(f.clone(), i));
                 }
+                continue;
+            }
+            judge(&f, args, &mut live);
+        }
+        // B-2026-09-07-4 — a method call site judges EVERY `Type.m` sharing the
+        // name, because this walk cannot resolve the receiver's type. The effect
+        // is one-directional: a call site can only take a candidate out of
+        // `live`, never put one in, so matching too many types costs the flip on
+        // an unrelated method and can never grant it on an unproven one.
+        for (m, args) in mcalls {
+            let Some(keys) = by_method.get(&m) else {
+                continue;
+            };
+            for key in keys.clone() {
+                judge(&key, args, &mut live);
             }
         }
     }

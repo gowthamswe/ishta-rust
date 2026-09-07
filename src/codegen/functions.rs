@@ -3088,8 +3088,31 @@ impl<'ctx> super::Codegen<'ctx> {
                                 // exit that handed the value back exactly as it
                                 // disarms the body today (`cmdrop.armed` gates
                                 // whatever function the action names).
-                                let owns_memory =
-                                    self.conditional_handback_memory_moves_to_callee(&func.name, i);
+                                // B-2026-09-07-4 — `i` counts from the
+                                // RECEIVER here (`func` is codegen's lowered
+                                // `Type.method`, `self` at param 0), while the
+                                // predicate keys on the receiver-EXCLUDING index
+                                // its `find_function_ast` lookup returns, which
+                                // is also the one both caller-side registrars
+                                // pass. Convert rather than teach the predicate
+                                // two conventions: the note ~90 lines up records
+                                // that two comments in `method_call.rs` once
+                                // disagreed about exactly this.
+                                let recv_offset = self
+                                    .program_snapshot
+                                    .as_deref()
+                                    .and_then(|p| {
+                                        crate::codegen::declarations::find_function_ast(
+                                            p, &func.name,
+                                        )
+                                    })
+                                    .is_some_and(|ast| ast.self_param.is_some())
+                                    as usize;
+                                let owns_memory = i >= recv_offset
+                                    && self.conditional_handback_memory_moves_to_callee(
+                                        &func.name,
+                                        i - recv_offset,
+                                    );
                                 if owns_memory {
                                     self.track_user_drop_var(struct_name, &param_name, alloca);
                                     self.drop_rc
