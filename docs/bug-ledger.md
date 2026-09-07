@@ -97,7 +97,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | leak | 296 |
 | double-free | 212 |
 | missing-feature | 194 |
-| codegen-gap | 166 |
+| codegen-gap | 167 |
 | diagnostics | 125 |
 | false-positive | 106 |
 | perf | 100 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1585 |
+| codegen | 1586 |
 | interp | 403 |
 | typecheck | 295 |
 | other | 75 |
@@ -165,12 +165,11 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
 | B-2026-09-07-30 | 2026-09-07 | codegen | medium | A PROJECTION OFF AN RC-PROMOTED LOCAL STRANDS 40 B WHEN ITS DESTINATION IS A `Vec.push` OR AN EXISTING BINDING -- `v.push(t.a)` also invalid-frees once, `s = t.a` leaks silently, and both survive B-2026-09-07-19's copy because neither destination routes through the let-binding or struct-literal registrars | — |
-| B-2026-09-07-35 | 2026-09-07 | interp | medium | A SPEC'D 128-BIT f-STRING HOLE PANICS THE INTERPRETER -- `f"{big:44}"` on a `u128` aborts with "128-bit value reached an i64-only consumer" while both compiled backends now render it correctly; the UNSPEC'D `f"{big}"` is fine on all three | none |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
 | B-2026-09-07-39 | 2026-09-07 | codegen | medium | FLOAT f-STRING INTERPOLATION IS STILL ON libc `snprintf` (spec'd holes) AND STILL ALLOCATES A `String` PER CALL (`karac_runtime_f64_to_str` / `_i128_to_str` build via `format!`) -- the two halves of the integer work that were never done | docs/investigations/autopar-alloc-scaling.md |
 | B-2026-09-07-40 | 2026-09-07 | other | medium | NOTHING IN THIS REPO CAN CATCH A USE-AFTER-FREE WRITE -- `tests/memory_sanitizer.rs` links `-fsanitize=address` but never INSTRUMENTS the karac-emitted object, so ASAN there is an allocator-interception gate (leaks, double/invalid free) and is blind to an invalid read or write; valgrind sees them and no harness or CI job runs valgrind | — |
 | B-2026-09-07-41 | 2026-09-07 | codegen | low | A WHOLE-VALUE REBIND OF A BY-VALUE ENUM PARAM STRANDS ITS PAYLOAD AT -O0 -- `fn rebind(w: W) -> i64 { let v = w; return match v { W.T(x) => x.a.unwrap_or(0), .. } }` loses the payload `String`, correcting B-2026-09-07-33's claim that this neighbour measures 0 errors | — |
-| B-2026-09-07-42 | 2026-09-07 | codegen | high | PERF-REGRESSION, UNNOTICED SINCE ~2026-08: kata:170 executes 3.71x MORE INSTRUCTIONS (10.46 G -> 38.84 G) and runs 3.05x slower (1068 -> 3255 ms) built by today's karac than by the 2026-08-04 karac, on identical source with an identical sink -- a per-probe cost on the map GET path (51 -> 190 instructions per key visit), with IPC UP, so it is emitted work and not stalling; source change, lane, placement, iterator-fallback and map-capacity all ruled out by measurement | kata:170 results.json still publishes the pre-regression 997.08 ms | found while running B-2026-08-28-77's placement sweep, where kata:170 was the positive control and failed to fire |
+| B-2026-09-07-42 | 2026-09-07 | codegen | high | PERF-REGRESSION, CORPUS-WIDE AND UNNOTICED SINCE ~2026-08: 12 of the 23 map-bearing benched katas whose recorded-run binary survives execute 1.30x-4.17x MORE INSTRUCTIONS built by today's karac than by the karac that produced their published figure -- up to 7.46x on WALL CLOCK (kata:146 236 -> 1683 ms), with IPC falling too, every sink identical, and the old binaries still reproducing their recorded numbers to 2-5%; source change, lane, placement, iterator-fallback and map-capacity all ruled out, and neither key/value type nor recorded date separates the regressed half from the flat half | kata:170 results.json still publishes the pre-regression 997.08 ms | found while running B-2026-08-28-77's placement sweep, where kata:170 was the positive control and failed to fire |
 | B-2026-09-07-43 | 2026-09-07 | codegen | medium | THE IF/ELSE SPELLING OF A DISCARDED AGGREGATE LITERAL NEVER REACHES THE OWNER REGISTRAR, so an RC-boxed projection's COPY is stranded -- 190 B in 5 blocks over a five-trip loop and 38 B in 1 with the source merely read afterwards, while the same construct with no `else`, the bare-statement spelling and the read-after-loop spelling are all clean since 8f3751b15 | tests/asan-o0-known-failures.txt |
 | B-2026-09-07-44 | 2026-09-07 | codegen | low | A FRESH-TEMP ENUM SCRUTINEE WHOSE CONSUMING ARM BINDS A COPY-DECLINED STRUCT PAYLOAD LEAKS THE PAYLOAD'S INTERIOR -- `match W.T(mkx(1)) { W.T(x) => .. }` loses 2 B while the `let`-bound scrutinee and the `W.T(_)` arm of the same program are clean | none |
 
@@ -2381,8 +2380,10 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-32 | codegen | high | AN ASSOC CALL NEVER RETRACTS A NAMED LOCAL'S CLEANUP FOR A DECLINED-COPY BY-VALUE ARGUMENT -- `Type.f(a)` was the third dispatch leg with no `move_de… | FIXED by hooking `move_declined_copy_struct_arg` into the a… |
 | B-2026-09-07-33 | codegen | high | A CALLEE HANDING A BOXED PAYLOAD OUT OF A `match` ARM WRITES INTO THE ENVELOPE IT JUST FREED -- `fn payout(w: W) -> X1 { return match w { W.T(x) => x… | 63b0628 |
 | B-2026-09-07-34 | codegen | high | A SPEC'D 128-BIT f-STRING HOLE FAILED LLVM MODULE VERIFICATION -- `f"{x:44}"` on an `i128` did not compile at all after B-2026-09-07-25 routed spec'd… | f5f86c16e |
+| B-2026-09-07-35 | interp | medium | A SPEC'D 128-BIT f-STRING HOLE PANICS THE INTERPRETER -- `f"{big:44}"` on a `u128` aborts with "128-bit value reached an i64-only consumer" while bot… | 328908980 |
 | B-2026-09-07-37 | other | medium | RUNNING THE GATE SUITE REPLACES THE CANONICAL RUNTIME ARCHIVE WITH A NON-DCE'D ONE -- `tests/par_codegen.rs` built it with the forbidden `cargo build… | 4bd617d8e |
 | B-2026-09-07-38 | codegen | medium | THE -O0 ASAN RATCHET IS RED ON `main`, WITH THREE UNLISTED LEAK FAILURES THAT ARRIVED WITH 6a4a86c78 -- one is that commit's OWN new fixture (`asan_b… | 8f3751b15 |
+| B-2026-09-07-45 | codegen | medium | THE SPEC-RE-PARSING FORMATTER WAS LEFT AT 64 BITS WHEN ITS FAST-PATH SIBLING WAS WIDENED -- `f"{big:^44}"`, `f"{big:b}"` and `f"{big:*>44}"` on a `u1… | 4b03864d1 |
 
 </details>
 
