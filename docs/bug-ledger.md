@@ -100,7 +100,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen-gap | 166 |
 | diagnostics | 125 |
 | false-positive | 106 |
-| perf | 98 |
+| perf | 99 |
 | soundness | 95 |
 | other | 80 |
 | crash | 77 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1580 |
+| codegen | 1581 |
 | interp | 403 |
 | typecheck | 295 |
 | other | 74 |
@@ -130,7 +130,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 
 | id | date | surface | sev | title | tracker |
 |---|---|---|---|---|---|
-| B-2026-08-28-76 | 2026-08-28 | autopar | high | AUTO-PAR RETURNS 1.08x FOR 15.7 CORES on the M5 (kata:288) and 3.09x (kata:282), against 3.06x/3.87x on 4 HOMOGENEOUS container cores -- the parallel lane burns 3.1-5.1x the sequential lane's USER CPU where the container burned 1.00x, and NO KARAC_PAR_WORKERS setting recovers it | kata:288-README |
+| B-2026-08-28-76 | 2026-08-28 | autopar | high | AUTO-PAR UNDER-RETURNS ON THE M5: kata:288 now 3.45x and kata:282 3.09x for ~15.7 cores, against 3.06x/3.87x on 4 HOMOGENEOUS container cores. FILED AT 1.08x ON kata:288 -- most of that gap was f-string `snprintf` serialization (B-2026-09-05-23, fixed), NOT the static partition this row originally blamed; kata:282 does not format and is unchanged | kata:288-README |
 | B-2026-08-28-77 | 2026-08-28 | codegen | medium | kata:895 IS THE ONLY CORPUS ROW THAT GOT SLOWER ON THE FASTER HOST -- 26.50ms on 4 x86 container cores -> 29.63ms on the M5, while rust_ovf went 34.71 -> 16.49 (2.10x faster), go 1.68x and c 1.75x; kara falls from 1.31x AHEAD of checked Rust to 1.80x behind. Prime suspect: the map hash-tag probe is DISABLED on aarch64 for primitive keys | kata:895-README |
 | B-2026-09-01-17 | 2026-09-01 | interp+codegen | low | THE PROJECTED SPELLING OF B-2026-08-31-35 STILL RUNS THE LOCAL'S `Drop` BODY TWICE -- `let _ = if c { W { r: t.r, b: 1 } } else { .. };` over a local `W` doubles on all three backends because the aggregate-literal source walker resolves a bare NAME and not a field projection, so the disarm e49a85f wired up never names `t` | — |
 | B-2026-09-01-23 | 2026-09-01 | codegen | low | THE BRANCH ARM-OWNER SLOT IS ONE PER CONSTRUCT AND RESET EACH PASS, so a branch inside a loop whose owner frame lives OUTSIDE the loop frees only the LAST pass's escaping value -- `while i < 3 { let k = if i > 0 { mkA(n) } else { t }.contains("aaa"); }` strands `iterations - 1` of them (42 B in 2 blocks at 3 iterations, 72 B in 4 at 5); the same branch with the sibling binding declared INSIDE the loop body is clean, which isolates the frame CHOICE rather than the slot as the cause | — |
@@ -170,6 +170,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-35 | 2026-09-07 | interp | medium | A SPEC'D 128-BIT f-STRING HOLE PANICS THE INTERPRETER -- `f"{big:44}"` on a `u128` aborts with "128-bit value reached an i64-only consumer" while both compiled backends now render it correctly; the UNSPEC'D `f"{big}"` is fine on all three | none |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
 | B-2026-09-07-38 | 2026-09-07 | codegen | medium | THE -O0 ASAN RATCHET IS RED ON `main`, WITH THREE UNLISTED LEAK FAILURES THAT ARRIVED WITH 6a4a86c78 -- one is that commit's OWN new fixture (`asan_by_value_enum_param_with_owning_struct_payload_transfers`, 6 B in 3 allocs) and the other two are 190 B in 5 allocs each; all three pass at the default -O2, 6a4a86c78 is the ONLY `src/` commit between the last clean measurement and its arrival, and the leg is still red two drop fixes later | none |
+| B-2026-09-07-39 | 2026-09-07 | codegen | medium | FLOAT f-STRING INTERPOLATION IS STILL ON libc `snprintf` (spec'd holes) AND STILL ALLOCATES A `String` PER CALL (`karac_runtime_f64_to_str` / `_i128_to_str` build via `format!`) -- the two halves of the integer work that were never done | docs/investigations/autopar-alloc-scaling.md |
 
 ### Relocated
 
