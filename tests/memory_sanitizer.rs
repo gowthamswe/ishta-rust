@@ -4134,6 +4134,61 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-6 — the memory side of the same program: the body was
+    /// lost with the buffers balanced, so this pins that RESTORING it did not
+    /// cost a second free anywhere — one owner per element on every spelling,
+    /// named-tuple sources included.
+    #[test]
+    fn asan_whole_tuple_argument_to_a_method() {
+        assert_clean_asan_run(
+            "struct Q { id: i64, name: String }\n\
+             impl Drop for Q { fn drop(mut ref self) { println(f\"  dQ{self.id}\") } }\n\
+             fn mkq(i: i64) -> Q { return Q { id: i, name: f\"q{i}\" }; }\n\
+             struct Hold { n: i64 }\n\
+             impl Hold { fn thrut(ref self, t: (Q, i64)) -> (Q, i64) { return t; } }\n\
+             impl Hold { fn mkt(ref self) -> (Q, i64) { return (mkq(4), 1); } }\n\
+             impl Hold { fn eatt(ref self, t: (Q, i64)) -> i64 { return t.1; } }\n\
+             impl Q { fn passt(t: (Q, i64)) -> (Q, i64) { return t; } }\n\
+             fn passt(t: (Q, i64)) -> (Q, i64) { return t; }\n\
+             fn main() {\n\
+               let h = Hold { n: 0 };\n\
+               println(\"method_tuple\"); let a = h.thrut((mkq(1), 7)); println(f\"  v={a.1}\");\n\
+               println(\"assoc_tuple\"); let b = Q.passt((mkq(2), 8)); println(f\"  v={b.1}\");\n\
+               println(\"free_tuple\"); let c = passt((mkq(3), 9)); println(f\"  v={c.1}\");\n\
+               println(\"method_mints\"); let d = h.mkt(); println(f\"  v={d.1}\");\n\
+               println(\"method_eats\"); println(f\"  v={h.eatt((mkq(5), 2))}\");\n\
+               println(\"named_tuple_method\"); let t = (mkq(6), 3); let e = h.thrut(t); println(f\"  v={e.1}\");\n\
+               println(\"named_tuple_assoc\"); let u = (mkq(7), 4); let f = Q.passt(u); println(f\"  v={f.1}\");\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "method_tuple",
+                "  v=7",
+                "  dQ1",
+                "assoc_tuple",
+                "  v=8",
+                "  dQ2",
+                "free_tuple",
+                "  v=9",
+                "  dQ3",
+                "method_mints",
+                "  v=1",
+                "  dQ4",
+                "method_eats",
+                "  dQ5",
+                "  v=2",
+                "named_tuple_method",
+                "  v=3",
+                "  dQ6",
+                "named_tuple_assoc",
+                "  v=4",
+                "  dQ7",
+                "end"
+            ],
+            "whole_tuple_argument_to_a_method",
+        );
+    }
+
     /// B-2026-09-07-4 — the MEMORY half of the via-call legs: the same program
     /// under ASAN + LSan, where the pre-fix build double-freed the object each
     /// hop handed on. One owner and one free per object on every leg.

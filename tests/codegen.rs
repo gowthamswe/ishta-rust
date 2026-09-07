@@ -35312,6 +35312,92 @@ end
         );
     }
 
+    /// B-2026-09-07-6 — a whole-tuple argument handed back by a METHOD or ASSOC fn
+    /// lost its element's `Drop` body on every compiled backend:
+    /// `h.thrut((mkq(1), 7))` over
+    /// `impl Hold { fn thrut(ref self, t: (Q, i64)) -> (Q, i64) { return t; } }`
+    /// printed `v=7` where `--interp` printed `v=7 dQ1`, with memory balanced — so
+    /// no leak gate could see it. The FREE-function twin was correct throughout.
+    ///
+    /// The row's own "where to start" was the argument registrar's element types,
+    /// and passing them changed nothing. The defect is on the RESULT side:
+    /// `tuple_binding_elem_tes` recovers a `let`'s element types from the callee's
+    /// declared return type through `fn_return_type_exprs`, which is keyed by FREE
+    /// function only — its comment names the method-call RHS as a deferred tail
+    /// that "leaks but never double-frees". With no element types the binding gets
+    /// no bodies walker at all, so the body ran ZERO times. A method that MINTS the
+    /// tuple (`fn mkt(ref self) -> (Q, i64)`) loses it identically, which is what
+    /// identifies the result binding rather than the argument.
+    ///
+    /// `find_function_ast` resolves a `Type.method` key against the impl blocks —
+    /// the same fallback B-2026-09-06-70 gave the parameter-side question.
+    ///
+    /// The NAMED-tuple spelling needed the other half: with the result binding
+    /// owning the elements, the caller's `t` had to stand its element walk down,
+    /// and the method leg's gate for that suppression asked only the STORE route.
+    /// `let t = (mkq(6), 3); let e = h.thrut(t);` ran two bodies until the return
+    /// routes joined it — the same disjunction the free leg has had since
+    /// B-2026-08-31-46.
+    ///
+    /// Cells: the method and assoc hand-backs, the free control, a method that
+    /// mints its tuple, a method that consumes it, and both named-tuple spellings.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_whole_tuple_argument_to_a_method`, pinned to the same string.
+    #[test]
+    fn e2e_whole_tuple_argument_to_a_method() {
+        let Some(out) = run_program(
+            r#"struct Q { id: i64, name: String }
+impl Drop for Q { fn drop(mut ref self) { println(f"  dQ{self.id}") } }
+fn mkq(i: i64) -> Q { return Q { id: i, name: f"q{i}" }; }
+struct Hold { n: i64 }
+impl Hold { fn thrut(ref self, t: (Q, i64)) -> (Q, i64) { return t; } }
+impl Hold { fn mkt(ref self) -> (Q, i64) { return (mkq(4), 1); } }
+impl Hold { fn eatt(ref self, t: (Q, i64)) -> i64 { return t.1; } }
+impl Q { fn passt(t: (Q, i64)) -> (Q, i64) { return t; } }
+fn passt(t: (Q, i64)) -> (Q, i64) { return t; }
+fn main() {
+  let h = Hold { n: 0 };
+  println("method_tuple"); let a = h.thrut((mkq(1), 7)); println(f"  v={a.1}");
+  println("assoc_tuple"); let b = Q.passt((mkq(2), 8)); println(f"  v={b.1}");
+  println("free_tuple"); let c = passt((mkq(3), 9)); println(f"  v={c.1}");
+  println("method_mints"); let d = h.mkt(); println(f"  v={d.1}");
+  println("method_eats"); println(f"  v={h.eatt((mkq(5), 2))}");
+  println("named_tuple_method"); let t = (mkq(6), 3); let e = h.thrut(t); println(f"  v={e.1}");
+  println("named_tuple_assoc"); let u = (mkq(7), 4); let f = Q.passt(u); println(f"  v={f.1}");
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"method_tuple
+  v=7
+  dQ1
+assoc_tuple
+  v=8
+  dQ2
+free_tuple
+  v=9
+  dQ3
+method_mints
+  v=1
+  dQ4
+method_eats
+  dQ5
+  v=2
+named_tuple_method
+  v=3
+  dQ6
+named_tuple_assoc
+  v=4
+  dQ7
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-4, the via-call half — an argument handed back THROUGH one
     /// further call double-freed on the METHOD and ASSOC-FN legs, where the free
     /// leg was clean: `R.passb(mk(1))` over

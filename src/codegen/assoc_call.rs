@@ -3394,7 +3394,29 @@ impl<'ctx> super::Codegen<'ctx> {
                     if (!(always_handed_back || callee_owns_handback_memory) || arg_entry_copied)
                         && (!stored_in_outliving_place || store_entry_copied)
                     {
-                        self.track_inline_owned_aggregate_arg(val, &a.value, escapes_frame);
+                        // B-2026-09-07-6 — the PARTS registrar, with the
+                        // callee's declared element types, where this leg used
+                        // to call the arity-3 form that has no element-types
+                        // channel at all. `Q.passt((mkq(32), 8))` over
+                        // `impl Q { fn passt(t: (Q, i64)) -> (Q, i64) }` printed
+                        // `m11=8` against the interpreter's `m11=8 dQ32`: the
+                        // per-element walk could not tell that the first element
+                        // carries a user `Drop`, so the body was lost with the
+                        // memory still balanced — invisible to every leak gate.
+                        // The other two channels are empty here on purpose: this
+                        // leg computes no escaping-parts or payload-skip sets,
+                        // and passing empties is exactly what the arity-3 form
+                        // did.
+                        let declared_tes = self.callee_tuple_param_elem_type_exprs(&qualified, i);
+                        self.track_inline_owned_aggregate_arg_parts(
+                            val,
+                            &a.value,
+                            escapes_frame,
+                            &[],
+                            &[],
+                            declared_tes.as_deref(),
+                            None,
+                        );
                     }
                     // The registrar above answers for an AGGREGATE (struct /
                     // enum / tuple temp). A bare `String` / `Vec` argument is

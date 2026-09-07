@@ -57444,6 +57444,61 @@ end
     );
 }
 
+/// B-2026-09-07-6 — the interpreter was right on every cell of this row (its
+/// tuple walk is value-driven, so it never needed the callee's declared types);
+/// the twin holds the compiled string to it.
+///
+/// Twin of `tests/codegen.rs`'s `e2e_whole_tuple_argument_to_a_method`, pinned to the same string.
+#[test]
+fn test_whole_tuple_argument_to_a_method() {
+    assert_eq!(
+        run(r#"struct Q { id: i64, name: String }
+impl Drop for Q { fn drop(mut ref self) { println(f"  dQ{self.id}") } }
+fn mkq(i: i64) -> Q { return Q { id: i, name: f"q{i}" }; }
+struct Hold { n: i64 }
+impl Hold { fn thrut(ref self, t: (Q, i64)) -> (Q, i64) { return t; } }
+impl Hold { fn mkt(ref self) -> (Q, i64) { return (mkq(4), 1); } }
+impl Hold { fn eatt(ref self, t: (Q, i64)) -> i64 { return t.1; } }
+impl Q { fn passt(t: (Q, i64)) -> (Q, i64) { return t; } }
+fn passt(t: (Q, i64)) -> (Q, i64) { return t; }
+fn main() {
+  let h = Hold { n: 0 };
+  println("method_tuple"); let a = h.thrut((mkq(1), 7)); println(f"  v={a.1}");
+  println("assoc_tuple"); let b = Q.passt((mkq(2), 8)); println(f"  v={b.1}");
+  println("free_tuple"); let c = passt((mkq(3), 9)); println(f"  v={c.1}");
+  println("method_mints"); let d = h.mkt(); println(f"  v={d.1}");
+  println("method_eats"); println(f"  v={h.eatt((mkq(5), 2))}");
+  println("named_tuple_method"); let t = (mkq(6), 3); let e = h.thrut(t); println(f"  v={e.1}");
+  println("named_tuple_assoc"); let u = (mkq(7), 4); let f = Q.passt(u); println(f"  v={f.1}");
+  println("end");
+}
+"#),
+        r#"method_tuple
+  v=7
+  dQ1
+assoc_tuple
+  v=8
+  dQ2
+free_tuple
+  v=9
+  dQ3
+method_mints
+  v=1
+  dQ4
+method_eats
+  dQ5
+  v=2
+named_tuple_method
+  v=3
+  dQ6
+named_tuple_assoc
+  v=4
+  dQ7
+end
+"#
+    );
+}
+
 /// B-2026-09-07-4, interpreter half — `record_method_arg_moves` did not count a
 /// ONE-HOP hand-back as an escape, so a named local passed to
 /// `fn thruv(ref self, r: R) -> R { return fwd(r); }` ran its `Drop` body twice

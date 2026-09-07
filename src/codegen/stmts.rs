@@ -17370,6 +17370,52 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
             }
         }
+        // B-2026-09-07-6 — the METHOD and ASSOC-FN call results, which the arm
+        // above names as its "deferred narrow tail" ("methods aren't keyed in
+        // `fn_return_type_exprs`; it leaks but never double-frees"). The
+        // measured symptom is worse than a leak: with no element types the
+        // binding gets no bodies walker, so `let z = h.thrut((mkq(31), 7));`
+        // over `fn thrut(ref self, t: (Q, i64)) -> (Q, i64)` printed `m11=7`
+        // where `--interp` printed `m11=7 dQ31` — the element's user `Drop`
+        // body ran ZERO times on all four compiled surfaces, with memory
+        // balanced, so no leak gate could see it. A method that MINTS the tuple
+        // (`fn mkt(ref self) -> (Q, i64) { return (mkq(40), 1); }`) loses it the
+        // same way, which is what shows the defect is the RESULT binding's
+        // types and not the argument registrar.
+        //
+        // `find_function_ast` resolves a `Type.method` key against the impl
+        // blocks — the same fallback B-2026-09-06-70 added to
+        // `callee_tuple_param_elem_type_exprs` for the mirror-image question on
+        // the parameter side.
+        let qualified = match &value.kind {
+            ExprKind::MethodCall { object, method, .. } => {
+                self.type_name_of(object).map(|tn| format!("{tn}.{method}"))
+            }
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Path { segments, .. } if segments.len() >= 2 => Some(format!(
+                    "{}.{}",
+                    segments[segments.len() - 2],
+                    segments[segments.len() - 1]
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(qualified) = qualified {
+            if let Some(f) = self
+                .program_snapshot
+                .as_deref()
+                .and_then(|p| super::declarations::find_function_ast(p, &qualified))
+            {
+                if let Some(TypeExpr {
+                    kind: TypeKind::Tuple(elems),
+                    ..
+                }) = f.return_type.as_ref()
+                {
+                    return Some(elems.clone());
+                }
+            }
+        }
         None
     }
 

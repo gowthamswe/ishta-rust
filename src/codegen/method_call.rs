@@ -7767,8 +7767,21 @@ impl<'ctx> super::Codegen<'ctx> {
                         // `compile_call`: a partial payload escape masks the
                         // binding's walker instead of retracting it.
                         let payload_escape = self.callee_enum_arg_payload_escape(&qualified, pidx);
-                        let whole_escape =
-                            self.call_arg_moves_into_outliving_place(&qualified, i, false);
+                        // B-2026-09-07-6 — the RETURN routes join the store one,
+                        // as they have on the free leg since B-2026-08-31-46.
+                        // This gate drives `suppress_container_elem_bodies_for_var`,
+                        // and a NAMED tuple argument the method hands straight
+                        // back needs it: `let t = (mkq(43), 4); let z = h.thrut(t);`
+                        // left `t`'s element walk armed while the result binding
+                        // ran the element's body too — two `dQ43` on every
+                        // compiled surface against the interpreter's one. The
+                        // free-function and ASSOC spellings of the same program
+                        // are correct, which is what identifies the gate rather
+                        // than the walk.
+                        let whole_escape = self
+                            .call_arg_moves_into_outliving_place(&qualified, i, false)
+                            || self.callee_hands_arg_off(&qualified, i)
+                            || self.callee_always_hands_arg_back_via_call(&qualified, i);
                         if whole_escape || payload_escape.is_some() {
                             if let ExprKind::Identifier(var_name) = &a.value.kind {
                                 let var_name = var_name.clone();
@@ -8287,13 +8300,29 @@ impl<'ctx> super::Codegen<'ctx> {
                     if (!(always_handed_back || callee_owns_handback_memory) || arg_entry_copied)
                         && (!stored_in_outliving_place || store_entry_copied)
                     {
+                        // B-2026-09-07-6 — the DECLARED element types, which
+                        // this leg passed as `None` while the free leg has
+                        // supplied them since the registrar gained the channel.
+                        // Without them the per-element walk cannot tell that
+                        // `(Q, i64)`'s first element carries a user `Drop`, so
+                        // `h.thrut((mkq(31), 7))` over
+                        // `fn thrut(ref self, t: (Q, i64)) -> (Q, i64)` printed
+                        // `m11=7` where `--interp` printed `m11=7 dQ31` — a LOST
+                        // body, memory-clean, so no leak gate could see it.
+                        // B-2026-09-06-70 taught
+                        // `callee_tuple_param_elem_type_exprs` to resolve an
+                        // impl method through `find_function_ast`, which is what
+                        // makes them available here at all; `i` is the key that
+                        // helper's receiver-EXCLUDING resolution wants, the same
+                        // one the tuple carve-out above uses.
+                        let declared_tes = self.callee_tuple_param_elem_type_exprs(&qualified, i);
                         self.track_inline_owned_aggregate_arg_parts(
                             val,
                             &a.value,
                             escapes_frame,
                             &escaping_parts,
                             &field_payload_paths,
-                            None,
+                            declared_tes.as_deref(),
                             payload_skip,
                         );
                     }
