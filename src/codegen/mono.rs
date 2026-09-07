@@ -2533,8 +2533,8 @@ impl<'ctx> super::Codegen<'ctx> {
             // caller, so its Drop body belongs to the value's new home while the
             // orphaned original's memory stays ours. This is the leg
             // `PriorityQueue[Item].push` actually takes.
-            let escapes_frame =
-                flows_into_return || self.call_arg_moves_into_outliving_place(name, i, true);
+            let stored_in_outliving_place = self.call_arg_moves_into_outliving_place(name, i, true);
+            let escapes_frame = flows_into_return || stored_in_outliving_place;
             // B-2026-08-27-44 — the monomorph leg of the same admission test.
             // The tuple sibling is needed here for the same reason as on the
             // free-fn path: a generic `passthru[T](p: (Bag[T], i64)) -> ..`
@@ -2547,9 +2547,40 @@ impl<'ctx> super::Codegen<'ctx> {
             // free-fn gate, so whether a generic enum arg leaks the same way is
             // an unmeasured question, and guessing a caller-side free onto an
             // unmeasured path is how a leak fix becomes a double free.
-            if !flows_into_return
-                || self.arg_is_entry_copied_heap_struct(&a.value)
-                || self.arg_is_entry_copied_heap_tuple(&a.value, name, i)
+            let arg_entry_copied = self.arg_is_entry_copied_heap_struct(&a.value)
+                || self.arg_is_entry_copied_heap_tuple(&a.value, name, i);
+            // B-2026-09-07-5 — the OUTLIVING-STORE half of the admission gate,
+            // the monomorph leg. `escapes_frame` above already carries the
+            // store route for the BODY half; nothing declined the registration,
+            // so a generic callee that stores a DECLINED-COPY argument left the
+            // caller owning a buffer the callee had handed to the vector:
+            // `fn stash[T](v: mut ref Vec[T], x: T) { v.push(x); }` at `T = R`
+            // over a struct with a `shared` field aborted `free(): double free
+            // detected in tcache 2` on every compiled surface (3 valgrind
+            // errors from 2 contexts) while `--interp` printed `len=1 dR56`.
+            // The rationale is written out once on the free leg
+            // (`call_dispatch.rs`).
+            //
+            // `arg_entry_copied` is the pair this leg already admits on, ENUM
+            // STILL ABSENT — see the note above. Adding the enum sibling here
+            // would widen an unmeasured path, and this row's business is the
+            // store route, not that question.
+            //
+            // The STORE clause asks the enum question that the RETURN clause
+            // above deliberately does not. The note on `arg_entry_copied` guards
+            // the return route, where a generic enum arg's leak behaviour is
+            // unmeasured; the store route is a different question and it IS
+            // measured. Without the two enum predicates here,
+            // `fn stashg[T](v: mut ref Vec[T], x: T)` at `T = Es` traded its
+            // (pre-existing) DOUBLE `Drop` body for a single body and 3 bytes
+            // definitely lost — the exact trade the other three legs refuse.
+            // Both spellings are needed: the ctor one, and the fn-call one that
+            // `enum_name_of_expr` cannot resolve (B-2026-09-07-5's helper).
+            let store_entry_copied = arg_entry_copied
+                || self.arg_is_entry_copied_heap_enum(&a.value)
+                || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
+            if (!flows_into_return || arg_entry_copied)
+                && (!stored_in_outliving_place || store_entry_copied)
             {
                 let escaping_parts = self.callee_returned_param_parts(name, i);
                 let field_payload_paths = self.callee_escaping_field_payload_paths(name, i);

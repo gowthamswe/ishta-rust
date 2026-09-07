@@ -5793,6 +5793,125 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-5 — a callee that STORES its by-value argument into a place
+    /// that outlives the call owns it, and the caller must not also.
+    ///
+    /// The argument registrars ran the STORE route through `escapes_frame`,
+    /// which picks the registrar's bodies-vs-memory MODE and never declines the
+    /// registration. For a param the prologue refuses to COPY — a struct with a
+    /// `shared` field fails `aggregate_param_copy_supported_struct`, so the
+    /// param FORWARDS the caller's object — the memory-only registration was a
+    /// second owner of the very buffer the callee had just handed to the
+    /// vector. `impl Box2 { fn push(mut ref self, r: R) { self.xs.push(r); } }`
+    /// over `b.push(mk(16))` aborted `free(): double free detected in tcache 2`
+    /// under `karac run` and at BOTH opt levels while `--interp` printed
+    /// `a1 dR16` correctly.
+    ///
+    /// FOUR LEGS, not one. The row was filed as method-only; the free-function
+    /// twin (`c`), the assoc-fn twin (`d`) and the MONOMORPH leg (`e`,
+    /// `fn stashg[T](v: mut ref Vec[T], x: T)`) abort identically, so the gate
+    /// is repeated in `method_call.rs`, `assoc_call.rs`, `call_dispatch.rs` and
+    /// `mono.rs`. Cells `f`–`j` are the shapes that reach the same registrars by
+    /// other spellings: a bare `mut ref Vec[R]` param, two stored arguments in
+    /// one call, a callee that stores AND returns, a struct LITERAL argument,
+    /// and one level of forwarding (`fn_moves_param_into_outliving_place_via_-
+    /// call`).
+    ///
+    /// `k`/`l` ARE THE CONTROL THAT PICKS THE PREDICATE. The store analysis is a
+    /// MAY-analysis (`any` at every branch) with an ALWAYS sibling, which is the
+    /// same union-vs-all-paths fork B-2026-09-06-70 had to resolve the other
+    /// way. Here the MAY reading is the correct one, measured rather than
+    /// assumed: `fn maybe(mut ref self, r: R, k: bool) { if k { self.xs.push(r);
+    /// } }` is correct on all five surfaces with 0 valgrind errors at BOTH `k`
+    /// values, because the callee registers a guarded body drop whenever the
+    /// ALWAYS predicate is false. Standing the caller down on the non-storing
+    /// path loses nothing.
+    ///
+    /// `m`/`n` ARE THE OTHER CONTROL, and the reason the gate cannot be
+    /// unconditional. B-2026-08-26-9 put the store route into `escapes_frame`
+    /// for the BODY and deliberately KEPT the memory half registered: a
+    /// COPY-SUPPORTED element is deep-copied at callee entry, so the caller's
+    /// original really is orphaned, and "suppressing the whole registration
+    /// instead orphaned it and traded the double body for a 9-byte leak". That
+    /// reasoning is exactly right for a copy-supported param and exactly wrong
+    /// for one the prologue declines to copy — which is why the entry-copy
+    /// carve-outs the RETURN route already used are shared with this clause
+    /// rather than re-derived.
+    ///
+    /// A NAMED-LOCAL argument is deliberately absent: every arm of the registrar
+    /// matches a PRODUCER shape, so an `Identifier` registers nothing here.
+    /// `let a = mk(28); b.push(a);` double-frees through the BINDING's own
+    /// cleanup and runs two `Drop` bodies on the INTERPRETER too — a different
+    /// mechanism, on its own row.
+    ///
+    /// Non-vacuous on the parent: 35 valgrind errors from 24 contexts, and an
+    /// abort on every compiled surface.
+    fn test_e2e_stored_argument_is_owned_by_its_new_home_not_the_caller() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+
+struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"s{i}" }; }
+
+struct Box2 { mut xs: Vec[R] }
+impl Box2 {
+    fn push(mut ref self, r: R) { self.xs.push(r); }
+    fn put2(mut ref self, a: R, c: R) { self.xs.push(a); self.xs.push(c); }
+    fn puts(mut ref self, r: R) -> i64 { self.xs.push(r); return 5; }
+    fn maybe(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } }
+    fn stash(b: mut ref Box2, r: R) { b.xs.push(r); }
+}
+struct Box3 { mut one: R }
+impl Box3 { fn set(mut ref self, r: R) { self.one = r; } }
+struct BoxS { mut xs: Vec[S] }
+impl BoxS { fn add(mut ref self, s: S) { self.xs.push(s); } }
+
+fn take(b: mut ref Box2, r: R) { b.xs.push(r); }
+fn inner_push(b: mut ref Box2, r: R) { b.xs.push(r); }
+fn outer_push(b: mut ref Box2, r: R) { inner_push(b, r); }
+fn pushv(v: mut ref Vec[R], r: R) { v.push(r); }
+fn stashg[T](v: mut ref Vec[T], x: T) { v.push(x); }
+fn takes(b: mut ref BoxS, s: S) { b.xs.push(s); }
+
+fn c_method() { let mut b = Box2 { xs: Vec.new() }; b.push(mk(16)); println(f"a{b.xs.len()}"); }
+fn c_field()  { let mut b = Box3 { one: mk(1) }; b.set(mk(17)); println(f"b{b.one.id}"); }
+fn c_free()   { let mut b = Box2 { xs: Vec.new() }; take(mut b, mk(18)); println(f"c{b.xs.len()}"); }
+fn c_assoc()  { let mut b = Box2 { xs: Vec.new() }; Box2.stash(mut b, mk(19)); println(f"d{b.xs.len()}"); }
+fn c_generic(){ let mut v: Vec[R] = Vec.new(); stashg(mut v, mk(20)); println(f"e{v.len()}"); }
+fn c_vecref() { let mut v: Vec[R] = Vec.new(); pushv(mut v, mk(21)); println(f"f{v.len()}"); }
+fn c_two()    { let mut b = Box2 { xs: Vec.new() }; b.put2(mk(22), mk(23)); println(f"g{b.xs.len()}"); }
+fn c_ret()    { let mut b = Box2 { xs: Vec.new() }; let z = b.puts(mk(24)); println(f"h{z}{b.xs.len()}"); }
+fn c_lit()    { let mut b = Box2 { xs: Vec.new() }; b.push(R { id: 25, name: "n", inner: Inner { v: 1 } }); println(f"i{b.xs.len()}"); }
+fn c_viacall(){ let mut b = Box2 { xs: Vec.new() }; outer_push(mut b, mk(26)); println(f"j{b.xs.len()}"); }
+fn c_cond_no(){ let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(27), false); println(f"k{b.xs.len()}"); }
+fn c_cond_yes(){ let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(28), true); println(f"l{b.xs.len()}"); }
+fn c_copy_m() { let mut b = BoxS { xs: Vec.new() }; b.add(mks(41)); println(f"m{b.xs.len()}"); }
+fn c_copy_f() { let mut b = BoxS { xs: Vec.new() }; takes(mut b, mks(42)); println(f"n{b.xs.len()}"); }
+
+fn main() {
+    c_method(); c_field(); c_free(); c_assoc(); c_generic(); c_vecref();
+    c_two(); c_ret(); c_lit(); c_viacall(); c_cond_no(); c_cond_yes();
+    c_copy_m(); c_copy_f();
+    println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "a1\ndR16\nb17\ndR17\nc1\ndR18\nd1\ndR19\ne1\ndR20\nf1\ndR21\ng2\ndR22\ndR23\nh51\ndR24\ni1\ndR25\nj1\ndR26\ndR27\nk0\nl1\ndR28\nm1\ndS41\nn1\ndS42\nend\n",
+                "a callee that stores its by-value argument into an outliving \
+                 place owns it; the caller registers a second owner only where \
+                 the callee's entry copy orphaned the original; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-06-69 — a MIXED-PATH callee hands its by-value param back on
     /// one exit and lets it die on another, and exactly one frame frees it
     /// either way.

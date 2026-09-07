@@ -8089,8 +8089,9 @@ impl<'ctx> super::Codegen<'ctx> {
                     // as the free-fn path always has (B-2026-08-29-38's cell,
                     // `t.take(Box2.Full(mk(7)))`, resolves to a TOTAL skip and
                     // still emits no walker).
-                    let escapes_frame = handed_off
-                        || self.call_arg_moves_into_outliving_place(&qualified, i, false);
+                    let stored_in_outliving_place =
+                        self.call_arg_moves_into_outliving_place(&qualified, i, false);
+                    let escapes_frame = handed_off || stored_in_outliving_place;
                     // B-2026-09-05-33 — the per-ELEMENT escape set, exactly as
                     // the free-fn leg carries it: a method whose arm hands one
                     // element of a tuple argument out (`(r, k) => r`) must not
@@ -8177,10 +8178,31 @@ impl<'ctx> super::Codegen<'ctx> {
                     // 3 bytes on `h.thrut((mkq(31), 7))` and 3 more on the
                     // assoc twin. The `find_function_ast` fallback that fixes
                     // it is receiver-EXCLUDING, which is what settles the key.
-                    if !always_handed_back
-                        || self.arg_is_entry_copied_heap_struct(&a.value)
+                    let arg_entry_copied = self.arg_is_entry_copied_heap_struct(&a.value)
                         || self.arg_is_entry_copied_heap_enum(&a.value)
-                        || self.arg_is_entry_copied_heap_tuple(&a.value, &qualified, i)
+                        || self.arg_is_entry_copied_heap_tuple(&a.value, &qualified, i);
+                    // B-2026-09-07-5 — the OUTLIVING-STORE half of the same
+                    // gate. The clause above is the RETURN route; the second
+                    // escape route (the callee stores the argument into a place
+                    // that outlives the call) had a seat in `escapes_frame`,
+                    // which only picks the registrar's MODE, and none here — so
+                    // for a declined-copy param the memory-only registration
+                    // was a second owner of the buffer the callee had just
+                    // stored. `impl Box2 { fn push(mut ref self, r: R) {
+                    // self.xs.push(r); } }` over `b.push(mk(27))` aborted
+                    // `free(): double free detected in tcache 2` on every
+                    // compiled surface while `--interp` printed `len=1 dR27`.
+                    // The rationale, the -08-26-9 copy-supported carve-out it
+                    // must not disturb, and the named-local shape it
+                    // deliberately does NOT reach are written out once on the
+                    // FREE leg (`call_dispatch.rs`), whose predicate this is.
+                    // The store clause resolves an enum-returning fn-call
+                    // argument, which the return route's predicate cannot; the
+                    // helper's doc says why the two are not merged.
+                    let store_entry_copied =
+                        arg_entry_copied || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
+                    if (!always_handed_back || arg_entry_copied)
+                        && (!stored_in_outliving_place || store_entry_copied)
                     {
                         self.track_inline_owned_aggregate_arg_parts(
                             val,

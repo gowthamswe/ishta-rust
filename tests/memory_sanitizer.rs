@@ -7586,6 +7586,94 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-5 — the FREEING half of
+    /// `test_e2e_stored_argument_is_owned_by_its_new_home_not_the_caller`.
+    ///
+    /// That test asserts the OUTPUT, and output is not what was broken here at
+    /// `-O2`: LLVM inlines the storing callee and the double free degrades into
+    /// a surviving use-after-free that prints every line correctly. `b`
+    /// (`self.one = r`) is the clearest instance — on the parent it printed
+    /// `b17 dR17` at `-O2` and aborted at `-O0`, from the same object being
+    /// freed twice either way. Only a sanitizer separates "prints the right
+    /// lines" from "owns its memory once".
+    ///
+    /// Measured after the fix: 0 valgrind errors. On the parent: 35 errors from
+    /// 24 contexts, `Invalid free()` and `Invalid read of size 8` in pairs
+    /// across the method, free-function, assoc-fn and monomorph legs.
+    ///
+    /// The whole E2E fixture is carried, `k`/`l` and `m`/`n` included, because
+    /// here they are not redundant controls: `k` is the conditional store's
+    /// NON-storing path, where a stand-down would strand the value with no
+    /// owner at all, and `m`/`n` are the copy-supported pair whose original the
+    /// callee's entry copy really does orphan — a leak in either would mean the
+    /// gate had over-fired, which no output assertion can see. Unlike
+    /// `asan_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it`
+    /// this fixture omits nothing: every cell in it is leak-free on the fix.
+    fn asan_stored_argument_is_owned_by_its_new_home_not_the_caller() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+
+struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"s{i}" }; }
+
+struct Box2 { mut xs: Vec[R] }
+impl Box2 {
+    fn push(mut ref self, r: R) { self.xs.push(r); }
+    fn put2(mut ref self, a: R, c: R) { self.xs.push(a); self.xs.push(c); }
+    fn puts(mut ref self, r: R) -> i64 { self.xs.push(r); return 5; }
+    fn maybe(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } }
+    fn stash(b: mut ref Box2, r: R) { b.xs.push(r); }
+}
+struct Box3 { mut one: R }
+impl Box3 { fn set(mut ref self, r: R) { self.one = r; } }
+struct BoxS { mut xs: Vec[S] }
+impl BoxS { fn add(mut ref self, s: S) { self.xs.push(s); } }
+
+fn take(b: mut ref Box2, r: R) { b.xs.push(r); }
+fn inner_push(b: mut ref Box2, r: R) { b.xs.push(r); }
+fn outer_push(b: mut ref Box2, r: R) { inner_push(b, r); }
+fn pushv(v: mut ref Vec[R], r: R) { v.push(r); }
+fn stashg[T](v: mut ref Vec[T], x: T) { v.push(x); }
+fn takes(b: mut ref BoxS, s: S) { b.xs.push(s); }
+
+fn c_method() { let mut b = Box2 { xs: Vec.new() }; b.push(mk(16)); println(f"a{b.xs.len()}"); }
+fn c_field()  { let mut b = Box3 { one: mk(1) }; b.set(mk(17)); println(f"b{b.one.id}"); }
+fn c_free()   { let mut b = Box2 { xs: Vec.new() }; take(mut b, mk(18)); println(f"c{b.xs.len()}"); }
+fn c_assoc()  { let mut b = Box2 { xs: Vec.new() }; Box2.stash(mut b, mk(19)); println(f"d{b.xs.len()}"); }
+fn c_generic(){ let mut v: Vec[R] = Vec.new(); stashg(mut v, mk(20)); println(f"e{v.len()}"); }
+fn c_vecref() { let mut v: Vec[R] = Vec.new(); pushv(mut v, mk(21)); println(f"f{v.len()}"); }
+fn c_two()    { let mut b = Box2 { xs: Vec.new() }; b.put2(mk(22), mk(23)); println(f"g{b.xs.len()}"); }
+fn c_ret()    { let mut b = Box2 { xs: Vec.new() }; let z = b.puts(mk(24)); println(f"h{z}{b.xs.len()}"); }
+fn c_lit()    { let mut b = Box2 { xs: Vec.new() }; b.push(R { id: 25, name: "n", inner: Inner { v: 1 } }); println(f"i{b.xs.len()}"); }
+fn c_viacall(){ let mut b = Box2 { xs: Vec.new() }; outer_push(mut b, mk(26)); println(f"j{b.xs.len()}"); }
+fn c_cond_no(){ let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(27), false); println(f"k{b.xs.len()}"); }
+fn c_cond_yes(){ let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(28), true); println(f"l{b.xs.len()}"); }
+fn c_copy_m() { let mut b = BoxS { xs: Vec.new() }; b.add(mks(41)); println(f"m{b.xs.len()}"); }
+fn c_copy_f() { let mut b = BoxS { xs: Vec.new() }; takes(mut b, mks(42)); println(f"n{b.xs.len()}"); }
+
+fn main() {
+    c_method(); c_field(); c_free(); c_assoc(); c_generic(); c_vecref();
+    c_two(); c_ret(); c_lit(); c_viacall(); c_cond_no(); c_cond_yes();
+    c_copy_m(); c_copy_f();
+    println("end");
+}
+"#,
+            &[
+                "a1", "dR16", "b17", "dR17", "c1", "dR18", "d1", "dR19", "e1", "dR20", "f1",
+                "dR21", "g2", "dR22", "dR23", "h51", "dR24", "i1", "dR25", "j1", "dR26", "dR27",
+                "k0", "l1", "dR28", "m1", "dS41", "n1", "dS42", "end",
+            ],
+            "b0907-5-outliving-store-admission",
+            40,
+        );
+    }
+
+    #[test]
     /// B-2026-09-06-70 — the FREEING half of
     /// `test_e2e_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it`.
     ///

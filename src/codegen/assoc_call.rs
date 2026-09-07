@@ -3291,8 +3291,9 @@ impl<'ctx> super::Codegen<'ctx> {
                                     i,
                                 )
                             });
-                    let escapes_frame = handed_off
-                        || self.call_arg_moves_into_outliving_place(&qualified, i, false);
+                    let stored_in_outliving_place =
+                        self.call_arg_moves_into_outliving_place(&qualified, i, false);
+                    let escapes_frame = handed_off || stored_in_outliving_place;
                     // B-2026-09-06-70 — the ADMISSION gate, absent from this leg
                     // exactly as from the method one. `escapes_frame` above picks
                     // the registrar's MODE and never declines the registration,
@@ -3315,10 +3316,31 @@ impl<'ctx> super::Codegen<'ctx> {
                     // argument `i` IS the declared index on BOTH the
                     // `find_function_ast` and the `fn_asts` key, where the
                     // method leg's tuple carve-out has to shift to `pidx`.
-                    if !always_handed_back
-                        || self.arg_is_entry_copied_heap_struct(&a.value)
+                    let arg_entry_copied = self.arg_is_entry_copied_heap_struct(&a.value)
                         || self.arg_is_entry_copied_heap_enum(&a.value)
-                        || self.arg_is_entry_copied_heap_tuple(&a.value, &qualified, i)
+                        || self.arg_is_entry_copied_heap_tuple(&a.value, &qualified, i);
+                    // B-2026-09-07-5 — the OUTLIVING-STORE half of the same
+                    // gate. The clause above is the RETURN route; the second
+                    // escape route (the callee stores the argument into a place
+                    // that outlives the call) had a seat in `escapes_frame`,
+                    // which only picks the registrar's MODE, and none here — so
+                    // for a declined-copy param the memory-only registration
+                    // was a second owner of the buffer the callee had just
+                    // stored. `impl Box2 { fn push(mut ref self, r: R) {
+                    // self.xs.push(r); } }` over `b.push(mk(27))` aborted
+                    // `free(): double free detected in tcache 2` on every
+                    // compiled surface while `--interp` printed `len=1 dR27`.
+                    // The rationale, the -08-26-9 copy-supported carve-out it
+                    // must not disturb, and the named-local shape it
+                    // deliberately does NOT reach are written out once on the
+                    // FREE leg (`call_dispatch.rs`), whose predicate this is.
+                    // The store clause resolves an enum-returning fn-call
+                    // argument, which the return route's predicate cannot; the
+                    // helper's doc says why the two are not merged.
+                    let store_entry_copied =
+                        arg_entry_copied || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
+                    if (!always_handed_back || arg_entry_copied)
+                        && (!stored_in_outliving_place || store_entry_copied)
                     {
                         self.track_inline_owned_aggregate_arg(val, &a.value, escapes_frame);
                     }

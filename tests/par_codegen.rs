@@ -13339,6 +13339,84 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-5, auto-par twin of
+    /// `test_e2e_stored_argument_is_owned_by_its_new_home_not_the_caller`.
+    ///
+    /// The store route's admission gate is shared by both lowerings, but the
+    /// argument temp it declines to register is materialized PER CALL SITE, so
+    /// an outlined parallel region reaches the same four registrars through a
+    /// different block. Pinned for the reason every drop fix in this file is:
+    /// a caller-side stand-down is exactly the shape that can be right in one
+    /// lowering and wrong in the other.
+    ///
+    /// The monomorph cell (`e`) earns its place here twice over — the generic
+    /// leg is instantiated per call site, so auto-par outlining and
+    /// monomorphization interact at exactly this registrar.
+    fn test_e2e_auto_par_stored_argument_is_owned_by_its_new_home() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+
+struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"s{i}" }; }
+
+struct Box2 { mut xs: Vec[R] }
+impl Box2 {
+    fn push(mut ref self, r: R) { self.xs.push(r); }
+    fn put2(mut ref self, a: R, c: R) { self.xs.push(a); self.xs.push(c); }
+    fn puts(mut ref self, r: R) -> i64 { self.xs.push(r); return 5; }
+    fn maybe(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } }
+    fn stash(b: mut ref Box2, r: R) { b.xs.push(r); }
+}
+struct Box3 { mut one: R }
+impl Box3 { fn set(mut ref self, r: R) { self.one = r; } }
+struct BoxS { mut xs: Vec[S] }
+impl BoxS { fn add(mut ref self, s: S) { self.xs.push(s); } }
+
+fn take(b: mut ref Box2, r: R) { b.xs.push(r); }
+fn inner_push(b: mut ref Box2, r: R) { b.xs.push(r); }
+fn outer_push(b: mut ref Box2, r: R) { inner_push(b, r); }
+fn pushv(v: mut ref Vec[R], r: R) { v.push(r); }
+fn stashg[T](v: mut ref Vec[T], x: T) { v.push(x); }
+fn takes(b: mut ref BoxS, s: S) { b.xs.push(s); }
+
+fn c_method() { let mut b = Box2 { xs: Vec.new() }; b.push(mk(16)); println(f"a{b.xs.len()}"); }
+fn c_field()  { let mut b = Box3 { one: mk(1) }; b.set(mk(17)); println(f"b{b.one.id}"); }
+fn c_free()   { let mut b = Box2 { xs: Vec.new() }; take(mut b, mk(18)); println(f"c{b.xs.len()}"); }
+fn c_assoc()  { let mut b = Box2 { xs: Vec.new() }; Box2.stash(mut b, mk(19)); println(f"d{b.xs.len()}"); }
+fn c_generic(){ let mut v: Vec[R] = Vec.new(); stashg(mut v, mk(20)); println(f"e{v.len()}"); }
+fn c_vecref() { let mut v: Vec[R] = Vec.new(); pushv(mut v, mk(21)); println(f"f{v.len()}"); }
+fn c_two()    { let mut b = Box2 { xs: Vec.new() }; b.put2(mk(22), mk(23)); println(f"g{b.xs.len()}"); }
+fn c_ret()    { let mut b = Box2 { xs: Vec.new() }; let z = b.puts(mk(24)); println(f"h{z}{b.xs.len()}"); }
+fn c_lit()    { let mut b = Box2 { xs: Vec.new() }; b.push(R { id: 25, name: "n", inner: Inner { v: 1 } }); println(f"i{b.xs.len()}"); }
+fn c_viacall(){ let mut b = Box2 { xs: Vec.new() }; outer_push(mut b, mk(26)); println(f"j{b.xs.len()}"); }
+fn c_cond_no(){ let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(27), false); println(f"k{b.xs.len()}"); }
+fn c_cond_yes(){ let mut b = Box2 { xs: Vec.new() }; b.maybe(mk(28), true); println(f"l{b.xs.len()}"); }
+fn c_copy_m() { let mut b = BoxS { xs: Vec.new() }; b.add(mks(41)); println(f"m{b.xs.len()}"); }
+fn c_copy_f() { let mut b = BoxS { xs: Vec.new() }; takes(mut b, mks(42)); println(f"n{b.xs.len()}"); }
+
+fn main() {
+    c_method(); c_field(); c_free(); c_assoc(); c_generic(); c_vecref();
+    c_two(); c_ret(); c_lit(); c_viacall(); c_cond_no(); c_cond_yes();
+    c_copy_m(); c_copy_f();
+    println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "a1\ndR16\nb17\ndR17\nc1\ndR18\nd1\ndR19\ne1\ndR20\nf1\ndR21\ng2\ndR22\ndR23\nh51\ndR24\ni1\ndR25\nj1\ndR26\ndR27\nk0\nl1\ndR28\nm1\ndS41\nn1\ndS42\nend\n",
+                "the store-route admission gate must hold under auto-par \
+                 outlining exactly as it does sequentially; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-06-61, auto-par twin of
     /// `test_e2e_param_handed_back_through_a_rebind_leaves_one_owner`.
     ///

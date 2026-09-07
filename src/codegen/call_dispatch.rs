@@ -2084,6 +2084,9 @@ impl<'ctx> super::Codegen<'ctx> {
             let escapes_frame = flows_into_return
                 || self.callee_hands_arg_off(&name, i)
                 || self.call_arg_moves_into_outliving_place(&name, i, false);
+            // The outliving-store predicate is asked again, by name, at the
+            // admission gate a few dozen lines down (B-2026-09-07-5); it stays
+            // spelled out here so this union reads as the four routes it is.
             // B-2026-08-05-7 — the TENSOR sibling of the `#20` arm above. A
             // tensor is a bare `ptr` to one `[rank][dims][data]` block, so
             // `llvm_ty_is_vec_struct` never admits it and the fresh-temp
@@ -2217,21 +2220,75 @@ impl<'ctx> super::Codegen<'ctx> {
                 && self
                     .arg_struct_type_name(&a.value)
                     .is_some_and(|tn| self.struct_param_transfer_eligible(&tn));
-            if !arg_transfers
-                && (!flows_into_return
-                || self.arg_is_entry_copied_heap_struct(&a.value)
-                // B-2026-08-01-14 — enum ctor args are entry-copied too:
-                // a passthrough callee returns the COPY, so the original
-                // must still be freed caller-side (memory only, inside
-                // the registrar's enum arm).
+            // The three entry-copy carve-outs, hoisted because BOTH escape
+            // routes below ask the same question of them.
+            //
+            // B-2026-08-01-14 — enum ctor args are entry-copied too: a
+            // passthrough callee returns the COPY, so the original must still
+            // be freed caller-side (memory only, inside the registrar's enum
+            // arm).
+            //
+            // B-2026-08-27-44 — and so is a whole TUPLE
+            // (`make_tuple_param_callee_owned`). Without this third sibling
+            // `passthru((Bag { .. }, 7))` never reached the registrar AT ALL on
+            // the escape path — not a gate that declined inside it, an
+            // admission test that excluded it — so the caller's orphaned
+            // original leaked 48 bytes.
+            let arg_entry_copied = self.arg_is_entry_copied_heap_struct(&a.value)
                 || self.arg_is_entry_copied_heap_enum(&a.value)
-                // B-2026-08-27-44 — and so is a whole TUPLE
-                // (`make_tuple_param_callee_owned`). Without this third
-                // sibling `passthru((Bag { .. }, 7))` never reached the
-                // registrar AT ALL on the escape path — not a gate that
-                // declined inside it, an admission test that excluded it —
-                // so the caller's orphaned original leaked 48 bytes.
-                || self.arg_is_entry_copied_heap_tuple(&a.value, &name, i))
+                || self.arg_is_entry_copied_heap_tuple(&a.value, &name, i);
+            // B-2026-09-07-5 — the OUTLIVING-STORE half of the admission gate.
+            //
+            // The clause above is the RETURN route. The second escape route —
+            // the callee stores the argument into a place that outlives the
+            // call (`fn take(b: mut ref Box2, r: R) { b.xs.push(r); }`) — had a
+            // seat in `escapes_frame`, which only picks the registrar's
+            // bodies-vs-memory MODE, and no seat here. So the memory-only
+            // registration went in unconditionally, and for a param the
+            // prologue declines to COPY it was a second owner of the buffer the
+            // callee had just stored: `take(mut b, mk(30))` over a struct with
+            // a `shared` field aborted `free(): double free detected in tcache
+            // 2` under `karac run` and at both opt levels (3 valgrind errors
+            // from 2 contexts) while `--interp` printed `len=1 dR30` correctly.
+            // The method (`b.push(mk(27))`) and assoc (`Box2.stash(mut b,
+            // mk(31))`) twins abort identically — this is one rule on three
+            // legs, not a method-only defect.
+            //
+            // The entry-copy question is the whole of it, and it is the SAME
+            // question the return route asks — which is why the carve-outs are
+            // shared rather than re-derived. B-2026-08-26-9 put the outliving
+            // route into `escapes_frame` for the BODY (the value's new home owns
+            // the body) and deliberately KEPT the memory half registered,
+            // recording why: a copy-supported element is deep-copied at callee
+            // entry, so the caller's original is genuinely orphaned and
+            // "suppressing the whole registration instead orphaned it and
+            // traded the double body for a 9-byte leak". That reasoning is
+            // exactly right for a copy-supported param and exactly wrong for
+            // one the prologue declines to copy, where there is no copy and the
+            // two buffers are the same one.
+            //
+            // Measured both ways on the copy-supported twin (`struct S { id:
+            // i64, name: String }`): `dS41` / `dS43` and 0 valgrind errors
+            // before AND after, so -08-26-9's carve-out is preserved by
+            // construction rather than by intent.
+            //
+            // A NAMED-LOCAL argument is not reached from here and is not fixed
+            // by this: every arm of the registrar matches a PRODUCER shape, so
+            // an `Identifier` registers nothing at this site. `let a = mk(28);
+            // b.push(a);` double-frees through the BINDING's own cleanup (which
+            // `struct_param_transfer_eligible` declines to retract for a
+            // declined-copy type) and runs two `Drop` bodies on the
+            // INTERPRETER too, so it is a different mechanism on a different
+            // row.
+            let stored_in_outliving_place =
+                self.call_arg_moves_into_outliving_place(&name, i, false);
+            // The store clause resolves one shape the return route cannot; see
+            // the helper's doc for why it is not folded into `arg_entry_copied`.
+            let store_entry_copied =
+                arg_entry_copied || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
+            if !arg_transfers
+                && (!flows_into_return || arg_entry_copied)
+                && (!stored_in_outliving_place || store_entry_copied)
             {
                 let escaping_parts = self.callee_returned_param_parts(&name, i);
                 let declared_tes = self.callee_tuple_param_elem_type_exprs(&name, i);
@@ -7066,6 +7123,53 @@ impl<'ctx> super::Codegen<'ctx> {
                 && !self.type_decls.shared_types.contains_key(en.as_str())
                 && self.enum_has_heap_payload(&en)
         })
+    }
+
+    /// B-2026-09-07-5 — the FN-CALL spelling of
+    /// [`Self::arg_is_entry_copied_heap_enum`], for the outliving-store half of
+    /// the argument admission gate ONLY.
+    ///
+    /// The sibling routes every shape through `enum_name_of_expr`, whose `Call`
+    /// arm resolves a VARIANT CONSTRUCTOR and nothing else — so `put(mkes(61))`
+    /// over `fn mkes(i: i64) -> Es` answers false where `put(Es.A("c74"))`
+    /// answers true, for the same type and the same callee. The struct sibling
+    /// grew exactly this leg in B-2026-07-30-12 ("a fn-call arg is entry-copied
+    /// just the same"); the enum one never did.
+    ///
+    /// USED ONLY BY THE STORE CLAUSE, deliberately, and not folded into the
+    /// sibling that the RETURN route also consults. Measured on `main`: the
+    /// return-route spelling `let z = passe(mkes(71))` is clean today with the
+    /// registration DECLINED, so teaching the shared predicate to resolve it
+    /// would admit a caller-side free onto a path that has no orphan — the
+    /// leak-fix-becomes-a-double-free move that the monomorph leg's own note
+    /// warns about. Widening it is a separate question with its own
+    /// measurements, and this row's business is the store route.
+    ///
+    /// What it buys here is a NON-regression rather than a fix: without it the
+    /// store clause declines a copy-supported enum whose payload really is
+    /// orphaned by the callee's entry copy, and `put(mkes(61))` trades its
+    /// (pre-existing, `main`-visible) DOUBLE `Drop` body for a single body and
+    /// 3 bytes definitely lost. The double body is a real defect and is filed
+    /// on its own row; converting it into a leak is not the way to hold it.
+    pub(super) fn arg_is_entry_copied_heap_enum_via_call(&self, arg: &Expr) -> bool {
+        let ExprKind::Call { callee, .. } = &arg.kind else {
+            return false;
+        };
+        let ExprKind::Identifier(fn_name) = &callee.kind else {
+            return false;
+        };
+        let Some(en) = self.fn_sig.fn_return_type_names.get(fn_name) else {
+            return false;
+        };
+        // The same four type-level questions the sibling asks, in the same
+        // order: a layout we know, not `Option`/`Result` (they forward through
+        // their own machinery), not `shared` (rc owns those), and carrying heap
+        // at all.
+        self.type_decls.enum_layouts.contains_key(en.as_str())
+            && en != "Option"
+            && en != "Result"
+            && !self.type_decls.shared_types.contains_key(en.as_str())
+            && self.enum_has_heap_payload(en)
     }
 
     /// B-2026-08-27-44 — the element `TypeExpr`s of a TUPLE-shaped argument,
