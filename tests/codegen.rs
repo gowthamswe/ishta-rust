@@ -35312,6 +35312,87 @@ end
         );
     }
 
+    /// B-2026-09-07-10 — `let a = mk(1); let z = via(a);` over
+    /// `fn via(r: R) -> R { return f(r); }` and `fn f(r: R) -> R { return r; }`
+    /// aborted `free(): double free detected in tcache 2` on every compiled backend
+    /// while the FRESH-TEMP spelling of the same call was clean, and `--interp` ran
+    /// the `Drop` body TWICE for one object — once on the moved-from binding before
+    /// the result was read, once as the result's own.
+    ///
+    /// One hop was the whole difference. The caller's ADMISSION gate
+    /// `call_arg_flows_into_return` has known the forwarding route since
+    /// B-2026-08-28-62; the STAND-DOWN beside it asks
+    /// `callee_takes_over_arg_drop_body`, which had a via-call disjunct for the
+    /// STORE route and none for the RETURN route. Both now ask
+    /// `fn_always_returns_param_via_call` — the ALL-paths form, because this is the
+    /// suppressing direction and a mixed-path callee's dies-inside leg is
+    /// registered bodies-only.
+    ///
+    /// Cells: the named local through one hop, the fresh-temp control, a hop with a
+    /// REBIND in front of it (`let m = r; return f(m);`, which reaches neither the
+    /// admission gate's any-path via test nor `callee_hands_arg_off`), a
+    /// copy-supported struct, a callee where the value dies one hop down, and a
+    /// MIXED-path hop on its dies-inside leg — the leg that must stay clean, and
+    /// the reason the predicate is all-paths.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_named_local_through_a_forwarding_hop`, pinned to the same string.
+    #[test]
+    fn e2e_named_local_through_a_forwarding_hop() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+struct P { id: i64, name: String, xs: Vec[i64] }
+impl Drop for P { fn drop(mut ref self) { println(f"  dP{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}", xs: [i] }; }
+fn f(r: R) -> R { return r; }
+fn ppass(p: P) -> P { return p; }
+fn dies(r: R) -> i64 { return r.id; }
+fn via(r: R) -> R { return f(r); }
+fn via2(r: R) -> R { let m = r; return f(m); }
+fn pvia(p: P) -> P { return ppass(p); }
+fn dvia(r: R) -> i64 { return dies(r); }
+fn mvia(r: R, c: bool) -> R { if c { return f(r); } return mk(99); }
+fn main() {
+  println("named_hop"); let a = mk(1); let z = via(a); println(f"  v={z.inner.v}");
+  println("fresh_hop"); let w = via(mk(2)); println(f"  v={w.inner.v}");
+  println("rebind_hop"); let b = mk(3); let y = via2(b); println(f"  v={y.inner.v}");
+  println("copyable_hop"); let c = mkp(4); let d = pvia(c); println(f"  v={d.id}");
+  println("dies_in_hop"); let e = mk(5); println(f"  v={dvia(e)}");
+  println("mixed_dies_inside"); let g = mk(6); let h = mvia(g, false); println(f"  v={h.id}");
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"named_hop
+  v=1
+  dR1
+fresh_hop
+  v=2
+  dR2
+rebind_hop
+  v=3
+  dR3
+copyable_hop
+  v=4
+  dP4
+dies_in_hop
+  v=5
+  dR5
+mixed_dies_inside
+  dR6
+  v=99
+  dR99
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-7 — a DISCARDED arm whose tail is an aggregate literal over a
     /// NAMED LOCAL stranded that local's buffer: `let s = payload(); let _ = if
     /// n == 1 { D { s: s } };` lost 38 B per evaluation on every compiled backend.

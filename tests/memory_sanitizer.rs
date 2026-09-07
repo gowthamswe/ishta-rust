@@ -4134,6 +4134,63 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-10 — the MEMORY half: the same program under ASAN + LSan,
+    /// where the pre-fix build double-freed the object handed back through the
+    /// hop. One owner and one free per object on every spelling, including the
+    /// copy-supported control, whose caller slot keeps its own copy.
+    #[test]
+    fn asan_named_local_through_a_forwarding_hop() {
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             struct P { id: i64, name: String, xs: Vec[i64] }\n\
+             impl Drop for P { fn drop(mut ref self) { println(f\"  dP{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn mkp(i: i64) -> P { return P { id: i, name: f\"p{i}\", xs: [i] }; }\n\
+             fn f(r: R) -> R { return r; }\n\
+             fn ppass(p: P) -> P { return p; }\n\
+             fn dies(r: R) -> i64 { return r.id; }\n\
+             fn via(r: R) -> R { return f(r); }\n\
+             fn via2(r: R) -> R { let m = r; return f(m); }\n\
+             fn pvia(p: P) -> P { return ppass(p); }\n\
+             fn dvia(r: R) -> i64 { return dies(r); }\n\
+             fn mvia(r: R, c: bool) -> R { if c { return f(r); } return mk(99); }\n\
+             fn main() {\n\
+               println(\"named_hop\"); let a = mk(1); let z = via(a); println(f\"  v={z.inner.v}\");\n\
+               println(\"fresh_hop\"); let w = via(mk(2)); println(f\"  v={w.inner.v}\");\n\
+               println(\"rebind_hop\"); let b = mk(3); let y = via2(b); println(f\"  v={y.inner.v}\");\n\
+               println(\"copyable_hop\"); let c = mkp(4); let d = pvia(c); println(f\"  v={d.id}\");\n\
+               println(\"dies_in_hop\"); let e = mk(5); println(f\"  v={dvia(e)}\");\n\
+               println(\"mixed_dies_inside\"); let g = mk(6); let h = mvia(g, false); println(f\"  v={h.id}\");\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "named_hop",
+                "  v=1",
+                "  dR1",
+                "fresh_hop",
+                "  v=2",
+                "  dR2",
+                "rebind_hop",
+                "  v=3",
+                "  dR3",
+                "copyable_hop",
+                "  v=4",
+                "  dP4",
+                "dies_in_hop",
+                "  v=5",
+                "  dR5",
+                "mixed_dies_inside",
+                "  dR6",
+                "  v=99",
+                "  dR99",
+                "end"
+            ],
+            "named_local_through_a_forwarding_hop",
+        );
+    }
+
     /// B-2026-09-07-7 — the MEMORY half, which IS this row: the same program
     /// under ASAN + LSan. Pre-fix it lost 93 B in 3 blocks (one per discarded
     /// literal over a named local); the buffer now has exactly one owner in

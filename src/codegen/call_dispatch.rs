@@ -2424,7 +2424,16 @@ impl<'ctx> super::Codegen<'ctx> {
                 // binding reaches `callee_takes_over_arg_drop_body` below
                 // for a constructor-wrapped conditional return too.
                 || self.callee_hands_arg_off(&name, i)
-                || self.call_arg_moves_into_outliving_place(&name, i, false);
+                || self.call_arg_moves_into_outliving_place(&name, i, false)
+                // B-2026-09-07-10 — and the ONE-HOP hand-back, which neither
+                // of those sees once a REBIND stands between the param and the
+                // inner call (`fn via2(r: R) -> R { let m = r; return f(m); }`).
+                // `flows_into_return`'s via-call disjunct matches the param's
+                // own name at the inner call, and `callee_hands_arg_off` knows
+                // nothing about hops at all, so this argument reached neither
+                // this gate nor the stand-down below and kept its cleanup while
+                // the result binding took a second one.
+                || self.callee_always_hands_arg_back_via_call(&name, i);
             if !borrow_skip && (whole_escape || payload_escape.is_some()) {
                 if let ExprKind::Identifier(var_name) = &a.value.kind {
                     let var_name = var_name.clone();
@@ -3870,6 +3879,22 @@ impl<'ctx> super::Codegen<'ctx> {
     /// the free-function scan its sibling uses, so the same helper answers for
     /// the method arg loop. That lookup returns a `Function` whose `params`
     /// EXCLUDE the receiver, so both call sites pass the non-self index.
+    /// B-2026-09-07-10 — does `callee_name`'s `arg_index` parameter leave the
+    /// frame through a hand-back that goes through ONE further call, on every
+    /// exit? See [`crate::ast::fn_always_returns_param_via_call`] for why the
+    /// all-paths form is the only safe one at a suppressing site.
+    pub(super) fn callee_always_hands_arg_back_via_call(
+        &self,
+        callee_name: &str,
+        arg_index: usize,
+    ) -> bool {
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return false;
+        };
+        super::declarations::find_function_ast(program, callee_name)
+            .is_some_and(|f| crate::ast::fn_always_returns_param_via_call(program, f, arg_index))
+    }
+
     pub(super) fn callee_takes_over_arg_drop_body(
         &self,
         callee_name: &str,
@@ -3893,6 +3918,25 @@ impl<'ctx> super::Codegen<'ctx> {
                     // one call further away.
                     || self.program_snapshot.as_deref().is_some_and(|p| {
                         crate::ast::fn_moves_param_into_outliving_place_via_call(p, f, arg_index)
+                    })
+                    // B-2026-09-07-10 — or handed back THROUGH a callee that
+                    // always returns it (`fn via(r: R) -> R { return f(r); }`).
+                    // The caller's admission gate `call_arg_flows_into_return`
+                    // has known that route since B-2026-08-28-62; this one did
+                    // not, so `via` was admitted there and dropped here, and a
+                    // named local passed to it kept its cleanup while the
+                    // result binding registered a second owner of the same
+                    // object — `free(): double free detected in tcache 2` under
+                    // `karac run` and at both opt levels, while the FRESH-TEMP
+                    // spelling of the same call was clean.
+                    //
+                    // ALL-paths, not `fn_returns_param_via_call`'s union, for
+                    // the reason B-2026-09-06-61's fix records: this is the
+                    // suppressing direction, and a mixed-path callee's
+                    // dies-inside leg is registered bodies-only "because the
+                    // caller still owns the memory".
+                    || self.program_snapshot.as_deref().is_some_and(|p| {
+                        crate::ast::fn_always_returns_param_via_call(p, f, arg_index)
                     })
             })
     }

@@ -2674,10 +2674,58 @@ fn type_carries_user_drop(
 /// deep-copies it (`10,277` vs `8,229` bytes against an inline-construction
 /// oracle, with and without a `Drop` impl alike), so the caller's slot holds a
 /// distinct buffer that its downgraded field cleanup still frees.
+/// B-2026-09-07-10 — what the ALL-PATHS walker needs in order to follow a
+/// hand-back through one call: the program to resolve the inner callee in, and
+/// this function's own name so self-recursion is not mistaken for a hop.
+#[derive(Clone, Copy)]
+struct ViaCtx<'a> {
+    program: &'a crate::Program,
+    self_name: &'a str,
+}
+
 pub fn fn_always_returns_param(
     program: Option<&crate::Program>,
     f: &Function,
     arg_index: usize,
+) -> bool {
+    fn_always_returns_param_ex(program, f, arg_index, false)
+}
+
+/// B-2026-09-07-10 — the ALL-PATHS form of [`fn_returns_param_via_call`]: does
+/// every exit hand the param back, counting a hand-back that goes THROUGH a
+/// callee which itself always returns it (`fn via(r: R) -> R { return f(r); }`)?
+///
+/// The caller's ADMISSION gate `call_arg_flows_into_return` learned the
+/// one-hop route in B-2026-08-28-62 by ORing in `fn_returns_param_via_call`;
+/// the STAND-DOWN gate beside it (`callee_takes_over_arg_drop_body`) never did,
+/// so `via` was admitted by one and dropped by the other, and a named local
+/// handed to it had two owners — the caller's binding and the result's.
+///
+/// It has to be the ALL-PATHS form rather than that ANY-path predicate for the
+/// reason B-2026-09-06-61's fix records: the stand-down is the SUPPRESSING
+/// direction, and a mixed-path callee's dies-inside leg registers bodies-only
+/// "because the caller still owns the memory", so retracting the caller there
+/// takes away that leg's only memory owner. Measured on the mixed spelling
+/// (`fn mvia(r: R, c: bool) -> R { if c { return f(r); } return mk(99); }`):
+/// the hand-back leg is the double free this closes, and the dies-inside leg is
+/// clean today and stays clean, because this predicate declines the function
+/// outright.
+///
+/// ONE HOP, and the inner callee is asked the ALL-PATHS question too, so the
+/// chain cannot launder a mixed-path callee through a passthrough wrapper.
+pub fn fn_always_returns_param_via_call(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> bool {
+    fn_always_returns_param_ex(Some(program), f, arg_index, true)
+}
+
+fn fn_always_returns_param_ex(
+    program: Option<&crate::Program>,
+    f: &Function,
+    arg_index: usize,
+    allow_via_call: bool,
 ) -> bool {
     let Some(param) = f.params.get(arg_index) else {
         return false;
@@ -2707,7 +2755,12 @@ pub fn fn_always_returns_param(
     /// provably owns the value on every path — there is no dies-inside path
     /// left to lose a body on. `option_result_ctor_payload` is the same shape
     /// test the conditional flip and both backends' tail walkers already share.
-    fn yields(e: &Expr, name: &[String], wraps: &[(String, ParamPath)]) -> bool {
+    fn yields(
+        e: &Expr,
+        name: &[String],
+        wraps: &[(String, ParamPath)],
+        via: Option<ViaCtx>,
+    ) -> bool {
         match &e.kind {
             ExprKind::Identifier(n) => {
                 name.iter().any(|a| a == n) || place_yields_wrapped_param(e, wraps)
@@ -2717,10 +2770,38 @@ pub fn fn_always_returns_param(
                 place_yields_wrapped_param(e, wraps)
             }
             ExprKind::StructLiteral { fields, .. } => {
-                fields.iter().any(|f| yields(&f.value, name, wraps))
+                fields.iter().any(|f| yields(&f.value, name, wraps, via))
             }
-            ExprKind::Tuple(elems) => elems.iter().any(|el| yields(el, name, wraps)),
-            _ => crate::ast::option_result_ctor_payload(e).is_some_and(|p| yields(p, name, wraps)),
+            ExprKind::Tuple(elems) => elems.iter().any(|el| yields(el, name, wraps, via)),
+            // B-2026-09-07-10 — the ONE-HOP route, when the caller asked for it:
+            // `return f(r)` where `f` itself always returns that argument.
+            ExprKind::Call { callee, args } if via.is_some() => {
+                if let Some(p) = crate::ast::option_result_ctor_payload(e) {
+                    if yields(p, name, wraps, via) {
+                        return true;
+                    }
+                }
+                let ViaCtx { program, self_name } = via.unwrap();
+                let ExprKind::Identifier(g) = &callee.kind else {
+                    return false;
+                };
+                // Self-recursion asks the same question of the same body.
+                if g == self_name {
+                    return false;
+                }
+                let Some(gf) = program.items.iter().find_map(|item| match item {
+                    Item::Function(gf) if &gf.name == g => Some(gf),
+                    _ => None,
+                }) else {
+                    return false;
+                };
+                args.iter().enumerate().any(|(j, a)| {
+                    matches!(&a.value.kind, ExprKind::Identifier(n) if name.iter().any(|al| al == n))
+                        && fn_always_returns_param(Some(program), gf, j)
+                })
+            }
+            _ => crate::ast::option_result_ctor_payload(e)
+                .is_some_and(|p| yields(p, name, wraps, via)),
         }
     }
     fn leaf_tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -2860,13 +2941,21 @@ pub fn fn_always_returns_param(
         }
     }
 
+    let via = if allow_via_call {
+        program.map(|p| ViaCtx {
+            program: p,
+            self_name: &f.name,
+        })
+    } else {
+        None
+    };
     let mut returns = Vec::new();
     return_operands_block(&f.body, &mut returns);
     // Is there a `return` that does NOT hand the param back? A bare `return;`
     // counts: it exits without yielding, so the param dies on that path.
     let any_bad_return = returns
         .iter()
-        .any(|o| !o.is_some_and(|x| yields(x, name, wraps)));
+        .any(|o| !o.is_some_and(|x| yields(x, name, wraps, via)));
 
     let Some(tail) = f.body.final_expr.as_deref() else {
         // NO TAIL EXPRESSION AT ALL — every exit is a `return` (B-2026-08-29-14).
@@ -2893,12 +2982,12 @@ pub fn fn_always_returns_param(
         // the caller must keep firing.
         let any_good_return = returns
             .iter()
-            .any(|o| o.is_some_and(|x| yields(x, name, wraps)));
+            .any(|o| o.is_some_and(|x| yields(x, name, wraps, via)));
         return f.return_type.is_some() && any_good_return && !any_bad_return;
     };
     let mut tails = Vec::new();
     leaf_tails(tail, &mut tails);
-    if tails.is_empty() || !tails.iter().all(|t| yields(t, name, wraps)) {
+    if tails.is_empty() || !tails.iter().all(|t| yields(t, name, wraps, via)) {
         return false;
     }
     !any_bad_return

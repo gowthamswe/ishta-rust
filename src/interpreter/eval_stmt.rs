@@ -6322,6 +6322,16 @@ impl<'a> super::Interpreter<'a> {
                         )
                         || crate::ast::fn_always_returns_param(Some(self.program), f, i)
                         || crate::ast::fn_conditionally_returns_param_bare(Some(self.program), f, i)
+                        // B-2026-09-07-10 — and the ONE-HOP hand-back
+                        // (`fn via(r: R) -> R { return f(r); }`), the codegen
+                        // twin of the disjunct in
+                        // `callee_takes_over_arg_drop_body`. Without it the
+                        // interpreter ran the argument's `Drop` body TWICE for
+                        // `let a = mk(20); let z = via(a);` — once on the
+                        // moved-from binding before the result was even read,
+                        // once as the result's own — while the DIRECT
+                        // passthrough of the same object ran it once.
+                        || crate::ast::fn_always_returns_param_via_call(self.program, f, i)
                 });
                 if !is_passthrough && !escapes_into_outliving_place {
                     return None;
@@ -6356,6 +6366,11 @@ impl<'a> super::Interpreter<'a> {
                                 f,
                                 i,
                             )
+                            // B-2026-09-07-10 — the one-hop hand-back carries
+                            // the same guarantee on every path: the inner
+                            // callee returns it, the outer returns that, so the
+                            // caller's result binding owns it.
+                            || crate::ast::fn_always_returns_param_via_call(self.program, f, i)
                     });
                 Some((n.clone(), callee_owns_body))
             })
