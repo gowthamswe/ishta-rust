@@ -80,8 +80,26 @@ unsafe fn write_out(s: &str, out_buf: *mut u8, out_cap: i64) -> i64 {
     }
 }
 
-/// Render an integer hole. `is_unsigned != 0` selects `apply_uint` (never
-/// negative, and the value's bits are the magnitude); otherwise `apply_int`.
+/// Render an integer hole. `is_unsigned != 0` selects `apply_uint128` (never
+/// negative, and the value's bits are the magnitude); otherwise
+/// `apply_int128`.
+///
+/// **The value arrives as two 64-bit WORDS**, little-endian, for the same
+/// reason [`crate::karac_runtime_int_fmt`] and `karac_runtime_i128_to_str`
+/// take it that way: passing an `i128` across the C ABI is not uniformly
+/// defined across this runtime's targets. A single `i64` here was the
+/// B-2026-09-07-45 defect — codegen handed a 128-bit value to an `i64`
+/// parameter and LLVM's verifier rejected the module, so `f"{x:^44}"`,
+/// `f"{x:b}"` and `f"{x:*>44}"` on a `u128`/`i128` FAILED TO COMPILE. That is
+/// the same failure B-2026-09-07-34 fixed on the pre-decoded fast path; this
+/// is its spec-re-parsing sibling, which that fix did not reach.
+///
+/// **The caller owns the extension, and it is keyed on RADIX as well as
+/// signedness.** A non-decimal radix reinterprets the value at the HOLE'S OWN
+/// width — `{-1i64:b}` is sixty-four ones, not a hundred and twenty-eight — so
+/// a narrower hole ZERO-extends there and only decimal sign-extends. Codegen
+/// applies exactly that rule before splitting the words (see
+/// `compile_fstr_part_spec_runtime`); rendering here is then width-agnostic.
 ///
 /// # Safety
 ///
@@ -90,17 +108,19 @@ unsafe fn write_out(s: &str, out_buf: *mut u8, out_cap: i64) -> i64 {
 pub unsafe extern "C" fn karac_runtime_fmt_int(
     spec_ptr: *const u8,
     spec_len: i64,
-    value: i64,
+    lo: u64,
+    hi: u64,
     is_unsigned: i32,
     out_buf: *mut u8,
     out_cap: i64,
 ) -> i64 {
     unsafe {
         let fs = parse_spec(spec_ptr, spec_len);
+        let raw: u128 = (u128::from(hi) << 64) | u128::from(lo);
         let rendered = if is_unsigned != 0 {
-            fs.apply_uint(value as u64)
+            fs.apply_uint128(raw)
         } else {
-            fs.apply_int(value)
+            fs.apply_int128(raw as i128)
         };
         write_out(&rendered, out_buf, out_cap)
     }
@@ -160,19 +180,39 @@ pub unsafe extern "C" fn karac_runtime_fmt_str(
 mod tests {
     use super::*;
 
-    unsafe fn call_int(spec: &str, v: i64, unsigned: bool) -> String {
+    /// Call the entrypoint with a 128-bit raw value already split into words.
+    unsafe fn call_raw(spec: &str, raw: u128, unsigned: bool) -> String {
         unsafe {
-            let mut buf = [0u8; 128];
+            let mut buf = [0u8; 256];
             let n = karac_runtime_fmt_int(
                 spec.as_ptr(),
                 spec.len() as i64,
-                v,
+                raw as u64,
+                (raw >> 64) as u64,
                 unsigned as i32,
                 buf.as_mut_ptr(),
                 buf.len() as i64,
             );
             String::from_utf8(buf[..n as usize].to_vec()).unwrap()
         }
+    }
+
+    /// A 64-bit hole, widened the way CODEGEN widens one before the call:
+    /// ZERO-extend for an unsigned hole or any NON-DECIMAL radix (which
+    /// reinterprets at the hole's own width, so `{-1:b}` must stay sixty-four
+    /// ones), SIGN-extend only for a signed decimal one. Getting this rule
+    /// wrong here would hide getting it wrong in codegen, so it is written the
+    /// same way in both places.
+    unsafe fn call_int(spec: &str, v: i64, unsigned: bool) -> String {
+        let dec = FormatSpec::parse(spec)
+            .map(|f| f.radix == super::format_spec::Radix::Dec)
+            .unwrap_or(true);
+        let raw: u128 = if unsigned || !dec {
+            u128::from(v as u64)
+        } else {
+            v as i128 as u128
+        };
+        unsafe { call_raw(spec, raw, unsigned) }
     }
     unsafe fn call_float(spec: &str, v: f64) -> String {
         unsafe {
@@ -248,10 +288,73 @@ mod tests {
         // overflowing (the hard safety net).
         unsafe {
             let mut buf = [0xAAu8; 4];
-            let n =
-                karac_runtime_fmt_int("b".as_ptr(), 1, 255, 0, buf.as_mut_ptr(), buf.len() as i64);
+            let n = karac_runtime_fmt_int(
+                "b".as_ptr(),
+                1,
+                255,
+                0,
+                0,
+                buf.as_mut_ptr(),
+                buf.len() as i64,
+            );
             assert_eq!(n, 4);
             assert_eq!(&buf, b"1111");
+        }
+    }
+
+    /// B-2026-09-07-45 — the SLOW path at 128 bits.
+    ///
+    /// `karac_runtime_fmt_int` took a single `i64` value, so codegen handed a
+    /// 128-bit hole to an `i64` parameter and LLVM's verifier rejected the
+    /// module: `f"{x:^44}"`, `f"{x:b}"` and `f"{x:*>44}"` on a `u128`/`i128`
+    /// FAILED TO COMPILE. B-2026-09-07-34 fixed exactly this on the
+    /// pre-decoded fast path and did not reach here — the two entrypoints look
+    /// alike and are reached by disjoint specs, which is how one kept the
+    /// defect after the other lost it.
+    ///
+    /// `FormatSpec::apply_int128` / `apply_uint128` are the oracle, as
+    /// `apply_int` / `apply_uint` are for every narrower width — the agreement
+    /// that makes `karac run` == `karac build` for these specs.
+    #[test]
+    fn runtime_fmt_int_renders_128_bit_values() {
+        unsafe {
+            // Only specs `needs_runtime_formatter()` actually diverts here.
+            let specs = ["b", "^44", "*>44", "*^46", "=^50", "08b", "^12"];
+            let unsigned: [u128; 5] = [0, 1, u128::MAX, u128::MAX - 1, 1 << 127];
+            for raw in specs {
+                let fs = FormatSpec::parse(raw).unwrap();
+                for v in unsigned {
+                    assert_eq!(
+                        call_raw(raw, v, true),
+                        fs.apply_uint128(v),
+                        "unsigned spec {raw:?} value {v}"
+                    );
+                }
+                for v in [
+                    0i128,
+                    1,
+                    -1,
+                    -7,
+                    i128::MAX,
+                    i128::MIN,
+                    1 << 100, // low word is ZERO — what a 64-bit truncation renders as 0
+                ] {
+                    // Codegen's radix rule, applied by the caller: a
+                    // non-decimal radix reinterprets at the hole's own width,
+                    // and a 128-bit hole is already that width, so the raw
+                    // pattern crosses unchanged either way.
+                    assert_eq!(
+                        call_raw(raw, v as u128, false),
+                        fs.apply_int128(v),
+                        "signed spec {raw:?} value {v}"
+                    );
+                }
+            }
+            // The 64-bit readings must be untouched by the widening: a hole
+            // narrower than 128 bits still renders at ITS width.
+            assert_eq!(call_int("b", -1, false), "1".repeat(64));
+            assert_eq!(call_raw("b", u128::MAX, false), "1".repeat(128));
+            assert_eq!(call_int("^6", -7, false), "  -7  ");
         }
     }
 
@@ -346,11 +449,17 @@ mod tests {
         }
     }
 
-    /// The 128-BIT arm, which the matrix above cannot cover: `apply_int` takes
-    /// `i64` and `apply_uint` takes `u64`, so `FormatSpec` has no 128-bit
-    /// oracle to differ from. Rust's own `{}` / `{:x}` / `{:o}` is the
-    /// reference instead, with the padding applied by `FormatSpec::pad` via a
-    /// width-free spec so only the DIGITS come from Rust.
+    /// The 128-BIT arm of the fast path.
+    ///
+    /// This used to reach for Rust's own `{}` / `{:x}` / `{:o}` as its
+    /// reference, because `apply_int` took `i64` and `apply_uint` took `u64` —
+    /// `FormatSpec` simply had no 128-bit renderer to differ from, which is a
+    /// weaker check than the interpreter-vs-runtime agreement every narrower
+    /// width gets. `apply_int128` / `apply_uint128` (B-2026-09-07-35, which
+    /// added them so the INTERPRETER would stop aborting on these holes) closed
+    /// that gap, so the spec matrix below is now a real oracle. Rust's
+    /// formatting is kept for the bare digits: two independent references cost
+    /// nothing and disagree loudly if either side drifts.
     ///
     /// This arm exists because passing a single `i64` here made a spec'd
     /// `i128` hole fail LLVM module verification outright — `f"{x:44}"` on an
@@ -369,6 +478,26 @@ mod tests {
                     0,
                     width,
                     0,
+                    buf.as_mut_ptr(),
+                    buf.len() as i64,
+                );
+                String::from_utf8(buf[..n as usize].to_vec()).unwrap()
+            }
+        }
+        /// The same call, driven by a parsed `FormatSpec` instead of loose
+        /// radix/width arguments — so the oracle matrix below can exercise
+        /// zero-pad and align, which the four-argument form cannot express.
+        unsafe fn fast_fs(fs: &FormatSpec, raw: u128, signed: bool) -> String {
+            unsafe {
+                let mut buf = [0u8; 256];
+                let n = crate::karac_runtime_int_fmt(
+                    raw as u64,
+                    (raw >> 64) as u64,
+                    signed as i32,
+                    fs.fast_radix_code(),
+                    fs.zero_pad as i32,
+                    fs.width.unwrap_or(0) as i64,
+                    fs.numeric_align_left() as i32,
                     buf.as_mut_ptr(),
                     buf.len() as i64,
                 );
@@ -408,6 +537,34 @@ mod tests {
         // octal u128::MAX is 43 digits — the widest rendering the scratch
         // buffer has to hold, so it is the one that would overflow it.
         assert_eq!(unsafe { fast(u128::MAX, false, 8, 0) }.len(), 43);
+
+        // ORACLE MATRIX against `FormatSpec`'s own 128-bit renderers, over
+        // every spec shape the fast path can receive. This is the assertion
+        // that actually pins run == build at this width; the Rust-reference
+        // checks above only pin the digits.
+        for raw in [
+            "", "44", "1", "<44", ">44", "044", "x", "X", "o", "44x", "044o", "<48X", "020",
+        ] {
+            let fs = FormatSpec::parse(raw).unwrap();
+            for v in [0u128, 1, u128::MAX, u128::MAX - 1, 1 << 127, 1 << 100] {
+                assert_eq!(
+                    unsafe { fast_fs(&fs, v, false) },
+                    fs.apply_uint128(v),
+                    "unsigned 128-bit spec {raw:?} value {v}"
+                );
+            }
+            for v in [0i128, 1, -1, -7, i128::MAX, i128::MIN, 1 << 100] {
+                // Codegen's rule: a NON-DECIMAL radix reinterprets at the
+                // hole's own width. A 128-bit hole IS that width, so the raw
+                // pattern crosses unchanged and `apply_int128` reads it the
+                // same way.
+                assert_eq!(
+                    unsafe { fast_fs(&fs, v as u128, true) },
+                    fs.apply_int128(v),
+                    "signed 128-bit spec {raw:?} value {v}"
+                );
+            }
+        }
     }
 
     /// The fast path must TRUNCATE rather than write past a short buffer.

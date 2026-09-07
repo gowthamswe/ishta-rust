@@ -74202,6 +74202,61 @@ fn main() {
         }
     }
 
+    /// B-2026-09-07-45 — the SLOW (spec-re-parsing) path at 128 bits.
+    ///
+    /// `karac_runtime_int_fmt` above is the PRE-DECODED fast path. The specs
+    /// `needs_runtime_formatter()` diverts — center align, binary radix,
+    /// non-space fill — go to a different entrypoint, `karac_runtime_fmt_int`,
+    /// which took a single `i64` value. So codegen handed it a 128-bit value
+    /// and LLVM's verifier rejected the module: all three of these spellings
+    /// FAILED TO COMPILE on a `u128`/`i128`, on every compiled leg.
+    ///
+    /// That is the identical defect B-2026-09-07-34 fixed on the fast path.
+    /// It survived there because the two entrypoints are reached by DISJOINT
+    /// spec shapes, so the fast path's own regression test could not see it —
+    /// which is why this test exercises the diverted shapes specifically.
+    ///
+    /// The last three holes are the CONTROLS, and they are the reason the
+    /// widening is keyed on RADIX and not just signedness: a non-decimal radix
+    /// reinterprets at the HOLE'S OWN width, so `{-1i64:b}` must stay
+    /// sixty-four ones where `{-1i128:b}` is a hundred and twenty-eight, and a
+    /// `u8` hole must stay eight bits wide.
+    #[test]
+    fn e2e_spec_128_bit_holes_on_the_runtime_formatter_path() {
+        if let Some(out) = run_program(
+            r#"
+fn main() {
+    let big: u128 = 170141183460469231731687303715884105727u128;
+    let umax: u128 = 340282366920938463463374607431768211455u128;
+    let ineg: i128 = -1i128;
+    let ism: i128 = -7i128;
+    println(f"[{big:^44}]");
+    println(f"[{big:*>44}]");
+    println(f"[{umax:b}]");
+    println(f"[{ineg:b}]");
+    println(f"[{ism:^12}]");
+    println(f"[{ism:=^12}]");
+    let n64: i64 = -1;
+    let u8v: u8 = 255;
+    println(f"[{n64:b}]");
+    println(f"[{u8v:*>12b}]");
+    println(f"[{n64:^8}]");
+}
+"#,
+        ) {
+            let want = "[  170141183460469231731687303715884105727   ]\n\
+                        [*****170141183460469231731687303715884105727]\n\
+                        [11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111]\n\
+                        [11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111]\n\
+                        [     -7     ]\n\
+                        [=====-7=====]\n\
+                        [1111111111111111111111111111111111111111111111111111111111111111]\n\
+                        [****11111111]\n\
+                        [   -1   ]\n";
+            assert_eq!(out, want, "128-bit runtime-formatter rendering drifted");
+        }
+    }
+
     /// The SPEC'D integer path must render exactly what `snprintf` did.
     ///
     /// Verified byte-identical against the pre-change compiler over these

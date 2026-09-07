@@ -3473,11 +3473,16 @@ impl<'ctx> Codegen<'ctx> {
         // `snprintf` can't express. Each takes the raw spec bytes + the value +
         // a caller output buffer, returns bytes written. Sizes are `i64` on
         // every target (the Rust ABI uses `i64`, so no wasm size-switching).
+        // The value crosses as two 64-bit WORDS (little-endian), not one — a
+        // single `i64` could not carry a 128-bit hole, and handing it one made
+        // LLVM's verifier reject the module outright (B-2026-09-07-45). Same
+        // arrangement, and same ABI reason, as `karac_runtime_int_fmt`.
         let fmt_int_type = i64_type.fn_type(
             &[
                 ptr_type.into(), // spec_ptr
                 i64_type.into(), // spec_len
-                i64_type.into(), // value
+                i64_type.into(), // value lo
+                i64_type.into(), // value hi
                 i32_type.into(), // is_unsigned
                 ptr_type.into(), // out_buf
                 i64_type.into(), // out_cap

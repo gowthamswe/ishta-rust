@@ -16343,19 +16343,53 @@ impl<'ctx> super::Codegen<'ctx> {
         } else {
             let iv = val.into_int_value();
             let unsigned = self.expr_is_unsigned_int(e);
-            let widened = if iv.get_type().get_bit_width() < 64 {
-                if unsigned {
+            // Normalize to 128 bits, then split into little-endian 64-bit
+            // words — the arrangement `karac_runtime_fmt_int` now takes, and
+            // the same one the pre-decoded fast path above uses.
+            //
+            // Passing the value as a single `i64` was wrong for a 128-bit hole
+            // in the loudest available way: LLVM's verifier rejected the
+            // module, so `f"{x:^44}"` / `f"{x:b}"` / `f"{x:*>44}"` on a
+            // `u128`/`i128` did not compile at all (B-2026-09-07-45). The fast
+            // path had the identical defect and was fixed by B-2026-09-07-34;
+            // this slow path was not reached by that fix, which is the whole
+            // reason it needed its own row.
+            //
+            // A NON-DECIMAL radix reinterprets at the HOLE'S OWN width, so
+            // widening must ZERO-extend there or an `i64` -1 becomes a 128-bit
+            // -1 and `{-1:b}` prints a hundred and twenty-eight ones instead of
+            // sixty-four. Decimal is the only case that sign-extends. Same rule,
+            // same reason, as the fast path.
+            let i128_t = self.context.i128_type();
+            let w = iv.get_type().get_bit_width();
+            let zero_ext = unsigned || fs.radix != crate::format_spec::Radix::Dec;
+            let wide = if w < 128 {
+                if zero_ext {
                     self.builder
-                        .build_int_z_extend(iv, i64_t, "fmt.n.zx")
+                        .build_int_z_extend(iv, i128_t, "fmt.n.zx")
                         .unwrap()
                 } else {
                     self.builder
-                        .build_int_s_extend(iv, i64_t, "fmt.n.sx")
+                        .build_int_s_extend(iv, i128_t, "fmt.n.sx")
                         .unwrap()
                 }
             } else {
                 iv
             };
+            let widened = self
+                .builder
+                .build_int_truncate(wide, i64_t, "fmt.n.lo")
+                .unwrap();
+            let widened_hi = self
+                .builder
+                .build_int_truncate(
+                    self.builder
+                        .build_right_shift(wide, i128_t.const_int(64, false), false, "fmt.n.sh")
+                        .unwrap(),
+                    i64_t,
+                    "fmt.n.hi",
+                )
+                .unwrap();
             let is_unsigned = i32_t.const_int(unsigned as u64, false);
             let fmt_int_fn = self
                 .module
@@ -16368,6 +16402,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         spec_g.into(),
                         spec_len.into(),
                         widened.into(),
+                        widened_hi.into(),
                         is_unsigned.into(),
                         buf_ptr.into(),
                         cap_v.into(),
