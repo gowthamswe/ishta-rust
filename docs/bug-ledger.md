@@ -92,8 +92,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 396 |
-| run-vs-build | 369 |
+| miscompile | 397 |
+| run-vs-build | 371 |
 | leak | 297 |
 | double-free | 212 |
 | missing-feature | 194 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1590 |
-| interp | 403 |
+| codegen | 1593 |
+| interp | 404 |
 | typecheck | 295 |
 | other | 75 |
 | ownership | 74 |
@@ -161,7 +161,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
 | B-2026-09-06-66 | 2026-09-07 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Option[Node], tag: String }` loses 67 bytes (64 direct, 3 indirect) in 1 block at both opt levels, while every EMPTY-`next` spelling of the same type is clean; both `Drop` bodies run, so it is the boxed payload's memory alone | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
-| B-2026-09-07-20 | 2026-09-07 | codegen | medium | `asan_stored_argument_is_owned_by_its_new_home_not_the_caller` LEAKS 35 B AT -O0 AND HAS SINCE THE DAY IT LANDED -- its `[b0907-5-outliving-store-admission]` cell loses 32 B in 2 objects plus 3 B in 1, clean at the default -O2, and nothing has run the -O0 leg since `d971ad5` added the fixture | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
@@ -173,6 +172,9 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-47 | 2026-09-07 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lane, with no projection anywhere and at trip count zero, and gone entirely when the same program is BUILT with `KARAC_AUTO_PAR=0` | — |
 | B-2026-09-07-48 | 2026-09-07 | codegen | high | READING AN RC-PROMOTED LOCAL'S PROJECTED FIELD AFTER THE LOOP DIVERGES THREE WAYS -- `let s = t.a` in a loop then `t.a.len()` prints 152 on the interpreter, -1 compiled and 117 on the JIT, silently, while the same read INSIDE the loop is correct on all four surfaces | — |
 | B-2026-09-07-49 | 2026-09-07 | codegen | medium | EVERY MECHANISM THAT ASKS `use_after_move_consume_sites` IS BLIND TO THE RC-FALLBACK PROMOTION, WHICH IS THE OWNERSHIP PASS'S OTHER ANSWER TO THE SAME QUESTION -- three rows (B-2026-09-07-23, -29, -30) have now been that one missing half, each fixed by a separate hand-written arm | — |
+| B-2026-09-07-50 | 2026-09-07 | codegen | medium | A CALLEE THAT READS ITS BY-VALUE PARAM AFTER A CONDITIONAL STORE LOSES THE `Drop` BODY OUTRIGHT ON THE COMPILED BACKENDS -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` at `k = false` prints no body while `--interp` prints it, and strands the param's whole heap (20 B in 2 blocks at -O0, 120 B in 12 over a six-trip loop); the same read placed BEFORE the store, or a trailing statement that does not read the param, is clean on both counts | — |
+| B-2026-09-07-51 | 2026-09-07 | codegen | medium | THE MONO LEG CARRIES NO CONDITIONAL-STORE REGISTRATION -- `fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }` at `k = false` runs NO `Drop` body on the compiled backends while `--interp` runs it, and leaks the argument's `shared` refcount block (16 B in 1 at -O0); the NON-generic spelling of the identical callee is clean on both counts, which is what isolates genericity as the whole difference | — |
+| B-2026-09-07-52 | 2026-09-07 | codegen+interp | medium | A FIELD ASSIGN WRITTEN `self.one = r` INSIDE A METHOD LOSES THE DISPLACED VALUE'S `Drop` BODY ON EVERY SURFACE -- B-2026-08-01-20's `emit_displaced_field_bodies` flattens the target's base for an `Identifier` root and `self` parses as `SelfValue`, so the caller-side spelling `h.one = mk(37)` prints the old value's body and the method-side one prints nothing, on the interpreter as well as both compiled backends; memory is unaffected, and it is the same gap B-2026-08-26-18 closed in the INDEX-assign twin | — |
 
 ### Relocated
 
@@ -2370,6 +2372,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-17 | codegen | high | AN RC-FALLBACK-PROMOTED LOCAL'S USER `Drop` RUNS OVER THE RELEASED BOX AND FREES IT A SECOND TIME -- the binding's alloca holds a `{i64 rc, T}` box H… | 9a50182d5 |
 | B-2026-09-07-18 | codegen | medium | THE ENUM SIBLING OF B-2026-09-07-17 IS UNTOUCHED -- an RC-fallback-promoted local of a `Drop`-bearing ENUM loses its `Drop` body entirely on the comp… | f37af501e |
 | B-2026-09-07-19 | codegen | high | A `let`-BOUND STRUCT LITERAL WHOSE FIELD PROJECTS AN RC-PROMOTED LOCAL FREES FIVE BUFFERS IT DOES NOT OWN -- `while i < 0 { let p = P { a: t.a, b: 1… | 9a50182 |
+| B-2026-09-07-20 | codegen | medium | `asan_stored_argument_is_owned_by_its_new_home_not_the_caller` LEAKS 35 B AT -O0 AND HAS SINCE THE DAY IT LANDED -- its `[b0907-5-outliving-store-adm… | dffb1d1 |
 | B-2026-09-07-22 | codegen | high | A METHOD OR ASSOC-FN ARGUMENT ON A MIXED-PATH CALLEE THAT HANDS IT BACK THROUGH ONE FURTHER CALL STILL DOUBLE-FREES -- `impl Hold { fn pick2(ref self… | 99bd72d |
 | B-2026-09-07-23 | codegen | high | A `let`-BOUND STRUCT LITERAL PROJECTING A LOOP-OUTER LOCAL FREES THE ALIASED BUFFER ONCE PER ITERATION -- `while i < 2 { let p = P { a: t.a, b: 1 };… | afe5abf |
 | B-2026-09-07-24 | interp | medium | A `u64` ABOVE `i64::MAX` IN A WIDTH-SPEC'D f-STRING HOLE RENDERS NEGATIVE UNDER `--interp` AND UNSIGNED ON BOTH COMPILED BACKENDS -- `f"{ubig:22}"` f… | f5f86c16e |
