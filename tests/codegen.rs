@@ -35312,6 +35312,82 @@ end
         );
     }
 
+    /// B-2026-09-07-22 — the METHOD and ASSOC-FN spelling of B-2026-09-07-15's
+    /// shape: `h.pick2(mk(1), false)` over
+    /// `impl Hold { fn pick2(ref self, r: R, k: bool) -> R { if k { return mk(90); }
+    /// return fwd(r); } }` aborted `free(): double free detected in tcache 2` on all
+    /// four compiled surfaces while `--interp` was correct.
+    ///
+    /// Closed by the SAME commit, without a line of method-specific code: the two
+    /// halves that fix it are the shared predicate
+    /// (`fn_conditionally_returns_param_bare` recognising the one-hop leaf, which is
+    /// what admits the callee to the per-path flip on every call leg at once) and
+    /// the per-path disarm at the hand-off INSIDE that callee — where `fwd(r)` is a
+    /// free-function call whatever spelling reached `pick2`. B-2026-09-07-4 had
+    /// already given the method and assoc legs the flip itself.
+    ///
+    /// That is worth a pin of its own rather than a note, because the row predicted
+    /// the opposite — that the flag-clearing keys on `ExprKind::Identifier` and so
+    /// could not see a `return fwd(r)` tail. It does not have to: the clearing
+    /// happens at the ARGUMENT hand-off, one frame down.
+    ///
+    /// Cells: both legs of the method hop, both legs of the assoc hop, the no-hop
+    /// method control, and a named local into the method hop.
+    ///
+    /// Twin of `tests/interpreter.rs`'s `test_mixed_path_hop_on_a_method`, pinned to the same string.
+    #[test]
+    fn e2e_mixed_path_hop_on_a_method() {
+        let Some(out) = run_program(
+            r#"shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"  dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+fn fwd(r: R) -> R { return r; }
+struct Hold { n: i64 }
+impl Hold { fn pick2(ref self, r: R, k: bool) -> R { if k { return mk(90); } return fwd(r); } }
+impl R { fn picka2(r: R, k: bool) -> R { if k { return mk(91); } return fwd(r); } }
+impl Hold { fn pick(ref self, r: R, k: bool) -> R { if k { return mk(92); } return r; } }
+fn main() {
+  let h = Hold { n: 0 };
+  println("method_hop_handback"); let a = h.pick2(mk(1), false); println(f"  v={a.inner.v}");
+  println("method_hop_dies"); let b = h.pick2(mk(2), true); println(f"  v={b.id}");
+  println("assoc_hop_handback"); let c = R.picka2(mk(3), false); println(f"  v={c.inner.v}");
+  println("assoc_hop_dies"); let d = R.picka2(mk(4), true); println(f"  v={d.id}");
+  println("method_nohop_handback"); let e = h.pick(mk(5), false); println(f"  v={e.inner.v}");
+  println("named_into_method_hop"); let g = mk(6); let n = h.pick2(g, false); println(f"  v={n.inner.v}");
+  println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"method_hop_handback
+  v=1
+  dR1
+method_hop_dies
+  dR2
+  v=90
+  dR90
+assoc_hop_handback
+  v=3
+  dR3
+assoc_hop_dies
+  dR4
+  v=91
+  dR91
+method_nohop_handback
+  v=5
+  dR5
+named_into_method_hop
+  v=6
+  dR6
+end
+"#
+        );
+    }
+
     /// B-2026-09-07-15 — a MIXED-PATH callee that hands its argument back THROUGH
     /// one further call (`fn mvia(r: R, c: bool) -> R { if c { return f(r); }
     /// return mk(90); }`) double-freed on its hand-back leg: `free(): double free

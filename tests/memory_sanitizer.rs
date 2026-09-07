@@ -4134,6 +4134,58 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-22 — the MEMORY half of the method and assoc spellings:
+    /// one owner and one free per object on both legs of the branch, on both
+    /// call legs.
+    #[test]
+    fn asan_mixed_path_hop_on_a_method() {
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"  dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn fwd(r: R) -> R { return r; }\n\
+             struct Hold { n: i64 }\n\
+             impl Hold { fn pick2(ref self, r: R, k: bool) -> R { if k { return mk(90); } return fwd(r); } }\n\
+             impl R { fn picka2(r: R, k: bool) -> R { if k { return mk(91); } return fwd(r); } }\n\
+             impl Hold { fn pick(ref self, r: R, k: bool) -> R { if k { return mk(92); } return r; } }\n\
+             fn main() {\n\
+               let h = Hold { n: 0 };\n\
+               println(\"method_hop_handback\"); let a = h.pick2(mk(1), false); println(f\"  v={a.inner.v}\");\n\
+               println(\"method_hop_dies\"); let b = h.pick2(mk(2), true); println(f\"  v={b.id}\");\n\
+               println(\"assoc_hop_handback\"); let c = R.picka2(mk(3), false); println(f\"  v={c.inner.v}\");\n\
+               println(\"assoc_hop_dies\"); let d = R.picka2(mk(4), true); println(f\"  v={d.id}\");\n\
+               println(\"method_nohop_handback\"); let e = h.pick(mk(5), false); println(f\"  v={e.inner.v}\");\n\
+               println(\"named_into_method_hop\"); let g = mk(6); let n = h.pick2(g, false); println(f\"  v={n.inner.v}\");\n\
+               println(\"end\");\n\
+             }\n",
+            &[
+                "method_hop_handback",
+                "  v=1",
+                "  dR1",
+                "method_hop_dies",
+                "  dR2",
+                "  v=90",
+                "  dR90",
+                "assoc_hop_handback",
+                "  v=3",
+                "  dR3",
+                "assoc_hop_dies",
+                "  dR4",
+                "  v=91",
+                "  dR91",
+                "method_nohop_handback",
+                "  v=5",
+                "  dR5",
+                "named_into_method_hop",
+                "  v=6",
+                "  dR6",
+                "end"
+            ],
+            "mixed_path_hop_on_a_method",
+        );
+    }
+
     /// B-2026-09-07-15 — the MEMORY half: the same program under ASAN + LSan,
     /// where the pre-fix build double-freed the object handed back through the
     /// hop. One owner and one free per object on BOTH legs of the branch, which
