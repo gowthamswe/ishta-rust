@@ -5633,6 +5633,166 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-70 — the METHOD and ASSOC-FN argument registrars had no
+    /// ADMISSION gate at all, so a fresh-temp argument a passthrough callee
+    /// hands straight back had two owners, with no rebind anywhere.
+    ///
+    /// Both legs computed `escapes_frame` and both fed it to the registrar, but
+    /// that flag only picks the bodies-vs-memory MODE — nothing declined the
+    /// registration. For a param the prologue declines to COPY (`R` owns a
+    /// `shared` field, so `aggregate_param_copy_supported_struct` fails and the
+    /// param FORWARDS the caller's object) the memory-only registration was a
+    /// second owner of the buffer the result binding already owns. The free leg
+    /// has had this gate since B-2026-07-01-7; `fn f(r: R) -> R { return r; }`
+    /// was clean throughout while its method and assoc twins aborted.
+    ///
+    /// The cells are the spellings that were red: the assoc passthrough `a`,
+    /// the method passthrough `b`, the method REBIND `c`, the struct-LITERAL
+    /// argument `d` (whose parent failure was `malloc(): unaligned tcache chunk
+    /// detected` — heap corruption, not a detected double free), the two
+    /// DISCARDED-result calls with no result binding at all, and the loop.
+    /// `R.mka()` is the discarded assoc call with no argument, which is
+    /// B-2026-09-07-2's own root and is pinned by
+    /// `test_e2e_discarded_assoc_fn_call_owns_its_result` — carried here too
+    /// because the gate is what removed its cover.
+    ///
+    /// `e`/`g` are the load-bearing controls: `P` is copy-supported, so the
+    /// callee entry-copies and hands back an INDEPENDENT object whose original
+    /// the caller must still drop. That case is re-admitted by
+    /// `arg_is_entry_copied_heap_struct`, and it is the reason the gate is safe
+    /// at all — without the carve-out this fix would trade every double free
+    /// for a leak. `k`/`l` are the second control: an argument the callee
+    /// CONSUMES keeps its body and its memory on both legs.
+    ///
+    /// -O2 MASKS most of this. LLVM inlines the callee and the double free
+    /// becomes a surviving use-after-free that prints every line correctly, so
+    /// on the parent this fixture's output was already right at `-O2` while the
+    /// program was corrupt. `asan_method_and_assoc_arg_registrars_admit_only_-
+    /// when_the_result_owns_it` is the half that sees it.
+    fn test_e2e_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkP(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+struct Hold { n: i64 }
+impl R {
+  fn passa(r: R) -> R { return r; }
+  fn eata(r: R) -> i64 { return r.id; }
+  fn mka() -> R { return mk(31); }
+}
+impl P { fn passp(p: P) -> P { return p; } }
+impl Hold {
+  fn thru(ref self, r: R) -> R { return r; }
+  fn reb(ref self, r: R) -> R { let m = r; return m; }
+  fn thrup(ref self, p: P) -> P { return p; }
+  fn eat(ref self, r: R) -> i64 { return r.id; }
+}
+fn main() {
+  let h = Hold { n: 0 };
+  let a = R.passa(mk(16)); println(f"a={a.inner.v}");
+  let b = h.thru(mk(17)); println(f"b={b.inner.v}");
+  let c = h.reb(mk(18)); println(f"c={c.inner.v}");
+  let d = h.thru(R { id: 19, name: "h19", inner: Inner { v: 19 } }); println(f"d={d.inner.v}");
+  h.thru(mk(20));
+  R.passa(mk(21));
+  R.mka();
+  let mut i = 0;
+  while i < 2 { let z = R.passa(mk(22)); println(f"lp={z.inner.v}"); i = i + 1; }
+  let e = h.thrup(mkP(23)); println(f"e={e.name}");
+  let g = P.passp(mkP(24)); println(f"g={g.name}");
+  let k = h.eat(mk(25)); println(f"k={k}");
+  let l = R.eata(mk(26)); println(f"l={l}");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out,
+                "a=16\ndR16\nb=17\ndR17\nc=18\ndR18\nd=19\ndR19\ndR20\ndR21\ndR31\nlp=22\ndR22\nlp=22\ndR22\ne=p23\ndP23\ng=p24\ndP24\ndR25\nk=25\ndR26\nl=26\nend\n",
+                "a method or assoc callee that hands its by-value argument back \
+                 leaves the result binding the only owner, so the argument temp \
+                 must not be registered beside it; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// B-2026-09-07-2 — a DISCARDED associated-function call registered no owner
+    /// at all: its returned value's `Drop` body ran on no compiled backend and
+    /// its heap leaked.
+    ///
+    /// `try_track_discarded_user_drop_temp` resolves the discarded value's type
+    /// by matching the tail expression, and its `Call` arm handled only an
+    /// `Identifier` callee. `Type.fn(args)` parses as a `Call` whose callee is a
+    /// two-segment PATH, so it fell to the arm's `_ => None` and the whole
+    /// battery below registered nothing. `Q.make2();` — no argument anywhere in
+    /// it — printed `dQ62` under `--interp` and nothing on any compiled surface,
+    /// losing 3 B in 1 block.
+    ///
+    /// The INSTANCE-METHOD twin `h.make3()` and the FREE-FUNCTION twin `mke2()`
+    /// are the controls that locate it: both were always correct, because a
+    /// `MethodCall` reaches the receiver-keyed arm and a bare `Identifier`
+    /// reaches the free-fn arm. Only the assoc spelling had no arm.
+    ///
+    /// `Ev.mke()` is the case the fix deliberately EXCLUDES, and it is here so
+    /// the exclusion cannot be silently dropped: a discarded assoc call
+    /// returning a user ENUM already has an owner on this leg, and registering
+    /// for it produced `dQ71 dQ71` at -O2 and a double free under `karac run`
+    /// and at -O0. `Ev.A(mkq(70))` (a bare variant ctor, the other two-segment
+    /// path that reaches the same arm) and `Q.count()` (a non-`Drop` return)
+    /// pin the two other shapes the guard has to keep out. `W.mkw()` is the
+    /// no-own-`Drop`-but-contains-one case, which routes through the same arm's
+    /// field-bodies walk.
+    fn test_e2e_discarded_assoc_fn_call_owns_its_result() {
+        let out = run_program(
+            r#"
+struct Q { id: i64, name: String }
+impl Drop for Q { fn drop(mut ref self) { println(f"dQ{self.id}") } }
+fn mkq(i: i64) -> Q { return Q { id: i, name: f"q{i}" }; }
+struct W { q: Q, n: i64 }
+enum Ev { A(Q), B(i64) }
+struct Hold { n: i64 }
+impl Q {
+  fn make2() -> Q { return mkq(62); }
+  fn passq(q: Q) -> Q { return q; }
+  fn count() -> i64 { return 7; }
+}
+impl W { fn mkw() -> W { return W { q: mkq(77), n: 1 }; } }
+impl Ev { fn mke() -> Ev { return Ev.A(mkq(71)); } }
+impl Hold { fn make3(ref self) -> Q { return mkq(63); } }
+fn mke2() -> Ev { return Ev.A(mkq(76)); }
+fn main() {
+  let h = Hold { n: 0 };
+  Q.make2();
+  Q.passq(mkq(64));
+  let _ = Q.make2();
+  Q.count();
+  W.mkw();
+  Ev.mke();
+  Ev.A(mkq(70));
+  mke2();
+  h.make3();
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "dQ62\ndQ64\ndQ62\ndQ77\ndQ71\ndQ70\ndQ76\ndQ63\nend\n",
+                "a discarded `Type.fn(..)` result is the caller's to own, and \
+                 exactly once — the enum-return and variant-ctor spellings \
+                 already have an owner and must stay out of it; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-05-37 — a whole rebind of a by-value `Drop` param NESTED in a
     /// branch frees the callee's entry copy on the path that never rebound.
     ///

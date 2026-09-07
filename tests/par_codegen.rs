@@ -13232,6 +13232,113 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-70, auto-par twin of
+    /// `test_e2e_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it`.
+    ///
+    /// The admission gate itself is shared by the sequential and auto-par
+    /// lowerings, but the argument temp it declines to register is materialized
+    /// per call site — so an outlined parallel region reaches the same two
+    /// registrars through a different block, and a caller-side STAND-DOWN is
+    /// exactly the shape that can be right in one lowering and wrong in the
+    /// other. Pinned for the reason every drop fix in this file is.
+    fn test_e2e_auto_par_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkP(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+struct Hold { n: i64 }
+impl R {
+  fn passa(r: R) -> R { return r; }
+  fn eata(r: R) -> i64 { return r.id; }
+  fn mka() -> R { return mk(31); }
+}
+impl P { fn passp(p: P) -> P { return p; } }
+impl Hold {
+  fn thru(ref self, r: R) -> R { return r; }
+  fn reb(ref self, r: R) -> R { let m = r; return m; }
+  fn thrup(ref self, p: P) -> P { return p; }
+  fn eat(ref self, r: R) -> i64 { return r.id; }
+}
+fn main() {
+  let h = Hold { n: 0 };
+  let a = R.passa(mk(16)); println(f"a={a.inner.v}");
+  let b = h.thru(mk(17)); println(f"b={b.inner.v}");
+  let c = h.reb(mk(18)); println(f"c={c.inner.v}");
+  let d = h.thru(R { id: 19, name: "h19", inner: Inner { v: 19 } }); println(f"d={d.inner.v}");
+  h.thru(mk(20));
+  R.passa(mk(21));
+  R.mka();
+  let mut i = 0;
+  while i < 2 { let z = R.passa(mk(22)); println(f"lp={z.inner.v}"); i = i + 1; }
+  let e = h.thrup(mkP(23)); println(f"e={e.name}");
+  let g = P.passp(mkP(24)); println(f"g={g.name}");
+  let k = h.eat(mk(25)); println(f"k={k}");
+  let l = R.eata(mk(26)); println(f"l={l}");
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out,
+                "a=16\ndR16\nb=17\ndR17\nc=18\ndR18\nd=19\ndR19\ndR20\ndR21\ndR31\nlp=22\ndR22\nlp=22\ndR22\ne=p23\ndP23\ng=p24\ndP24\ndR25\nk=25\ndR26\nl=26\nend\n",
+                "the method and assoc admission gate must hold under auto-par \
+                 too; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// B-2026-09-07-2, auto-par twin of
+    /// `test_e2e_discarded_assoc_fn_call_owns_its_result`.
+    fn test_e2e_auto_par_discarded_assoc_fn_call_owns_its_result() {
+        let out = run_program(
+            r#"
+struct Q { id: i64, name: String }
+impl Drop for Q { fn drop(mut ref self) { println(f"dQ{self.id}") } }
+fn mkq(i: i64) -> Q { return Q { id: i, name: f"q{i}" }; }
+struct W { q: Q, n: i64 }
+enum Ev { A(Q), B(i64) }
+struct Hold { n: i64 }
+impl Q {
+  fn make2() -> Q { return mkq(62); }
+  fn passq(q: Q) -> Q { return q; }
+  fn count() -> i64 { return 7; }
+}
+impl W { fn mkw() -> W { return W { q: mkq(77), n: 1 }; } }
+impl Ev { fn mke() -> Ev { return Ev.A(mkq(71)); } }
+impl Hold { fn make3(ref self) -> Q { return mkq(63); } }
+fn mke2() -> Ev { return Ev.A(mkq(76)); }
+fn main() {
+  let h = Hold { n: 0 };
+  Q.make2();
+  Q.passq(mkq(64));
+  let _ = Q.make2();
+  Q.count();
+  W.mkw();
+  Ev.mke();
+  Ev.A(mkq(70));
+  mke2();
+  h.make3();
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "dQ62\ndQ64\ndQ62\ndQ77\ndQ71\ndQ70\ndQ76\ndQ63\nend\n",
+                "the discarded assoc-fn owner must hold under auto-par too; \
+                 got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-06-61, auto-par twin of
     /// `test_e2e_param_handed_back_through_a_rebind_leaves_one_owner`.
     ///

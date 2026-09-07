@@ -7412,6 +7412,70 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-70 — the FREEING half of
+    /// `test_e2e_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it`.
+    ///
+    /// That test asserts the output, which on the parent was already correct at
+    /// `-O2` for most of these cells: LLVM inlines the callee and the double
+    /// free becomes a surviving use-after-free. Only a sanitizer separates
+    /// "prints the right lines" from "owns its memory once". Measured here 0
+    /// valgrind errors after the fix, against `free(): double free detected in
+    /// tcache 2` and 3 errors from 3 contexts per red cell on the parent — plus
+    /// `malloc(): unaligned tcache chunk detected` for the struct-literal cell,
+    /// which is heap corruption rather than a detected double free.
+    ///
+    /// DELIBERATELY OMITS the E2E fixture's `k`/`l` and loop cells, which are
+    /// controls for the output count rather than for ownership, and its tuple
+    /// sibling `h.thrut2((mk(35), 9))`: that one goes from a double free to
+    /// correct output with a 16-byte residual — the `shared` handle's refcount
+    /// block, B-2026-09-06-72's class, whose no-method twin leaks the same 16
+    /// bytes on the parent. Including it would make this fixture red for
+    /// someone else's bug.
+    fn asan_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkP(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+struct Hold { n: i64 }
+impl R {
+  fn passa(r: R) -> R { return r; }
+  fn mka() -> R { return mk(31); }
+}
+impl P { fn passp(p: P) -> P { return p; } }
+impl Hold {
+  fn thru(ref self, r: R) -> R { return r; }
+  fn reb(ref self, r: R) -> R { let m = r; return m; }
+  fn thrup(ref self, p: P) -> P { return p; }
+}
+fn main() {
+  let h = Hold { n: 0 };
+  let a = R.passa(mk(16)); println(f"a={a.inner.v}");
+  let b = h.thru(mk(17)); println(f"b={b.inner.v}");
+  let c = h.reb(mk(18)); println(f"c={c.inner.v}");
+  let d = h.thru(R { id: 19, name: "h19", inner: Inner { v: 19 } }); println(f"d={d.inner.v}");
+  h.thru(mk(20));
+  R.passa(mk(21));
+  R.mka();
+  let e = h.thrup(mkP(23)); println(f"e={e.name}");
+  let g = P.passp(mkP(24)); println(f"g={g.name}");
+  println("end");
+}
+"#,
+            &[
+                "a=16", "dR16", "b=17", "dR17", "c=18", "dR18", "d=19", "dR19", "dR20", "dR21",
+                "dR31", "e=p23", "dP23", "g=p24", "dP24", "end",
+            ],
+            "b0906-70-method-assoc-admission",
+            30,
+        );
+    }
+
+    #[test]
     fn asan_branch_nested_param_rebind_frees_the_entry_copy() {
         assert_clean_asan_run_min_allocs(
             r#"

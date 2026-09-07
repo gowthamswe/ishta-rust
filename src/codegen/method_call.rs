@@ -8025,6 +8025,21 @@ impl<'ctx> super::Codegen<'ctx> {
                     // by instrumentation (`B2.pick` → `self_param=true
                     // params=["r", "k"]`), the same key the sibling
                     // `call_arg_moves_into_outliving_place` is called on here.
+                    // B-2026-09-06-70 — the ALL-PATHS half on its own, because
+                    // the ADMISSION gate below may consult only that one. See
+                    // the gate's note for why the conditional sibling cannot
+                    // join it.
+                    let always_handed_back = self
+                        .program_snapshot
+                        .as_deref()
+                        .and_then(|p| super::declarations::find_function_ast(p, &qualified))
+                        .is_some_and(|f| {
+                            crate::ast::fn_always_returns_param(
+                                self.program_snapshot.as_deref(),
+                                f,
+                                i,
+                            )
+                        });
                     let handed_off = self
                         .program_snapshot
                         .as_deref()
@@ -8090,15 +8105,93 @@ impl<'ctx> super::Codegen<'ctx> {
                     let payload_skip = self.enum_arg_payload_skip(&qualified, pidx);
                     let field_payload_paths =
                         self.callee_escaping_field_payload_paths(&qualified, i);
-                    self.track_inline_owned_aggregate_arg_parts(
-                        val,
-                        &a.value,
-                        escapes_frame,
-                        &escaping_parts,
-                        &field_payload_paths,
-                        None,
-                        payload_skip,
-                    );
+                    // B-2026-09-06-70 — the ADMISSION gate, which this leg
+                    // never had at all. Everything above decides the
+                    // registrar's MODE (bodies-and-memory, or memory only when
+                    // `escapes_frame`); nothing decided whether to register.
+                    // For a param the callee's prologue declined to COPY — a
+                    // `shared` field makes `aggregate_param_copy_supported_-
+                    // struct` fail, so the param FORWARDS the caller's object —
+                    // the memory-only registration is a second owner of the
+                    // very buffer the result binding already owns. `impl R { fn
+                    // passa(r: R) -> R { return r; } }` called as
+                    // `R.passa(mk(16))`, and the method twin `h.thru(mk(17))`,
+                    // both aborted `free(): double free detected in tcache 2`
+                    // under `karac run` and at both opt levels, 3 valgrind
+                    // errors from 3 contexts, while `--interp` and the IDENTICAL
+                    // free function were clean. No rebind is involved: the
+                    // plainest passthrough the language can express was enough.
+                    //
+                    // The free leg has had this gate for months (B-2026-07-01-7,
+                    // widened by -07-08-6 / -08-01-14 / -08-27-44); this is that
+                    // gate, entry-copy carve-outs included.
+                    //
+                    // ALL-PATHS ONLY, never `handed_off`. Standing the caller
+                    // down is a retraction of the buffer's ONLY owner, so it is
+                    // safe exactly where another owner is certain on EVERY path.
+                    // `fn_always_returns_param` says so by construction — its
+                    // own doc puts it as "there is no dies-inside path left to
+                    // lose a body on". `fn_conditionally_returns_param_bare`
+                    // does not: the callee-side flip registers that path
+                    // through `emit_struct_user_drop_bodies_only_fn`, which
+                    // frees NOTHING, deliberately, "because the caller still
+                    // owns the memory". Suppressing here would retract that
+                    // memory owner and trade the double free for a leak.
+                    //
+                    // That is not a deduction — it is what the FREE leg's own
+                    // gate does today, and the reason this one is deliberately
+                    // NARROWER than it. `call_arg_flows_into_return` admits on
+                    // the union (`fn_returns_param`) and on the forwarding
+                    // route (`fn_returns_param_via_call`), both of which answer
+                    // true for a MIXED-path callee. Measured on the free leg,
+                    // `fn pick3(r: R, k: bool) -> R { if k { return mk(96); }
+                    // return r; }` at `k = true`: correct output, and 19 bytes
+                    // definitely lost in 2 blocks, 2 valgrind errors — its
+                    // `return fwd(r)` spelling loses the same 19 bytes. The
+                    // METHOD twin of that shape is CLEAN on `main` precisely
+                    // because this leg registers unconditionally, so widening
+                    // to the free leg's predicate here would trade one leg's
+                    // double free for the other's leak. The free-leg leak is
+                    // filed on its own row rather than mirrored into this one.
+                    //
+                    // The conditional route keeps its `escapes_frame` seat, one
+                    // line up, which is the BODY half and stays correct.
+                    //
+                    // The entry-copy carve-outs are load-bearing, not defensive:
+                    // a COPY-SUPPORTED param really is deep-copied at entry, so
+                    // the callee hands back an INDEPENDENT object and the
+                    // caller's orphaned original still needs its memory freed.
+                    // Without them this gate would convert the double free into
+                    // a leak for every `struct P { name: String }` passthrough.
+                    //
+                    // The tuple carve-out is asked on `i`, the same key as
+                    // `find_function_ast` above, because it resolves the
+                    // callee's declared element types through that helper too:
+                    // an impl method is in NEITHER `fn_sig.fn_asts` NOR
+                    // `generic_fns` (both are filled by scanning
+                    // `program.items` for `Item::Function`, which never sees a
+                    // body inside an `ImplBlock`), so the lookup answered
+                    // `None` and the carve-out silently under-fired — it read
+                    // `(Q, i64)` as NOT entry-copied and the gate then declined
+                    // a registration the callee's own entry copy needs, losing
+                    // 3 bytes on `h.thrut((mkq(31), 7))` and 3 more on the
+                    // assoc twin. The `find_function_ast` fallback that fixes
+                    // it is receiver-EXCLUDING, which is what settles the key.
+                    if !always_handed_back
+                        || self.arg_is_entry_copied_heap_struct(&a.value)
+                        || self.arg_is_entry_copied_heap_enum(&a.value)
+                        || self.arg_is_entry_copied_heap_tuple(&a.value, &qualified, i)
+                    {
+                        self.track_inline_owned_aggregate_arg_parts(
+                            val,
+                            &a.value,
+                            escapes_frame,
+                            &escaping_parts,
+                            &field_payload_paths,
+                            None,
+                            payload_skip,
+                        );
+                    }
                     self.disarm_escaping_place_tuple_elem_bodies(&qualified, i, &a.value);
                     // B-2026-09-05-17 — and the STRUCT sibling, which the method
                     // path never called: `h.m_fwd(g)` over `fn m_fwd(ref self,

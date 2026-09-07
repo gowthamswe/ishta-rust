@@ -3266,7 +3266,9 @@ impl<'ctx> super::Codegen<'ctx> {
                     // — never on the union-over-return-sites predicate, which
                     // answers true for a param that escapes on one path and
                     // dies on another and would lose that path's body.
-                    let handed_off = self
+                    // B-2026-09-06-70 — the ALL-PATHS half on its own, because
+                    // the ADMISSION gate below may consult only that one.
+                    let always_handed_back = self
                         .program_snapshot
                         .as_deref()
                         .and_then(|p| super::declarations::find_function_ast(p, &qualified))
@@ -3275,15 +3277,51 @@ impl<'ctx> super::Codegen<'ctx> {
                                 self.program_snapshot.as_deref(),
                                 f,
                                 i,
-                            ) || crate::ast::fn_conditionally_returns_param_bare(
-                                self.program_snapshot.as_deref(),
-                                f,
-                                i,
                             )
                         });
+                    let handed_off = always_handed_back
+                        || self
+                            .program_snapshot
+                            .as_deref()
+                            .and_then(|p| super::declarations::find_function_ast(p, &qualified))
+                            .is_some_and(|f| {
+                                crate::ast::fn_conditionally_returns_param_bare(
+                                    self.program_snapshot.as_deref(),
+                                    f,
+                                    i,
+                                )
+                            });
                     let escapes_frame = handed_off
                         || self.call_arg_moves_into_outliving_place(&qualified, i, false);
-                    self.track_inline_owned_aggregate_arg(val, &a.value, escapes_frame);
+                    // B-2026-09-06-70 — the ADMISSION gate, absent from this leg
+                    // exactly as from the method one. `escapes_frame` above picks
+                    // the registrar's MODE and never declines the registration,
+                    // so for a param the callee's prologue declined to COPY (a
+                    // `shared` field fails `aggregate_param_copy_supported_-
+                    // struct`, so the param FORWARDS the caller's object) the
+                    // memory-only registration became a SECOND owner of the
+                    // buffer the result binding already owns: `impl R { fn
+                    // passa(r: R) -> R { return r; } }` over `R.passa(mk(16))`
+                    // aborted `free(): double free detected in tcache 2` on
+                    // every compiled surface while `--interp` and the identical
+                    // FREE function were clean.
+                    //
+                    // Rationale for the ALL-PATHS predicate and for the
+                    // entry-copy carve-outs is written out once, on the method
+                    // leg's copy of this gate (`method_call.rs`); the two legs
+                    // are the same rule and B-2026-08-29-54 already keeps them
+                    // deliberately in step. The one difference is the parameter
+                    // index — a static fn has no `self_param`, so the source
+                    // argument `i` IS the declared index on BOTH the
+                    // `find_function_ast` and the `fn_asts` key, where the
+                    // method leg's tuple carve-out has to shift to `pidx`.
+                    if !always_handed_back
+                        || self.arg_is_entry_copied_heap_struct(&a.value)
+                        || self.arg_is_entry_copied_heap_enum(&a.value)
+                        || self.arg_is_entry_copied_heap_tuple(&a.value, &qualified, i)
+                    {
+                        self.track_inline_owned_aggregate_arg(val, &a.value, escapes_frame);
+                    }
                     // The registrar above answers for an AGGREGATE (struct /
                     // enum / tuple temp). A bare `String` / `Vec` argument is
                     // not one — it early-returns on the `vec_struct_type`

@@ -4427,6 +4427,67 @@ impl<'ctx> super::Codegen<'ctx> {
                             .or(declared)
                     }
                 }
+                // B-2026-09-06-70 — the ASSOCIATED-FUNCTION spelling, which no
+                // arm of this resolution reached. `Type.fn(args)` parses as a
+                // `Call` whose callee is a two-segment PATH, not an
+                // `Identifier`, so it fell straight to the `_ => None` below
+                // and a discarded assoc result was registered NOWHERE: its
+                // `Drop` body ran on no compiled backend and its heap leaked.
+                // `impl Q { fn make2() -> Q { return mkq(62); } }` under a bare
+                // `Q.make2();` printed `dQ62` under `--interp` and nothing
+                // under `karac run` or at either opt level, losing 3 B in 1
+                // block — with no argument anywhere in it, so this is the
+                // discard resolution alone. The INSTANCE-method twin
+                // `h.make3()` is correct on all five surfaces, because a
+                // MethodCall reaches the receiver-keyed arm further down.
+                //
+                // It surfaced through that row's admission gate rather than on
+                // its own: while the argument registrar registered
+                // unconditionally, its memory-only registration happened to
+                // free the buffer a passthrough assoc call handed back, so only
+                // the BODY was visibly missing. The gate removes that cover, so
+                // the two land together — the same pairing B-2026-09-05-18
+                // records for the generic leg of this registrar.
+                //
+                // Gated on the `fn_return_type_names` entry, which only a
+                // DECLARED assoc fn has: an enum variant ctor (`Ev.A(x)`) is
+                // the other two-segment path that reaches here, it has no such
+                // entry, and its fresh temp already has an owner.
+                //
+                // STRUCT returns only, and the exclusion is MEASURED. A
+                // discarded assoc call returning a user ENUM already has an
+                // owner on this leg — `Ev.mke();` over `impl Ev { fn mke() ->
+                // Ev { return Ev.A(mkq(71)); } }` is clean on `main` — so
+                // registering here made it two: `dQ71 dQ71` at -O2 and `free():
+                // double free detected in tcache 2` under `karac run` and at
+                // -O0. The asymmetry is this leg's alone: the METHOD twin
+                // (`h.mke()`), the FREE-FN twin (`mke2()`), and an assoc fn
+                // returning a struct that merely CONTAINS a `Drop` field
+                // (`W.mkw()`, no `Drop` of its own) are all clean before and
+                // after, which is what locates the pre-existing owner on the
+                // enum path specifically rather than on assoc dispatch as such.
+                ExprKind::Path { segments, .. }
+                    if segments.len() == 2
+                        && !self.user_ref_method_names.contains(segments[1].as_str())
+                        && self
+                            .fn_sig
+                            .fn_return_type_names
+                            .contains_key(&format!("{}.{}", segments[0], segments[1])) =>
+                {
+                    let qualified = format!("{}.{}", segments[0], segments[1]);
+                    let declared = self.fn_sig.fn_return_type_names.get(&qualified).cloned();
+                    let resolved = if declared
+                        .as_deref()
+                        .is_some_and(|d| self.names_a_drop_type(d))
+                    {
+                        declared
+                    } else {
+                        self.discarded_escaped_part_type_name(&qualified, args)
+                            .or_else(|| self.discarded_whole_param_type_name(&qualified, args))
+                            .or(declared)
+                    };
+                    resolved.filter(|d| !self.type_decls.enum_layouts.contains_key(d.as_str()))
+                }
                 _ => None,
             },
             // B-2026-07-30-11 (user-method discard): `f.make();` /
@@ -6994,7 +7055,30 @@ impl<'ctx> super::Codegen<'ctx> {
             .fn_sig
             .fn_asts
             .get(callee)
-            .or_else(|| self.mono_state.generic_fns.get(callee))?;
+            .or_else(|| self.mono_state.generic_fns.get(callee))
+            // B-2026-09-06-70 — an impl METHOD or assoc fn is in NEITHER map.
+            // Both are filled by scanning `program.items` for
+            // `Item::Function`, which never sees a body living inside an
+            // `ImplBlock`, so a `Type.method` key answered `None` here and the
+            // declared fill-in silently did nothing. That was invisible while
+            // only the free leg asked — its callees are all in `fn_asts` — and
+            // became load-bearing the moment the method and assoc legs gained
+            // an admission gate whose tuple carve-out reads this. Measured:
+            // `impl Hold { fn thrut(ref self, t: (Q, i64)) -> (Q, i64) }` under
+            // `h.thrut((mkq(31), 7))` reported the param as NOT entry-copied,
+            // so the gate declined a registration the callee's own copy needs,
+            // and the caller's orphaned original lost 3 bytes; the assoc twin
+            // `Q.passt` lost the same 3.
+            //
+            // `find_function_ast` resolves the `Type.` prefix against the impl
+            // blocks, and the method it returns has `params` EXCLUDING the
+            // receiver — the same convention the two callers pass here, since a
+            // free function's `i` and a method's source-argument `i` both index
+            // past no `self`. Strictly additive: it is asked only where both
+            // maps miss, so every free-function answer is byte-identical.
+            .or_else(|| {
+                super::declarations::find_function_ast(self.program_snapshot.as_deref()?, callee)
+            })?;
         match &f.params.get(idx)?.ty.kind {
             TypeKind::Tuple(elems) => Some(elems.clone()),
             _ => None,
