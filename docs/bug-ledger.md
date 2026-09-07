@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 393 |
 | run-vs-build | 361 |
-| leak | 280 |
+| leak | 281 |
 | double-free | 197 |
 | missing-feature | 194 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1539 |
+| codegen | 1540 |
 | interp | 396 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -124,7 +124,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | lexer | 8 |
 ## Current state
 
-_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-06). Do not edit this block by hand; edit the ledger and regenerate._
+_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-07). Do not edit this block by hand; edit the ledger and regenerate._
 
 ### Open
 
@@ -164,8 +164,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-60 | 2026-09-06 | codegen | high | A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `Map` FIELD DOUBLE-FREES WITH NO REBIND AT ALL -- `fn norebind(q: Q) -> i64 { return q.id; }` over `struct Q { id: i64, name: String, tbl: Map[i64, i64] }` aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (10 valgrind errors from 10 contexts) and SEGFAULTS at the default -O2 (9 errors from 9 contexts), while `--interp` prints `dQ43 nq=43 end` correctly. A `Map` field declines copy support but is NOT shared-owning, so the param is owned BY TRANSFER (B-2026-08-05-33) -- whose safety argument is a caller-side retraction held in lockstep. Passing the struct by value is the whole trigger; the same struct built and dropped in `main` is clean | — |
 | B-2026-09-06-61 | 2026-09-06 | codegen | high | RETURNING A WHOLE REBIND OF A DECLINED-COPY PARAM DOUBLE-FREES -- `fn rebret(r: R) -> R { let m = r; return m; }` over a struct with a `shared` field aborts `free(): double free detected in tcache 2` under `karac run` and at -O0 (3 valgrind errors from 3 contexts), and at the default -O2 survives as an invalid read of the freed 16-byte refcount block while printing the right answer; `--interp` is correct. The SAME function without the rebind (`return r;`) is clean on every surface, so one binding separates sound from unsound. B-2026-09-06-52's fix gives the frame-local answer (the destination takes the borrow-alias edge) and leaves the ESCAPING one unanswered: the caller then owns the returned value and its own argument temp | — |
 | B-2026-09-06-63 | 2026-09-06 | interp+codegen | low | A CALLEE THAT WRAPS A `Drop`-BEARING ARGUMENT IN ANOTHER `Drop`-BEARING TYPE LOSES THE WRAPPER'S OWN BODY -- `fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }` called as `let h = wrap_bodied(r)` prints the `R`'s body once and the `H`'s never, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; the view mark that keeps the `R` correct is what suppresses the `H` | — |
-| B-2026-09-06-64 | 2026-09-06 | codegen | high | A SELF-REFERENTIAL STRUCT CRASHES `karac build` WITH A COMPILER STACK OVERFLOW -- `struct Node { id: i64, next: Option[Node], tag: String }` plus a `main` that builds one aborts with `thread '<unknown>' has overflowed its stack / fatal runtime error: stack overflow`, with NO user `Drop` impl and no method involved, while `karac run --interp` runs the same program correctly | — |
 | B-2026-09-06-65 | 2026-09-06 | interp+codegen | low | A PLAIN OWNED-`self` METHOD ON A FRESH TEMP RUNS THE RECEIVER'S `Drop` BODY BEFORE THE CALL'S RESULT IS PRINTED ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `println(f"v={mk(4).plain()}")` over `fn plain(self) -> i64 { return self.id; }` prints `dR4 v=4` under --interp and `v=4 dR4` on jit / aot / -O0, a stdout-visible A/B divergence with no memory difference | — |
+| B-2026-09-06-66 | 2026-09-07 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Option[Node], tag: String }` loses 67 bytes (64 direct, 3 indirect) in 1 block at both opt levels, while every EMPTY-`next` spelling of the same type is clean; both `Drop` bodies run, so it is the boxed payload's memory alone | — |
 
 ### Relocated
 
@@ -2333,6 +2333,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-57 | codegen | high | `main` IS RED: B-2026-09-06-45's OWN TWO REGRESSION TESTS FAIL ON A CLEAN CHECKOUT OF 6138e02 -- `asan_nested_self_rebind_keeps_one_owner` double-fre… | d3b39b8 |
 | B-2026-09-06-58 | interp+codegen | medium | THE `String`-PARAMETER SIBLING OF B-2026-09-06-53 STILL LOSES THE RETURNED VALUE'S `Drop` BODY -- `fn mk2(i: i64, s: String) -> R { return R { id: i,… | c88eb3f |
 | B-2026-09-06-62 | codegen | high | THE OWNED-`self` RECEIVER SPELLING OF B-2026-09-06-52 IS STILL RED -- `impl R { fn take(self) -> i64 { let m = self; return m.inner.v; } }` over a st… | 96efdca |
+| B-2026-09-06-64 | codegen | high | A SELF-REFERENTIAL STRUCT CRASHES `karac build` WITH A COMPILER STACK OVERFLOW -- `struct Node { id: i64, next: Option[Node], tag: String }` plus a `… | ed5335c |
 
 </details>
 
