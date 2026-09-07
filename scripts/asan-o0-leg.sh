@@ -24,6 +24,13 @@
 # it rots into a permanent allowlist). Every entry names the bug row that owns
 # it; nothing goes on the list without one.
 #
+# PARAMETERIZED SINCE B-2026-09-07-40. The instrumented leg
+# (scripts/asan-instrumented-leg.sh) is the same run with one more env var and
+# its own quarantine list, so it sets the three knobs below and execs this
+# script rather than duplicating ~100 lines of ratchet logic. The defaults
+# reproduce the -O0 leg exactly; any other leg's environment is inherited by the
+# cargo run, so a new leg is a wrapper, not a fork.
+#
 # Usage:
 #   scripts/asan-o0-leg.sh                  # full leg
 #   scripts/asan-o0-leg.sh --update         # rewrite the list from this run
@@ -31,16 +38,18 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPECTED="$REPO/tests/asan-o0-known-failures.txt"
+LEG="${ASAN_LEG_NAME:--O0}"
+OPT_LEVEL="${ASAN_LEG_OPT_LEVEL:-0}"
+EXPECTED="${ASAN_LEG_EXPECTED:-$REPO/tests/asan-o0-known-failures.txt}"
 THREADS="${ASAN_O0_TEST_THREADS:-4}"
-LOG="$(mktemp -t asan-o0-XXXXXX.log)"
+LOG="$(mktemp -t asan-leg-XXXXXX.log)"
 trap 'rm -f "$LOG"' EXIT
 
 UPDATE=0
 [[ "${1:-}" == "--update" ]] && UPDATE=1
 
-echo ">> KARAC_OPT_LEVEL=0 cargo test --features llvm --test memory_sanitizer (--test-threads=$THREADS)"
-KARAC_OPT_LEVEL=0 cargo test --features llvm --test memory_sanitizer \
+echo ">> [$LEG] KARAC_OPT_LEVEL=$OPT_LEVEL cargo test --features llvm --test memory_sanitizer (--test-threads=$THREADS)"
+KARAC_OPT_LEVEL="$OPT_LEVEL" cargo test --features llvm --test memory_sanitizer \
   -- --test-threads="$THREADS" >"$LOG" 2>&1
 echo ">> suite exited $?"
 
@@ -54,7 +63,7 @@ if ! grep -qE '^test result:' "$LOG"; then
   exit 2
 fi
 if grep -q 'ASAN unavailable on this host' "$LOG"; then
-  echo ">> ASAN unavailable on this host — leg skipped (not a pass)"
+  echo ">> [$LEG] ASAN unavailable on this host — leg skipped (not a pass)"
   exit 0
 fi
 
@@ -72,7 +81,7 @@ fi
 
 if [[ ! -f "$EXPECTED" ]]; then
   echo "!! no quarantine list at $EXPECTED"
-  echo "   Seed one with: scripts/asan-o0-leg.sh --update"
+  echo "   Seed one with: <this leg's script> --update"
   echo "   then annotate every line with the bug row that owns it."
   exit 2
 fi
@@ -88,7 +97,7 @@ status=0
 if [[ -n "$new_failures" ]]; then
   status=1
   echo
-  echo "!! NEW -O0 FAILURES (not on the quarantine list):"
+  echo "!! NEW $LEG FAILURES (not on the quarantine list):"
   echo "$new_failures" | sed 's/^/     /'
   # A LINK failure lands in this same bucket and is NOT a leak. Under
   # KARAC_REQUIRE_RUNTIME_ARCHIVE=1 the soft-skip becomes a hard failure, so a
@@ -106,7 +115,7 @@ if [[ -n "$new_failures" ]]; then
     echo "   vacuously. Re-run the plain full build afterward so the canonical"
     echo "   archive name is the non-feature one again."
   else
-    echo "   These are real: at -O0 the fixture's allocations are not optimized away,"
+    echo "   These are real: at -O$OPT_LEVEL the fixture's allocations are not optimized away,"
     echo "   so ASAN is reporting on memory the program actually touched. Fix the"
     echo "   codegen defect, or add the fixture to $(basename "$EXPECTED") WITH the"
     echo "   bug row that owns it."
@@ -123,6 +132,6 @@ fi
 
 if [[ "$status" == "0" ]]; then
   n=$(echo "$expected" | sed '/^$/d' | wc -l | tr -d ' ')
-  echo ">> -O0 leg matches the quarantine list exactly ($n known failure(s))"
+  echo ">> $LEG leg matches the quarantine list exactly ($n known failure(s))"
 fi
 exit "$status"
