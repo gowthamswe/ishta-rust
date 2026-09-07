@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 393 |
 | run-vs-build | 366 |
-| leak | 286 |
+| leak | 287 |
 | double-free | 205 |
 | missing-feature | 194 |
 | codegen-gap | 166 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1558 |
+| codegen | 1559 |
 | interp | 400 |
 | typecheck | 295 |
 | ownership | 74 |
@@ -2353,6 +2353,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-71 | codegen | high | A NAMED-LOCAL ARGUMENT TO A PASSTHROUGH FREE FUNCTION DOUBLE-FREES -- `let a = mk(15); let z = f(a);` over `fn f(r: R) -> R { return r; }` and a stru… | 6b21fe8 |
 | B-2026-09-07-2 | codegen | medium | A DISCARDED ASSOCIATED-FUNCTION CALL REGISTERS NO OWNER AT ALL, so its returned value's `Drop` body runs on NO compiled backend and its heap leaks --… | c76f658 |
 | B-2026-09-07-5 | codegen | high | A METHOD THAT STORES ITS BY-VALUE ARGUMENT INTO `self` DOUBLE-FREES A DECLINED-COPY STRUCT -- `impl Box2 { fn push(mut ref self, r: R) { self.xs.push… | d971ad5 |
+| B-2026-09-07-14 | codegen | medium | A DISCARDED ARM WHOSE TAIL IS AN AGGREGATE LITERAL OVER A NAMED LOCAL STRANDS THAT LOCAL'S BUFFER -- `let s = payload(); let _ = if n >= 0 { D { s: s… | 58e6a5b |
 
 </details>
 
