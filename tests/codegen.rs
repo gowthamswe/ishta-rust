@@ -73873,6 +73873,45 @@ fn main() {
         );
     }
 
+    /// A SPEC'D 128-BIT HOLE MUST COMPILE AND RENDER ITS FULL WIDTH.
+    ///
+    /// `karac_runtime_int_fmt` took a single `i64` when it was first added, so
+    /// an `i128` hole passed a 128-bit value to a 64-bit parameter and LLVM's
+    /// module verifier REJECTED THE MODULE — `f"{x:44}"` on an `i128` failed to
+    /// compile at all, where the older `snprintf` path had silently truncated
+    /// to the low 64 bits instead. The value now crosses as two 64-bit words,
+    /// like `karac_runtime_i128_to_str`'s.
+    ///
+    /// `2^100` is the discriminating value: its LOW WORD IS ZERO, so a 64-bit
+    /// truncation renders it as `0` rather than as something visibly corrupt.
+    #[test]
+    fn e2e_spec_128_bit_holes_compile_and_keep_their_top_half() {
+        if let Some(out) = run_program(
+            r#"
+fn main() {
+    let big: u128 = 170141183460469231731687303715884105727u128;
+    let pow: i128 = 1267650600228229401496703205376i128;
+    let neg: i128 = -1267650600228229401496703205376i128;
+    let small: u128 = 42u128;
+    println(f"[{small:6}]");
+    println(f"[{pow}]");
+    println(f"[{pow:44}]");
+    println(f"[{neg:44}]");
+    println(f"[{big:44}]");
+    println(f"[{pow:<34}]");
+}
+"#,
+        ) {
+            let want = "[    42]\n\
+                        [1267650600228229401496703205376]\n\
+                        [             1267650600228229401496703205376]\n\
+                        [            -1267650600228229401496703205376]\n\
+                        [     170141183460469231731687303715884105727]\n\
+                        [1267650600228229401496703205376   ]\n";
+            assert_eq!(out, want, "128-bit spec'd rendering drifted");
+        }
+    }
+
     /// The SPEC'D integer path must render exactly what `snprintf` did.
     ///
     /// Verified byte-identical against the pre-change compiler over these

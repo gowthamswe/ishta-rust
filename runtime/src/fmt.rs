@@ -257,7 +257,7 @@ mod tests {
 
     /// ORACLE AGREEMENT for the allocation-free fast path.
     ///
-    /// `karac_runtime_i64_fmt` reproduces `FormatSpec::apply_int` /
+    /// `karac_runtime_int_fmt` reproduces `FormatSpec::apply_int` /
     /// `apply_uint` from PRE-DECODED constants instead of parsing the spec and
     /// building a `String`. Those two are the interpreter's path, so the fast
     /// path is only correct insofar as it matches them byte for byte — and the
@@ -268,12 +268,16 @@ mod tests {
     /// Specs `needs_runtime_formatter()` diverts (binary radix, center align,
     /// non-space fill) are excluded: codegen never routes them here.
     #[test]
-    fn i64_fmt_fast_path_matches_apply_int_over_a_matrix() {
-        unsafe fn fast(fs: &FormatSpec, raw: u64, signed: bool) -> String {
+    fn int_fmt_fast_path_matches_apply_int_over_a_matrix() {
+        // `raw` is the value already widened to 128 bits the way codegen
+        // widens it — SIGN-extended for a signed hole, ZERO-extended for an
+        // unsigned one — then split into little-endian words for the call.
+        unsafe fn fast(fs: &FormatSpec, raw: u128, signed: bool) -> String {
             unsafe {
                 let mut buf = [0u8; 256];
-                let n = crate::karac_runtime_i64_fmt(
-                    raw,
+                let n = crate::karac_runtime_int_fmt(
+                    raw as u64,
+                    (raw >> 64) as u64,
                     signed as i32,
                     fs.fast_radix_code(),
                     fs.zero_pad as i32,
@@ -318,7 +322,14 @@ mod tests {
             }
             for v in signed_vals {
                 let want = fs.apply_int(v);
-                let got = unsafe { fast(&fs, v as u64, true) };
+                // Mirror codegen's widening rule exactly: decimal sign-extends,
+                // every other radix zero-extends at the hole's own width.
+                let widened = if fs.radix == format_spec::Radix::Dec {
+                    v as i128 as u128
+                } else {
+                    u128::from(v as u64)
+                };
+                let got = unsafe { fast(&fs, widened, true) };
                 assert_eq!(
                     got, want,
                     "signed mismatch: spec {raw:?} value {v} -> fast {got:?} vs apply_int {want:?}"
@@ -326,7 +337,7 @@ mod tests {
             }
             for v in unsigned_vals {
                 let want = fs.apply_uint(v);
-                let got = unsafe { fast(&fs, v, false) };
+                let got = unsafe { fast(&fs, u128::from(v), false) };
                 assert_eq!(
                     got, want,
                     "unsigned mismatch: spec {raw:?} value {v} -> fast {got:?} vs apply_uint {want:?}"
@@ -335,27 +346,100 @@ mod tests {
         }
     }
 
+    /// The 128-BIT arm, which the matrix above cannot cover: `apply_int` takes
+    /// `i64` and `apply_uint` takes `u64`, so `FormatSpec` has no 128-bit
+    /// oracle to differ from. Rust's own `{}` / `{:x}` / `{:o}` is the
+    /// reference instead, with the padding applied by `FormatSpec::pad` via a
+    /// width-free spec so only the DIGITS come from Rust.
+    ///
+    /// This arm exists because passing a single `i64` here made a spec'd
+    /// `i128` hole fail LLVM module verification outright — `f"{x:44}"` on an
+    /// `i128` did not compile — where the older `snprintf` path had silently
+    /// truncated to the low 64 bits instead.
+    #[test]
+    fn int_fmt_fast_path_renders_128_bit_values() {
+        unsafe fn fast(raw: u128, signed: bool, radix: i32, width: i64) -> String {
+            unsafe {
+                let mut buf = [0u8; 256];
+                let n = crate::karac_runtime_int_fmt(
+                    raw as u64,
+                    (raw >> 64) as u64,
+                    signed as i32,
+                    radix,
+                    0,
+                    width,
+                    0,
+                    buf.as_mut_ptr(),
+                    buf.len() as i64,
+                );
+                String::from_utf8(buf[..n as usize].to_vec()).unwrap()
+            }
+        }
+        fn pad_right(body: &str, width: usize) -> String {
+            if body.len() >= width {
+                body.to_string()
+            } else {
+                format!("{}{}", " ".repeat(width - body.len()), body)
+            }
+        }
+
+        let signed: [i128; 6] = [
+            0,
+            1,
+            -1,
+            i128::MAX,
+            i128::MIN,
+            1_267_650_600_228_229_401_496_703_205_376, // 2^100 — low word is ZERO,
+        ]; // which is exactly what a 64-bit truncation renders as 0
+        for v in signed {
+            assert_eq!(unsafe { fast(v as u128, true, 10, 0) }, format!("{v}"));
+            assert_eq!(
+                unsafe { fast(v as u128, true, 10, 44) },
+                pad_right(&format!("{v}"), 44),
+                "signed 128-bit width padding, value {v}"
+            );
+        }
+        for v in [0u128, 1, u128::MAX, u128::MAX - 1, 1u128 << 127] {
+            assert_eq!(unsafe { fast(v, false, 10, 0) }, format!("{v}"));
+            assert_eq!(unsafe { fast(v, false, 16, 0) }, format!("{v:x}"));
+            assert_eq!(unsafe { fast(v, false, -16, 0) }, format!("{v:X}"));
+            assert_eq!(unsafe { fast(v, false, 8, 0) }, format!("{v:o}"));
+        }
+        // octal u128::MAX is 43 digits — the widest rendering the scratch
+        // buffer has to hold, so it is the one that would overflow it.
+        assert_eq!(unsafe { fast(u128::MAX, false, 8, 0) }.len(), 43);
+    }
+
     /// The fast path must TRUNCATE rather than write past a short buffer.
     /// Codegen sizes the buffer as `max(64, width + 2)` so this is a guard, not
     /// an expected path — but it is the one bug in a hand-rolled renderer that
     /// corrupts memory instead of printing wrong.
     #[test]
-    fn i64_fmt_fast_path_truncates_into_a_short_buffer() {
+    fn int_fmt_fast_path_truncates_into_a_short_buffer() {
         unsafe {
             let mut buf = [0xAAu8; 8];
-            let n =
-                crate::karac_runtime_i64_fmt(1234567890123u64, 1, 10, 0, 0, 0, buf.as_mut_ptr(), 4);
+            let n = crate::karac_runtime_int_fmt(
+                1234567890123u64,
+                0,
+                1,
+                10,
+                0,
+                0,
+                0,
+                buf.as_mut_ptr(),
+                4,
+            );
             assert_eq!(n, 4, "should stop at the cap");
             assert_eq!(&buf[..4], b"1234");
             assert_eq!(&buf[4..], &[0xAA; 4], "must not write past buf_len");
 
             // null / non-positive cap write nothing
             assert_eq!(
-                crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, std::ptr::null_mut(), 8),
+                crate::karac_runtime_int_fmt(1, 0, 1, 10, 0, 0, 0, std::ptr::null_mut(), 8),
                 0
             );
             assert_eq!(
-                crate::karac_runtime_i64_fmt(1, 1, 10, 0, 0, 0, buf.as_mut_ptr(), 0),
+                crate::karac_runtime_int_fmt(1, 0, 1, 10, 0, 0, 0, buf.as_mut_ptr(), 0),
                 0
             );
         }

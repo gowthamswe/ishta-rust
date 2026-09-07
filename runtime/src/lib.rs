@@ -538,7 +538,7 @@ pub fn __preserve_no_mangle_symbols() -> usize {
         karac_runtime_f64_to_str,
         karac_runtime_i128_to_str,
         karac_runtime_i64_to_str,
-        karac_runtime_i64_fmt,
+        karac_runtime_int_fmt,
         karac_vec_sort_by,
         karac_vec_sort_i64_8,
         karac_vec_reverse,
@@ -9490,7 +9490,7 @@ pub unsafe extern "C" fn karac_runtime_i64_to_str(
     }
 }
 
-/// Format a 64-bit integer under a `f"{x:spec}"` specifier, into a
+/// Format an integer of up to 128 bits under a `f"{x:spec}"` specifier, into a
 /// caller-supplied buffer. Returns the byte length written.
 ///
 /// The spec-carrying sibling of [`karac_runtime_i64_to_str`], and it exists for
@@ -9525,8 +9525,9 @@ pub unsafe extern "C" fn karac_runtime_i64_to_str(
 /// non-positive `buf_len` writes nothing and returns 0. Output is NOT
 /// NUL-terminated; the caller uses the returned length.
 #[no_mangle]
-pub unsafe extern "C" fn karac_runtime_i64_fmt(
-    val: u64,
+pub unsafe extern "C" fn karac_runtime_int_fmt(
+    lo: u64,
+    hi: u64,
     is_signed: i32,
     radix: i32,
     zero_pad: i32,
@@ -9544,25 +9545,31 @@ pub unsafe extern "C" fn karac_runtime_i64_fmt(
         // `apply_int`: the sign is only taken in DECIMAL. In hex/octal the
         // value is reinterpreted as unsigned, so `{-1:x}` renders the full
         // 64-bit pattern rather than "-1".
+        // The value arrives as two 64-bit WORDS, for the same reason
+        // `karac_runtime_i128_to_str` takes them that way: passing an `i128`
+        // across the C ABI is not uniformly defined across this runtime's
+        // targets. A hole narrower than 128 bits sign- or zero-extends into
+        // `hi` at the call site.
+        let raw: u128 = (u128::from(hi) << 64) | u128::from(lo);
         let dec = radix == 10;
-        let neg = is_signed != 0 && dec && (val as i64) < 0;
-        let base: u64 = match radix {
+        let neg = is_signed != 0 && dec && (raw as i128) < 0;
+        let base: u128 = match radix {
             8 => 8,
             16 | -16 => 16,
             _ => 10,
         };
         let upper = radix == -16;
         // `unsigned_abs` for the same reason as `karac_runtime_i64_to_str`:
-        // negating `i64::MIN` as an `i64` overflows.
-        let mut mag: u64 = if neg {
-            (val as i64).unsigned_abs()
+        // negating `i128::MIN` as an `i128` overflows.
+        let mut mag: u128 = if neg {
+            (raw as i128).unsigned_abs()
         } else {
-            val
+            raw
         };
 
-        // 22 covers the longest rendering in any base handled here (octal
-        // u64::MAX is 22 digits); no bounds check needed inside the loop.
-        let mut scratch = [0u8; 24];
+        // 43 covers the longest rendering in any base handled here (octal
+        // u128::MAX is 43 digits); no bounds check needed inside the loop.
+        let mut scratch = [0u8; 48];
         let mut i = scratch.len();
         loop {
             i -= 1;

@@ -71,6 +71,46 @@ fn run_no_errors(source: &str) -> String {
 /// `Item::Function` found nothing. `callee_fn_for_param_ownership` resolves it,
 /// and the associated spelling now matches the free-function one exactly, which
 /// is what the neighbouring rows of this table assert.
+/// B-2026-09-07-24 — A `u64` AT OR ABOVE 2^63 IN A WIDTH-SPEC'D f-STRING HOLE
+/// MUST RENDER UNSIGNED UNDER THE INTERPRETER, as it already did on both
+/// compiled backends.
+///
+/// The carrier is a SIGNED `Value::Int(i128)` and `truncate_to_width` stores a
+/// `u64` at or above 2^63 WRAPPED — the i64 reinterpretation — so reading it
+/// back through `FormatSpec::apply_int` printed `u64::MAX` as `-1`. The
+/// UNSPEC'D spelling `f"{x}"` was already correct (B-2026-08-19-27), and so was
+/// `f"{x:x}"`, because a non-decimal radix reinterprets as unsigned anyway;
+/// only the DECIMAL spec'd hole diverged, which is what kept it narrow enough
+/// to survive this long.
+///
+/// `u8`/`u32` are here to pin the other half: they fit the signed carrier
+/// non-negatively, so they must keep rendering through the signed path
+/// unchanged.
+#[test]
+fn test_interp_unsigned_spec_hole_renders_unsigned() {
+    let out = run(r#"
+fn main() {
+    let ubig: u64 = 18446744073709551615u64;
+    let umid: u64 = 9223372036854775808u64;
+    let usmall: u64 = 42u64;
+    let u32v: u32 = 4294967295;
+    let u8v: u8 = 255;
+    let sneg: i64 = -7;
+    println(f"[{ubig:22}][{umid:22}][{usmall:22}]");
+    println(f"[{ubig:<24}][{umid:>24}][{ubig:026}]");
+    println(f"[{u32v:14}][{u8v:6}][{sneg:6}][{sneg:06}]");
+    println(f"[{ubig:x}][{umid:x}]");
+}
+"#);
+    assert_eq!(
+        out,
+        "[  18446744073709551615][   9223372036854775808][                    42]\n\
+         [18446744073709551615    ][     9223372036854775808][00000018446744073709551615]\n\
+         [    4294967295][   255][    -7][-00007]\n\
+         [ffffffffffffffff][8000000000000000]\n"
+    );
+}
+
 #[test]
 fn test_conditional_return_param_drop_matrix() {
     let out = run(

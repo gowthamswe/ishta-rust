@@ -225,6 +225,34 @@ impl<'a> super::Interpreter<'a> {
                                 // fallback keeps eval total.
                                 if let Ok(fs) = crate::format_spec::FormatSpec::parse(spec_raw) {
                                     let formatted = match &v {
+                                        // B-2026-09-07-24 — a `u64`/`usize` at
+                                        // or above 2^63 is stored WRAPPED in
+                                        // the signed `Value::Int(i128)` carrier
+                                        // (see `truncate_to_width`), so reading
+                                        // it back through `apply_int` rendered
+                                        // `u64::MAX` as `-1` while BOTH compiled
+                                        // backends rendered it unsigned. Ask the
+                                        // static type, exactly as the unspec'd
+                                        // arm below already does — this is the
+                                        // same defect B-2026-08-19-27 fixed for
+                                        // `f"{x}"` and B-2026-08-30-44 fixed for
+                                        // the generic case, one spelling over.
+                                        //
+                                        // `span_unsigned_int_width` answers
+                                        // `None` for `u8`..`u32` deliberately:
+                                        // those fit the signed carrier
+                                        // non-negatively, so the two readings
+                                        // already coincide. `Some(128)` falls
+                                        // through to the signed arm because
+                                        // `FormatSpec` has no 128-bit renderer
+                                        // — unchanged behaviour, tracked
+                                        // separately.
+                                        Value::Int(i)
+                                            if self.span_unsigned_int_width(&e.span)
+                                                == Some(64) =>
+                                        {
+                                            fs.apply_uint(*i as u64)
+                                        }
                                         Value::Int(i) => fs.apply_int(narrow_to_i64(*i)),
                                         Value::Float(f) => fs.apply_float(*f),
                                         Value::String(s) => fs.apply_str(s),

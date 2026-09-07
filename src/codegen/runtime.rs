@@ -16069,25 +16069,67 @@ impl<'ctx> super::Codegen<'ctx> {
                 if !is_float {
                     let iv = val.into_int_value();
                     let unsigned = self.expr_is_unsigned_int(e);
-                    let widened = if iv.get_type().get_bit_width() < 64 {
-                        if unsigned {
+                    // Normalize to 128 bits, then split into little-endian
+                    // 64-bit words for the call — the same arrangement
+                    // `format_i128_to_stack_buf` uses, and for the same ABI
+                    // reason. A NARROWER hole extends first (zero for
+                    // unsigned, sign for signed) so `hi` carries the correct
+                    // upper half; a 128-bit hole is already the right width.
+                    //
+                    // Passing a single `i64` here was wrong for a 128-bit hole
+                    // in the loudest way available: LLVM's verifier rejected
+                    // the module, so `f"{x:44}"` on an `i128` failed to
+                    // compile at all.
+                    let i128_t = self.context.i128_type();
+                    let w = iv.get_type().get_bit_width();
+                    // A NON-DECIMAL radix reinterprets the value as unsigned AT
+                    // THE HOLE'S OWN WIDTH -- `FormatSpec::apply_int` renders
+                    // `{-1:x}` as `ffffffffffffffff`, the 64-bit pattern, not a
+                    // negative number. So widening to 128 bits must ZERO-extend
+                    // there, or an `i64` -1 becomes a 128-bit -1 and prints
+                    // THIRTY-TWO f's. Decimal is the only case that
+                    // sign-extends. (Caught by the oracle matrix, not by
+                    // inspection.)
+                    let zero_ext = unsigned || fs.radix != crate::format_spec::Radix::Dec;
+                    let wide = if w < 128 {
+                        if zero_ext {
                             self.builder
-                                .build_int_z_extend(iv, i64_t, "fss.zx")
+                                .build_int_z_extend(iv, i128_t, "fss.zx")
                                 .unwrap()
                         } else {
                             self.builder
-                                .build_int_s_extend(iv, i64_t, "fss.sx")
+                                .build_int_s_extend(iv, i128_t, "fss.sx")
                                 .unwrap()
                         }
                     } else {
                         iv
                     };
+                    let lo = self
+                        .builder
+                        .build_int_truncate(wide, i64_t, "fss.lo")
+                        .unwrap();
+                    let hi = self
+                        .builder
+                        .build_int_truncate(
+                            self.builder
+                                .build_right_shift(
+                                    wide,
+                                    i128_t.const_int(64, false),
+                                    false,
+                                    "fss.sh",
+                                )
+                                .unwrap(),
+                            i64_t,
+                            "fss.hi",
+                        )
+                        .unwrap();
                     let len = self
                         .builder
                         .build_call(
-                            self.i64_fmt_fn(),
+                            self.int_fmt_fn(),
                             &[
-                                widened.into(),
+                                lo.into(),
+                                hi.into(),
                                 i32_t.const_int(u64::from(!unsigned), false).into(),
                                 i32_t.const_int(fs.fast_radix_code() as u64, true).into(),
                                 i32_t.const_int(u64::from(fs.zero_pad), false).into(),
@@ -16399,18 +16441,24 @@ impl<'ctx> super::Codegen<'ctx> {
             .add_function("karac_runtime_i64_to_str", fn_ty, None)
     }
 
-    /// Lazily declare `karac_runtime_i64_fmt(val: i64, is_signed: i32,
+    /// Lazily declare `karac_runtime_int_fmt(lo: i64, hi: i64, is_signed: i32,
     /// radix: i32, zero_pad: i32, width: i64, align_left: i32, buf: ptr,
     /// buf_len: i64) -> i64` — the SPEC-carrying integer formatter, sibling of
     /// `i64_to_str_fn`.
+    ///
+    /// The value crosses as two 64-bit WORDS like `i128_to_str_fn`'s, so this
+    /// covers 128-bit holes too. It took a single `i64` when first added, which
+    /// meant a spec'd `i128` hole handed an `i128` to an `i64` parameter and
+    /// failed LLVM module verification outright — a hard compile error where
+    /// the pre-`snprintf`-removal path had silently truncated instead.
     ///
     /// The spec goes across as pre-decoded constants rather than as text: the
     /// existing `karac_runtime_fmt_int` re-parses the raw spec and returns a
     /// `String`, and routing this path there measured 4.1x WORSE than
     /// `snprintf` single-threaded. Codegen knows the spec at compile time, so
     /// there is nothing to parse and nothing to allocate.
-    pub(super) fn i64_fmt_fn(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function("karac_runtime_i64_fmt") {
+    pub(super) fn int_fmt_fn(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("karac_runtime_int_fmt") {
             return f;
         }
         let i64_t = self.context.i64_type();
@@ -16418,6 +16466,7 @@ impl<'ctx> super::Codegen<'ctx> {
         let ptr_t = self.context.ptr_type(AddressSpace::default());
         let fn_ty = i64_t.fn_type(
             &[
+                i64_t.into(),
                 i64_t.into(),
                 i32_t.into(),
                 i32_t.into(),
@@ -16430,7 +16479,7 @@ impl<'ctx> super::Codegen<'ctx> {
             false,
         );
         self.module
-            .add_function("karac_runtime_i64_fmt", fn_ty, None)
+            .add_function("karac_runtime_int_fmt", fn_ty, None)
     }
 
     /// Lazily declare `karac_runtime_gpu_map(wgsl_ptr: ptr, wgsl_len: i64,
