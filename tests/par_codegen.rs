@@ -7,9 +7,9 @@
 //!   real threads, and produces output from every branch.
 //!
 //! The end-to-end tests build the runtime crate on first use via
-//! `cargo build -p karac-runtime --release`. If that build fails (e.g., no
-//! Cargo available in the test environment) the tests soft-skip by returning
-//! early, matching the pattern in tests/codegen.rs.
+//! `cargo rustc -p karac-runtime --release --crate-type staticlib`. If that
+//! build fails (e.g., no Cargo available in the test environment) the tests
+//! soft-skip by returning early, matching the pattern in tests/codegen.rs.
 
 mod common;
 
@@ -24,11 +24,36 @@ mod par_codegen_tests {
 
     /// Build the runtime static library once per test process and return its
     /// path. Returns None if the build fails — callers soft-skip.
+    ///
+    /// **`cargo rustc --crate-type staticlib`, NOT `cargo build`** — the same
+    /// rule `tests/park_and_wake.rs::runtime_path` spells out and CLAUDE.md's
+    /// setup recipe states. The runtime's `[lib] crate-type` is
+    /// `["staticlib", "rlib"]`, and under `lto = "fat"` emitting both artifacts
+    /// in one `cargo build` defeats the staticlib's cross-module DCE: std's
+    /// panic/alloc-error default hooks stay reachable and the DWARF backtrace
+    /// symbolizer survives `-dead_strip` into every AOT binary.
+    ///
+    /// This wrote the CANONICAL `target/release/libkarac_runtime.a`, so it did
+    /// not merely affect this suite — it replaced the archive every later
+    /// `karac build` links, for the rest of the container's life. Measured on
+    /// the gate cycle that found it: the archive went 20,039,794 -> 57,832,342
+    /// bytes (331 -> 546 members, 0 -> 95 gimli/addr2line/symbolize symbols)
+    /// the moment this target ran, and a hello-world AOT binary linked against
+    /// the result grew 349,616 -> 390,872 bytes (+41,256, +11.8%). The
+    /// `memory_sanitizer` target runs after this one and so measured the fat
+    /// archive throughout. B-2026-09-07-37.
     #[allow(static_mut_refs)]
     fn runtime_path() -> Option<PathBuf> {
         RUNTIME_BUILT.call_once(|| {
             let output = std::process::Command::new("cargo")
-                .args(["build", "-p", "karac-runtime", "--release"])
+                .args([
+                    "rustc",
+                    "-p",
+                    "karac-runtime",
+                    "--release",
+                    "--crate-type",
+                    "staticlib",
+                ])
                 .output();
             if let Ok(out) = output {
                 if out.status.success() {
