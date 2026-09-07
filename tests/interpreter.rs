@@ -56982,6 +56982,44 @@ end
     );
 }
 
+/// B-2026-09-07-33 — the interpreter half of the boxed-payload hand-out.
+///
+/// The interpreter was CORRECT throughout this row: the defect was a compiled
+/// backend writing into an envelope it had already freed, on a program every
+/// backend printed correctly. So this twin fails on neither side of the fix,
+/// and it is here for the reason every twin is — to make a future regression on
+/// either backend show up as a DIVERGENCE rather than as two backends quietly
+/// agreeing on a wrong answer.
+///
+/// Twin of `tests/codegen.rs`'s
+/// `e2e_boxed_payload_handed_out_of_a_match_arm_keeps_its_value`, pinned to the
+/// same string.
+#[test]
+fn test_boxed_payload_handed_out_of_a_match_arm_keeps_its_value() {
+    assert_eq!(
+        run(r#"struct X1 { a: Option[i64], s: String }
+struct Ctl { s: String, n: i64 }
+enum W { T(X1), U(i64) }
+enum C { T(Ctl), U(i64) }
+fn mkx(i: i64) -> X1 { return X1 { a: Option.Some(i), s: f"s{i}" }; }
+fn mkc(i: i64) -> Ctl { return Ctl { s: f"c{i}", n: i }; }
+fn payout(w: W) -> X1 { return match w { W.T(x) => x, W.U(n) => mkx(n) }; }
+fn payoutc(c: C) -> Ctl { return match c { C.T(x) => x, C.U(n) => mkc(n) }; }
+fn rebind(w: W) -> i64 { let v = w; return match v { W.T(x) => x.a.unwrap_or(0), W.U(n) => n }; }
+fn store(w: W, out: mut ref Vec[W]) { out.push(w); }
+fn main() {
+    let p = payout(W.T(mkx(23))); println(f"a={p.a.unwrap_or(0)}/{p.s}")
+    let q = payout(W.U(24)); println(f"b={q.a.unwrap_or(0)}/{q.s}")
+    let r = payoutc(C.T(mkc(25))); println(f"c={r.n}/{r.s}")
+    println(f"d={rebind(W.T(mkx(26)))}")
+    let mut v: Vec[W] = Vec.new(); store(W.T(mkx(27)), mut v); println(f"e={v.len()}")
+    println("end")
+}
+"#),
+        "a=23/s23\nb=24/s24\nc=25/c25\nd=26\ne=1\nend\n"
+    );
+}
+
 /// B-2026-09-06-45 — the interpreter half of the nested `self` rebind: the
 /// caller's retained walk stands down for the whole call and this frame adopts
 /// the receiver's body, running it on the paths where the rebind did not

@@ -18959,6 +18959,49 @@ done
         assert_eq!(out, "dR101\ndR1\none\nn\ndR102\ndR2\ntwo\nin\ndR103\ndR3\nthree\ndR104\ndR4\nfour\nn\ndR105\ndR5\nfive\nin\ndR106\ndR6\nsix\ndR107\ndR7\nin\nseven\nin\ndR8\neight\ndR9\nnine\nn\nten\nend\n");
     }
 
+    /// B-2026-09-07-33 — the VALUE half of
+    /// `asan_boxed_payload_handed_out_of_a_match_arm_is_not_written_after_free`.
+    ///
+    /// This test PASSES on the parent, and that is the point worth stating
+    /// rather than hiding: the defect it guards was a write into freed memory
+    /// on a program whose printed answer was already right at both opt levels
+    /// and under `--interp`. So the ASAN twin is the pin that fails pre-fix,
+    /// and this one exists to catch the opposite regression — a future change
+    /// that silences the use-after-free by dropping the payload instead of
+    /// handing it over, which would show up here as a wrong value or an empty
+    /// string and nowhere else.
+    ///
+    /// Covers both arms of the hand-out callee (the boxed payload and the
+    /// constructed fallback), the copy-supported twin, and the two neighbours
+    /// the fix must leave alone.
+    #[test]
+    fn e2e_boxed_payload_handed_out_of_a_match_arm_keeps_its_value() {
+        let Some(out) = run_program(
+            "struct X1 { a: Option[i64], s: String }\n\
+             struct Ctl { s: String, n: i64 }\n\
+             enum W { T(X1), U(i64) }\n\
+             enum C { T(Ctl), U(i64) }\n\
+             fn mkx(i: i64) -> X1 { return X1 { a: Option.Some(i), s: f\"s{i}\" }; }\n\
+             fn mkc(i: i64) -> Ctl { return Ctl { s: f\"c{i}\", n: i }; }\n\
+             fn payout(w: W) -> X1 { return match w { W.T(x) => x, W.U(n) => mkx(n) }; }\n\
+             fn payoutc(c: C) -> Ctl { return match c { C.T(x) => x, C.U(n) => mkc(n) }; }\n\
+             fn rebind(w: W) -> i64 { let v = w; return match v { W.T(x) => x.a.unwrap_or(0), W.U(n) => n }; }\n\
+             fn store(w: W, out: mut ref Vec[W]) { out.push(w); }\n\
+             fn main() {\n\
+             \x20   let p = payout(W.T(mkx(23))); println(f\"a={p.a.unwrap_or(0)}/{p.s}\")\n\
+             \x20   let q = payout(W.U(24)); println(f\"b={q.a.unwrap_or(0)}/{q.s}\")\n\
+             \x20   let r = payoutc(C.T(mkc(25))); println(f\"c={r.n}/{r.s}\")\n\
+             \x20   println(f\"d={rebind(W.T(mkx(26)))}\")\n\
+             \x20   let mut v: Vec[W] = Vec.new(); store(W.T(mkx(27)), mut v); println(f\"e={v.len()}\")\n\
+             \x20   println(\"end\")\n\
+             }\n\
+             ",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "a=23/s23\nb=24/s24\nc=25/c25\nd=26\ne=1\nend\n");
+    }
+
     /// B-2026-09-07-16 — a by-value ENUM param whose payload struct owns heap
     /// the entry copy CANNOT duplicate is owned by TRANSFER, not by copy.
     ///

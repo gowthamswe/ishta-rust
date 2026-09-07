@@ -78651,6 +78651,73 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-33 — a callee that hands a BOXED payload out of a `match`
+    /// arm must not write into the envelope it just freed.
+    ///
+    /// The shape B-2026-09-07-16's fixture deliberately left out, because it
+    /// was still red when that row landed: `payout` frees the payload box in
+    /// the arm (B-2026-09-05-26's envelope free, without which the box leaks)
+    /// and the move-out mirror then stored three zero words THROUGH that freed
+    /// pointer — `Invalid write of size 8` at offsets 0, 40 and 48 of a
+    /// 56-byte block, on a program that printed the right answer at both opt
+    /// levels and under `--interp`.
+    ///
+    /// WHAT THIS PIN DOES AND DOES NOT CATCH, stated plainly because the
+    /// distinction cost a measurement to find. It does NOT catch the row's
+    /// defect: this suite links `-fsanitize=address` but the karac-emitted
+    /// object is never INSTRUMENTED (`link_executable_with_sanitizer` passes
+    /// the flag at the link step only), so the ASAN runtime sees what it can
+    /// intercept in the allocator — leaks, double and invalid frees — and an
+    /// invalid WRITE into a freed block is invisible to it. Measured: this
+    /// fixture is green on the PARENT at `-O2` and reports no use-after-free on
+    /// the parent at `-O0` either, while valgrind reports three `Invalid write
+    /// of size 8` on the same program. The defect is valgrind-only, and this
+    /// repo has no valgrind harness (B-2026-09-07-40).
+    ///
+    /// What it DOES pin is the fix's own risk direction, which is the reason to
+    /// keep it. The fix works by DROPPING a registration, and an over-broad
+    /// drop turns the use-after-free into a leaked envelope or a double-freed
+    /// payload — both squarely allocator-visible, both caught here, and both
+    /// caught on the `-O0` leg (`scripts/asan-o0-leg.sh`) where these payloads
+    /// actually get allocated. So the E2E twin pins the value, valgrind pinned
+    /// the defect by hand, and this pins the trade.
+    ///
+    /// The neighbouring shapes are carried for that same reason: an outliving
+    /// STORE, and the same hand-out over a COPY-SUPPORTED payload whose
+    /// envelope the callee owns outright. A whole-value REBIND belongs here too
+    /// and is deliberately ABSENT — it strands its payload at `-O0`
+    /// (B-2026-09-07-41, measured identical on both sides of this fix), so
+    /// including it would paint this fixture red on the `-O0` leg for a defect
+    /// that is not this row's.
+    #[test]
+    fn asan_boxed_payload_handed_out_of_a_match_arm_is_not_written_after_free() {
+        assert_clean_asan_run_min_allocs(
+            "struct X1 { a: Option[i64], s: String }\n\
+struct Ctl { s: String, n: i64 }\n\
+enum W { T(X1), U(i64) }\n\
+enum C { T(Ctl), U(i64) }\n\
+fn mkx(i: i64) -> X1 { return X1 { a: Option.Some(i), s: f\"s{i}\" }; }\n\
+fn mkc(i: i64) -> Ctl { return Ctl { s: f\"c{i}\", n: i }; }\n\
+fn payout(w: W) -> X1 { return match w { W.T(x) => x, W.U(n) => mkx(n) }; }\n\
+fn payoutc(c: C) -> Ctl { return match c { C.T(x) => x, C.U(n) => mkc(n) }; }\n\
+fn store(w: W, out: mut ref Vec[W]) { out.push(w); }\n\
+fn main() {\n\
+  // THE DEFECT: hand a boxed, copy-declined payload out of the arm.\n\
+  let p = payout(W.T(mkx(23))); println(f\"a={p.a.unwrap_or(0)}\")\n\
+  // the U arm of the same callee -- no payload box to free at all\n\
+  let q = payout(W.U(24)); println(f\"b={q.a.unwrap_or(0)}\")\n\
+  // COPY-SUPPORTED twin: entry-copied, the envelope is the callee's own\n\
+  let r = payoutc(C.T(mkc(25))); println(f\"c={r.n}\")\n\
+  // a neighbour that was already clean and must stay clean\n\
+  let mut v: Vec[W] = Vec.new(); store(W.T(mkx(27)), mut v); println(f\"e={v.len()}\")\n\
+  println(\"end\")\n\
+}\n",
+            &["a=23", "b=24", "c=25", "e=1", "end"],
+            "boxed payload handed out of a match arm",
+            5,
+        );
+    }
+
     /// B-2026-09-07-16 — the memory half of
     /// `test_e2e_by_value_enum_param_with_owning_struct_payload_transfers`.
     ///

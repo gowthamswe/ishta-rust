@@ -10769,7 +10769,7 @@ impl<'ctx> super::Codegen<'ctx> {
     /// payload-BODIES disarm also consults so the two channels agree on what
     /// "this arm moved the payload out" means.
     pub(super) fn suppress_destructured_enum_payload_cleanup_at(
-        &self,
+        &mut self,
         slot_ptr: PointerValue<'ctx>,
         enum_name: &str,
         pattern: &Pattern,
@@ -10883,6 +10883,28 @@ impl<'ctx> super::Codegen<'ctx> {
                         .unwrap();
                     self.builder.build_unconditional_branch(join_bb).unwrap();
                     self.builder.position_at_end(join_bb);
+                    // B-2026-09-07-33 — the envelope is GONE as of the free
+                    // above, so nothing may write through it afterwards. The
+                    // move-out mirror (`deboxed_payload_box_ptrs`,
+                    // B-2026-08-06-10) is registered for an OWNED-PARAM
+                    // scrutinee and fires later, at the point the binding is
+                    // moved on: `return match w { W.T(x) => x, .. }` emitted
+                    // three `store i64 0` through this very pointer AFTER this
+                    // block freed it — `Invalid write of size 8` at offsets 0,
+                    // 40 and 48 of a 56-byte block, on a program that prints
+                    // the right answer.
+                    //
+                    // Dropping the registration rather than reordering the two:
+                    // the mirror exists to disarm a reader of the box, and a
+                    // freed box has none. Its stated reader is the CALLER's
+                    // payload drop, which cannot be reading a buffer this frame
+                    // just returned to the allocator — and the slot zeroing
+                    // right below already disarms this frame's own
+                    // `__karac_drop_<E>`, which is why the free is safe in the
+                    // first place. So the zeroing it would emit is dead on
+                    // every path that reaches here, and writing it is the whole
+                    // defect.
+                    self.forget_moved_payload_box_mirror(enum_name, pattern, pos);
                 }
             }
             for w in 0..num_words {
@@ -10897,6 +10919,59 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
             }
         }
+    }
+
+    /// B-2026-09-07-33 — drop the move-out mirror registered against the
+    /// binding that took payload position `pos`, because the box it points at
+    /// has just been freed.
+    ///
+    /// Keyed through the BINDING, which is how both mirror channels are keyed:
+    /// `deboxed_payload_box_ptrs` by the binding's slot and
+    /// `deferred_payload_box_ptrs` (B-2026-08-18-4) by its name. Both are
+    /// cleared, so a shape that took the deferred channel cannot keep a live
+    /// registration onto dead memory just because it was routed differently.
+    ///
+    /// Direct bindings only — a nested destructure at this position binds the
+    /// payload's PARTS, and those have mirrors of their own keyed on slots this
+    /// walk does not own. Leaving those alone keeps the change to the shape
+    /// that is actually broken; a nested spelling that turns out to need it can
+    /// have it on its own measurement rather than on this one's guess.
+    fn forget_moved_payload_box_mirror(&mut self, enum_name: &str, pattern: &Pattern, pos: usize) {
+        let bound = match &pattern.kind {
+            PatternKind::TupleVariant { patterns, .. } => {
+                match patterns.get(pos).map(|p| &p.kind) {
+                    Some(PatternKind::Binding(n)) => n.clone(),
+                    _ => return,
+                }
+            }
+            PatternKind::Struct { path, fields, .. } => {
+                let Some(variant_name) = path.last().cloned() else {
+                    return;
+                };
+                let Some(field_names) =
+                    self.enum_variant_struct_field_names(enum_name, &variant_name)
+                else {
+                    return;
+                };
+                let Some(fp) = fields
+                    .iter()
+                    .find(|fp| field_names.iter().position(|n| n == &fp.name) == Some(pos))
+                else {
+                    return;
+                };
+                match fp.pattern.as_ref().map(|p| &p.kind) {
+                    // Shorthand (`{ value }`) binds under the field's own name.
+                    None => fp.name.clone(),
+                    Some(PatternKind::Binding(n)) => n.clone(),
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        if let Some(slot) = self.variables.get(bound.as_str()).map(|s| s.ptr) {
+            self.payload_vars.deboxed_payload_box_ptrs.remove(&slot);
+        }
+        self.payload_vars.deferred_payload_box_ptrs.remove(&bound);
     }
 
     /// `(variant name, declared-position indices of the payload fields this
