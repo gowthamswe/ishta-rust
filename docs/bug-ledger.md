@@ -92,12 +92,12 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 395 |
+| miscompile | 396 |
 | run-vs-build | 369 |
-| leak | 296 |
+| leak | 297 |
 | double-free | 212 |
 | missing-feature | 194 |
-| codegen-gap | 167 |
+| codegen-gap | 168 |
 | diagnostics | 125 |
 | false-positive | 106 |
 | perf | 100 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1587 |
+| codegen | 1590 |
 | interp | 403 |
 | typecheck | 295 |
 | other | 75 |
@@ -164,13 +164,15 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-20 | 2026-09-07 | codegen | medium | `asan_stored_argument_is_owned_by_its_new_home_not_the_caller` LEAKS 35 B AT -O0 AND HAS SINCE THE DAY IT LANDED -- its `[b0907-5-outliving-store-admission]` cell loses 32 B in 2 objects plus 3 B in 1, clean at the default -O2, and nothing has run the -O0 leg since `d971ad5` added the fixture | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
-| B-2026-09-07-30 | 2026-09-07 | codegen | medium | A PROJECTION OFF AN RC-PROMOTED LOCAL STRANDS 40 B WHEN ITS DESTINATION IS A `Vec.push` OR AN EXISTING BINDING -- `v.push(t.a)` also invalid-frees once, `s = t.a` leaks silently, and both survive B-2026-09-07-19's copy because neither destination routes through the let-binding or struct-literal registrars | — |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
 | B-2026-09-07-40 | 2026-09-07 | other | medium | NOTHING IN THIS REPO CAN CATCH A USE-AFTER-FREE WRITE -- `tests/memory_sanitizer.rs` links `-fsanitize=address` but never INSTRUMENTS the karac-emitted object, so ASAN there is an allocator-interception gate (leaks, double/invalid free) and is blind to an invalid read or write; valgrind sees them and no harness or CI job runs valgrind | — |
 | B-2026-09-07-41 | 2026-09-07 | codegen | low | A WHOLE-VALUE REBIND OF A BY-VALUE ENUM PARAM STRANDS ITS PAYLOAD AT -O0 -- `fn rebind(w: W) -> i64 { let v = w; return match v { W.T(x) => x.a.unwrap_or(0), .. } }` loses the payload `String`, correcting B-2026-09-07-33's claim that this neighbour measures 0 errors | — |
 | B-2026-09-07-42 | 2026-09-07 | codegen | high | PERF-REGRESSION, CORPUS-WIDE AND UNNOTICED SINCE ~2026-08: 12 of the 23 map-bearing benched katas whose recorded-run binary survives execute 1.30x-4.17x MORE INSTRUCTIONS built by today's karac than by the karac that produced their published figure -- up to 7.46x on WALL CLOCK (kata:146 236 -> 1683 ms), with IPC falling too, every sink identical, and the old binaries still reproducing their recorded numbers to 2-5%; source change, lane, placement, iterator-fallback and map-capacity all ruled out, and neither key/value type nor recorded date separates the regressed half from the flat half | kata:170 results.json still publishes the pre-regression 997.08 ms | found while running B-2026-08-28-77's placement sweep, where kata:170 was the positive control and failed to fire | CAUSE: 59c8d30cd (2026-08-22), the landing half of B-2026-08-21-6 — a deliberate security fix whose cost was never measured |
 | B-2026-09-07-43 | 2026-09-07 | codegen | medium | THE IF/ELSE SPELLING OF A DISCARDED AGGREGATE LITERAL NEVER REACHES THE OWNER REGISTRAR, so an RC-boxed projection's COPY is stranded -- 190 B in 5 blocks over a five-trip loop and 38 B in 1 with the source merely read afterwards, while the same construct with no `else`, the bare-statement spelling and the read-after-loop spelling are all clean since 8f3751b15 | tests/asan-o0-known-failures.txt |
 | B-2026-09-07-44 | 2026-09-07 | codegen | low | A FRESH-TEMP ENUM SCRUTINEE WHOSE CONSUMING ARM BINDS A COPY-DECLINED STRUCT PAYLOAD LEAKS THE PAYLOAD'S INTERIOR -- `match W.T(mkx(1)) { W.T(x) => .. }` loses 2 B while the `let`-bound scrutinee and the `W.T(_)` arm of the same program are clean | none |
+| B-2026-09-07-47 | 2026-09-07 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lane, with no projection anywhere and at trip count zero, and gone entirely when the same program is BUILT with `KARAC_AUTO_PAR=0` | — |
+| B-2026-09-07-48 | 2026-09-07 | codegen | high | READING AN RC-PROMOTED LOCAL'S PROJECTED FIELD AFTER THE LOOP DIVERGES THREE WAYS -- `let s = t.a` in a loop then `t.a.len()` prints 152 on the interpreter, -1 compiled and 117 on the JIT, silently, while the same read INSIDE the loop is correct on all four surfaces | — |
+| B-2026-09-07-49 | 2026-09-07 | codegen | medium | EVERY MECHANISM THAT ASKS `use_after_move_consume_sites` IS BLIND TO THE RC-FALLBACK PROMOTION, WHICH IS THE OWNERSHIP PASS'S OTHER ANSWER TO THE SAME QUESTION -- three rows (B-2026-09-07-23, -29, -30) have now been that one missing half, each fixed by a separate hand-written arm | — |
 
 ### Relocated
 
@@ -2375,6 +2377,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-27 | codegen | high | AN RC-FALLBACK BOX HAS NO TYPE IDENTITY, so it runs a SAME-SHAPED TWIN'S `Drop` body -- B-2026-09-07-17 named the boxed value by reverse lookup over… | f37af501e |
 | B-2026-09-07-28 | codegen | medium | AN RC-BOXED TUPLE LOSES ITS ELEMENT'S `Drop` BODY -- `let t = (S { . | 0e881224f |
 | B-2026-09-07-29 | codegen | high | A WHOLE CONSUME INSIDE A LOOP THAT ACTUALLY RUNS DOUBLE-FREES AN RC-PROMOTED LOCAL, with no projection anywhere in the program -- `while i < 3i64 { t… | ebc87c6 |
+| B-2026-09-07-30 | codegen | medium | A PROJECTION OFF AN RC-PROMOTED LOCAL DOUBLE-FREES WHEN ITS DESTINATION IS A `Vec.push` ARGUMENT OR AN EXISTING BINDING -- `v.push(t.a)` in a loop gi… | 13fe42c |
 | B-2026-09-07-31 | codegen | low | AN RC-BOXED TUPLE WITH AN ENUM OR `Option` ELEMENT LOSES ITS PAYLOAD MEMORY -- the box's memory step was the enum-blind `emit_aggregate_heap_field_fr… | 0e881224f |
 | B-2026-09-07-32 | codegen | high | AN ASSOC CALL NEVER RETRACTS A NAMED LOCAL'S CLEANUP FOR A DECLINED-COPY BY-VALUE ARGUMENT -- `Type.f(a)` was the third dispatch leg with no `move_de… | FIXED by hooking `move_declined_copy_struct_arg` into the a… |
 | B-2026-09-07-33 | codegen | high | A CALLEE HANDING A BOXED PAYLOAD OUT OF A `match` ARM WRITES INTO THE ENVELOPE IT JUST FREED -- `fn payout(w: W) -> X1 { return match w { W.T(x) => x… | 63b0628 |
