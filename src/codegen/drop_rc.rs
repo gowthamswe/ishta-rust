@@ -232,6 +232,29 @@ pub(crate) struct DropRc<'ctx> {
     /// Per function, like `cond_store_flag_params`: cleared with it and saved
     /// and restored around a closure or mono body with it.
     pub(crate) cond_returned_body_params: std::collections::HashSet<String>,
+    /// B-2026-09-06-69 — the SUBSET of `cond_returned_body_params` whose
+    /// conditional-return registration carries the MEMORY as well as the body.
+    ///
+    /// A mixed-path callee normally registers BODIES ONLY, because the caller
+    /// still owns the buffer it passed by value. That premise is false for one
+    /// param class: a struct the prologue REFUSED to own
+    /// (`caller_retained_aggregate_memory`) is forwarded rather than copied, so
+    /// the caller's temp and the callee's object are one buffer and the caller
+    /// cannot free it on the exit that hands it back. For exactly that class
+    /// the caller stands all the way down
+    /// (`conditional_handback_memory_moves_to_callee`) and the registration
+    /// here is the whole `karac_drop_<T>` wrapper under the same per-path flag.
+    ///
+    /// Recorded rather than re-derived for the reason the rebind hand-off
+    /// exists at all: `let m = r;` moves the registration to `m`, and the
+    /// hand-off has to reinstall the SAME kind it retracted. Deriving the kind
+    /// a second time from the binding's shape is what would let the two drift —
+    /// and a drift in either direction is a memory fault or a leak, not a
+    /// missed side effect. Closed under the rebind, exactly like
+    /// `cond_returned_body_params` and `caller_retained_aggregate_memory`.
+    ///
+    /// Per function: cleared, saved and restored alongside them.
+    pub(crate) cond_returned_owned_params: std::collections::HashSet<String>,
     /// B-2026-08-30-54 / B-2026-09-02-10 — for each base binding a FIELD of
     /// which received a param view, that field's OWN per-path flag: `true`
     /// while the base still owns the field's value, `false` on a path where a

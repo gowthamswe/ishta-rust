@@ -5793,6 +5793,96 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-06-69 — a MIXED-PATH callee hands its by-value param back on
+    /// one exit and lets it die on another, and exactly one frame frees it
+    /// either way.
+    ///
+    /// The param class here is the one whose prologue REFUSES to own it — a
+    /// struct with a `shared` field, or a self-referential one, neither
+    /// copy-supported nor eligible for the transfer bargain — so the callee
+    /// FORWARDS the caller's object instead of copying it. With the caller
+    /// owning the buffer statically, the hand-back exit had two owners (its own
+    /// temp and the result binding) and aborted `free(): double free detected
+    /// in tcache 2` under `karac run` and at both opt levels; standing the
+    /// caller down instead left the dies-inside exit with none and stranded
+    /// 18 B at `-O0`. Neither half is a fix alone, which is why the memory now
+    /// sits on the callee's per-path registration beside the `Drop` body and the
+    /// caller retracts.
+    ///
+    /// `bare`/`d` is the cell that shows the defect was never about the rebind:
+    /// the no-rebind spelling reached the caller's stand-down through
+    /// `fn_returns_param`'s union all along, so its dies-inside exit leaked the
+    /// same 18 B on the PARENT — the row filed that spelling as "clean on every
+    /// surface" having measured only its hand-back exit.
+    ///
+    /// Controls, each pinning one gate rather than decorating the fixture:
+    /// `copyok` is entry-copied, so the caller keeps its own object and nothing
+    /// here may move; `never` consumes the param without handing it back, so
+    /// the conditional predicate must decline it; `selfref` is the second
+    /// declined-copy class; `wrap` reaches the hand-back through an
+    /// `Option.Some` constructor rather than a bare tail.
+    fn test_e2e_conditional_handback_of_a_rebound_param_frees_once() {
+        let out = run_program(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct N { id: i64, name: String, next: Option[N] }
+impl Drop for N { fn drop(mut ref self) { println(f"dN{self.id}") } }
+fn mkn(i: i64) -> N { return N { id: i, name: f"h{i}", next: Option.None }; }
+struct P { id: i64, name: String }
+impl Drop for P { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkP(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+
+fn reb(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(99); }
+fn bare(r: R, c: bool) -> R { if c { return r; } return mk(98); }
+fn arm(r: R, c: bool) -> R { let m = r; match c { true => m, false => mk(97) } }
+fn two(r: R, c: bool) -> R { let m = r; let n = m; if c { return n; } return mk(96); }
+fn rd(r: R, c: bool) -> R { let m = r; if c { return m; } println(f"in={m.name}"); return mk(95); }
+fn wrap(r: R, c: bool) -> Option[R] { let m = r; if c { return Option.Some(m); } return Option.None; }
+fn selfref(n: N, c: bool) -> N { let m = n; if c { return m; } return mkn(94); }
+fn copyok(p: P, c: bool) -> P { let m = p; if c { return m; } return mkP(93); }
+fn never(r: R, c: bool) -> i64 { let m = r; if c { return m.id; } return 0; }
+
+fn main() {
+  let a = reb(mk(1), true);  println(f"a={a.inner.v}");
+  let b = reb(mk(2), false); println(f"b={b.inner.v}");
+  let c = bare(mk(3), true);  println(f"c={c.inner.v}");
+  let d = bare(mk(4), false); println(f"d={d.inner.v}");
+  let e = arm(mk(5), true);  println(f"e={e.inner.v}");
+  let f = arm(mk(6), false); println(f"f={f.inner.v}");
+  let g = two(mk(7), true);  println(f"g={g.inner.v}");
+  let h = two(mk(8), false); println(f"h={h.inner.v}");
+  let i2 = rd(mk(9), true);  println(f"i={i2.inner.v}");
+  let j = rd(mk(10), false); println(f"j={j.inner.v}");
+  match wrap(mk(11), true) { Option.Some(v) => println(f"k={v.inner.v}"), Option.None => println("kn") }
+  match wrap(mk(12), false) { Option.Some(v) => println(f"l={v.inner.v}"), Option.None => println("ln") }
+  let m2 = selfref(mkn(13), true);  println(f"m={m2.name}");
+  let n2 = selfref(mkn(14), false); println(f"n={n2.name}");
+  let o = copyok(mkP(15), true);  println(f"o={o.name}");
+  let p2 = copyok(mkP(16), false); println(f"p={p2.name}");
+  println(f"q={never(mk(17), true)}");
+  println(f"r={never(mk(18), false)}");
+  reb(mk(19), true);
+  reb(mk(20), false);
+  let mut z = 0;
+  while z < 2 { let w = reb(mk(21), z == 0); println(f"w={w.inner.v}"); z = z + 1; }
+  println("end");
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "a=1\ndR1\ndR2\nb=99\ndR99\nc=3\ndR3\ndR4\nd=98\ndR98\ne=5\ndR5\ndR6\nf=97\ndR97\ng=7\ndR7\ndR8\nh=96\ndR96\ni=9\ndR9\nin=h10\ndR10\nj=95\ndR95\nk=11\ndR11\ndR12\nln\nm=h13\ndN13\ndN14\nn=h94\ndN94\no=p15\ndP15\ndP16\np=p93\ndP93\ndR17\nq=17\ndR18\nr=0\ndR19\ndR20\ndR99\nw=21\ndR21\ndR21\nw=99\ndR99\nend\n",
+                "a MIXED-PATH callee over a param its prologue declined to own \
+                 must free that buffer itself where the value dies inside and \
+                 leave it to the result binding where it is handed back; got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     /// B-2026-09-05-37 — a whole rebind of a by-value `Drop` param NESTED in a
     /// branch frees the callee's entry copy on the path that never rebound.
     ///

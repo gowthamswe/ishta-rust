@@ -1513,6 +1513,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.drop_rc.loop_decl_rearm_anchors.clear();
         self.drop_rc.cond_store_flag_params.clear();
         self.drop_rc.cond_returned_body_params.clear();
+        self.drop_rc.cond_returned_owned_params.clear();
         self.drop_rc.field_view_flags.clear();
         // B-2026-08-30-2 — same reasoning one map over: `branch_tail_owner_slots`
         // holds ALLOCAS, so an entry surviving into the next function names a
@@ -3060,7 +3061,44 @@ impl<'ctx> super::Codegen<'ctx> {
                                     .shared_types
                                     .contains_key(struct_name.as_str())
                             {
-                                if let Some(bodies) =
+                                // B-2026-09-06-69 — the MEMORY too, for the
+                                // one param class where BODIES ONLY leaves the
+                                // dies-inside path with no owner at all.
+                                //
+                                // "The caller still owns the memory" is the
+                                // premise of the bodies-only split, and it is
+                                // TRUE of every param that arrives here except
+                                // one: a struct the prologue REFUSED to own
+                                // (copy-unsupported, and carrying a `shared`
+                                // field or self-referential, so the transfer
+                                // bargain is off too). That one is FORWARDED —
+                                // the caller's temp and this frame's object are
+                                // one buffer — so the caller cannot free it on
+                                // the exit that hands it back without freeing
+                                // what its own result binding frees. Standing
+                                // the caller down is therefore forced, and it
+                                // is what leaves this path unowned. The two
+                                // moves are one fix and the shared predicate is
+                                // what makes them one: the caller consults it
+                                // from `call_arg_flows_into_return`.
+                                //
+                                // Same registration otherwise — the WRAPPER
+                                // rather than the field-bodies walker, under the
+                                // same per-path flag, which disarms it on the
+                                // exit that handed the value back exactly as it
+                                // disarms the body today (`cmdrop.armed` gates
+                                // whatever function the action names).
+                                let owns_memory =
+                                    self.conditional_handback_memory_moves_to_callee(&func.name, i);
+                                if owns_memory {
+                                    self.track_user_drop_var(struct_name, &param_name, alloca);
+                                    self.drop_rc
+                                        .cond_returned_body_params
+                                        .insert(param_name.clone());
+                                    self.drop_rc
+                                        .cond_returned_owned_params
+                                        .insert(param_name.clone());
+                                } else if let Some(bodies) =
                                     self.emit_struct_user_drop_bodies_only_fn(struct_name)
                                 {
                                     self.track_user_drop_var_with_fn(

@@ -10147,7 +10147,38 @@ impl<'ctx> super::Codegen<'ctx> {
                                     // Recorded in turn so a further `let n = m;`
                                     // hands it on again.
                                     if self.drop_rc.cond_returned_body_params.contains(src) {
-                                        if let Some(bodies) =
+                                        // B-2026-09-06-69 — hand on the SAME
+                                        // KIND that was retracted. When the
+                                        // param's registration carries the
+                                        // memory as well as the body (the
+                                        // forwarded, prologue-declined class —
+                                        // see `cond_returned_owned_params`), a
+                                        // bodies-only reinstall here would drop
+                                        // the memory half on the floor and the
+                                        // dies-inside path would strand the
+                                        // buffer the caller has stood down for.
+                                        // The comment below — "memory is
+                                        // untouched, the memory-only tracking
+                                        // above already frees the entry copy" —
+                                        // is exactly the premise that fails for
+                                        // this class: there was no entry copy
+                                        // and the tracking above declined.
+                                        if self.drop_rc.cond_returned_owned_params.contains(src) {
+                                            if !self.guard_user_drop_for_nested_return(src) {
+                                                self.suppress_user_drop_for_var(src);
+                                            }
+                                            self.track_user_drop_var(
+                                                &struct_name,
+                                                var_name,
+                                                alloca,
+                                            );
+                                            self.drop_rc
+                                                .cond_returned_body_params
+                                                .insert(var_name.to_string());
+                                            self.drop_rc
+                                                .cond_returned_owned_params
+                                                .insert(var_name.to_string());
+                                        } else if let Some(bodies) =
                                             self.emit_struct_user_drop_bodies_only_fn(&struct_name)
                                         {
                                             if !self.guard_user_drop_for_nested_return(src) {

@@ -1958,6 +1958,14 @@ pub(super) struct Codegen<'ctx> {
     /// its own struct drop). Empty under `KARAC_MOVE_STRUCT_PARAMS=0`, which
     /// restores the unconditional entry copy.
     pub(crate) transfer_struct_params: rustc_hash::FxHashSet<(String, usize)>,
+    /// B-2026-09-06-69 — the `(callee, param index)` pairs whose CONDITIONAL
+    /// hand-back may move the param's MEMORY into the callee, because every
+    /// call site in the program passes it in a shape whose caller-side owner
+    /// this fix retracts. Whole-program for the same reason
+    /// `transfer_struct_params` is: one body per callee, so the fact has to
+    /// hold at every site before the single registration may act on it. See
+    /// `param_transfer::compute_handback_safe_params`.
+    pub(crate) handback_safe_params: rustc_hash::FxHashSet<(String, usize)>,
     /// Names of user struct/enum types whose `karac_cmp_<T>` ordering fn is
     /// mid-emission, so a self-referential field (`S { next: Vec[S] }`) that
     /// recurses back into the same type returns `None` (unorderable — the sort
@@ -6227,6 +6235,7 @@ impl<'ctx> Codegen<'ctx> {
                 loop_decl_rearm_anchors: HashMap::new(),
                 cond_store_flag_params: std::collections::HashSet::new(),
                 cond_returned_body_params: std::collections::HashSet::new(),
+                cond_returned_owned_params: std::collections::HashSet::new(),
                 field_view_flags: HashMap::new(),
                 deep_copy_rc_inc_bare_shared: false,
                 enum_drop_fns: HashMap::new(),
@@ -6396,6 +6405,7 @@ impl<'ctx> Codegen<'ctx> {
             },
             program_snapshot: None,
             transfer_struct_params: rustc_hash::FxHashSet::default(),
+            handback_safe_params: rustc_hash::FxHashSet::default(),
             cmp_fn_in_progress: std::collections::HashSet::new(),
             display: Display {
                 baked_display_enum_names: HashSet::new(),
@@ -7661,6 +7671,12 @@ impl<'ctx> Codegen<'ctx> {
             &self.span_tables.uam_consume_sites,
         );
         self.transfer_struct_params = transferable;
+        // B-2026-09-06-69 — the CONDITIONAL hand-back's call-site gate, computed
+        // beside the transfer gate and for the identical structural reason: one
+        // callee body serves every call site, so the callee may only take the
+        // memory where every caller can give it up.
+        self.handback_safe_params =
+            crate::codegen::param_transfer::compute_handback_safe_params(program);
         // Level 2 crash diagnostics — Part 2: stand up DWARF debug-info state
         // before any function compiles (no-op unless KARAC_DEBUG_INFO is set and
         // a source filename was threaded in via set_source_filename, which runs

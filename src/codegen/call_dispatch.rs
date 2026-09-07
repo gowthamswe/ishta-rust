@@ -2400,7 +2400,23 @@ impl<'ctx> super::Codegen<'ctx> {
                     // is why this retracts the BODY while leaving the memory:
                     // the caller's slot owns that copy's buffer and is the only
                     // thing that will ever free it.
-                    if self.callee_takes_over_arg_drop_body(&name, i) {
+                    // B-2026-09-06-69 — and the MEMORY as well, for the one
+                    // callee shape that has taken it over. The retraction just
+                    // below is deliberately body-only because "the caller's slot
+                    // owns that copy's buffer and is the only thing that will
+                    // ever free it" — true wherever the callee ENTRY-COPIED, and
+                    // false for a param the callee's prologue declined to copy
+                    // AND hands back on only some exits. There the buffer is one
+                    // object, the callee now frees it per path, and leaving the
+                    // memory half here double-freed the dies-inside path (which
+                    // was clean before this fix) while fixing the hand-back one.
+                    //
+                    // The named-local spelling only: a fresh temp has no binding
+                    // to retract and stands down through `flows_into_return`
+                    // instead, which is the same predicate this asks.
+                    if self.conditional_handback_memory_moves_to_callee(&name, i) {
+                        self.suppress_user_drop_for_var(&var_name);
+                    } else if self.callee_takes_over_arg_drop_body(&name, i) {
                         self.suppress_user_drop_body_keeping_memory(&var_name);
                     }
                 }
@@ -3684,6 +3700,24 @@ impl<'ctx> super::Codegen<'ctx> {
                     // why `fn f(s: S) -> S { let m = s; return m; }` over a
                     // copy-supported `S` is clean before and after.
                     || crate::ast::fn_always_returns_param(Some(program), f, arg_index)
+                    // B-2026-09-06-69 — the MIXED-path spelling the paragraph
+                    // above measured and declined, now that its other half
+                    // exists. The reason the union was refused there is that
+                    // the callee's dies-inside registration is BODIES-ONLY and
+                    // retracting the caller left that path with no memory owner
+                    // (18 B at -O0). For the ONE param class where that
+                    // registration is also the only owner there could be — a
+                    // param whose prologue declined to own it, so the caller's
+                    // temp and the callee's forwarded object are one buffer —
+                    // `compile_function` now registers the whole wrapper rather
+                    // than the bodies, per path, and this stands the caller all
+                    // the way down to match.
+                    //
+                    // Not a widening of the ALL-paths rule but a second,
+                    // narrower gate beside it: the predicate is asked of the
+                    // same `Function` the callee's registration is asked of, so
+                    // the two answers cannot disagree about which frame frees.
+                    || self.conditional_handback_memory_moves_to_callee(callee_name, arg_index)
                     ))
         })
     }

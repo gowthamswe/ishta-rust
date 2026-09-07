@@ -2198,6 +2198,133 @@ impl<'ctx> super::Codegen<'ctx> {
             && !self.struct_is_self_referential(struct_name)
     }
 
+    /// B-2026-09-06-69 — is a by-value struct param one the callee's prologue
+    /// REFUSES to own outright, so its memory stays the CALLER's for the whole
+    /// call?
+    ///
+    /// The complement of [`Self::struct_param_owned_by_transfer`] inside the
+    /// copy-unsupported class.
+    /// `make_aggregate_param_callee_owned_transfer` tries the entry copy first
+    /// and the transfer bargain second; what falls through both is written down
+    /// in `caller_retained_aggregate_memory`, and THAT SET IS THE AUTHORITY.
+    /// This is its type-level statement, which exists for one reason: the
+    /// CALLER cannot read the callee's prologue, and the fix this was written
+    /// for needs both frames to agree about who owns the buffer.
+    ///
+    /// Conservative in the direction that matters. A type this DECLINES keeps
+    /// today's behaviour exactly; a type it wrongly ADMITS would stand the
+    /// caller down for memory the callee never took, which is a leak at best.
+    /// So every clause is a refusal to admit, and the two structural halves —
+    /// a direct `shared` field (B-2026-08-05-32) and self-reference
+    /// (B-2026-07-28-3) — are read through the transfer predicate rather than
+    /// re-spelled, so a change to either one cannot put the two out of step.
+    pub(super) fn struct_param_memory_stays_with_caller(&self, struct_name: &str) -> bool {
+        if !self.type_decls.struct_types.contains_key(struct_name)
+            || self.type_decls.shared_types.contains_key(struct_name)
+        {
+            return false;
+        }
+        !self.aggregate_param_copy_supported_struct(struct_name, &mut Vec::new())
+            && !self.struct_param_owned_by_transfer(struct_name, false)
+    }
+
+    /// B-2026-09-06-69 — does the MEMORY of a CONDITIONALLY handed-back
+    /// by-value param move to the callee, per path?
+    ///
+    /// One predicate, two consumers, and the pairing is the whole fix. A
+    /// mixed-path callee over a param whose memory
+    /// [`Self::struct_param_memory_stays_with_caller`] leaves with the caller
+    /// has no frame that can own the buffer STATICALLY: the caller's temp is
+    /// wrong on the exit that hands the value back (its result binding frees
+    /// the same buffer — `free(): double free detected in tcache 2`), and
+    /// nobody at all is right on the exit where the value dies inside. Only the
+    /// callee knows which exit ran, so the memory has to sit where the BODY
+    /// already sits — on `compile_function`'s conditional-return registration,
+    /// under B-2026-08-28-51's per-path flag — and the caller has to stand all
+    /// the way down rather than into its memory-only mode.
+    ///
+    /// That is why this is asked on both sides instead of each side deciding
+    /// for itself. B-2026-09-06-61 recorded the measurement that forces it:
+    /// standing the caller down ALONE fixes the double free and strands 18 B at
+    /// `-O0` on the dies-inside path, because the registration it retracts was
+    /// that path's only memory owner. Giving the callee the memory ALONE frees
+    /// a buffer the caller's temp frees again. Neither half is a fix by itself
+    /// and neither is safe by itself.
+    ///
+    /// Every gate here mirrors one on the registration it authorises, because a
+    /// gate present on only one side reopens exactly one of those two failures:
+    ///
+    ///   * NON-GENERIC callee. A generic one is compiled by
+    ///     `compile_mono_function`, whose own param loop carries the sibling
+    ///     registration (B-2026-08-28-71) and is untouched here.
+    ///   * NON-GENERIC struct. `drop_method_keys` is keyed by the impl target's
+    ///     HEAD name, so `impl[T] Drop for S[T]` answers true while no
+    ///     `karac_drop_S` wrapper is ever emitted and `track_user_drop_var`
+    ///     registers nothing (B-2026-09-03-35). Standing the caller down for
+    ///     one of those would trade this row's double free for that row's leak.
+    ///   * A real `impl Drop`, and not a `shared` type — the flip registers
+    ///     nothing without them, so there would be no owner to hand the memory
+    ///     to.
+    ///   * `!fn_moves_param_into_outliving_place`, the same partner the flip
+    ///     takes: a param stored into `self` or a `ref` param outlives the
+    ///     frame by a route with no tail, so no per-path flag clears it.
+    pub(super) fn conditional_handback_memory_moves_to_callee(
+        &self,
+        callee_name: &str,
+        arg_index: usize,
+    ) -> bool {
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return false;
+        };
+        // Resolved HERE, by name, through the same `Item::Function` lookup the
+        // caller-side gate uses — not handed in as a `&Function`. That is what
+        // keeps a METHOD out: `compile_function` compiles an impl method under
+        // its lowered `Type.method` key, which matches no top-level item, so
+        // the callee half cannot register a memory owner for a shape whose
+        // caller half (which only ever resolves free functions) never stood
+        // down. The two sides ask one question of one function or of none.
+        let Some(f) = program.items.iter().find_map(|item| match item {
+            crate::ast::Item::Function(f) if f.name == callee_name => Some(f),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if f.generic_params.is_some() || self.is_coroutine_compiled(&f.name) {
+            return false;
+        }
+        let Some(param) = f.params.get(arg_index) else {
+            return false;
+        };
+        let crate::ast::TypeKind::Path(path) = &param.ty.kind else {
+            return false;
+        };
+        let Some(struct_name) = path.segments.first() else {
+            return false;
+        };
+        if !self.struct_param_memory_stays_with_caller(struct_name) {
+            return false;
+        }
+        if self
+            .type_decls
+            .struct_generic_params
+            .get(struct_name.as_str())
+            .is_some_and(|g| !g.is_empty())
+        {
+            return false;
+        }
+        if !program.drop_method_keys.contains_key(struct_name.as_str()) {
+            return false;
+        }
+        if !self
+            .handback_safe_params
+            .contains(&(callee_name.to_string(), arg_index))
+        {
+            return false;
+        }
+        crate::ast::fn_conditionally_returns_param_bare(Some(program), f, arg_index)
+            && !crate::ast::fn_moves_param_into_outliving_place(f, arg_index)
+    }
+
     fn aggregate_param_copy_supported_struct_mono(&self, struct_name: &str) -> bool {
         if self.type_decls.shared_types.contains_key(struct_name) {
             return false;

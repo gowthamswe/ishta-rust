@@ -726,3 +726,218 @@ fn classify_call(f: &str, args: &[crate::ast::CallArg], fr: &FrameOwned, cx: &mu
         }
     }
 }
+
+/// B-2026-09-06-69 — whole-program call-site gate for the CONDITIONAL hand-back
+/// ownership flip.
+///
+/// A sibling of [`compute_transferable_struct_params`] above, computed here for
+/// the reason that module doc gives and answering a different question. The
+/// flip lets a MIXED-PATH callee own the MEMORY of a by-value struct param that
+/// its prologue refused to copy or take by transfer, under the per-path flag
+/// that already guards the `Drop` body — so the buffer is freed on the exit
+/// where the value died inside and left alone on the exit that handed it back.
+/// The caller stands all the way down in exchange.
+///
+/// The structural asymmetry is the same one: the callee's decision is
+/// PER-FUNCTION, one body serving every call site, while whether the caller CAN
+/// stand down is a property of the CALL SITE. Measured on the version of this
+/// fix without this gate: `fn g(a: R, c: bool) { f(a, c); }` — an enclosing
+/// frame handing ITS OWN caller-retained param straight on — went from clean to
+/// `free(): double free detected in tcache 2`, because `g` has no registration
+/// to retract (the buffer belongs to a frame further up) and the callee then
+/// freed it anyway.
+///
+/// So: **the flip applies to a param only when EVERY call site in the program
+/// passes it in a shape whose caller-side owner this fix can actually retract.**
+/// Two such shapes, and nothing else:
+///
+///   * A FRESH TEMP — `f(mk(1), c)`, `f(R { .. }, c)`, `f(x.build(), c)` — whose
+///     owner is the argument registrar's, retracted by
+///     `call_arg_flows_into_return`.
+///   * A `let`-bound LOCAL whose initializer was itself a fresh temp, retracted
+///     by name at the call (`suppress_user_drop_for_var`).
+///
+/// Everything else disqualifies, and the two that matter are worth naming. A
+/// PARAMETER of the enclosing frame is the measured hazard above. A local
+/// REBOUND from one (`let q = a; f(q, c);`) is the same hazard one hop on, so
+/// admission is seeded from fresh temps and propagated through `let a = b;`
+/// rather than granted to every local — the taint travels the way
+/// `caller_retained_aggregate_memory`'s own induction step does.
+///
+/// Note this is the OPPOSITE polarity to the transfer gate on one point: there,
+/// an own-mode parameter is an admitted source (its buffers are the callee's
+/// after the transfer); here it is precisely the disqualifying one (its buffers
+/// may be a further frame's). The two gates are not interchangeable and neither
+/// subsumes the other.
+///
+/// Soundness rests on the same exhaustive walk, so a missed call site is a
+/// build error rather than a silent double free.
+pub(crate) fn compute_handback_safe_params(program: &Program) -> FxHashSet<ParamKey> {
+    let mut live: FxHashSet<ParamKey> = FxHashSet::default();
+    let mut fns: FxHashMap<String, (usize, bool)> = FxHashMap::default();
+    for item in &program.items {
+        let Item::Function(f) = item else { continue };
+        // `pub` and `main`: same reason as the transfer gate — their call sites
+        // need not be in this program, so "every call site" is unanswerable.
+        if f.is_pub || f.name == "main" {
+            continue;
+        }
+        let has_default = f.params.iter().any(|p| p.default_value.is_some());
+        fns.insert(f.name.clone(), (f.params.len(), has_default));
+        for (i, p) in f.params.iter().enumerate() {
+            if matches!(p.ty.kind, TypeKind::Path(_)) && p.name().is_some() {
+                live.insert((f.name.clone(), i));
+            }
+        }
+    }
+    if live.is_empty() {
+        return live;
+    }
+    let mut poisoned: FxHashSet<String> = FxHashSet::default();
+
+    for region in all_regions(program) {
+        let params: &[Param] = match region {
+            Region::Body(p, _) => p,
+            Region::Loose(_) => &[],
+        };
+        // Every parameter name, in EVERY mode. The transfer gate splits owned
+        // from borrowed here; this one does not, because an own-mode parameter
+        // is exactly the shape whose memory may belong to a frame further up.
+        let mut forbidden: FxHashSet<String> = FxHashSet::default();
+        forbidden.insert("self".to_string());
+        for p in params {
+            if let Some(n) = p.name() {
+                forbidden.insert(n.to_string());
+            }
+        }
+        // Locals seeded by a fresh temp, plus the `let a = b;` edges that carry
+        // that status on. Collected first and closed afterwards so a call site
+        // can be judged against a `let` appearing anywhere in the body.
+        let mut fresh: FxHashSet<String> = FxHashSet::default();
+        let mut aliased: Vec<(String, String)> = Vec::new();
+        let mut calls: Vec<(String, &[crate::ast::CallArg])> = Vec::new();
+        let mut callees: FxHashSet<*const Expr> = FxHashSet::default();
+        let mut mentions: Vec<(String, *const Expr)> = Vec::new();
+        let mut collect = |n| match n {
+            Node::Stmt(st) => match &st.kind {
+                StmtKind::Let { pattern, value, .. } => {
+                    if let PatternKind::Binding(b) = &pattern.kind {
+                        match &value.kind {
+                            ExprKind::Call { .. }
+                            | ExprKind::MethodCall { .. }
+                            | ExprKind::StructLiteral { .. } => {
+                                fresh.insert(b.clone());
+                            }
+                            ExprKind::Identifier(src) => {
+                                aliased.push((b.clone(), src.clone()));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        pattern_names(&pattern.kind, &mut forbidden);
+                    }
+                }
+                StmtKind::LetElse { pattern, .. } => pattern_names(&pattern.kind, &mut forbidden),
+                StmtKind::LetUninit { name, .. } => {
+                    forbidden.insert(name.clone());
+                }
+                // A name ever written through is not the value its `let`
+                // produced, so it stops being a retractable fresh temp.
+                StmtKind::Assign { target, .. } | StmtKind::CompoundAssign { target, .. } => {
+                    if let Some(r) = place_root(target) {
+                        forbidden.insert(r.to_string());
+                    }
+                }
+                StmtKind::MultiAssign { targets, .. } => {
+                    for t in targets {
+                        if let Some(r) = place_root(t) {
+                            forbidden.insert(r.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Node::Expr(e) => match &e.kind {
+                ExprKind::IfLet { pattern, .. }
+                | ExprKind::WhileLet { pattern, .. }
+                | ExprKind::For { pattern, .. } => pattern_names(&pattern.kind, &mut forbidden),
+                ExprKind::Match { arms, .. } => {
+                    for a in arms {
+                        pattern_names(&a.pattern.kind, &mut forbidden);
+                    }
+                }
+                ExprKind::Closure { params, .. } => {
+                    for cp in params {
+                        pattern_names(&cp.pattern.kind, &mut forbidden);
+                    }
+                }
+                ExprKind::Call { callee, args } => {
+                    if let ExprKind::Identifier(f) = &callee.kind {
+                        callees.insert(&**callee as *const Expr);
+                        calls.push((f.clone(), args.as_slice()));
+                    }
+                }
+                ExprKind::Identifier(n) => mentions.push((n.clone(), e as *const Expr)),
+                ExprKind::Path { segments, .. } => {
+                    if let Some(last) = segments.last() {
+                        mentions.push((last.clone(), e as *const Expr));
+                    }
+                }
+                _ => {}
+            },
+        };
+        match region {
+            Region::Body(_, b) => visit_block(b, &mut collect),
+            Region::Loose(e) => visit_expr(e, &mut collect),
+        }
+        for (n, ptr) in mentions {
+            if !callees.contains(&ptr) {
+                poisoned.insert(n);
+            }
+        }
+        // Close the `let a = b;` edges to a fixpoint: `a` is retractable only
+        // if `b` was, whatever order the two statements appear in.
+        loop {
+            let mut grew = false;
+            for (dst, src) in &aliased {
+                if fresh.contains(src.as_str()) && !fresh.contains(dst.as_str()) {
+                    fresh.insert(dst.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        for (f, args) in calls {
+            let (nparams, has_default) = fns.get(&f).copied().unwrap_or((0, false));
+            if args.iter().any(|a| a.label.is_some()) {
+                for i in 0..nparams {
+                    live.remove(&(f.clone(), i));
+                }
+                continue;
+            }
+            if has_default && args.len() < nparams {
+                for i in args.len()..nparams {
+                    live.remove(&(f.clone(), i));
+                }
+            }
+            for (i, a) in args.iter().enumerate() {
+                let admit = match &a.value.kind {
+                    ExprKind::Call { .. }
+                    | ExprKind::MethodCall { .. }
+                    | ExprKind::StructLiteral { .. } => true,
+                    ExprKind::Identifier(n) => {
+                        fresh.contains(n.as_str()) && !forbidden.contains(n.as_str())
+                    }
+                    _ => false,
+                };
+                if !admit {
+                    live.remove(&(f.clone(), i));
+                }
+            }
+        }
+    }
+    live.retain(|(f, _)| !poisoned.contains(f));
+    live
+}
