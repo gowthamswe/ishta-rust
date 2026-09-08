@@ -107,16 +107,50 @@
 # honest answer to "which frame read freed memory" and the wrong answer to
 # "which lowering is wrong".
 #
-# The one NON-heap finding: `stack-buffer-overflow`, a read at offset 40 of a
-# frame that has exactly one object. Same fixture family as B-2026-09-07-43's
-# two lines above, filed separately because a stack overread is a different
-# failure mode from that row's leak.
-memory_sanitizer_tests::asan_discarded_literal_projected_field_keeps_its_owner                 # B-2026-09-07-57
+# B-2026-09-07-57 REMOVED 2026-09-08, its owning row fixed. BOTH its entries
+# came off together. They read:
 #
-# The if/else sibling of the line above, and the same stack overread. It reached
-# this list under B-2026-09-07-43, whose LEAK it also had; that leak is fixed and
-# this is what was underneath.
-memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_after_declines     # B-2026-09-07-57
+#   The one NON-heap finding: `stack-buffer-overflow`, a read at offset 40 of a
+#   frame that has exactly one object.
+#   memory_sanitizer_tests::asan_discarded_literal_projected_field_keeps_its_owner
+#
+#   The if/else sibling of the line above, and the same stack overread. It
+#   reached this list under B-2026-09-07-43, whose LEAK it also had.
+#   memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_after_declines
+#
+# No fix was written against either entry. The row was closed against
+# `9ee19bbd2`, B-2026-09-07-48's fix, exactly as its own closing note said to:
+# `lower_field_access_ptr` knew three receiver slot shapes and fell through to
+# the raw slot pointer for a fourth, so a projected read off an RC-FALLBACK
+# PROMOTED local GEP'd the 8-byte box HANDLE as if it were the struct. Both
+# fixtures re-measured green on this leg after that fix, 1535 passed / 0 failed.
+#
+# THIS ENTRY IS THE COUNTER-EXAMPLE TO THE THREE LESSONS ABOVE, and it is worth
+# keeping for that reason. B-2026-09-07-54, -55 and -56 each record a version of
+# "a quarantine entry says WHERE the report landed, not where the defect is".
+# This one said where the defect was. The frame layout WAS the localization:
+#
+#     This frame has 1 object(s):
+#       [32, 40) 't' <== Memory access at offset 40 overflows this variable
+#
+# `t` is eight bytes because it holds a box handle rather than the 32-byte
+# struct, and the read one word past it is precisely a GEP of field 1 computed
+# against the handle's address. B-2026-09-07-48 had that as a written HYPOTHESIS
+# and no way to test it; this leg turned it into a measurement. So the reading
+# rule is neither "trust the entry" nor "distrust it" — it is that a report
+# naming a STACK FRAME LAYOUT carries information a heap report does not, because
+# the object's declared extent is in the message.
+#
+# The half ASAN could NOT see is the other half of the lesson. The same defect's
+# `v.push(t.a)` spelling printed 0 against an oracle of 38 while running CLEAN
+# under instrumentation — a wrong answer with every access in bounds. It was
+# re-measured at 38 on all four surfaces before this removal. A fixture list
+# gated on memory safety is silent about that class by construction, which is
+# why the row's closing note asked for it to be checked separately.
+#
+# THE ACTIVE LIST IS NOW EMPTY. That is the ratchet arriving where it was aimed,
+# not a reason to retire it: the leg still fails on any unlisted fixture that
+# starts failing, and an empty list is the strongest form of that gate.
 
 # B-2026-09-07-43's leak is fixed, so ONE of its two entries came off this list:
 #
