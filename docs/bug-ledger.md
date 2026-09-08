@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 400 |
+| miscompile | 401 |
 | run-vs-build | 371 |
 | leak | 300 |
 | double-free | 212 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1605 |
+| codegen | 1606 |
 | interp | 405 |
 | typecheck | 295 |
 | other | 75 |
@@ -167,7 +167,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-41 | 2026-09-07 | codegen | low | A WHOLE-VALUE REBIND OF A BY-VALUE ENUM PARAM STRANDS ITS PAYLOAD AT -O0 -- `fn rebind(w: W) -> i64 { let v = w; return match v { W.T(x) => x.a.unwrap_or(0), .. } }` loses the payload `String`, correcting B-2026-09-07-33's claim that this neighbour measures 0 errors | — |
 | B-2026-09-07-42 | 2026-09-07 | codegen | high | PERF-REGRESSION, CORPUS-WIDE AND UNNOTICED SINCE ~2026-08: 12 of the 23 map-bearing benched katas whose recorded-run binary survives execute 1.30x-4.17x MORE INSTRUCTIONS built by today's karac than by the karac that produced their published figure -- up to 7.46x on WALL CLOCK (kata:146 236 -> 1683 ms), with IPC falling too, every sink identical, and the old binaries still reproducing their recorded numbers to 2-5%; source change, lane, placement, iterator-fallback and map-capacity all ruled out, and neither key/value type nor recorded date separates the regressed half from the flat half | kata:170 results.json still publishes the pre-regression 997.08 ms | found while running B-2026-08-28-77's placement sweep, where kata:170 was the positive control and failed to fire | CAUSE: 59c8d30cd (2026-08-22), the landing half of B-2026-08-21-6 — a deliberate security fix whose cost was never measured |
 | B-2026-09-07-44 | 2026-09-07 | codegen | low | A FRESH-TEMP ENUM SCRUTINEE WHOSE CONSUMING ARM BINDS A COPY-DECLINED STRUCT PAYLOAD LEAKS THE PAYLOAD'S INTERIOR -- `match W.T(mkx(1)) { W.T(x) => .. }` loses 2 B while the `let`-bound scrutinee and the `W.T(_)` arm of the same program are clean | none |
-| B-2026-09-07-48 | 2026-09-07 | codegen | high | READING AN RC-PROMOTED LOCAL'S PROJECTED FIELD AFTER THE LOOP DIVERGES THREE WAYS -- `let s = t.a` in a loop then `t.a.len()` prints 152 on the interpreter, -1 compiled and 117 on the JIT, silently, while the same read INSIDE the loop is correct on all four surfaces | — |
 | B-2026-09-07-49 | 2026-09-07 | codegen | medium | EVERY MECHANISM THAT ASKS `use_after_move_consume_sites` IS BLIND TO THE RC-FALLBACK PROMOTION, WHICH IS THE OWNERSHIP PASS'S OTHER ANSWER TO THE SAME QUESTION -- three rows (B-2026-09-07-23, -29, -30) have now been that one missing half, each fixed by a separate hand-written arm | — |
 | B-2026-09-07-50 | 2026-09-07 | codegen | medium | A CALLEE THAT READS ITS BY-VALUE PARAM AFTER A CONDITIONAL STORE LOSES THE `Drop` BODY OUTRIGHT ON THE COMPILED BACKENDS -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` at `k = false` prints no body while `--interp` prints it, and strands the param's whole heap (20 B in 2 blocks at -O0, 120 B in 12 over a six-trip loop); the same read placed BEFORE the store, or a trailing statement that does not read the param, is clean on both counts | — |
 | B-2026-09-07-51 | 2026-09-07 | codegen | medium | THE MONO LEG CARRIES NO CONDITIONAL-STORE REGISTRATION -- `fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }` at `k = false` runs NO `Drop` body on the compiled backends while `--interp` runs it, and leaks the argument's `shared` refcount block (16 B in 1 at -O0); the NON-generic spelling of the identical callee is clean on both counts, which is what isolates genericity as the whole difference | — |
@@ -177,6 +176,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-62 | 2026-09-08 | codegen | medium | A BOXED SHARED-ENUM PAYLOAD'S NESTED STRUCT FIELD NEVER HAS ITS BUFFERS FREED UNLESS THAT FIELD IS MOVED OUT -- 32 B leaked with no move-out and with a SIBLING field moved out, the opposite direction of B-2026-09-07-55's use-after-free at the same line | — |
 | B-2026-09-08-1 | 2026-09-08 | codegen | medium | A REBIND OF A BY-VALUE `Vec[weak T]` PARAM LEAKS ONE BOX PER ELEMENT -- `let work = xs` copies the weak handles without a weak-count inc, so both containers weak-drain the same boxes and the strong-zero release never fires; 24 B per element at BOTH opt levels, and the no-rebind control is clean | none |
 | B-2026-09-07-63 | 2026-09-08 | codegen+interp | high | A CALLER-SIDE MOVE-OUT OF A FIELD IS INVISIBLE TO THE DISPLACEMENT GATE, SO A LATER ASSIGN TO THAT FIELD FIRES A BODY THE MOVER ALREADY OWNS -- `let taken = g.one; g.one = mks(7);` prints `dS1` twice on both compiled backends against `--interp`'s once, and separately loses the NEW value's `dS7` there; the method spelling `g.set(mks(7))` now takes the same double on every surface, because B-2026-09-07-52's fix routes it through the same per-frame gate | — |
+| B-2026-09-08-2 | 2026-09-08 | codegen | high | A `mut ref` ARGUMENT PROJECTING OFF AN RC-PROMOTED LOCAL SILENTLY DISCARDS THE WRITE -- `bump(mut t.a)` after a loop that consumed `t.a` gives 40 on the interpreter but 0 compiled and 38 on the JIT, and the non-heap `bumpi(mut t.b)` spelling loses the write just as completely (10 vs 9 on every compiled backend) | — |
 
 ### Relocated
 
@@ -2396,6 +2396,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-45 | codegen | medium | THE SPEC-RE-PARSING FORMATTER WAS LEFT AT 64 BITS WHEN ITS FAST-PATH SIBLING WAS WIDENED -- `f"{big:^44}"`, `f"{big:b}"` and `f"{big:*>44}"` on a `u1… | 4b03864d1 |
 | B-2026-09-07-46 | codegen | high | A SPEC'D FLOAT HOLE WIDER THAN ITS BUFFER PRINTS UNINITIALIZED STACK -- `f"{x:.2}"` on `f64::MAX` is 312 bytes into a 64-byte buffer, and codegen use… | 0e7ace131 |
 | B-2026-09-07-47 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lan… | b440bbe |
+| B-2026-09-07-48 | codegen | high | READING AN RC-PROMOTED LOCAL'S PROJECTED FIELD AFTER THE LOOP DIVERGES THREE WAYS -- `let s = t.a` in a loop then `t.a.len()` prints 152 on the inter… | 9ee19bbd2 |
 | B-2026-09-07-52 | codegen+interp | medium | A FIELD ASSIGN WRITTEN `self.one = r` INSIDE A METHOD LOSES THE DISPLACED VALUE'S `Drop` BODY ON EVERY SURFACE -- B-2026-08-01-20's `emit_displaced_f… | 202d8fe |
 | B-2026-09-07-54 | codegen | high | A REUSED `let`-BOUND `Vec[Option[shared T]]` HAS ITS ELEMENT RC DEC READ A FREED CONTROL BLOCK -- `__karac_vec_elem_rc_dec_Node` reads offset 0 of a… | 6d46e2a |
 | B-2026-09-07-55 | codegen | high | A SHARED-ENUM BOXED STRUCT PAYLOAD MOVE-OUT LEAVES `__karac_rc_drop_E` READING ITS OWN FREED 120-BYTE BLOCK -- the fixture is named `no_double_free`… | f362b10 |
