@@ -273,7 +273,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         slot.binding_name.clone(),
                         super::state::VarSlot {
                             ptr: alloca,
-                            ty: slot.llvm_ty,
+                            ty: self.joined_slot_var_type(&slot.binding_name, slot.llvm_ty),
                         },
                     );
                     // Preserve narrow-unsigned signedness across the join —
@@ -505,6 +505,80 @@ impl<'ctx> super::Codegen<'ctx> {
     /// in `compile_function_body`). No-op for bindings without a
     /// transfer record (i64 / f64 / Vec / RC slots — the latter two
     /// have their own suppression/track flows).
+    /// B-2026-09-07-47 — the LLVM type the PARENT's joined slot variable must
+    /// carry, which is not always the slot's own `llvm_ty`.
+    ///
+    /// A return slot is typed by `infer_let_binding_llvm_type`, which reads the
+    /// `let` — its annotation or its RHS — and therefore answers with the
+    /// binding's LOGICAL type. That is the physical type for almost every
+    /// binding, and the two places it already is not are handled inside that
+    /// function: an SoA-laid-out `Vec[E]` is physically the 4-field SoA struct,
+    /// and a handle-backed builtin (`Column` / `Tensor` / `DataFrame`,
+    /// B-2026-08-08-18) is physically one control-block pointer. RC-FALLBACK
+    /// PROMOTION is a third such divergence and nothing taught it: when the
+    /// ownership pass promotes a binding (a consume inside a loop, the
+    /// `perf[rc-fallback]` diagnostic), the let site heap-boxes it and the
+    /// local holds a `{i64 rc, T}` box HANDLE — a pointer — while the slot is
+    /// still typed `T`.
+    ///
+    /// Nothing downstream noticed, because every RC-fallback READ path resolves
+    /// through `rc_fallback_heap_types` and touches offset 0, which is exactly
+    /// where the branch's 8-byte handle store landed inside the wider field. The
+    /// one path that is not offset-based is the scope-exit `RcDec`, and it is
+    /// gated:
+    ///
+    /// ```text
+    /// let current_ptr = match self.variables.get(name) {
+    ///     Some(slot) if slot.ty.is_pointer_type() => build_load(ptr_ty, slot.ptr),
+    ///     _ => *ptr,
+    /// };
+    /// ```
+    ///
+    /// That guard is B-2026-07-12-6's — it stops an `i64` shadow of a shared
+    /// binding from being reinterpreted as a heap pointer. With a struct-typed
+    /// slot it declines the reload and falls back to the pointer captured at
+    /// REGISTRATION, which for a par-transferred cleanup
+    /// (`register_one_slot_ownership`) is the parent's ALLOCA, not the box. The
+    /// dec then decrements the stack slot's first word as if it were the box's
+    /// refcount: no crash, no corruption anyone can observe, and the box plus
+    /// everything it owns is never freed. Measured on
+    /// `let t = mkp(9); let mut r = payload(); while i < 3 { t.take(); i = i + 1; }`
+    /// — 40 B direct + 38 B indirect stranded per program, allocated in
+    /// `__par_branch_0_0`, and gone when the same program is BUILT with
+    /// `KARAC_AUTO_PAR=0` (the sequential lane's binding is pointer-typed, so
+    /// the guard passes and the same `RcDec` frees the box).
+    ///
+    /// Answered from `rc_fallback_heap_types` — what the branch ACTUALLY did —
+    /// rather than by re-deriving the boxing decision from the `let`. The let
+    /// site's condition is `!shared && !Option[shared] && !is_vec &&
+    /// is_rc_fallback_binding`, and re-deriving it here would have to
+    /// reconstruct the first two from ~150 lines of the let arm; predicting
+    /// "boxed" for a `Vec` or `Option[shared]` binding the let arm declines to
+    /// box would hand the parent a pointer-typed view of a value that is not a
+    /// pointer. The branch has already made the call and recorded it, and
+    /// `drop_rc` deliberately survives `emit_par_branch_fn` (which is what lets
+    /// the parent's own reads of the binding resolve through the box at all),
+    /// so the recorded answer is in scope and cannot disagree with itself.
+    ///
+    /// The alloca keeps the slot's own (wider) type: the handle sits at offset
+    /// 0 either way, and re-typing the VARIABLE is what restores the invariant
+    /// the sequential lane already holds — an RC-promoted binding is
+    /// pointer-typed in `variables`.
+    pub(super) fn joined_slot_var_type(
+        &self,
+        binding_name: &str,
+        slot_ty: BasicTypeEnum<'ctx>,
+    ) -> BasicTypeEnum<'ctx> {
+        if self
+            .drop_rc
+            .rc_fallback_heap_types
+            .contains_key(binding_name)
+        {
+            return self.context.ptr_type(AddressSpace::default()).into();
+        }
+        slot_ty
+    }
+
     pub(super) fn register_slot_ownership(
         &mut self,
         binding_name: &str,

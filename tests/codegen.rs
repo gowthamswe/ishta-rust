@@ -36557,6 +36557,133 @@ fn main() { println(go()); }
         }
     }
 
+    /// B-2026-09-07-47 — output-side twin of
+    /// `asan_rc_promoted_binding_crossing_a_par_join_still_frees_its_box`.
+    ///
+    /// The defect is a LEAK and nothing about it is observable in stdout, so
+    /// this test cannot fail on the parent compiler and is not a regression
+    /// guard on its own — `tests/memory_sanitizer.rs` is. What it pins is the
+    /// half a leak fix can still get wrong: the fix re-types the joined
+    /// variable as a POINTER (an RC-promoted binding is physically a
+    /// `{i64 rc, T}` box handle), and every read of that binding after the join
+    /// resolves through it. If that re-typing ever disagrees with what the
+    /// branch actually stored, these cells stop printing the right answer —
+    /// which is exactly how a slot-type change goes wrong (B-2026-08-08-18's
+    /// `y` allocated as an `i64` and loaded 8 bytes of control-block pointer
+    /// out of it).
+    ///
+    /// Every cell is verified identical on all four surfaces — `--interp`, the
+    /// JIT, and `karac build` at `KARAC_OPT_LEVEL` 2 and 0, each with auto-par
+    /// on and BUILT with `KARAC_AUTO_PAR=0`.
+    #[test]
+    fn e2e_rc_promoted_binding_crossing_a_par_join_reads_correctly() {
+        const PRE: &str = r#"struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+"#;
+        // (source tail, expected stdout, cell name)
+        let cells: [(&str, &str, &str); 7] = [
+            // 1 — the row's own shape. `r.len()` is 38: the f-string payload.
+            (
+                r#"impl P { fn take(self) -> i64 { return self.b; } }
+fn go() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 3i64 { t.take(); i = i + 1; }
+  return r.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "whole_method_consume_3_trips",
+            ),
+            // 2 — a PROJECTING argument off the promoted binding: 38 + 3*38.
+            (
+                r#"fn takes(s: String) -> i64 { return s.len(); }
+fn go() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64; let mut acc = 0i64;
+  while i < 3i64 { acc = acc + takes(t.a); i = i + 1; }
+  return r.len() + acc; }
+fn main() { println(go()); }
+"#,
+                "152",
+                "projecting_argument",
+            ),
+            // 3 — zero trips.
+            (
+                r#"impl P { fn take(self) -> i64 { return self.b; } }
+fn go() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 0i64 { t.take(); i = i + 1; }
+  return r.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "zero_trip_loop",
+            ),
+            // 4 — five trips.
+            (
+                r#"impl P { fn take(self) -> i64 { return self.b; } }
+fn go() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 5i64 { t.take(); i = i + 1; }
+  return r.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "five_trips",
+            ),
+            // 5 — READ THE PROMOTED BINDING AFTER THE JOIN, through the box.
+            // The re-typed variable is what this read resolves through, so a
+            // wrong slot type surfaces here as a wrong number rather than as a
+            // leak.
+            (
+                r#"impl P { fn take(self) -> i64 { return self.b; } }
+fn go() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 3i64 { t.take(); i = i + 1; }
+  return r.len() + t.b; }
+fn main() { println(go()); }
+"#,
+                "47",
+                "read_promoted_binding_after_join",
+            ),
+            // 6 (CONTROL) — free-function consume; no fan-out at all.
+            (
+                r#"fn takep(p: P) -> i64 { return p.b; }
+fn go() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 3i64 { takep(t); i = i + 1; }
+  return r.len(); }
+fn main() { println(go()); }
+"#,
+                "38",
+                "control_free_fn_consume_no_fanout",
+            ),
+            // 7 — explicit statement-position `par` block, the sibling
+            // bind-back site.
+            (
+                r#"fn takep(p: P) -> i64 { return p.b; }
+fn go() -> i64 {
+  par {
+    let t = mkp(9);
+    let k = seed() + 41i64;
+  }
+  let mut i = 0i64;
+  while i < 3i64 { takep(t); i = i + 1; }
+  return k; }
+fn main() { println(go()); }
+"#,
+                "42",
+                "explicit_statement_par_block",
+            ),
+        ];
+        for (tail, expected, name) in cells {
+            let src = format!("{PRE}{tail}");
+            if let Some(cap) = run_program_capturing(&src) {
+                assert_eq!(
+                    cap.stdout.trim(),
+                    expected,
+                    "[{name}] wrong stdout for an RC-promoted binding across a par join"
+                );
+                assert!(cap.status.success(), "[{name}] program exited non-zero");
+            }
+        }
+    }
+
     /// B-2026-09-07-23 — a heap field PROJECTED out of an RC-FALLBACK-PROMOTED
     /// local shared one buffer with the box, and both freed it once per loop
     /// iteration. (Its never-entered sibling, B-2026-09-07-19, is clean and was

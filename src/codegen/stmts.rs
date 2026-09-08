@@ -1791,11 +1791,15 @@ impl<'ctx> super::Codegen<'ctx> {
                                 slot.llvm_ty,
                             );
                             self.builder.build_store(alloca, *loaded).unwrap();
+                            // B-2026-09-07-47 — an RC-fallback-promoted binding
+                            // is physically a box HANDLE, so the joined variable
+                            // must be pointer-typed even though the slot is
+                            // typed by the `let`. See `joined_slot_var_type`.
                             self.variables.insert(
                                 slot.binding_name.clone(),
                                 VarSlot {
                                     ptr: alloca,
-                                    ty: slot.llvm_ty,
+                                    ty: self.joined_slot_var_type(&slot.binding_name, slot.llvm_ty),
                                 },
                             );
                             // Re-register the binding's surface type name so a

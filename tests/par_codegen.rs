@@ -13527,6 +13527,73 @@ fn main() {
         }
     }
 
+    /// B-2026-09-07-47 — the auto-par twin. An RC-promoted binding that crosses
+    /// a fan-out JOIN must still read correctly on the other side.
+    ///
+    /// The leak itself is guarded in `tests/memory_sanitizer.rs`; what this
+    /// pins is the value round-trip, because the fix works by re-typing the
+    /// joined variable as a POINTER (the binding is physically a
+    /// `{i64 rc, T}` box handle, not the `T` its `let` says). Every read after
+    /// the join resolves through that type, so a slot-type change that
+    /// disagrees with what the branch stored shows up here as a wrong number.
+    ///
+    /// `second_local` is load-bearing in every case: it is the second heap
+    /// local that gives the analyzer a second group to fan out. Without it the
+    /// function compiles to one group, no join, and none of this is exercised
+    /// — which is why the `nofanout` cell prints the same number for a
+    /// structurally different reason.
+    #[test]
+    fn test_e2e_auto_par_rc_promoted_binding_crossing_a_join_reads_correctly() {
+        let out = run_program(
+            r#"
+struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn takes(s: String) -> i64 { return s.len(); }
+fn takep(p: P) -> i64 { return p.b; }
+impl P { fn take(self) -> i64 { return self.b; } }
+fn loop3() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 3i64 { t.take(); i = i + 1; }
+  return r.len(); }
+fn zero() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 0i64 { t.take(); i = i + 1; }
+  return r.len(); }
+fn proj() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64; let mut acc = 0i64;
+  while i < 3i64 { acc = acc + takes(t.a); i = i + 1; }
+  return r.len() + acc; }
+fn after() -> i64 { let t = mkp(9); let mut r = payload(); let mut i = 0i64;
+  while i < 3i64 { t.take(); i = i + 1; }
+  return r.len() + t.b; }
+fn nofanout() -> i64 { let t = mkp(9); let mut i = 0i64; let mut acc = 0i64;
+  while i < 3i64 { acc = acc + t.take(); i = i + 1; }
+  return acc; }
+fn explicitpar() -> i64 {
+  par {
+    let t = mkp(9);
+    let k = seed() + 41i64;
+  }
+  let mut i = 0i64;
+  while i < 3i64 { takep(t); i = i + 1; }
+  return k; }
+fn main() {
+  println(loop3());
+  println(zero());
+  println(proj());
+  println(after());
+  println(nofanout());
+  println(explicitpar());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "38\n38\n152\n47\n27\n42\n",
+                "an RC-promoted binding must survive the auto-par join intact; got {out:?}"
+            );
+        }
+    }
+
     #[test]
     /// B-2026-09-07-23, auto-par twin of
     /// `e2e_rc_boxed_projection_copies_instead_of_sharing_an_owner`.

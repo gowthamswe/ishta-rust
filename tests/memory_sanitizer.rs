@@ -65890,6 +65890,172 @@ fn main() { println(go()); }
         );
     }
 
+    /// B-2026-09-07-47 — AN RC-PROMOTED BINDING THAT CROSSES AN AUTO-PAR JOIN
+    /// LOSES ITS BOX, because the joined variable is typed by the `let` rather
+    /// than by what the branch actually put in it.
+    ///
+    /// A par return slot's LLVM type comes from `infer_let_binding_llvm_type`,
+    /// which reads the `let` and answers with the binding's LOGICAL type. Two
+    /// physical-vs-logical divergences were already taught to it — an
+    /// SoA-laid-out `Vec[E]` is the 4-field SoA struct, and a handle-backed
+    /// builtin is one control-block pointer (B-2026-08-08-18). RC-FALLBACK
+    /// PROMOTION is a third and nothing taught it: the let site heap-boxes the
+    /// binding, so the local holds a `{i64 rc, T}` box HANDLE — a pointer —
+    /// while the slot stays typed `T`.
+    ///
+    /// Every RC-fallback READ path survived that, because they all resolve
+    /// through `rc_fallback_heap_types` and touch offset 0 — exactly where the
+    /// branch's 8-byte handle store lands inside the wider field. The one path
+    /// that is not offset-based is the scope-exit `RcDec`, and it is gated on
+    /// `slot.ty.is_pointer_type()` (B-2026-07-12-6, which stops an `i64` shadow
+    /// of a shared binding being reinterpreted as a heap pointer). A
+    /// struct-typed slot fails that guard, so the dec falls back to the pointer
+    /// captured at REGISTRATION — for a par-transferred cleanup
+    /// (`register_one_slot_ownership`) the parent's ALLOCA — and decrements the
+    /// stack slot's first word as if it were the refcount. No crash, nothing
+    /// observable, box never freed.
+    ///
+    /// Measured on the parent, x86_64 Linux, valgrind, three runs each: 58
+    /// allocs / 33 frees with `40 (direct) + 38 (indirect)` definitely lost,
+    /// against 58/35 and zero lost after the fix — the SAME allocations and
+    /// exactly two more frees, the box and its `String`. Cell 5 is the same
+    /// program BUILT with `KARAC_AUTO_PAR=0`, which is 25/25 clean on both
+    /// compilers: the sequential lane's binding is pointer-typed, so the guard
+    /// passes there and the identical `RcDec` frees the box. That is what makes
+    /// this a build-lane property rather than a run-time one.
+    ///
+    /// CELLS 5 AND 6 ARE NOT "fan-out that handles the box correctly" — they
+    /// emit ZERO `__par_branch_*` functions, so they never reach the path at
+    /// all. B-2026-09-07-47's own row presents them as discriminating controls,
+    /// which overstates them; they are kept because a change that made either
+    /// shape start fanning out would newly expose it here.
+    ///
+    /// TRIP COUNT IS IRRELEVANT (cells 1 / 3 / 4 at 3 / 0 / 5 trips all lose
+    /// the same 40 B): the box is minted at the `let`, not in the loop, and it
+    /// is the JOIN that strands it. A loop that never runs still loses it.
+    #[test]
+    fn asan_rc_promoted_binding_crossing_a_par_join_still_frees_its_box() {
+        const PRE: &str = "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n";
+
+        // Cell 1 — the row's own shape: an owned-`self` WHOLE consume in a
+        // running loop, with a second heap local to give the analyzer a second
+        // group to fan out. 3 trips.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}impl P {{ fn take(self) -> i64 {{ return self.b; }} }}\n\
+                 fn go() -> i64 {{ let t = mkp(9); let mut r = payload(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ t.take(); i = i + 1; }}\n\
+                 \x20 return r.len(); }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["38"],
+            "b47-whole-method-consume-3-trips",
+            6,
+        );
+
+        // Cell 2 — a PROJECTING call argument off the same promoted binding.
+        // A different consume spelling reaching the same join.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}fn takes(s: String) -> i64 {{ return s.len(); }}\n\
+                 fn go() -> i64 {{ let t = mkp(9); let mut r = payload(); let mut i = 0i64; let mut acc = 0i64;\n\
+                 \x20 while i < 3i64 {{ acc = acc + takes(t.a); i = i + 1; }}\n\
+                 \x20 return r.len() + acc; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["152"],
+            "b47-projecting-argument",
+            6,
+        );
+
+        // Cell 3 — ZERO trips. The loop body never executes and the same 40 B
+        // goes missing, which is what says the box is stranded by the join and
+        // not by the consume.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}impl P {{ fn take(self) -> i64 {{ return self.b; }} }}\n\
+                 fn go() -> i64 {{ let t = mkp(9); let mut r = payload(); let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ t.take(); i = i + 1; }}\n\
+                 \x20 return r.len(); }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["38"],
+            "b47-zero-trip-loop",
+            6,
+        );
+
+        // Cell 4 — 5 trips, the other direction from cell 3.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}impl P {{ fn take(self) -> i64 {{ return self.b; }} }}\n\
+                 fn go() -> i64 {{ let t = mkp(9); let mut r = payload(); let mut i = 0i64;\n\
+                 \x20 while i < 5i64 {{ t.take(); i = i + 1; }}\n\
+                 \x20 return r.len(); }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["38"],
+            "b47-five-trips",
+            6,
+        );
+
+        // Cell 5 (CONTROL) — a FREE-FUNCTION whole consume. Emits no
+        // `__par_branch_*` at all, so it never reaches the join; clean on both
+        // compilers. See this test's doc on why that is weaker than the row
+        // claims.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}fn takep(p: P) -> i64 {{ return p.b; }}\n\
+                 fn go() -> i64 {{ let t = mkp(9); let mut r = payload(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return r.len(); }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["38"],
+            "b47-control-free-fn-consume-no-fanout",
+            6,
+        );
+
+        // Cell 6 (CONTROL) — strip the second heap local. One group, nothing to
+        // fan out, no join, no slot. Also zero `__par_branch_*`.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}impl P {{ fn take(self) -> i64 {{ return self.b; }} }}\n\
+                 fn go() -> i64 {{ let t = mkp(9); let mut i = 0i64; let mut acc = 0i64;\n\
+                 \x20 while i < 3i64 {{ acc = acc + t.take(); i = i + 1; }}\n\
+                 \x20 return acc; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["27"],
+            "b47-control-single-heap-local-no-fanout",
+            6,
+        );
+
+        // Cell 7 — an EXPLICIT statement-position `par` block, whose bindings
+        // hoist into the surrounding scope (B-2026-07-11-3). This is the
+        // sibling bind-back site (`compile_par_block` Step 6), reached without
+        // an outer `let` to rebind the name over it.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}fn takep(p: P) -> i64 {{ return p.b; }}\n\
+                 fn go() -> i64 {{\n\
+                 \x20 par {{\n\
+                 \x20   let t = mkp(9);\n\
+                 \x20   let k = seed() + 41i64;\n\
+                 \x20 }}\n\
+                 \x20 let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ takep(t); i = i + 1; }}\n\
+                 \x20 return k; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["42"],
+            "b47-explicit-statement-par-block",
+            6,
+        );
+    }
+
     /// B-2026-09-07-23 — a heap field PROJECTED out of an RC-FALLBACK-PROMOTED
     /// local was freed by the destination AND by the box, once per loop
     /// iteration.
