@@ -82492,4 +82492,67 @@ fn main() {
         assert_clean_asan_run_no_auto_par(&promoted, &["152"], "b8-promoted-noautopar");
         assert_clean_asan_run_min_allocs_auto_par(&promoted, &["152"], "b8-promoted-autopar", 6);
     }
+
+    /// B-2026-09-07-41 — a WHOLE-VALUE REBIND of a by-value ENUM param the
+    /// callee owns BY TRANSFER must still own its payload's contents.
+    ///
+    /// `fn rebind(w: W) -> i64 { let v = w; match v { W.T(x) => .. } }` freed the
+    /// payload ENVELOPE and stranded its `String`: 2 B at `-O0` (11 allocs / 10
+    /// frees), clean at `-O2`, `c=5` on every surface and under `--interp`.
+    ///
+    /// The gate is `scrutinee_is_transfer_owned_enum_param`, which
+    /// `bind_pattern_values`'s copy-supported arm reads to tell a callee-owned
+    /// source from the caller-retains one it otherwise assumes
+    /// (B-2026-09-07-38). It tested `current_fn_param_names` for a BARE param
+    /// name, so the rebound local `v` answered false, the gate kept its
+    /// conservative answer, and the consuming arm's binding got no owner for the
+    /// contents. It now asks `ident_is_whole_param_alias`, which admits the
+    /// bare param AND the whole-value rebind aliases `fn_whole_param_aliases`
+    /// names — while still refusing a PROJECTION view, which is the case the
+    /// gate's `param_view_locals` exclusion was written for.
+    ///
+    /// Cell 2 is the direct `match w` control that was already clean: it must
+    /// stay 11/11, so a widening that double-registered would fail here as an
+    /// invalid free rather than pass quietly.
+    ///
+    /// Measured parent -> fix by hand (`karac build`, `KARAC_OPT_LEVEL=0`,
+    /// `KARAC_AUTO_PAR=0`, valgrind), stdout unchanged on both cells:
+    /// rebind 11 allocs / 10 frees with 2 B definitely lost -> 11 / 11 clean;
+    /// direct 11 / 11 -> 11 / 11.
+    ///
+    /// WHAT THIS FIXTURE DOES AND DOES NOT PIN, stated plainly because the
+    /// distinction is measurable and was measured: it does NOT pin the leak.
+    /// The defect is `-O0`-only (the row records 0 errors at `-O2`), this
+    /// harness compiles above `-O0`, and there is no `-O0` variant among its
+    /// helpers — verified by reverting the fix, at which point BOTH cells still
+    /// pass here. What it does pin is the hazard THIS change introduces: a
+    /// widening that registered a second owner would abort under ASAN as a
+    /// double free at any opt level, and cell 2 is the already-clean control
+    /// that would catch it. The leak half needs an `-O0` leg; `tests/cli.rs`
+    /// can set `KARAC_OPT_LEVEL=0` on a spawned `karac` but has no leak
+    /// checker, so neither harness can assert it today.
+    #[test]
+    fn asan_transfer_owned_enum_param_rebind_owns_its_payload() {
+        const PRE: &str = "struct X1 { a: Option[i64], s: String }\n\
+             enum W { T(X1), U(i64) }\n\
+             fn mkx(i: i64) -> X1 { return X1 { a: Option.Some(i), s: f\"s{i}\" }; }\n";
+        // 1 — the row's cell: the rebind spelling.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{PRE}fn rebind(w: W) -> i64 {{ let v = w; return match v {{ W.T(x) => x.a.unwrap_or(0), W.U(n) => n }}; }}\n\
+                 fn main() {{ println(f\"c={{rebind(W.T(mkx(5)))}}\"); println(\"end\") }}\n"
+            ),
+            &["c=5", "end"],
+            "b41-rebind",
+        );
+        // 2 — CONTROL: the direct `match w`, clean before and after.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{PRE}fn rebind(w: W) -> i64 {{ return match w {{ W.T(x) => x.a.unwrap_or(0), W.U(n) => n }}; }}\n\
+                 fn main() {{ println(f\"c={{rebind(W.T(mkx(5)))}}\"); println(\"end\") }}\n"
+            ),
+            &["c=5", "end"],
+            "b41-direct-control",
+        );
+    }
 }

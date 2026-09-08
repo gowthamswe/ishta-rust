@@ -1656,9 +1656,21 @@ impl<'ctx> super::Codegen<'ctx> {
             ExprKind::SelfValue => "self",
             _ => return false,
         };
-        if !self.fn_ctx.current_fn_param_names.contains(name)
-            || self.borrow_vars.ref_params.contains_key(name)
-        {
+        // B-2026-09-07-41 — a WHOLE-VALUE REBIND of the param (`let v = w;`
+        // then `match v`) is the same slot's ownership under a new name, and
+        // the bare-param test alone declined it: `v` is not in
+        // `current_fn_param_names`, so the copy-supported gate kept its
+        // conservative answer and the consuming arm's binding got no owner for
+        // the payload CONTENTS — the envelope was freed and its `String` was
+        // not (2 B at `-O0`, clean at `-O2`, `c=5` on every surface).
+        //
+        // `ident_is_whole_param_alias` is the right widening rather than
+        // dropping the `param_view_locals` exclusion this comment's paragraph
+        // above defends: that exclusion is about locals holding a PART of a
+        // live param, and the helper narrows the same set to the WHOLE-param
+        // aliases `fn_whole_param_aliases` names. A projection view still
+        // answers false here, which is the case the exclusion was written for.
+        if !self.ident_is_whole_param_alias(name) {
             return false;
         }
         self.var_types
