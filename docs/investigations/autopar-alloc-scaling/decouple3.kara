@@ -1,0 +1,41 @@
+// THREE-worker sibling of decouple2.kara — same total inner work (3 x 144000).
+//
+// `n_workers = min(pool_workers, iter_total)`, so an outer loop of exactly 2
+// runs TWO ACTIVE WORKERS no matter how large the pool is. That separates the
+// two hypotheses the row cannot currently tell apart:
+//
+//   (a) a TWO-THREAD POOL is pathological  -> this probe is FAST at pool=18
+//   (b) TWO ACTIVE WORKERS are pathological -> this probe is SLOW at pool=18
+//
+// The row's earlier attempt at this was inconclusive because the runtime cost
+// gate skipped the dispatch entirely: `gate_skip` fires when
+// `iter_total * per_iter_cost < pool_workers * DISPATCH_OVERHEAD_PER_CALL_UNITS_RT`,
+// which at iter_total=2 and an 18-thread pool means the body must score
+// >= 90_000 units. A `while` loop would be scored by
+// RUNTIME_NESTED_LOOP_MULTIPLIER (64) and fall far short, so the inner loop
+// here is a COMPILE-TIME-EVALUABLE `for` range — the estimator uses its exact
+// trip count (see src/par_cost.rs, "a nested loop with a compile-time-evaluable
+// range uses its exact trip count").
+//
+// Total inner steps are 2 x 216000 = 432000, deliberately identical to
+// alloc3.kara's 720 x 600, so the allocation VOLUME is held constant and only
+// the partitioning changes. Same body as alloc3: two short-lived Strings per
+// step (substring + concat), no formatting.
+fn work(seed: i64, base: ref String) -> i64 {
+    let mut acc = seed + 1;
+    for k in 0..144000 {
+        let s = base.substring(0, (acc % 8) + 1);
+        let t = s + "x";
+        acc = (acc * 7 + t.len()) % 100000;
+    }
+    return acc % 1000;
+}
+
+fn main() {
+    let base = "abcdefghij";
+    let mut acc = 0;
+    for i in 0..3 {
+        acc = acc + work(i, base);
+    }
+    println(f"sum {acc}");
+}
