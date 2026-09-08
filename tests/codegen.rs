@@ -31907,17 +31907,24 @@ fn main() {
     /// which is why every straight-line move-out pin passed either way; a frame
     /// dump showed the action in frame0 before the disarm and frame1 after.
     ///
-    /// This pins the TAKEN path, which the fix makes fully correct on all five
-    /// surfaces: pre-fix the compiled backends printed `t1 dS1 m3`, losing the
-    /// un-moved sibling `g.two`'s body to a drain inside the branch.
+    /// TWO DEFECTS, fixed in that order and both pinned here. The FRAME one
+    /// cost the TAKEN path its un-moved sibling (`t1 dS1 m3`, no `dS2`). The
+    /// second is that the mask is COMPILE-TIME state applied on every path
+    /// while the move it records may not run, so the UNTAKEN path skipped
+    /// `one`'s body although nothing had moved it — `dS2 m3` against
+    /// `--interp`'s `dS2 dS1 m3`. A conditional SIMPLE field move-out now takes
+    /// a runtime per-field flag that the death-site tree selects on.
     ///
-    /// The UNTAKEN path is deliberately NOT pinned here and B-2026-09-08-4
-    /// stays open for it: the mask is compile-time state applied on every path,
-    /// so `f = false` still skips `one`'s body although the move never ran —
-    /// `dS2 m3` against `--interp`'s `dS2 dS1 m3`. That is a second, independent
-    /// defect needing a runtime per-field flag, and pinning today's reading for
-    /// it would pin a known-wrong output. Cell (b) pins only what IS settled
-    /// there: the sibling's body comes back on the untaken path too.
+    /// Cell (a) fails if the walk goes back to draining in the branch's frame;
+    /// cell (b) fails if the runtime route regresses to a static mask. Both
+    /// read byte-identically to `--interp` on all five surfaces.
+    ///
+    /// The runtime route is deliberately NOT taken for a partial DESTRUCTURE:
+    /// `asan_match_arm_struct_payload_binding_field_bodies_clean` loses the
+    /// discarded field's body without the masked walker on the source's action,
+    /// and kept losing it when the move map was written too — so that path
+    /// needs its transfer worked out first, and B-2026-09-08-5 (the conditional
+    /// ASSIGN, a different site) is untouched by this.
     ///
     /// Twin of `tests/interpreter.rs`'s
     /// `test_cond_field_move_walk_stays_in_the_owning_frame`.
@@ -31945,8 +31952,9 @@ fn main() {
             return;
         };
         assert_eq!(out, "t1\ndS1\ndS2\nm3\n");
-        // (b) UNTAKEN path — the sibling's body is back; `one`'s is still
-        // missing (B-2026-09-08-4's remaining half) and is NOT asserted.
+        // (b) UNTAKEN path — nothing moved, so BOTH fields' bodies are due.
+        // This is the cell the runtime flag buys: under the static mask it
+        // read `dS2 m3`.
         let Some(out) = run_program(
             "struct Rs { id: i64, name: String }\n\
              impl Drop for Rs {\n\
@@ -31967,10 +31975,7 @@ fn main() {
         ) else {
             return;
         };
-        assert!(
-            out.contains("dS2"),
-            "the un-moved sibling's body must survive the untaken branch: {out:?}"
-        );
+        assert_eq!(out, "dS2\ndS1\nm3\n");
     }
 
     /// B-2026-08-01-19 — storing an owned param into a local container

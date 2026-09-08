@@ -7740,6 +7740,17 @@ impl<'ctx> super::Codegen<'ctx> {
         if self.drop_rc.rc_fallback_heap_types.contains_key(var_name) {
             return;
         }
+        // B-2026-09-08-4 — a CONDITIONAL move-out takes a runtime per-field
+        // flag rather than the compile-time mask below.
+        //
+        // ORDERED AFTER the promoted decline above, not before it: that row's
+        // point is that a promoted source's field has exactly one owner
+        // already, so this route must not claim it either — the flag would say
+        // "skip the field's body" on the moving path for a walk that is not
+        // the field's owner to begin with.
+        if !owns_body && self.conditional_field_move_takes_runtime_flag(var_name, field, idx) {
+            return;
+        }
         if !owns_body && self.mask_moved_field_in_bodies_walk(var_name, struct_name, idx) {
             return;
         }
@@ -7771,6 +7782,96 @@ impl<'ctx> super::Codegen<'ctx> {
                 });
             }
         }
+    }
+
+    /// B-2026-09-08-4 (runtime half) — route a CONDITIONAL simple field
+    /// move-out through a per-field runtime flag instead of the compile-time
+    /// mask, so the path that never ran the move keeps the field's body.
+    ///
+    /// The mask is compile-time state applied on every path while the move it
+    /// records may be a runtime condition, so `if f { let taken = g.one; }`
+    /// with `f` false skipped `one`'s body although nothing had moved it.
+    /// `field_view_flags` already expresses exactly this and is already
+    /// selected on at the death site: entry-block `true`, a `false` stored in
+    /// the block the move compiles into, and `emit_field_view_leaf_tree`
+    /// branching to a walker masked to whichever fields are false ON THAT PATH
+    /// (B-2026-09-02-10). A moved-out field wants the same answer a viewed one
+    /// does, so the flag is reused rather than duplicated, and its other
+    /// readers agree under that reading: the Assign lowering re-arms it when
+    /// the field is given a value of its own, and `emit_displaced_field_bodies`
+    /// guards the displaced body on it.
+    ///
+    /// THE MAP IS STILL WRITTEN and only the walker REPLACEMENT is skipped, so
+    /// the readers that ask "did this field move" — the displacement gate, the
+    /// rebind transfer — answer exactly as before.
+    ///
+    /// SIMPLE `base.field` MOVES ONLY, and that restriction is measured rather
+    /// than cautious. Applying it to every disarm caller broke
+    /// `asan_match_arm_struct_payload_binding_field_bodies_clean`: a partial
+    /// DESTRUCTURE inside a `match` arm (`let Two { a, b: _ } = h`) lost the
+    /// DISCARDED field's body outright, and it kept losing it when the map was
+    /// written too — so that path depends on the source's action carrying the
+    /// masked WALKER, not merely on the map, and its transfer must be worked
+    /// out before it can be made conditional. Reached only from
+    /// `disarm_struct_field_move_bodies` and the flat field-move disarm, which
+    /// are the two `let x = base.field` routes.
+    ///
+    /// UNCONDITIONAL MOVES KEEP THE STATIC MASK: when the binding's walk lives
+    /// in the innermost frame the move runs whenever the walk does, so the mask
+    /// is exact and every existing pin keeps its current IR. CAPPED at
+    /// [`Self::FIELD_VIEW_SELECT_MAX`], past which the death-site tree gives up
+    /// and calls the walker UNMASKED — which for a move-out would run a body
+    /// over the husk, worse than the over-masking this fixes.
+    pub(super) fn conditional_field_move_takes_runtime_flag(
+        &mut self,
+        var_name: &str,
+        field: &str,
+        idx: usize,
+    ) -> bool {
+        let n = self.drop_rc.scope_cleanup_actions.len();
+        if n < 2 {
+            return false;
+        }
+        let owns_here = |f: &Vec<super::state::CleanupAction<'ctx>>| {
+            f.iter().any(|a| {
+                matches!(a,
+                    super::state::CleanupAction::UserDrop { binding_name, kind, .. }
+                        if binding_name == var_name
+                            && *kind == super::state::UserDropKind::StructFieldBodies)
+            })
+        };
+        if owns_here(&self.drop_rc.scope_cleanup_actions[n - 1]) {
+            return false;
+        }
+        if !self.drop_rc.scope_cleanup_actions[..n - 1]
+            .iter()
+            .any(owns_here)
+        {
+            return false;
+        }
+        let flags = self.drop_rc.field_view_flags.get(var_name);
+        let already = flags.map(|m| m.len()).unwrap_or(0);
+        let have = flags.is_some_and(|m| m.contains_key(field));
+        if already + usize::from(!have) > Self::FIELD_VIEW_SELECT_MAX {
+            return false;
+        }
+        let Some(flag) = self.field_view_flag_for(var_name, field) else {
+            return false;
+        };
+        let bool_t = self.context.bool_type();
+        if self
+            .builder
+            .build_store(flag, bool_t.const_int(0, false))
+            .is_err()
+        {
+            return false;
+        }
+        self.type_decls
+            .struct_moved_field_bodies
+            .entry(var_name.to_string())
+            .or_default()
+            .insert(idx);
+        true
     }
 
     /// B-2026-09-06-46 — mask ONE moved-out field in `var_name`'s live

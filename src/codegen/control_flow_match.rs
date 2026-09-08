@@ -9663,6 +9663,15 @@ impl<'ctx> super::Codegen<'ctx> {
         else {
             return;
         };
+        // B-2026-09-08-4 — a CONDITIONAL move-out takes a runtime per-field
+        // flag instead of the static mask. Gated HERE, on the simple
+        // `base.field` route, rather than inside `disarm_struct_field_bodies_at`
+        // — the destructure callers of that helper depend on the source's
+        // action carrying the masked walker and lose the discarded field's body
+        // without it (measured, see the helper's doc).
+        if self.conditional_field_move_takes_runtime_flag(&obj, field, fidx) {
+            return;
+        }
         self.disarm_struct_field_bodies_at(&obj, fidx);
     }
 

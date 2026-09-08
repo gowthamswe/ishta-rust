@@ -46933,10 +46933,9 @@ fn test_depth1_field_move_then_reassign_rearms_new_value() {
 /// the base's own live-range end on either path. The pin keeps that reference
 /// fixed while codegen's frame placement is corrected.
 ///
-/// The UNTAKEN cell asserts the FULL correct string here, including the `dS1`
-/// the compiled backends still lose — which is exactly the asymmetry
-/// B-2026-09-08-4 stays open for, and the reason its codegen twin asserts only
-/// the sibling.
+/// Both cells assert the full correct string, and the codegen twin now asserts
+/// the same two strings — the asymmetry that stood while only the frame half
+/// was fixed is gone.
 #[test]
 fn test_cond_field_move_walk_stays_in_the_owning_frame() {
     assert_eq!(
