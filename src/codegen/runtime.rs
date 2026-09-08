@@ -4249,6 +4249,65 @@ impl<'ctx> super::Codegen<'ctx> {
         drop_fn
     }
 
+    /// Per-slot WEAK-COUNT RETAIN for a `weak T` container slot — the exact
+    /// twin of [`emit_weak_slot_drop_fn`], and the reason the two are written
+    /// as a pair rather than as one call site each.
+    ///
+    /// B-2026-09-08-1. A by-value `Vec[weak T]` param that is REBOUND
+    /// (`let work = xs`) gets a defensive buffer copy, because an owned Vec
+    /// param is caller-retains: the caller still drains the original at ITS
+    /// scope exit, so the callee must not alias it. The copy was a flat memcpy
+    /// of the weak handles, which left TWO containers each running the
+    /// per-element `__karac_weak_slot_drop` over the same boxes. One
+    /// `karac_weak_downgrade` in, two `karac_weak_drop`s out: the weak count
+    /// lands below its true owner set, `karac_weak_box_strong_zero_release`'s
+    /// `strong == 0 && weak == 0` never holds, and the box is never reclaimed.
+    ///
+    /// It reads as a LEAK rather than the strong tier's use-after-free
+    /// (B-2026-09-07-56, the same defect one tier up) for a structural reason:
+    /// a weak dec never frees a payload, it only fails to. So the strong tier
+    /// crashes under an instrumented run and this one is invisible to
+    /// everything except a leak checker — and invisible to THAT too until a
+    /// fixture rebinds such a param, which none did.
+    ///
+    /// `karac_weak_downgrade` is null-safe (weak += 1 on a live control block,
+    /// no-op on null), so an empty slot needs no guard here — the same reason
+    /// the drop twin has none, and the reason both bodies are one call. Slot
+    /// type plays no part (a weak slot is a bare pointer whatever it points
+    /// at), so one shared fn serves every weak container slot in the module,
+    /// memoized by symbol name exactly as the drop twin is.
+    pub(super) fn emit_weak_slot_downgrade_fn(&mut self) -> inkwell::values::FunctionValue<'ctx> {
+        let fn_name = "__karac_weak_slot_downgrade";
+        if let Some(f) = self.module.get_function(fn_name) {
+            return f;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let void_ty = self.context.void_type();
+        let saved_bb = self.builder.get_insert_block();
+        let saved_fn = self.current_fn;
+        let fn_ty = void_ty.fn_type(&[ptr_ty.into()], false);
+        let inc_fn =
+            self.module
+                .add_function(fn_name, fn_ty, Some(inkwell::module::Linkage::Internal));
+        self.current_fn = Some(inc_fn);
+        let entry = self.context.append_basic_block(inc_fn, "entry");
+        self.builder.position_at_end(entry);
+        let elem_ptr = inc_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let w = self
+            .builder
+            .build_load(ptr_ty, elem_ptr, "weakslot.inc.target")
+            .unwrap()
+            .into_pointer_value();
+        let downgrade = self.weak_runtime_fn("karac_weak_downgrade", true);
+        self.builder.build_call(downgrade, &[w.into()], "").unwrap();
+        self.builder.build_return(None).unwrap();
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        self.current_fn = saved_fn;
+        inc_fn
+    }
+
     /// The per-slot drop for a `File` handle a container owns — load the
     /// `*mut KaracFile` and close it, then null the slot.
     ///
@@ -4869,7 +4928,75 @@ impl<'ctx> super::Codegen<'ctx> {
                         Some("Map") | Some("Set")
                     )
             );
-            if inner_is_string_or_vec {
+            if matches!(&inner_te.kind, TypeKind::Weak(_)) {
+                // B-2026-09-08-1 — a `weak T` element, and CHECKED FIRST for
+                // the same reason `vec_elem_agg_drop_for_type_expr` checks it
+                // first on the drain side: every arm below is keyed on the
+                // element's shape or name, and a weak slot's referent is a
+                // `shared T`. None of them sees through `TypeKind::Weak` today
+                // (verified — before this arm the chain fell through entirely
+                // and the copy emitted no element loop at all), but the arm
+                // that would match if one ever did is the STRONG retain
+                // directly below, and a strong retain against a weak drain is
+                // worse than the leak it would be papering over: it pins the
+                // payload for the life of the process. Ordering makes that
+                // unreachable rather than merely absent.
+                //
+                // The defect itself is B-2026-09-07-56 one tier down. The
+                // caller-retains copy flat-memcpy'd the weak handles, so the
+                // copy and the source each ran the per-element
+                // `__karac_weak_slot_drop` over the same boxes — measured in
+                // the IR as exactly ONE `karac_weak_downgrade` (the `push`)
+                // against TWO `__karac_weak_slot_drop` call sites, one in the
+                // callee and one in `main`. The weak count ends below its true
+                // owner set and `karac_weak_box_strong_zero_release` never
+                // fires: 24 bytes per element, at both opt levels, while the
+                // no-rebind control is clean.
+                //
+                // The weak count is the whole of a weak slot's ownership, so
+                // one `karac_weak_downgrade` per slot is the complete
+                // correction — there is no payload to deep-copy and nothing to
+                // clone. That is why this arm calls a slot helper rather than
+                // `emit_clone_fn_for_type_expr`: cloning a weak handle would
+                // mean deciding what a cloned weak REFERENT is, a question the
+                // copy does not have to answer.
+                let inc_fn = self.emit_weak_slot_downgrade_fn();
+                let loop_bb = self.context.append_basic_block(fn_val, "dcopy.weak.loop");
+                let body_bb = self.context.append_basic_block(fn_val, "dcopy.weak.body");
+                let exit_bb = self.context.append_basic_block(fn_val, "dcopy.weak.exit");
+                let pre_bb = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(loop_bb).unwrap();
+
+                self.builder.position_at_end(loop_bb);
+                let idx_phi = self.builder.build_phi(i64_t, "dcopy.weak.i").unwrap();
+                idx_phi.add_incoming(&[(&i64_t.const_int(0, false), pre_bb)]);
+                let idx = idx_phi.as_basic_value().into_int_value();
+                let in_range = self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::ULT, idx, len, "dcopy.weak.cmp")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(in_range, body_bb, exit_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(body_bb);
+                // One pointer-width weak handle per slot — stride by
+                // `elem_ty`, not the 24-byte `vec_ty`.
+                let slot = unsafe {
+                    self.builder
+                        .build_gep(elem_ty, buf, &[idx], "dcopy.weak.slot")
+                        .unwrap()
+                };
+                self.builder.build_call(inc_fn, &[slot.into()], "").unwrap();
+                let next = self
+                    .builder
+                    .build_int_add(idx, i64_t.const_int(1, false), "dcopy.weak.next")
+                    .unwrap();
+                self.builder.build_unconditional_branch(loop_bb).unwrap();
+                idx_phi.add_incoming(&[(&next, body_bb)]);
+
+                self.builder.position_at_end(exit_bb);
+            } else if inner_is_string_or_vec {
                 let inner_elem_ty: BasicTypeEnum<'ctx> = if self.is_string_type_expr(inner_te) {
                     self.context.i8_type().into()
                 } else {

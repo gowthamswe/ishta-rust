@@ -47030,6 +47030,217 @@ fn main() {
     }
 
     #[test]
+    fn asan_rebound_vec_weak_param_co_owns_its_elements() {
+        // B-2026-09-08-1 — B-2026-09-07-56's shape one OWNERSHIP TIER down, and
+        // the reason that row's fix declined `weak` rather than covering it: a
+        // weak slot is `TypeKind::Weak`, not a `Path`, so the strong arm never
+        // sees it. Declining was right; what it exposed is that the weak tier
+        // needs the WEAK-count version of the same operation.
+        //
+        // `let work = xs` over a by-value `Vec[weak T]` param deep-copies the
+        // buffer for the same caller-retains reason, and the copy was a flat
+        // memcpy of weak handles. Measured in the IR: exactly ONE
+        // `karac_weak_downgrade` (the `push`) against TWO
+        // `__karac_weak_slot_drop` call sites — the callee's copy and `main`'s
+        // original both drain the same box.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn probe(xs: Vec[weak N]) -> i64 {
+    let work = xs;
+    match work[0] { Some(x) => { x.v } None => { 0 - 1 } }
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    println(probe(w));
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "rebound_vec_weak_param_co_owns_its_elements",
+        );
+    }
+
+    #[test]
+    fn asan_rebound_vec_weak_param_leaks_per_element_not_per_program() {
+        // The under-count is PER SLOT, so the loss scales with the element
+        // count rather than being one fixed block. Measured pre-fix under
+        // valgrind: one 24-byte loss record for the single-element fixture
+        // above and THREE for this one, one per element. A per-program leak
+        // would look identical at one element and is what a single-element
+        // regression alone would fail to distinguish.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn at(xs: ref Vec[weak N], i: i64) -> i64 {
+    match xs[i] { Some(x) => { x.v } None => { 0 - 1 } }
+}
+
+fn probe(xs: Vec[weak N]) -> i64 {
+    let work = xs;
+    at(work, 0) + at(work, 1) + at(work, 2)
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let b: N = N { v: 11 };
+    let c: N = N { v: 13 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    w.push(b);
+    w.push(c);
+    println(probe(w));
+}
+"#,
+            &["31"],
+            "rebound_vec_weak_param_per_element",
+        );
+    }
+
+    #[test]
+    fn asan_rebound_vec_weak_param_with_dead_referent_is_not_a_use_after_free() {
+        // THE CLASS IS LIFETIME-DEPENDENT, and this is the fixture that shows
+        // it. B-2026-09-08-1's own mechanism note reasoned that the defect
+        // "reads as a LEAK rather than the strong tier's use-after-free"
+        // because "a weak dec never frees a payload, it only fails to". That
+        // is true only while the STRONG owner outlives the container.
+        //
+        // Here the referent is already dead when the containers drain (`build`
+        // returns the weak Vec and drops its strong binding), so the FIRST of
+        // the two drops takes weak 1 -> 0 against strong == 0 and
+        // `karac_weak_box_strong_zero_release` frees the control block; the
+        // second drop then reads it. Measured pre-fix: `Invalid read of size
+        // 8`, not a leak. Same defect, same fix, a strictly worse symptom —
+        // which is why the row's `medium` severity was the floor rather than
+        // the ceiling.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn probe(xs: Vec[weak N]) -> i64 {
+    let work = xs;
+    match work[0] { Some(x) => { x.v } None => { 0 - 1 } }
+}
+
+fn build() -> Vec[weak N] {
+    let a: N = N { v: 7 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    w
+}
+
+fn main() {
+    let dead = build();
+    println(probe(dead));
+}
+"#,
+            &["-1"],
+            "rebound_vec_weak_param_dead_referent",
+        );
+    }
+
+    #[test]
+    fn asan_returned_vec_weak_param_co_owns_its_elements() {
+        // The SECOND consume site of the same copy helper. `let work = xs` and
+        // `return xs` both reach `emit_vecstr_defensive_copy`, so a fix keyed
+        // on the rebind statement rather than on the copy would leave this one
+        // broken — measured pre-fix at 24 bytes lost, exactly as the rebind.
+        // Pinning both is what makes the fix's placement (in the copy, not at
+        // the statement) load-bearing rather than incidental.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn hand_back(xs: Vec[weak N]) -> Vec[weak N] {
+    xs
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    let back = hand_back(w);
+    match back[0] { Some(x) => { println(x.v) } None => { println(0 - 1) } }
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "returned_vec_weak_param_co_owns",
+        );
+    }
+
+    #[test]
+    fn asan_map_weak_value_param_rebind_is_unchanged() {
+        // CONTROL — passes both with and without the fix, and pins the reason
+        // the defect was Vec-only. A `Map[K, weak V]` drains its values through
+        // the SAME `__karac_weak_slot_drop`, so the same double-drain was
+        // available to it; what saves it is that a Map param's copy goes
+        // through `karac_clone_Map`, whose weak-value branch already emits the
+        // per-entry `karac_weak_downgrade` (maps.rs). The Vec copy was the
+        // outlier, not the weak tier as a whole.
+        //
+        // It also guards the direction a fix like this fails: an over-retain
+        // here would be a quiet leak, and this test would catch it.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn probe(m: Map[i64, weak N]) -> i64 {
+    let work = m;
+    match work.get(1) { Some(x) => { x.v } None => { 0 - 1 } }
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut m: Map[i64, weak N] = Map.new();
+    m.insert(1, a);
+    println(probe(m));
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "map_weak_value_param_rebind_unchanged",
+        );
+    }
+
+    #[test]
+    fn asan_struct_field_vec_weak_view_is_unchanged() {
+        // CONTROL — the other shape that reaches a `Vec[weak T]` through a
+        // by-value param, and the one that was already clean: `let ks = h.kids`
+        // off an owned struct param is handled by the entry-copy machinery
+        // rather than by the copy helper's element chain. Clean before and
+        // after, so it pins that this fix did not widen into that path.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+struct Holder { kids: Vec[weak N] }
+
+fn probe(h: Holder) -> i64 {
+    let ks = h.kids;
+    match ks[0] { Some(x) => { x.v } None => { 0 - 1 } }
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    let h: Holder = Holder { kids: w };
+    println(probe(h));
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "struct_field_vec_weak_view_unchanged",
+        );
+    }
+
+    #[test]
     fn asan_owned_string_param_let_move_grow() {
         // String sibling with a realloc after the move — without the
         // deep copy the caller frees a stale (realloc-moved) pointer.

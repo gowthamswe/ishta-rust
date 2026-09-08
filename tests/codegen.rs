@@ -40413,6 +40413,75 @@ fn main() {
         assert_eq!(run_program(src), Some("16\n".to_string()));
     }
 
+    #[test]
+    fn test_e2e_rebound_vec_weak_param_reads_back_unchanged() {
+        // B-2026-09-08-1 — the SEMANTICS half, and worth being explicit about
+        // what it does and does not guard. Unlike B-2026-09-07-56 one tier up,
+        // this defect is NOT a miscompile: measured pre-fix, this program
+        // prints exactly the same four lines while leaking 24 bytes. So this
+        // test is not the regression guard — `tests/memory_sanitizer.rs` is.
+        //
+        // What it pins is the direction the FIX could go wrong. The correction
+        // adds a weak-count retain per element, and a weak retain must not
+        // change what the slot observes: the referent is alive throughout, so
+        // every read still upgrades, and repeated passes must not drift.
+        let src = r#"
+shared struct N { v: i64 }
+
+fn probe(xs: Vec[weak N]) -> i64 {
+    let work = xs;
+    match work[0] { Some(x) => { x.v } None => { 0 - 1 } }
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    println(probe(w));
+    println(probe(w));
+    match w[0] { Some(x) => { println(x.v) } None => { println(0 - 1) } }
+    println(a.v);
+}
+"#;
+        assert_eq!(run_program(src), Some("7\n7\n7\n7\n".to_string()));
+    }
+
+    #[test]
+    fn test_e2e_rebound_vec_weak_param_dead_referent_still_reads_none() {
+        // The other direction, and the one a retain-based fix is most likely to
+        // break: a weak handle must NOT keep its referent alive. `build` drops
+        // the only strong binding, so the upgrade must fail even though the
+        // copy now holds an extra weak count — a weak count keeps the CONTROL
+        // BLOCK addressable, never the payload.
+        //
+        // This shape is also where the defect stops being a mere leak: pre-fix
+        // it reported `Invalid read of size 8` under valgrind, because the
+        // first of the two drops released the block while the second still
+        // held a handle to it. The ASAN sibling pins that; this pins that the
+        // value stayed `None` through the correction.
+        let src = r#"
+shared struct N { v: i64 }
+
+fn probe(xs: Vec[weak N]) -> i64 {
+    let work = xs;
+    match work[0] { Some(x) => { x.v } None => { 0 - 1 } }
+}
+
+fn build() -> Vec[weak N] {
+    let a: N = N { v: 7 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    w
+}
+
+fn main() {
+    let dead = build();
+    println(probe(dead));
+}
+"#;
+        assert_eq!(run_program(src), Some("-1\n".to_string()));
+    }
+
     /// B-2026-09-07-59 — the VALUE half. A `.clone()` whose receiver is a
     /// niche-encoded `Option[shared T]` field returned an empty chain on every
     /// compiled backend while `--interp` returned the real one.
