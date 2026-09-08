@@ -314,6 +314,20 @@ where it diverges; against *that*, Kāra is at parity or ahead (the apparent
 kernels. The residue is a few string-building loops (~1.2×, tracked). Go
 trails on most single-threaded work.
 
+> **The map-bearing kernels are excepted, as of 2026-09-08.** `karac`
+> `59c8d30cd` (2026-08-22) replaced codegen's integer hash — one multiply
+> against a compile-time-constant seed in the compiler's own source — with
+> per-process-seeded SipHash-1-3, closing an offline hash-collision hole. The
+> earlier map figures were scoring Kāra hashing far more cheaply than the
+> comparators it was measured against. All twelve affected katas have been
+> re-benched and nine now sit **behind** safety-matched Rust. The list, tree and
+> backtracking kernels do not hash and are unaffected. The remaining gap is
+> smaller than the kata ratios suggest — an isolated `Map[i64,i64]` lookup is
+> 1.73× Rust's instruction count but **1.14× its wall clock**. Detail in
+> [kara-katas BENCHMARKS.md](https://github.com/karalang/kara-katas/blob/main/BENCHMARKS.md);
+> tracked as `B-2026-09-07-42` / `B-2026-09-07-53`. The chart above predates the
+> re-bench for those katas.
+
 ![Binary size, sequential lane — relative to Rust, log scale](docs/assets/binary-seq.png)
 
 C-sized binaries (~33 KiB) for most programs, rising to a ~285 KiB floor
