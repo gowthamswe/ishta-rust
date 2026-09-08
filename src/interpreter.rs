@@ -507,6 +507,12 @@ pub struct Interpreter<'a> {
     /// walker with the same field masked. Cleared for a name by
     /// `rearm_container_bodies_for_name`.
     pub(crate) moved_out_struct_field_bodies: HashSet<(String, String)>,
+    /// B-2026-09-08-10 — span keys of the consume sites that triggered an
+    /// RC-fallback promotion, from `OwnershipCheckResult::rc_promoted_consume_spans`.
+    /// EMPTY unless a caller opted in via [`Self::with_rc_promotions`], which
+    /// keeps every existing `Interpreter::new` caller byte-identical.
+    pub(crate) rc_promoted_consume_spans: HashSet<(usize, usize)>,
+
     /// B-2026-08-29-47 — `(binding, field)` pairs a struct literal filled from
     /// a param VIEW. The interpreter twin of codegen's
     /// `param_view_struct_fields`, and held apart from the mask above for the
@@ -1027,6 +1033,19 @@ fn seed_rand_state() -> u64 {
 }
 
 impl<'a> Interpreter<'a> {
+    /// B-2026-09-08-10 — opt in to the ownership pass's RC-fallback promotions.
+    ///
+    /// An additive builder step rather than a fourth `new` parameter: 20 call
+    /// sites construct an `Interpreter`, most of them (comptime, the REPL, the
+    /// test runner) with no ownership result in hand, and widening the
+    /// constructor would make every one of them answer a question they cannot.
+    /// Callers that HAVE run the ownership pass chain this; the rest keep
+    /// today's behaviour exactly, because the set stays empty.
+    pub fn with_rc_promotions(mut self, ow: &crate::ownership::OwnershipCheckResult) -> Self {
+        self.rc_promoted_consume_spans = ow.rc_promoted_consume_spans();
+        self
+    }
+
     pub fn new(program: &'a Program, typecheck_result: &'a TypeCheckResult) -> Self {
         // Install this thread's derived-Ord declaration-order registry so the
         // free `value_compare` / `OrdValue::cmp` can order structs/enums by
@@ -1107,6 +1126,7 @@ impl<'a> Interpreter<'a> {
             moved_out_container_bodies_bindings: HashSet::new(),
             moved_out_tuple_elem_bodies: HashSet::new(),
             moved_out_struct_field_bodies: HashSet::new(),
+            rc_promoted_consume_spans: HashSet::new(),
             param_view_struct_fields: HashSet::new(),
             param_view_tuple_elems: HashSet::new(),
             moved_out_struct_field_payload_bodies: HashSet::new(),

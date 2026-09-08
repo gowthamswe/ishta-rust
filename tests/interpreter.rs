@@ -66239,3 +66239,77 @@ fn main() {
         "dR5\ndR4\nv=5\none\nv=3\ntwo\nv=321\nthree\nv=2\nfour\nv=31\nfive\nend\n"
     );
 }
+
+/// B-2026-09-08-10 — `--interp` must DESTROY the field an RC-fallback-promoted
+/// base retains, not mask it out of the base's walk.
+///
+/// `while i < N { let taken = g.one; }` promotes `g` (a consume inside a loop),
+/// and a promoted base RETAINS its field while the destination takes a COPY —
+/// the rule `projection_root_is_rc_boxed` states and the compiled backends
+/// follow. The interpreter recorded a MOVE-OUT instead and masked `one` out of
+/// `g`'s walk, so it ran N bodies where N+1 values exist and lost the surviving
+/// original's outright:
+///
+/// ```text
+///   N=1   --interp   t1 dS1 dS2 m3            jit/aot   t1 dS1 m3 dS2 dS1
+///   N=3   --interp   t1 dS1 x3, dS2, m3       jit/aot   t1 dS1 x3, m3, dS2 dS1
+/// ```
+///
+/// Its own output is what convicted it rather than the comparison: it printed
+/// `t1` on EVERY trip, so it agreed the source was live and not a husk, yet ran
+/// `dS2` alone at `g`'s death — destroying three copies of a value it also
+/// claimed was moved once, and the original zero times.
+///
+/// THE ROOT WAS A PLUMBING GAP, not a wrong decision in a helper:
+/// `Interpreter::new` took only the program and the typecheck result, and
+/// nothing under `src/interpreter*` referenced `rc_values` at all, so the one
+/// signal separating "moved" from "retained by a promoted base" had no path in.
+///
+/// ONLY THE BODY COUNT IS ASSERTED HERE. These cells also differ in drop
+/// PLACEMENT — the interpreter drops `g` at the binding's live-range end
+/// (before `m3`), the compiled backends at lexical scope exit (after) — which
+/// is a separate, independent row (B-2026-09-04-32) that this fix deliberately
+/// does not touch. The zero-trip cell proves the two are separable: its body
+/// never runs, so no mask is ever recorded, and it diverges in placement alone
+/// both before and after.
+#[test]
+fn rc_promoted_base_still_destroys_its_retained_field() {
+    const PRE: &str = "struct Rs { id: i64, name: String }\n\
+         impl Drop for Rs { fn drop(mut ref self) { println(f\"dS{self.id}\") } }\n\
+         fn mks(i: i64) -> Rs { return Rs { id: i, name: f\"h{i}\" }; }\n\
+         struct Bs { mut one: Rs, mut two: Rs }\n";
+    // N=1 — one copy taken, so `dS1` twice: the copy's and the retained
+    // original's, plus `dS2` for the untouched sibling.
+    let (out1, _) = run_program_with_drops(&format!(
+        "{PRE}fn main() {{\n\
+         \x20 let mut g = Bs {{ one: mks(1), two: mks(2) }};\n\
+         \x20 let mut i = 0;\n\
+         \x20 while i < 1 {{ let taken = g.one; println(f\"t{{taken.id}}\"); i = i + 1; }}\n\
+         \x20 println(\"m3\");\n}}\n"
+    ));
+    assert_eq!(out1, vec!["t1\n", "dS1\n", "dS2\n", "dS1\n", "m3\n"]);
+    // N=3 — the count scales with the trip count and the original still dies
+    // exactly once.
+    let (out3, _) = run_program_with_drops(&format!(
+        "{PRE}fn main() {{\n\
+         \x20 let mut g = Bs {{ one: mks(1), two: mks(2) }};\n\
+         \x20 let mut i = 0;\n\
+         \x20 while i < 3 {{ let taken = g.one; println(f\"t{{taken.id}}\"); i = i + 1; }}\n\
+         \x20 println(\"m3\");\n}}\n"
+    ));
+    assert_eq!(
+        out3,
+        vec!["t1\n", "dS1\n", "t1\n", "dS1\n", "t1\n", "dS1\n", "dS2\n", "dS1\n", "m3\n"]
+    );
+    // CONTROL — a genuine MOVE: `g` is never re-used, so the ownership pass
+    // does not promote it and the mask must still apply. `g`'s walk runs `dS2`
+    // only, and this cell is byte-identical on `--interp` and the JIT.
+    let (outm, _) = run_program_with_drops(&format!(
+        "{PRE}fn main() {{\n\
+         \x20 let g = Bs {{ one: mks(1), two: mks(2) }};\n\
+         \x20 let taken = g.one;\n\
+         \x20 println(f\"t{{taken.id}}\");\n\
+         \x20 println(\"m3\");\n}}\n"
+    ));
+    assert_eq!(outm, vec!["dS2\n", "t1\n", "dS1\n", "m3\n"]);
+}

@@ -3945,3 +3945,39 @@ pub(crate) fn merge_branch_into(
         target.insert(name.clone(), ValueState::Moved { at: *at });
     }
 }
+
+impl OwnershipCheckResult {
+    /// B-2026-09-08-10 — the CONSUME SITES that triggered an RC-fallback
+    /// promotion, as `(offset, length)` span keys.
+    ///
+    /// The one signal the interpreter needs and had no path to. It masks a
+    /// field out of its base's `Drop` walk whenever it sees `let x = b.f`,
+    /// which is right for a MOVE and wrong for a promoted base: there the base
+    /// RETAINS the field and the destination takes a COPY, so the base must go
+    /// on running that field's body. `Interpreter::new` takes only the program
+    /// and the typecheck result, and nothing in `src/interpreter*` referenced
+    /// `rc_values` at all, so the interpreter could not tell the two apart.
+    ///
+    /// Keyed by SPAN rather than by `(function, binding)` because the
+    /// interpreter tracks no current-function name, and adding one would mean
+    /// threading a key through every call path for a single consumer. The
+    /// consume span is exact: `use_classifier` records a place consume against
+    /// the ROOT identifier's span, and a `FieldAccess` copies its object's span
+    /// verbatim, so `b.f`'s span key and the recorded consume's agree by
+    /// construction — the same collision B-2026-08-18-31 documents, relied on
+    /// here rather than worked around.
+    ///
+    /// DELIBERATELY THE CONSUME SITES ONLY, not every projection off a promoted
+    /// binding. The interpreter's own comment at the mask site gives the
+    /// asymmetry: skipping a mask that WAS needed doubles a `Drop` body, while
+    /// keeping one that was not is inert for the shapes this touches. Suppressing
+    /// exactly where the ownership pass recorded the promotion is the
+    /// under-suppressing direction, which is the safe one.
+    pub fn rc_promoted_consume_spans(&self) -> std::collections::HashSet<(usize, usize)> {
+        self.rc_values
+            .values()
+            .flat_map(|per_fn| per_fn.values())
+            .map(|e| (e.consume_span.offset, e.consume_span.length))
+            .collect()
+    }
+}

@@ -1442,7 +1442,16 @@ pub(super) fn cmd_run(
     }
 
     // Run
-    let mut interp = Interpreter::new(&pipeline.parsed.program, pipeline.typed.as_ref().unwrap());
+    // B-2026-09-08-10 — hand the interpreter the ownership pass's RC-fallback
+    // promotions. Computed with the pure library entry point rather than
+    // `pipeline.ownershipcheck()` on purpose: only the promotion SPANS are
+    // wanted, and routing through the pipeline would put this lane's
+    // diagnostics on the ownership result's errors and notes, which it has
+    // never consulted.
+    let interp_ownership =
+        crate::ownershipcheck(&pipeline.parsed.program, pipeline.typed.as_ref().unwrap());
+    let mut interp = Interpreter::new(&pipeline.parsed.program, pipeline.typed.as_ref().unwrap())
+        .with_rc_promotions(&interp_ownership);
     interp.set_source_filename(filename);
     interp.set_program_args(filename, program_args);
     interp.set_source_text(&source);

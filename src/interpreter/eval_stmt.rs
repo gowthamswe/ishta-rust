@@ -7502,8 +7502,31 @@ impl<'a> super::Interpreter<'a> {
                 // this arm is being matched to.
                 if let ExprKind::FieldAccess { object, field } = &value.kind {
                     if let ExprKind::Identifier(src) = &object.kind {
-                        self.moved_out_struct_field_bodies
-                            .insert((src.clone(), field.clone()));
+                        // B-2026-09-08-10 — an RC-FALLBACK-PROMOTED base is not
+                        // moved from: it RETAINS the field and the destination
+                        // takes a COPY, the rule `projection_root_is_rc_boxed`
+                        // states and the compiled backends follow. Masking the
+                        // field here made `--interp` run N bodies where N+1
+                        // values exist and lose the surviving original's
+                        // outright — its own `t1` on every trip said the source
+                        // was still live while its `g`-death walk ran `dS2`
+                        // alone.
+                        // Keyed on the ROOT IDENTIFIER's span, not the
+                        // projection's. `use_classifier` records a place
+                        // consume against the root (B-2026-08-18-31) and a
+                        // `FieldAccess` copies its object's OFFSET but carries
+                        // its own LENGTH, so `g.one` measures (311, 5) against
+                        // the recorded (311, 1) — the offsets agree and the
+                        // lengths cannot. Measured, after the whole-projection
+                        // key silently matched nothing and left the defect
+                        // exactly as it was.
+                        if !self
+                            .rc_promoted_consume_spans
+                            .contains(&(object.span.offset, object.span.length))
+                        {
+                            self.moved_out_struct_field_bodies
+                                .insert((src.clone(), field.clone()));
+                        }
                     } else if !matches!(
                         &val,
                         Value::Int(_)

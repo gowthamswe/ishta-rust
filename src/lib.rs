@@ -676,7 +676,13 @@ pub fn run_program_with_drops(source: &str) -> (Vec<String>, Vec<String>) {
         let typed = typecheck(&parsed.program, &resolved);
         lower(&mut parsed.program, &typed);
         comptime_eval(&mut parsed.program, &typed);
-        let mut interp = interpreter::Interpreter::new(&parsed.program, &typed);
+        // B-2026-09-08-10 — the interpreter needs the ownership pass's
+        // RC-fallback promotions to tell a MOVED field from one a promoted base
+        // RETAINS. Only the promotion spans are taken; this lane's diagnostics
+        // are unchanged because the result's errors and notes are not consulted.
+        let ow = ownershipcheck(&parsed.program, &typed);
+        let mut interp =
+            interpreter::Interpreter::new(&parsed.program, &typed).with_rc_promotions(&ow);
         interp.captured_output = Some(Vec::new());
         interp.run();
         let output = interp.captured_output.take().unwrap_or_default();
