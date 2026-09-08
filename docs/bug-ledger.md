@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 402 |
 | run-vs-build | 373 |
-| leak | 301 |
+| leak | 302 |
 | double-free | 213 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1611 |
+| codegen | 1612 |
 | interp | 406 |
 | typecheck | 295 |
 | other | 75 |
@@ -171,13 +171,13 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-50 | 2026-09-07 | codegen | medium | A CALLEE THAT READS ITS BY-VALUE PARAM AFTER A CONDITIONAL STORE LOSES THE `Drop` BODY OUTRIGHT ON THE COMPILED BACKENDS -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` at `k = false` prints no body while `--interp` prints it, and strands the param's whole heap (20 B in 2 blocks at -O0, 120 B in 12 over a six-trip loop); the same read placed BEFORE the store, or a trailing statement that does not read the param, is clean on both counts | — |
 | B-2026-09-07-51 | 2026-09-07 | codegen | medium | THE MONO LEG CARRIES NO CONDITIONAL-STORE REGISTRATION -- `fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }` at `k = false` runs NO `Drop` body on the compiled backends while `--interp` runs it, and leaks the argument's `shared` refcount block (16 B in 1 at -O0); the NON-generic spelling of the identical callee is clean on both counts, which is what isolates genericity as the whole difference | — |
 | B-2026-09-07-53 | 2026-09-07 | codegen | high | AT EQUAL HASHING kara's Map IS NOW SLOWER THAN RUST'S, INVERTING A PUBLISHED HEADLINE: on 3 of 4 re-measured map katas kara went from 3-4x AHEAD of both rustc builds to 1.2-2.4x BEHIND (kata:146 0.31x -> 2.35x vs rust_ovf), and also lost its lead over Go -- so the 2026-06-15 equal-safety claim "parity with memory-safe Rust, BEATS IT ON COLLECTIONS" rested on comparing kara's compile-time-constant-seeded FxHash against Rust's per-process SipHash-1-3, and cannot be quoted until the collection set is re-run | BENCHMARKS.md + the 16 collection/pointer kata READMEs still publish the pre-59c8d30cd collection-superiority claim | corrects the unmeasured speculation in B-2026-09-07-42's COST DECOMPOSED section |
-| B-2026-09-07-58 | 2026-09-08 | codegen | medium | AN RC-PROMOTED BINDING PUBLISHED THROUGH A VALUE-PRODUCING `par` BLOCK'S JOIN STILL LOSES ITS BOX -- `let (t, k) = par { let t = mkp(9); ... (t, k) }` strands 40 B + 38 B in BOTH lanes, because the outer destructuring `let` rebinds the name over the pointer-typed entry B-2026-09-07-47 installs | — |
 | B-2026-09-07-62 | 2026-09-08 | codegen | medium | A BOXED SHARED-ENUM PAYLOAD'S NESTED STRUCT FIELD NEVER HAS ITS BUFFERS FREED UNLESS THAT FIELD IS MOVED OUT -- 32 B leaked with no move-out and with a SIBLING field moved out, the opposite direction of B-2026-09-07-55's use-after-free at the same line | — |
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
 | B-2026-09-08-4 | 2026-09-08 | codegen | medium | A FIELD MOVE-OUT INSIDE AN `if` THAT NEVER RUNS SILENCES THE BASE'S ENTIRE `Drop` BODIES WALK -- `if f { let taken = g.one; }` with `f` false prints nothing on the JIT and all four AOT surfaces against `--interp`'s `dS2 dS1`, losing the UN-MOVED sibling's body too; the bare-block spelling of the same move is correct, so the trigger is the condition and not the pushed frame, and `karac check` says nothing | — |
 | B-2026-09-08-5 | 2026-09-08 | codegen | low | THE B-2026-09-07-63 RE-ARM IS INNERMOST-FRAME ONLY, so a reassign one frame deeper still loses the new value's `Drop` body -- `if f { g.one = mks(7); }` and the bare-block `{ g.one = mks(7); }` alike print no `dS7` on the compiled backends against `--interp`'s, the documented remainder of that row's fix | — |
 | B-2026-09-08-6 | 2026-09-08 | codegen | high | THE FOURTH `use_after_move_consume_sites` BLIND-SPOT SITE B-2026-09-07-49 PREDICTED, found the way it said it would be: a field move-out inside a `while` THAT ITERATES ONCE double-frees on the JIT and at -O0 (SIGABRT, valgrind `Invalid free()`) and runs SIX `Drop` bodies where three are due at -O2, one of them over the zeroed husk -- while the straight-line spelling of the identical single move is correct on every surface | — |
 | B-2026-09-08-7 | 2026-09-08 | codegen | medium | A `Vec[weak T]` NESTED INSIDE ANOTHER CONTAINER NEVER DRAINS ITS WEAK SLOTS -- `te_recursive_drop_fully_supported` answers false for a `TypeKind::Weak` leaf, so `Vec[Vec[weak T]]` / `Map[K, Vec[weak T]]` take the one-level buffer-only path; 24 B per slot at both opt levels, reachable with no function parameter at all, and the obvious two-line fix turns the leak into a use-after-free | none |
+| B-2026-09-08-8 | 2026-09-08 | codegen | medium | A VALUE-PRODUCING `par` BLOCK IS NOT A FRESH OWNED TEMP AT THE DESTRUCTURE, so every heap-bearing leaf of `let (t, k) = par { ... (t, k) }` is left with no owner -- 38 B per leaf, measured with NO RC promotion anywhere in the program and clean off an identical destructure from a plain call | none |
 
 ### Relocated
 
@@ -2405,6 +2405,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-57 | codegen | high | A DISCARDED PROJECTED-FIELD LITERAL OVER A LOOP READS 8 BYTES PAST ITS ONE STACK OBJECT -- `stack-buffer-overflow` in `go` at frame offset 40, the on… | 9ee19bbd2 |
 | B-2026-09-07-59 | codegen | high | A `.clone()` OVER A FIELD RECEIVER RETURNS AN EMPTY CHAIN ON EVERY COMPILED BACKEND -- `let s = n.left.clone()` prints 0 against `--interp`'s 2, sile… | 89e9db306 |
 | B-2026-09-07-60 | codegen | medium | A `.clone()` OVER A CALL RECEIVER FAILS CODEGEN OUTRIGHT -- `mk().clone()` where `mk() -> Option[shared T]` dies on `no handler for method 'clone' on… | 89e9db306 |
+| B-2026-09-07-58 | codegen | medium | AN RC-PROMOTED BINDING PUBLISHED THROUGH A VALUE-PRODUCING `par` BLOCK'S JOIN STILL LOSES ITS BOX -- `let (t, k) = par { let t = mkp(9); .. | a701a3266 |
 | B-2026-09-08-1 | codegen | medium | A REBIND OF A BY-VALUE `Vec[weak T]` PARAM LEAKS ONE BOX PER ELEMENT -- `let work = xs` copies the weak handles without a weak-count inc, so both con… | cfd16635e |
 | B-2026-09-07-63 | codegen+interp | high | A CALLER-SIDE MOVE-OUT OF A FIELD IS INVISIBLE TO THE DISPLACEMENT GATE, SO A LATER ASSIGN TO THAT FIELD FIRES A BODY THE MOVER ALREADY OWNS -- `let… | 993ee36 |
 | B-2026-09-08-2 | codegen | high | A `mut ref` ARGUMENT PROJECTING OFF AN RC-PROMOTED LOCAL SILENTLY DISCARDS THE WRITE -- `bump(mut t.a)` after a loop that consumed `t.a` gives 40 on… | 08ab81b2f |
