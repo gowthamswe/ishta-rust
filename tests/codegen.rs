@@ -39852,6 +39852,130 @@ impl BuildHasher for SumBuild {\n\
         run_program_capturing(src).map(|c| c.stdout)
     }
 
+    /// B-2026-09-07-54 — the ESCALATION half of the cloned-`Option[shared]`
+    /// reuse defect, gated where it is actually visible: under the NATIVE
+    /// allocator.
+    ///
+    /// An untyped `let s = src[0].clone()` was never registered into the
+    /// caller-retains model, so each by-value pass decremented the payload
+    /// without a matching arg-site inc. The refcount after N passes is 2 - N, so
+    /// the third pass hands an already-freed block to the allocator a second
+    /// time. Pre-fix, under glibc, the three-pass program aborts:
+    ///
+    ///     one=2
+    ///     two=4
+    ///     malloc(): unaligned tcache chunk detected
+    ///
+    /// — `two=4` being printed is the point: two passes is a silent
+    /// use-after-free READ that answers correctly, so nothing before the third
+    /// pass gives the defect away.
+    ///
+    /// WHY THIS TEST EXISTS SEPARATELY FROM THE ASAN FIXTURE. The obvious home
+    /// for a double free is `tests/memory_sanitizer.rs`, and it does not work
+    /// there: ASAN replaces the allocator, and its quarantine means the second
+    /// free is not the glibc abort. Measured on the parent, a three-pass cell
+    /// PASSES the ASAN suite's default leg outright while failing here. So the ASAN
+    /// fixture (`asan_cloned_option_shared_binding_is_owned_on_every_reuse`)
+    /// gates the two-pass READ under `KARAC_SANITIZE_ADDRESS=1`, and this test
+    /// gates the three-pass FREE on the plain `--features llvm` leg that CI
+    /// already runs. Neither one covers the other.
+    ///
+    /// Each pass count builds its own `src`, so the three cells cannot
+    /// contaminate one another and the failure names which count broke.
+    #[test]
+    fn e2e_cloned_option_shared_binding_survives_repeated_reuse() {
+        let Some(one) = run_program(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut src: Vec[Option[Node]] = Vec.new();
+    src.push(Some(Node { val: 1, left: Some(Node { val: 2, left: None, right: None }), right: None }));
+    let s = src[0].clone();
+    let l0 = clone_offset(s, 10);
+    println(f"one={count_nodes(l0)}");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            one, "one=2\n",
+            "one pass is balanced by luck and must stay so"
+        );
+
+        let Some(two) = run_program(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut src: Vec[Option[Node]] = Vec.new();
+    src.push(Some(Node { val: 1, left: Some(Node { val: 2, left: None, right: None }), right: None }));
+    let s = src[0].clone();
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    println(f"two={count_nodes(l0) + count_nodes(l1)}");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            two, "two=4\n",
+            "two passes free the payload while `src` still holds it — the ANSWER \
+             stays right, which is why this half needs the instrumented ASAN leg \
+             to see anything"
+        );
+
+        let Some(three) = run_program(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut src: Vec[Option[Node]] = Vec.new();
+    src.push(Some(Node { val: 1, left: Some(Node { val: 2, left: None, right: None }), right: None }));
+    let s = src[0].clone();
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    let l2 = clone_offset(s, 30);
+    println(f"three={count_nodes(l0) + count_nodes(l1) + count_nodes(l2)}");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            three, "three=6\n",
+            "three passes drive the refcount to -1 and free the block twice; \
+             pre-fix this aborts under glibc with `malloc(): unaligned tcache \
+             chunk detected` and prints nothing at all"
+        );
+    }
+
     /// B-2026-09-01-16 — A STRUCT WHOSE FIELD IS PASSED BY VALUE FROM INSIDE AN
     /// INTERPOLATED-STRING ARGUMENT HAS ITS `Drop` DEFERRED TO SCOPE EXIT ON THE
     /// COMPILED SURFACES — the sequential column.

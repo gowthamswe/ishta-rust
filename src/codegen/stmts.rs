@@ -3596,6 +3596,62 @@ impl<'ctx> super::Codegen<'ctx> {
     /// merely *aliases* an existing binding (a bare identifier / field read)
     /// bails, leaving the binding unregistered rather than risk an unbalanced
     /// dec.
+    /// B-2026-09-07-54 — resolve the `Option[shared T]` payload type of a
+    /// `.clone()` RECEIVER, for the untyped-`let` registration case (h).
+    ///
+    /// `.clone()` preserves its receiver's type, so this is the same question
+    /// cases (d) and (f) already answer for a bare RHS — asked one method call
+    /// deeper. Answering it is what puts the cloned binding into the
+    /// caller-retains model (`var_option_shared_heap`): one arg-site inc per
+    /// by-value pass against the callee's exit dec, and one scope-exit dec
+    /// against the clone's own +1.
+    ///
+    /// DELIBERATELY NARROWER THAN "any receiver". Only the two spellings that
+    /// lower to a retaining clone today are resolved:
+    ///
+    /// - `Identifier` — a tracked `Option[shared]` binding, resolved by the
+    ///   same `heap_type` reverse-lookup case (d) uses. Structurally-equal
+    ///   anonymous heap layouts compare equal, so whichever same-layout name
+    ///   is picked carries the correct `heap_type`; that is the property
+    ///   `track_rc_option_var`'s own `struct_name_for_heap_type` already
+    ///   relies on.
+    /// - `Index` — a `Vec[Option[shared T]]` element, resolved exactly as case
+    ///   (f) does. A ranged index is excluded: it is a slice, not an element.
+    ///
+    /// A `FieldAccess` receiver and a call receiver are NOT resolved, and that
+    /// is a correctness gate rather than an omission: `n.left.clone()`
+    /// miscompiles to an empty chain (B-2026-09-07-59) and `mk().clone()`
+    /// fails codegen outright (B-2026-09-07-60). Registering either would queue
+    /// a scope-exit dec against a handle the clone never handed back.
+    fn option_shared_info_for_clone_receiver(
+        &self,
+        recv: &Expr,
+    ) -> Option<crate::codegen::state::SharedTypeInfo<'ctx>> {
+        match &recv.kind {
+            ExprKind::Identifier(name) => {
+                let heap_type = self
+                    .borrow_vars
+                    .var_option_shared_heap
+                    .get(name.as_str())
+                    .copied()?;
+                self.type_decls
+                    .shared_types
+                    .values()
+                    .find(|i| i.heap_type == heap_type)
+                    .cloned()
+            }
+            ExprKind::Index { object, index } => {
+                if matches!(&index.kind, ExprKind::Range { .. }) {
+                    return None;
+                }
+                let elem_te = self.vec_index_elem_type_expr(object)?;
+                self.option_inner_shared_type_for_type_expr(&elem_te)
+                    .map(|(_, info)| info)
+            }
+            _ => None,
+        }
+    }
+
     fn control_flow_owned_option_shared(
         &self,
         e: &Expr,
@@ -6480,6 +6536,70 @@ impl<'ctx> super::Codegen<'ctx> {
                         {
                             if let Some(Some(info)) = self.control_flow_owned_option_shared(value) {
                                 shared_option_info = Some((var_name.clone(), info));
+                            }
+                        }
+                        // (h) Untyped let whose RHS is `<receiver>.clone()`
+                        //     yielding `Option[shared T]` — `let s = v[i].clone()`,
+                        //     `let s = base.clone()`. `.clone()` on such a receiver
+                        //     RETAINS: the indexed spelling reaches
+                        //     `compile_indexed_receiver_method`, which synthesizes an
+                        //     `__indexed_elem_*` identifier and re-dispatches into
+                        //     `try_compile_clone` (Identifier-only), and both land on
+                        //     `karac_clone_Option_<T>` — the same retain-inc case (f)
+                        //     names. So the binding owns its +1 exactly as in cases
+                        //     (e)/(f), and — exactly as there — NO extra inner inc is
+                        //     flagged; the `Identifier`-keyed aliasing acquire below
+                        //     does not fire for a MethodCall RHS.
+                        //
+                        //     What was missing is the REGISTRATION. Cases (a)-(g) each
+                        //     match one RHS shape and none of them looks through a
+                        //     method call, so an untyped `.clone()` RHS got no
+                        //     `var_option_shared_heap` entry: no call-site
+                        //     `share_option_shared_ref_for_arg` retain on a by-value
+                        //     pass, and no scope-exit `RcDecOption`. The callee's
+                        //     `Option[shared]` param decs at its exit regardless, so
+                        //     ONE pass balanced the clone's +1 and worked by luck;
+                        //     passing the binding by value a SECOND time drove the
+                        //     refcount to zero while the container still held the
+                        //     element, and the container's teardown
+                        //     (`__karac_vec_elem_rc_dec_<T>`) then read the freed
+                        //     control block — B-2026-09-07-54's use-after-free. A
+                        //     THIRD pass frees it again: `Invalid free()` and
+                        //     `malloc(): unaligned tcache chunk detected`.
+                        //
+                        //     This is case (f) one spelling over, and the bare
+                        //     spelling case (f) was written for
+                        //     (`let s = v[i];`) is no longer legal — the typechecker
+                        //     rejects it with E_INDEX_MOVE_NON_COPY and names
+                        //     `v[i].clone()` as the remedy. So every user following
+                        //     that diagnostic lands on the unregistered spelling, and
+                        //     case (f) is now unreachable for a `Vec` element.
+                        //
+                        //     Only the receiver spellings that actually LOWER are
+                        //     resolved (see `option_shared_info_for_clone_receiver`):
+                        //     an Index and a tracked Identifier. A FieldAccess
+                        //     receiver is deliberately excluded — it miscompiles
+                        //     independently of the refcount (`n.left.clone()` prints
+                        //     0 against the interpreter's 2, B-2026-09-07-59), and a
+                        //     call receiver does not compile at all
+                        //     (B-2026-09-07-60). Registering a binding whose value is
+                        //     already wrong would queue a dec against a handle the
+                        //     clone never produced.
+                        if shared_option_info.is_none() {
+                            if let ExprKind::MethodCall {
+                                object,
+                                method,
+                                args,
+                                ..
+                            } = &value.kind
+                            {
+                                if method == "clone" && args.is_empty() {
+                                    if let Some(info) =
+                                        self.option_shared_info_for_clone_receiver(object)
+                                    {
+                                        shared_option_info = Some((var_name.clone(), info));
+                                    }
+                                }
                             }
                         }
                         // Aliasing acquire: when the RHS is an Identifier naming

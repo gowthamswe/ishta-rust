@@ -47,9 +47,28 @@ memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_afte
 
 # ── New, and visible only under instrumentation (access class) ──
 #
-# `__karac_vec_elem_rc_dec_Node` reads offset 0 of a 32-byte block that
-# `__karac_rc_drop_Node` already freed. No double free, no leak.
-memory_sanitizer_tests::asan_let_bound_vec_option_shared_reused_no_uaf                         # B-2026-09-07-54
+# B-2026-09-07-54 REMOVED 2026-09-08, its owning row fixed. The entry read:
+#
+#   `__karac_vec_elem_rc_dec_Node` reads offset 0 of a 32-byte block that
+#   `__karac_rc_drop_Node` already freed. No double free, no leak.
+#   memory_sanitizer_tests::asan_let_bound_vec_option_shared_reused_no_uaf
+#
+# The cause was an untyped `let s = <receiver>.clone()` yielding
+# `Option[shared T]`, which no case in stmts.rs's untyped-let chain registered
+# into the caller-retains model: each by-value pass decremented without a
+# matching arg-site inc, so two passes drove the element's refcount to zero
+# while the container still held it. This fixture reads `src[0].clone()` and is
+# named for the BARE `let s = v[i]` spelling (case (f)) that the typechecker no
+# longer accepts -- `E_INDEX_MOVE_NON_COPY`, whose own remedy text names
+# `v[i].clone()`. So it had been testing the unregistered path under the
+# registered path's name.
+#
+# The lesson worth keeping is about this file rather than that fix. "No double
+# free, no leak" was a property of the FIXTURE'S TWO PASSES, not of the defect:
+# a third pass drives the count to -1 and frees the block twice, which glibc
+# reports as `malloc(): unaligned tcache chunk detected`. A quarantine entry
+# records what one program did on one leg -- it is not a characterization of the
+# bug, and reading it as one costs the escalation.
 #
 # `__karac_rc_drop_E` frees a 120-byte block and reads it again — both ends
 # inside the same generated drop.

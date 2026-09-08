@@ -53560,6 +53560,172 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-54 — an untyped `let` whose RHS is `<receiver>.clone()`
+    /// yielding `Option[shared T]` was never registered into the caller-retains
+    /// model, so REUSING the binding over-decremented the payload.
+    ///
+    /// The arithmetic, which is what makes each cell's outcome predictable
+    /// rather than incidental. `push` leaves the element at rc 1 and `.clone()`
+    /// retains it to 2 — `emit_option_value_clone_fn` admits a shared payload
+    /// precisely so the copy gets "an independent +1". Each by-value pass into
+    /// `clone_offset` should then be an arg-site inc against the callee's exit
+    /// dec, but an unregistered binding gets no inc while the callee decs
+    /// anyway, so the count after N passes is 2 - N:
+    ///
+    ///   1 pass  → rc 1. Balanced by luck. Cell (c) is clean pre-fix and is here
+    ///             to say so: a one-pass fixture cannot see this defect at all.
+    ///   2 passes → rc 0. The payload is freed while `src` still holds the
+    ///             element, and the container's teardown
+    ///             `__karac_vec_elem_rc_dec_Node` then READS the freed control
+    ///             block. A read and nothing more — no double free, no leak —
+    ///             which is exactly why every gate this repo ran before the
+    ///             instrumented leg reported this family clean.
+    ///
+    /// SO ONLY THE INSTRUMENTED LEG GATES THIS TEST. Both live cells are
+    /// read-only violations, and `KARAC_SANITIZE_ADDRESS=1` (B-2026-09-07-40) is
+    /// what makes a read through freed memory visible; the default link-only
+    /// `-fsanitize=address` buys allocator interposition only. Measured on the
+    /// parent: this test PASSES on the default leg and fails on the instrumented
+    /// one with `heap-use-after-free ... in __karac_vec_elem_rc_dec_Node`. Do not
+    /// read a green default-leg run of this test as evidence of anything.
+    ///
+    /// THE THREE-PASS ESCALATION IS DELIBERATELY NOT A CELL HERE, and the reason
+    /// is worth recording. At three passes rc goes to -1 and the block is handed
+    /// to the allocator a SECOND time; under glibc that is `Invalid free()` and
+    /// the process aborts with `malloc(): unaligned tcache chunk detected`. That
+    /// IS an allocator event, so it looked like the cell that would finally gate
+    /// this family on the leg CI runs — and it is not: measured on the parent,
+    /// this test with a three-pass cell added PASSES the DEFAULT leg of this
+    /// suite outright, because ASAN replaces the allocator and its quarantine
+    /// changes what the second free does. (The instrumented leg never reaches
+    /// that cell — it stops at cell (a) — so what is measured is the default
+    /// leg, which is precisely the leg the cell was supposed to gate.) A cell
+    /// that passes pre-fix pins nothing. The escalation is gated by
+    /// `e2e_cloned_option_shared_binding_survives_repeated_reuse`
+    /// (tests/codegen.rs) instead, which runs the binary under the NATIVE
+    /// allocator where the abort is real.
+    ///
+    /// Cell (d) is the control that localizes the defect to the REGISTRATION
+    /// rather than to `.clone()`: the same program with the binding ANNOTATED
+    /// (`let s: Option[Node] = src[0].clone()`) is clean pre-fix, because the
+    /// annotation reaches case (a) and registers. Only the untyped spelling
+    /// falls through every case.
+    ///
+    /// Cell (b) is why the fix keys on the CLONE and not on the index: a
+    /// `.clone()` over a tracked `Option[shared]` binding has the identical hole.
+    ///
+    /// Worth recording next to the fixture: the bare spelling the original case
+    /// (f) was written for (`let s = src[0];`) no longer compiles — the
+    /// typechecker rejects it with `E_INDEX_MOVE_NON_COPY`, and that
+    /// diagnostic's own remedy text names `v[i].clone()`. So every user who
+    /// follows the compiler's advice lands on the spelling that was
+    /// unregistered.
+    #[test]
+    fn asan_cloned_option_shared_binding_is_owned_on_every_reuse() {
+        // (a) The index-receiver spelling, two passes — the row's report.
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut src: Vec[Option[Node]] = Vec.new();
+    src.push(Some(Node { val: 1, left: Some(Node { val: 2, left: None, right: None }), right: None }));
+    let s = src[0].clone();
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    println(count_nodes(l0) + count_nodes(l1));
+}
+"#,
+            &["4"],
+            "b0907-54-index-clone-two-passes",
+        );
+        // (b) The same hole one receiver spelling over: `.clone()` on a tracked
+        // `Option[shared]` BINDING.
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut src: Vec[Option[Node]] = Vec.new();
+    src.push(Some(Node { val: 1, left: Some(Node { val: 2, left: None, right: None }), right: None }));
+    let base: Option[Node] = src[0].clone();
+    let s = base.clone();
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    println(count_nodes(l0) + count_nodes(l1));
+}
+"#,
+            &["4"],
+            "b0907-54-binding-clone-two-passes",
+        );
+        // (c) ONE pass — clean before the fix and after it. Present so a future
+        // reduction cannot lose the fact that this defect needs REUSE.
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut src: Vec[Option[Node]] = Vec.new();
+    src.push(Some(Node { val: 1, left: Some(Node { val: 2, left: None, right: None }), right: None }));
+    let s = src[0].clone();
+    let l0 = clone_offset(s, 10);
+    println(count_nodes(l0));
+}
+"#,
+            &["2"],
+            "b0907-54-index-clone-one-pass",
+        );
+        // (d) The ANNOTATED control — clean before the fix, via case (a).
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut src: Vec[Option[Node]] = Vec.new();
+    src.push(Some(Node { val: 1, left: Some(Node { val: 2, left: None, right: None }), right: None }));
+    let s: Option[Node] = src[0].clone();
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    println(count_nodes(l0) + count_nodes(l1));
+}
+"#,
+            &["4"],
+            "b0907-54-annotated-clone-control",
+        );
+    }
+
     #[test]
     fn asan_let_bound_vec_option_shared_reused_no_uaf() {
         // B-2026-07-11-29 (`let s = v[i]` reuse leg): binding a
