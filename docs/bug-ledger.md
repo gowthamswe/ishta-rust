@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 398 |
 | run-vs-build | 371 |
-| leak | 297 |
+| leak | 298 |
 | double-free | 212 |
 | missing-feature | 194 |
 | codegen-gap | 168 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1598 |
+| codegen | 1599 |
 | interp | 404 |
 | typecheck | 295 |
 | other | 75 |
@@ -124,7 +124,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | lexer | 8 |
 ## Current state
 
-_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-07). Do not edit this block by hand; edit the ledger and regenerate._
+_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-08). Do not edit this block by hand; edit the ledger and regenerate._
 
 ### Open
 
@@ -168,7 +168,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-42 | 2026-09-07 | codegen | high | PERF-REGRESSION, CORPUS-WIDE AND UNNOTICED SINCE ~2026-08: 12 of the 23 map-bearing benched katas whose recorded-run binary survives execute 1.30x-4.17x MORE INSTRUCTIONS built by today's karac than by the karac that produced their published figure -- up to 7.46x on WALL CLOCK (kata:146 236 -> 1683 ms), with IPC falling too, every sink identical, and the old binaries still reproducing their recorded numbers to 2-5%; source change, lane, placement, iterator-fallback and map-capacity all ruled out, and neither key/value type nor recorded date separates the regressed half from the flat half | kata:170 results.json still publishes the pre-regression 997.08 ms | found while running B-2026-08-28-77's placement sweep, where kata:170 was the positive control and failed to fire | CAUSE: 59c8d30cd (2026-08-22), the landing half of B-2026-08-21-6 — a deliberate security fix whose cost was never measured |
 | B-2026-09-07-43 | 2026-09-07 | codegen | medium | THE IF/ELSE SPELLING OF A DISCARDED AGGREGATE LITERAL NEVER REACHES THE OWNER REGISTRAR, so an RC-boxed projection's COPY is stranded -- 190 B in 5 blocks over a five-trip loop and 38 B in 1 with the source merely read afterwards, while the same construct with no `else`, the bare-statement spelling and the read-after-loop spelling are all clean since 8f3751b15 | tests/asan-o0-known-failures.txt |
 | B-2026-09-07-44 | 2026-09-07 | codegen | low | A FRESH-TEMP ENUM SCRUTINEE WHOSE CONSUMING ARM BINDS A COPY-DECLINED STRUCT PAYLOAD LEAKS THE PAYLOAD'S INTERIOR -- `match W.T(mkx(1)) { W.T(x) => .. }` loses 2 B while the `let`-bound scrutinee and the `W.T(_)` arm of the same program are clean | none |
-| B-2026-09-07-47 | 2026-09-07 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lane, with no projection anywhere and at trip count zero, and gone entirely when the same program is BUILT with `KARAC_AUTO_PAR=0` | — |
 | B-2026-09-07-48 | 2026-09-07 | codegen | high | READING AN RC-PROMOTED LOCAL'S PROJECTED FIELD AFTER THE LOOP DIVERGES THREE WAYS -- `let s = t.a` in a loop then `t.a.len()` prints 152 on the interpreter, -1 compiled and 117 on the JIT, silently, while the same read INSIDE the loop is correct on all four surfaces | — |
 | B-2026-09-07-49 | 2026-09-07 | codegen | medium | EVERY MECHANISM THAT ASKS `use_after_move_consume_sites` IS BLIND TO THE RC-FALLBACK PROMOTION, WHICH IS THE OWNERSHIP PASS'S OTHER ANSWER TO THE SAME QUESTION -- three rows (B-2026-09-07-23, -29, -30) have now been that one missing half, each fixed by a separate hand-written arm | — |
 | B-2026-09-07-50 | 2026-09-07 | codegen | medium | A CALLEE THAT READS ITS BY-VALUE PARAM AFTER A CONDITIONAL STORE LOSES THE `Drop` BODY OUTRIGHT ON THE COMPILED BACKENDS -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` at `k = false` prints no body while `--interp` prints it, and strands the param's whole heap (20 B in 2 blocks at -O0, 120 B in 12 over a six-trip loop); the same read placed BEFORE the store, or a trailing statement that does not read the param, is clean on both counts | — |
@@ -179,6 +178,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-55 | 2026-09-07 | codegen | high | A SHARED-ENUM BOXED STRUCT PAYLOAD MOVE-OUT LEAVES `__karac_rc_drop_E` READING ITS OWN FREED 120-BYTE BLOCK -- the fixture is named `no_double_free` and there is indeed no double free, only a read of freed memory nothing could see | none |
 | B-2026-09-07-56 | 2026-09-07 | codegen | high | AN INDEX-ASSIGN OVERWRITE OF A PLAIN `shared` Vec ELEMENT READS THE ELEMENT IT JUST RELEASED -- `main` reads offset 0 of a 16-byte block `__karac_vec_elem_rc_dec_Node` freed; caught only once the object is instrumented | none |
 | B-2026-09-07-57 | 2026-09-07 | codegen | high | A DISCARDED PROJECTED-FIELD LITERAL OVER A LOOP READS 8 BYTES PAST ITS ONE STACK OBJECT -- `stack-buffer-overflow` in `go` at frame offset 40, the only NON-heap finding of the instrumented leg's first run | none |
+| B-2026-09-07-58 | 2026-09-08 | codegen | medium | AN RC-PROMOTED BINDING PUBLISHED THROUGH A VALUE-PRODUCING `par` BLOCK'S JOIN STILL LOSES ITS BOX -- `let (t, k) = par { let t = mkp(9); ... (t, k) }` strands 40 B + 38 B in BOTH lanes, because the outer destructuring `let` rebinds the name over the pointer-typed entry B-2026-09-07-47 installs | — |
 
 ### Relocated
 
@@ -2396,6 +2396,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-40 | other | medium | NOTHING IN THIS REPO CAN CATCH A USE-AFTER-FREE WRITE -- `tests/memory_sanitizer.rs` links `-fsanitize=address` but never INSTRUMENTS the karac-emitt… | 415f0ae86 |
 | B-2026-09-07-45 | codegen | medium | THE SPEC-RE-PARSING FORMATTER WAS LEFT AT 64 BITS WHEN ITS FAST-PATH SIBLING WAS WIDENED -- `f"{big:^44}"`, `f"{big:b}"` and `f"{big:*>44}"` on a `u1… | 4b03864d1 |
 | B-2026-09-07-46 | codegen | high | A SPEC'D FLOAT HOLE WIDER THAN ITS BUFFER PRINTS UNINITIALIZED STACK -- `f"{x:.2}"` on `f64::MAX` is 312 bytes into a 64-byte buffer, and codegen use… | 0e7ace131 |
+| B-2026-09-07-47 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lan… | b440bbe |
 
 </details>
 
