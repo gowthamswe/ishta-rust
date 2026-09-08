@@ -176,7 +176,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-62 | 2026-09-08 | codegen | medium | A BOXED SHARED-ENUM PAYLOAD'S NESTED STRUCT FIELD NEVER HAS ITS BUFFERS FREED UNLESS THAT FIELD IS MOVED OUT -- 32 B leaked with no move-out and with a SIBLING field moved out, the opposite direction of B-2026-09-07-55's use-after-free at the same line | — |
 | B-2026-09-08-1 | 2026-09-08 | codegen | medium | A REBIND OF A BY-VALUE `Vec[weak T]` PARAM LEAKS ONE BOX PER ELEMENT -- `let work = xs` copies the weak handles without a weak-count inc, so both containers weak-drain the same boxes and the strong-zero release never fires; 24 B per element at BOTH opt levels, and the no-rebind control is clean | none |
 | B-2026-09-07-63 | 2026-09-08 | codegen+interp | high | A CALLER-SIDE MOVE-OUT OF A FIELD IS INVISIBLE TO THE DISPLACEMENT GATE, SO A LATER ASSIGN TO THAT FIELD FIRES A BODY THE MOVER ALREADY OWNS -- `let taken = g.one; g.one = mks(7);` prints `dS1` twice on both compiled backends against `--interp`'s once, and separately loses the NEW value's `dS7` there; the method spelling `g.set(mks(7))` now takes the same double on every surface, because B-2026-09-07-52's fix routes it through the same per-frame gate | — |
-| B-2026-09-08-2 | 2026-09-08 | codegen | high | A `mut ref` ARGUMENT PROJECTING OFF AN RC-PROMOTED LOCAL SILENTLY DISCARDS THE WRITE -- `bump(mut t.a)` after a loop that consumed `t.a` gives 40 on the interpreter but 0 compiled and 38 on the JIT, and the non-heap `bumpi(mut t.b)` spelling loses the write just as completely (10 vs 9 on every compiled backend) | — |
 
 ### Relocated
 
@@ -2403,6 +2402,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-56 | codegen | high | AN INDEX-ASSIGN OVERWRITE OF A PLAIN `shared` Vec ELEMENT READS THE ELEMENT IT JUST RELEASED -- `main` reads offset 0 of a 16-byte block `__karac_vec… | 8858ff02d |
 | B-2026-09-07-59 | codegen | high | A `.clone()` OVER A FIELD RECEIVER RETURNS AN EMPTY CHAIN ON EVERY COMPILED BACKEND -- `let s = n.left.clone()` prints 0 against `--interp`'s 2, sile… | 89e9db306 |
 | B-2026-09-07-60 | codegen | medium | A `.clone()` OVER A CALL RECEIVER FAILS CODEGEN OUTRIGHT -- `mk().clone()` where `mk() -> Option[shared T]` dies on `no handler for method 'clone' on… | 89e9db306 |
+| B-2026-09-08-2 | codegen | high | A `mut ref` ARGUMENT PROJECTING OFF AN RC-PROMOTED LOCAL SILENTLY DISCARDS THE WRITE -- `bump(mut t.a)` after a loop that consumed `t.a` gives 40 on… | 08ab81b2f |
 
 </details>
 
