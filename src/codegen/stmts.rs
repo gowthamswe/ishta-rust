@@ -21124,7 +21124,37 @@ impl<'ctx> super::Codegen<'ctx> {
                     })
                 });
             if flat_masked || nested_masked {
-                return;
+                // B-2026-09-08-14 — DEFER TO THE RUNTIME GUARD when this field
+                // carries one. Since B-2026-09-08-4 a CONDITIONAL move-out
+                // records the move in the map (its other readers need that
+                // answer) AND mints a `field_view_flags` bit, so the map alone
+                // no longer says whether the move ACTUALLY RAN on the path
+                // being compiled. Declining statically here answered for every
+                // path, and the untaken one still owns the old value: with
+                // `f` false, `if f { let taken = g.one; } g.one = mks(7);`
+                // printed `dS2 dS7 m3` against `--interp`'s
+                // `dS1 dS2 dS7 m3`, losing the displaced body.
+                //
+                // The guard further down reads exactly the right bit and has
+                // the right polarity already — `open_guard_on_flag` runs the
+                // body when the flag is TRUE, and it is true precisely on the
+                // paths where nothing moved this field — so the fix is to let
+                // it speak rather than to return before it.
+                //
+                // DEPTH 1 ONLY, because that is where the flag is minted:
+                // B-2026-09-08-4 routes only the simple `base.field` moves, and
+                // the guard's lookup is keyed by the ROOT binding and the LEAF
+                // field name, which coincide only at depth 1. A deep chain has
+                // no flag and keeps the static decline B-2026-09-06-55 gave it.
+                let deferred_to_guard = hop_idxs.is_empty()
+                    && self
+                        .drop_rc
+                        .field_view_flags
+                        .get(base.as_str())
+                        .is_some_and(|m| m.contains_key(field));
+                if !deferred_to_guard {
+                    return;
+                }
             }
         }
         // Full-action gate: the ROOT's UserDrop must be armed and must not

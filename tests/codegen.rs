@@ -31978,6 +31978,76 @@ fn main() {
         assert_eq!(out, "dS2\ndS1\nm3\n");
     }
 
+    /// B-2026-09-08-14 — a CONDITIONAL move-out followed by an UNCONDITIONAL
+    /// reassign lost the DISPLACED value's body on the path the move never
+    /// took: `dS2 dS7 m3` against `--interp`'s `dS1 dS2 dS7 m3`.
+    ///
+    /// `emit_displaced_field_bodies` decides in two stages — a STATIC decline
+    /// when the assigned field is in `struct_moved_field_bodies`, then a
+    /// RUNTIME guard on the field's `field_view_flags` bit. The static decline
+    /// returned first, so the guard never got to speak. Since B-2026-09-08-4 a
+    /// conditional move-out records the move in the map (its other readers need
+    /// that answer) AND mints the flag, so the map alone no longer says whether
+    /// the move actually RAN on the path being compiled; the decline now defers
+    /// to the guard whenever the flag exists.
+    ///
+    /// Cell (b) is the one that keeps the deferral honest in the other
+    /// direction: on the TAKEN path `taken` owns the old value and the
+    /// displaced body must NOT fire, which is what the flag being false buys.
+    /// A deferral that simply stopped declining would print `dS1` twice here.
+    ///
+    /// Twin of `tests/interpreter.rs`'s
+    /// `test_cond_move_then_reassign_displaces_on_the_untaken_path`.
+    #[test]
+    fn e2e_cond_move_then_reassign_displaces_on_the_untaken_path() {
+        // (a) UNTAKEN — nothing moved `one`, so the reassign displaces it.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let f = false;\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   if f { let taken = g.one; println(f\"t{taken.id}\"); }\n\
+             \x20   g.one = mks(7);\n\
+             \x20   println(\"m3\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dS1\ndS2\ndS7\nm3\n");
+        // (b) TAKEN — `taken` owns the old value, so NO displaced body.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let f = true;\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   if f { let taken = g.one; println(f\"t{taken.id}\"); }\n\
+             \x20   g.one = mks(7);\n\
+             \x20   println(\"m3\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "t1\ndS1\ndS2\ndS7\nm3\n");
+    }
+
     /// B-2026-08-01-19 — storing an owned param into a local container
     /// FIELD (`o.h = h;`) fired the caller-retained value's body TWICE on
     /// both backends (o's bodies walk at its death + the caller's NLL
