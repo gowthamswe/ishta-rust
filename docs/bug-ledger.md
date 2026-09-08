@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 402 |
 | run-vs-build | 376 |
-| leak | 302 |
+| leak | 303 |
 | double-free | 214 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1616 |
+| codegen | 1617 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 76 |
@@ -177,7 +177,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-11 | 2026-09-08 | codegen | low | `display_mangle_te` RENDERS EVERY UNNAMEABLE TYPE AS `unknown`, SO THEY SHARE ONE MANGLED SYMBOL AND ONE DROP/CLONE CACHE ENTRY -- `Vec[weak A]` and `Vec[weak B]` both emit `karac_drop_Vec_unknown` / `karac_clone_unknown` and the second requested gets the first's function; benign for `weak` ONLY because every weak-slot operation is slot-type-agnostic, and the fallback is not weak-only | none |
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
 | B-2026-09-08-13 | 2026-09-08 | codegen | medium | A LET-BOUND LOCAL OF A SELF-REFERENTIAL STRUCT PASSED BY VALUE LOSES ITS `Drop` BODY ON EVERY COMPILED BACKEND -- `let c = mkn(10); read(c)` prints the body under `--interp` and nothing under the JIT, `-O0`, `-O2` and `KARAC_AUTO_PAR=0`; passing the SAME value as a temporary agrees, which is the only variable, and is why six existing fixtures for this type all miss it | none |
-| B-2026-09-08-14 | 2026-09-08 | codegen | low | A CONDITIONAL MOVE-OUT FOLLOWED BY AN UNCONDITIONAL REASSIGN LOSES THE DISPLACED VALUE'S `Drop` BODY -- `if f { let taken = g.one; } g.one = mks(7);` with `f` false prints `dS2 dS7 m3` against `--interp`'s `dS1 dS2 dS7 m3`, because `emit_displaced_field_bodies` takes its STATIC decline before its RUNTIME guard can speak; `karac check` says nothing | — |
+| B-2026-09-08-15 | 2026-09-08 | codegen | high | `main` IS RED ON BOTH -O0 ASAN RATCHETS SINCE acdcf50 -- `rc_boxed_tuple_index_destinations_stay_clean` leaks 76 B in 2 objects on its `b49_tuple_assign_three_trips` cell, so neither the tuple-assign destination nor the RC-fallback box owns the projected buffer; green on the link-only leg because -O2 elides the allocation, and every session's gate cycle is red until it is fixed | — |
 
 ### Relocated
 
@@ -2415,6 +2415,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-6 | codegen | high | THE FOURTH `use_after_move_consume_sites` BLIND-SPOT SITE B-2026-09-07-49 PREDICTED, found the way it said it would be: a field move-out inside a `wh… | 3dd9f19 |
 | B-2026-09-08-7 | codegen | medium | A `Vec[weak T]` NESTED INSIDE ANOTHER CONTAINER NEVER DRAINS ITS WEAK SLOTS -- `te_recursive_drop_fully_supported` answers false for a `TypeKind::Wea… | 730ae1828 |
 | B-2026-09-08-8 | codegen | medium | A VALUE-PRODUCING `par` BLOCK IS NOT A FRESH OWNED TEMP AT THE DESTRUCTURE, so every heap-bearing leaf of `let (t, k) = par { .. | 4e6aca105 |
+| B-2026-09-08-14 | codegen | low | A CONDITIONAL MOVE-OUT FOLLOWED BY AN UNCONDITIONAL REASSIGN LOSES THE DISPLACED VALUE'S `Drop` BODY -- `if f { let taken = g.one; } g.one = mks(7);`… | 1606c18 |
 
 </details>
 
