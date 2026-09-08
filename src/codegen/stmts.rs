@@ -3617,12 +3617,25 @@ impl<'ctx> super::Codegen<'ctx> {
     ///   relies on.
     /// - `Index` — a `Vec[Option[shared T]]` element, resolved exactly as case
     ///   (f) does. A ranged index is excluded: it is a slice, not an element.
+    /// - `FieldAccess` — an `Option[shared T]` FIELD of a struct binding,
+    ///   resolved from the field's declared `TypeExpr` exactly as the `Index`
+    ///   arm resolves the element's. Admitted once B-2026-09-07-59 was fixed:
+    ///   this spelling used to miscompile to an empty chain, so registering it
+    ///   would have queued a scope-exit dec against a handle the clone never
+    ///   handed back. With the value correct the clone takes a real `+1`, and
+    ///   WITHOUT this registration that `+1` is the binding's only accounting —
+    ///   measured as a 24-byte leak on one use of `n.left.clone()` and, on two
+    ///   uses, a use-after-free read AND write of the inner node's refcount
+    ///   word, which is B-2026-08-27-34's arithmetic reached by a different
+    ///   spelling.
     ///
-    /// A `FieldAccess` receiver and a call receiver are NOT resolved, and that
-    /// is a correctness gate rather than an omission: `n.left.clone()`
-    /// miscompiles to an empty chain (B-2026-09-07-59) and `mk().clone()`
-    /// fails codegen outright (B-2026-09-07-60). Registering either would queue
-    /// a scope-exit dec against a handle the clone never handed back.
+    /// - `Call` — a free fn returning `Option[shared T]`. Admitted once
+    ///   B-2026-09-07-60 was fixed: this spelling used to fail codegen
+    ///   outright, and a spelling that does not compile cannot be registered
+    ///   into an ownership model. It now lowers to the call itself (clone is
+    ///   identity on a fresh owned rvalue — see `compile_method_call`), so the
+    ///   binding owns the call's `+1` and needs exactly the accounting a bare
+    ///   `let s = mk();` gets.
     fn option_shared_info_for_clone_receiver(
         &self,
         recv: &Expr,
@@ -3648,8 +3661,142 @@ impl<'ctx> super::Codegen<'ctx> {
                 self.option_inner_shared_type_for_type_expr(&elem_te)
                     .map(|(_, info)| info)
             }
+            // `n.left.clone()` — an `Option[shared T]` field of a named struct
+            // binding. Resolved from the DECLARED field type, so it answers
+            // identically for a niche-encoded field (the storage is one
+            // pointer) and a conventional one: the receiver's type is what
+            // `.clone()` preserves, not its layout.
+            //
+            // `self.field.clone()` is covered too — `self` is registered in
+            // `var_type_names` under that name, the same normalisation the
+            // field-receiver method hoist relies on.
+            ExprKind::FieldAccess { object, field } => {
+                // Two ways to learn the field's type, mirroring the two the
+                // `Identifier` leaf of `control_flow_owned_option_shared` uses
+                // and for the same reason:
+                //
+                //   1. the outer is STILL a live binding, so the declared field
+                //      type is readable directly — the common `let n = …;
+                //      n.left.clone()` shape;
+                //
+                //   2. the EMISSION RECORD, for an ARM-LOCAL outer
+                //      (`match root { Some(n) => n.left.clone(), … }`) whose
+                //      name was reverted with its arm frame before this
+                //      classification runs. The clone still took its `+1`; only
+                //      the means of naming its type is gone.
+                //
+                // Fail-closed: neither answer means no qualifying clone was
+                // emitted here, and registering a scope-exit dec against a
+                // value that never took a `+1` would double-free.
+                self.field_option_shared_info_or_record(object, field, recv)
+            }
+            ExprKind::Call { .. } => self.option_shared_info_for_call_receiver(recv),
             _ => None,
         }
+    }
+
+    /// True when `e` is a call to a free fn whose declared return type is
+    /// `Option[shared T]`. The receiver test behind the identity-clone lowering
+    /// in `compile_method_call` and the `Call` arm of
+    /// [`Self::option_shared_info_for_clone_receiver`], so the two agree by
+    /// construction about which call receivers qualify (B-2026-09-07-60).
+    pub(crate) fn call_returns_option_shared(&self, e: &Expr) -> bool {
+        self.option_shared_info_for_call_receiver(e).is_some()
+    }
+
+    /// The `Option[shared T]` info a qualifying call receiver returns, or
+    /// `None`. `Some(x)` is deliberately NOT accepted here: that is an
+    /// enum-variant constructor, not a call whose declared return type the
+    /// `fn_return_option_inner_shared` table describes, and it already has its
+    /// own producer arms elsewhere.
+    fn option_shared_info_for_call_receiver(
+        &self,
+        e: &Expr,
+    ) -> Option<crate::codegen::state::SharedTypeInfo<'ctx>> {
+        let ExprKind::Call { callee, .. } = &e.kind else {
+            return None;
+        };
+        let ExprKind::Identifier(name) = &callee.kind else {
+            return None;
+        };
+        let inner = self
+            .fn_sig
+            .fn_return_option_inner_shared
+            .get(name.as_str())?;
+        self.type_decls.shared_types.get(inner.as_str()).cloned()
+    }
+
+    /// Resolve `<outer>.<field>`'s declared type to its `Option[shared T]`
+    /// info, given an outer that is a live named binding. Shared by the
+    /// `FieldAccess` arm of [`Self::option_shared_info_for_clone_receiver`] and
+    /// by the emission-time recorder below, so the two cannot disagree about
+    /// which fields qualify.
+    pub(crate) fn field_option_shared_info(
+        &self,
+        outer: &Expr,
+        field: &str,
+    ) -> Option<crate::codegen::state::SharedTypeInfo<'ctx>> {
+        let outer_name = match &outer.kind {
+            ExprKind::Identifier(n) => n.clone(),
+            ExprKind::SelfValue => "self".to_string(),
+            _ => return None,
+        };
+        let ty_name = self.var_types.var_type_names.get(outer_name.as_str())?;
+        let idx = self
+            .type_decls
+            .struct_field_names
+            .get(ty_name)?
+            .iter()
+            .position(|f| f == field)?;
+        let field_te = self
+            .type_decls
+            .struct_field_type_exprs
+            .get(ty_name)?
+            .get(idx)?;
+        self.option_inner_shared_type_for_type_expr(field_te)
+            .map(|(_, info)| info)
+    }
+
+    /// Emission-time half of the `FieldAccess` clone registration: stamp the
+    /// `+1` a `<outer>.<field>.clone()` produced onto that receiver node's
+    /// span. Read back by [`Self::option_shared_info_for_clone_receiver`] when
+    /// the outer is no longer a live binding — see the call site in
+    /// `compile_method_call` for why that is the only moment both facts exist.
+    pub(crate) fn record_field_clone_option_shared_retain(
+        &self,
+        outer: &Expr,
+        field: &str,
+        recv: &Expr,
+    ) {
+        if let Some(info) = self.field_option_shared_info(outer, field) {
+            self.borrow_vars
+                .option_shared_leaf_retains
+                .borrow_mut()
+                .insert((recv.span.offset, recv.span.length), info.heap_type);
+        }
+    }
+
+    /// The `FieldAccess` clone-receiver resolution, split out so the arm above
+    /// reads as one question.
+    fn field_option_shared_info_or_record(
+        &self,
+        object: &Expr,
+        field: &str,
+        recv: &Expr,
+    ) -> Option<crate::codegen::state::SharedTypeInfo<'ctx>> {
+        self.field_option_shared_info(object, field).or_else(|| {
+            let heap_type = self
+                .borrow_vars
+                .option_shared_leaf_retains
+                .borrow()
+                .get(&(recv.span.offset, recv.span.length))
+                .copied()?;
+            self.type_decls
+                .shared_types
+                .values()
+                .find(|i| i.heap_type == heap_type)
+                .cloned()
+        })
     }
 
     fn control_flow_owned_option_shared(
@@ -3774,6 +3921,27 @@ impl<'ctx> super::Codegen<'ctx> {
                     info = info.or(c);
                 }
                 Some(info)
+            }
+            // `<recv>.clone()` as a control-flow LEAF — the arm-tail spelling of
+            // case (h) (`let s = match root { None => None, Some(n) => n.left.clone() };`).
+            // A clone hands back its own `+1` wherever it is written, so a leaf
+            // one owns exactly what a direct-RHS one does; it resolves through
+            // the SAME receiver gate, so the two spellings cannot drift apart
+            // about which receivers are safe to register.
+            //
+            // Without this arm the enclosing `Match` above resolves to `None`
+            // (every arm must answer, and this one fell to the catch-all), so
+            // the binding got no per-use retain and no scope-exit dec — the
+            // same use-after-free on the inner node's refcount word that the
+            // direct spelling had, reached one level of control flow up.
+            // B-2026-09-07-59 files this spelling alongside the direct one.
+            ExprKind::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } if method == "clone" && args.is_empty() => {
+                self.option_shared_info_for_clone_receiver(object).map(Some)
             }
             _ => None,
         }

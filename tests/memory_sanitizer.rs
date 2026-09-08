@@ -81012,4 +81012,133 @@ fn main() {
             "b4-boxed-enum-struct-payload-box-copy",
         );
     }
+
+    /// B-2026-09-07-59 — a `.clone()` whose receiver is a NICHE-ENCODED
+    /// `Option[shared T]` field. The field stores one nullable pointer while
+    /// the declared type's value shape is the seeded 4-i64 Option, so the
+    /// method-receiver hoist used to hand `karac_clone_Option_*` a 32-byte view
+    /// of an 8-byte slot: it read the pointer as the tag and three words off
+    /// the end of the heap object. The published fixture printed a silent `0`
+    /// (garbage tag ⇒ `None` ⇒ an empty chain); a one-node reduction segfaults
+    /// instead, which is the same read landing on a plausible `Some`.
+    ///
+    /// Gated here rather than only in the E2E suite because the WRONG ANSWER
+    /// and the BAD READ are separate failures: the answer was fixed by
+    /// unpacking the niche, and the `+1` accounting by registering the cloned
+    /// binding. This asserts the second — two by-value uses of the clone,
+    /// which is what turns an unowned `+1` into a use-after-free on the inner
+    /// node's refcount word.
+    #[test]
+    fn asan_niche_option_field_clone_is_owned_on_every_use() {
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut t = 0i64;
+    let mut i = 0i64;
+    while i < 20i64 {
+        let n: Node = Node { val: 5, left: Some(Node { val: 6, left: None, right: None }), right: None };
+        let s = n.left.clone();
+        let l0 = clone_offset(s, 10);
+        let l1 = clone_offset(s, 20);
+        t = t + count_nodes(l0) + count_nodes(l1);
+        i = i + 1i64;
+    }
+    println(f"{t}");
+}
+"#,
+            &["40"],
+            "asan-niche-option-field-clone",
+        );
+    }
+
+    /// B-2026-09-07-59, ARM-LOCAL OUTER spelling — the receiver's outer is a
+    /// match-arm binding (`Some(n) => n.left.clone()`), so its name has been
+    /// reverted with the arm frame by the time the consuming `let` classifies
+    /// its RHS. The env cannot answer what the clone retained; the emission
+    /// record can, which is the same asymmetry `option_shared_leaf_retains`
+    /// exists for. Without it this spelling kept the use-after-free after the
+    /// direct one was fixed, so it is gated separately.
+    #[test]
+    fn asan_niche_option_field_clone_from_match_arm_local_is_owned() {
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let mut t = 0i64;
+    let mut i = 0i64;
+    while i < 20i64 {
+        let root: Option[Node] = Some(Node { val: 5, left: Some(Node { val: 6, left: None, right: None }), right: None });
+        let s = match root { None => None, Some(n) => n.left.clone() };
+        let l0 = clone_offset(s, 10);
+        let l1 = clone_offset(s, 20);
+        t = t + count_nodes(l0) + count_nodes(l1);
+        i = i + 1i64;
+    }
+    println(f"{t}");
+}
+"#,
+            &["40"],
+            "asan-niche-option-field-clone-arm-local",
+        );
+    }
+
+    /// B-2026-09-07-60 — `mk().clone()` over a call returning
+    /// `Option[shared T]`. It failed codegen outright before, so there is no
+    /// prior memory behaviour to regress; this pins the ACCOUNTING of the
+    /// lowering that replaced the error. Clone is identity on a fresh owned
+    /// rvalue — the clone's `+1` and the discarded temporary's `-1` cancel — so
+    /// the binding must end up owning exactly one reference, which two by-value
+    /// uses and a loop make observable in both directions: a missing `+1` reads
+    /// freed memory on the second use, a spurious one leaks every iteration.
+    #[test]
+    fn asan_call_receiver_option_shared_clone_is_owned_once() {
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn mk() -> Option[Node] { Some(Node { val: 3, left: Some(Node { val: 4, left: None, right: None }), right: None }) }
+fn main() {
+    let mut t = 0i64;
+    let mut i = 0i64;
+    while i < 20i64 {
+        let s = mk().clone();
+        let l0 = clone_offset(s, 10);
+        let l1 = clone_offset(s, 20);
+        t = t + count_nodes(l0) + count_nodes(l1);
+        i = i + 1i64;
+    }
+    println(f"{t}");
+}
+"#,
+            &["80"],
+            "asan-call-receiver-option-shared-clone",
+        );
+    }
 }

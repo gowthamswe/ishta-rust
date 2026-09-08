@@ -2990,6 +2990,23 @@ impl<'ctx> super::Codegen<'ctx> {
             if let Some(value) =
                 self.try_compile_field_receiver_method(inner, field, method, args, call_span)?
             {
+                // Record the `+1` a `<struct>.<field>.clone()` just produced,
+                // keyed by this receiver node's span, so a consuming `let` can
+                // ask the EMISSION what it did instead of re-deriving it from
+                // the name env. Written HERE because this is the one point where
+                // both facts are available at once: the field's declared type,
+                // and an `inner` that is still a live binding. An ARM-LOCAL
+                // outer (`match root { Some(n) => n.left.clone(), … }`) has been
+                // reverted out of the env by the time the `let` classifies its
+                // RHS, so the env answer is gone but the retain still happened —
+                // the same asymmetry `option_shared_leaf_retains` was introduced
+                // for (B-2026-08-27-43), reached by a clone rather than a leaf.
+                // Without it that `+1` is unowned: measured as a use-after-free
+                // read and write of the inner node's refcount word once the
+                // binding is consumed twice (B-2026-09-07-59).
+                if method == "clone" && args.is_empty() {
+                    self.record_field_clone_option_shared_retain(inner, field, object);
+                }
                 return Ok(value);
             }
         }
@@ -3155,6 +3172,27 @@ impl<'ctx> super::Codegen<'ctx> {
             }
             // Scalar `Copy` primitive — clone is identity.
             if recv_is_scalar_primitive {
+                return self.compile_expr(object);
+            }
+            // A CALL returning `Option[shared T]` — `mk().clone()`, which used
+            // to fail codegen outright with "no handler for method 'clone' on
+            // non-identifier receiver" while the interpreter answered fine
+            // (B-2026-09-07-60). Clone is IDENTITY here, and that is an
+            // equality rather than an approximation: `karac_clone_Option_*` is
+            // a shallow clone — it copies the `{tag,w0,w1,w2}` value and
+            // rc-incs the inner handle — while the call result is a fresh
+            // temporary holding the only reference, which is dropped once the
+            // clone has been taken. The `+1` the clone would add and the `-1`
+            // the discarded temporary would take cancel exactly, so emitting
+            // the receiver alone is the same object graph with the same final
+            // count, minus a dead inc/dec pair.
+            //
+            // Restricted to a call whose return type is a KNOWN
+            // `Option[shared T]` (the same `fn_return_option_inner_shared`
+            // table `control_flow_owned_option_shared` reads), so nothing else
+            // is quietly reinterpreted as identity — any other non-identifier
+            // receiver still reaches the loud fall-through below.
+            if self.call_returns_option_shared(object) {
                 return self.compile_expr(object);
             }
         }

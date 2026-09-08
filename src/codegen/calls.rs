@@ -1015,6 +1015,58 @@ impl<'ctx> super::Codegen<'ctx> {
         else {
             return Ok(None);
         };
+        // A NICHE-OPTIMIZED `Option[shared T]` field stores ONE nullable
+        // pointer (null = None), while the field's declared TypeExpr says
+        // `Option[T]`, whose value shape is the seeded 4-i64 `{tag,w0,w1,w2}`.
+        // The synth minted below is registered from that TypeExpr, so binding
+        // it to the raw field pointer hands every downstream reader a 32-byte
+        // view of an 8-byte slot: word 0 (the tag it expects) is the POINTER,
+        // and words 1..3 are whatever follows the field in the heap object —
+        // past the end of the allocation for a trailing field. `karac_clone_*`
+        // reads exactly that way, so `n.left.clone()` returned a garbage-tagged
+        // Option: usually tag != 1, i.e. a silent `None` (the empty chain of
+        // B-2026-09-07-59), and a segfault whenever the garbage happened to
+        // read as `Some` and its w0 was dereferenced.
+        //
+        // Materialize the declared shape instead: `niche_load_option_field` is
+        // the same unpack the VALUE path (`compile_field_access`) already
+        // applies, which is why `let s = n.left;` was correct all along and
+        // only the method-receiver hoist diverged.
+        //
+        // The temp is a READ-ONLY alias — a method that wrote through it would
+        // lose the write, since nothing copies back into the niche slot. That
+        // is sound here rather than merely convenient: the mutating Option
+        // combinators (`take`, `get_or_insert`) are gated to a trivially
+        // copyable payload and decline a `shared` one loudly before reaching a
+        // receiver hoist (verified: `n.left.take()` errors with
+        // "Option/Result.take over a non-trivially-copyable payload"), so no
+        // shape that can arrive here mutates its receiver.
+        //
+        // Detected by the LAYOUT MISMATCH itself — declared `Option[shared T]`,
+        // stored as one pointer — which is equivalent to the stamped
+        // `niche_field_inner_heap_type` decision but needs neither the struct
+        // name nor the field index re-derived, so it covers the `outer.f` and
+        // `outer[i].f` inner shapes through one check. `weak T` is excluded: it
+        // also READS as `Option[shared T]`, but its read is intercepted earlier
+        // to inject `karac_weak_upgrade`, so it is not a niche slot to unpack.
+        let is_niche_option_field = field_ll_ty.is_pointer_type()
+            && !matches!(field_te.kind, TypeKind::Weak(_))
+            && self
+                .option_inner_shared_type_for_type_expr(&field_te)
+                .is_some();
+        let (field_ptr, field_ll_ty) = if is_niche_option_field {
+            let opt_val = self.niche_load_option_field(field_ptr, field);
+            let opt_ty: BasicTypeEnum<'ctx> =
+                self.type_decls.enum_layouts["Option"].llvm_type.into();
+            let fn_val = self
+                .current_fn
+                .ok_or_else(|| "field-receiver niche Option: no current function".to_string())?;
+            let tmp = self.create_entry_alloca(fn_val, "fr.niche.opt", opt_ty);
+            self.builder.build_store(tmp, opt_val).unwrap();
+            (tmp, opt_ty)
+        } else {
+            (field_ptr, field_ll_ty)
+        };
         self.compile_method_via_synth_elem_ptr(
             field_ptr,
             field_ll_ty,

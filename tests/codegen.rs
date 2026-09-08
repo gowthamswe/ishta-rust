@@ -39852,6 +39852,133 @@ impl BuildHasher for SumBuild {\n\
         run_program_capturing(src).map(|c| c.stdout)
     }
 
+    /// B-2026-09-07-59 — the VALUE half. A `.clone()` whose receiver is a
+    /// niche-encoded `Option[shared T]` field returned an empty chain on every
+    /// compiled backend while `--interp` returned the real one.
+    ///
+    /// The field stores ONE nullable pointer (null = None); the declared type's
+    /// value shape is the seeded 4-i64 `{tag,w0,w1,w2}`. The method-receiver
+    /// hoist bound its synth straight to the field pointer, so
+    /// `karac_clone_Option_*` read the pointer as the tag and three words past
+    /// the field — a garbage tag, hence `None`, hence `0`. The plain-struct
+    /// outer never diverged (its field is not niche-encoded), which is what
+    /// made this look like a `shared`-payload bug rather than a layout one.
+    ///
+    /// `let s = n.left;` was correct throughout: the VALUE path already unpacks
+    /// the niche, and only the method-receiver hoist skipped it — asserted
+    /// alongside so a fix that broke the working path cannot pass this test.
+    #[test]
+    fn test_e2e_clone_of_niche_option_shared_field_keeps_the_chain() {
+        let src = r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let n: Node = Node { val: 5, left: Some(Node { val: 6, left: None, right: None }), right: None };
+    let s = n.left.clone();
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    println(f"{count_nodes(l0) + count_nodes(l1)}");
+    let direct = n.left;
+    println(f"{count_nodes(direct)}");
+}
+"#;
+        assert_eq!(run_program(src).as_deref(), Some("2\n1\n"));
+    }
+
+    /// B-2026-09-07-59, MATCH-ARM spelling — filed in the same row and
+    /// diverging identically (`2` interpreted, `0` compiled). Kept as its own
+    /// test because its outer is an ARM-LOCAL binding, a different resolution
+    /// path for the ownership half even though the value half is the one niche
+    /// unpack.
+    #[test]
+    fn test_e2e_clone_of_niche_option_field_via_match_arm_binding() {
+        let src = r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn main() {
+    let root: Option[Node] = Some(Node { val: 5, left: Some(Node { val: 6, left: None, right: None }), right: None });
+    let s = match root { None => None, Some(n) => n.left.clone() };
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    println(f"{count_nodes(l0) + count_nodes(l1)}");
+}
+"#;
+        assert_eq!(run_program(src).as_deref(), Some("2\n"));
+    }
+
+    /// B-2026-09-07-60 — `mk().clone()` over a call returning
+    /// `Option[shared T]` used to fail codegen outright ("no handler for method
+    /// 'clone' on non-identifier receiver") while `--interp` answered `4`.
+    ///
+    /// It lowers to the call itself: `karac_clone_Option_*` is a SHALLOW clone
+    /// (copy the value, rc-inc the inner handle) and the receiver is a fresh
+    /// temporary holding the only reference, so the clone's `+1` and the
+    /// discarded temporary's `-1` cancel exactly. Identity here is an equality,
+    /// not an approximation.
+    #[test]
+    fn test_e2e_clone_of_call_receiver_returning_option_shared() {
+        let src = r#"
+shared struct Node { val: i64, mut left: Option[Node], mut right: Option[Node] }
+fn clone_offset(node: Option[Node], delta: i64) -> Option[Node] {
+    match node {
+        None => None,
+        Some(n) => Some(Node { val: n.val + delta, left: clone_offset(n.left, delta), right: clone_offset(n.right, delta) }),
+    }
+}
+fn count_nodes(node: Option[Node]) -> i64 {
+    match node { None => 0, Some(n) => 1 + count_nodes(n.left) + count_nodes(n.right) }
+}
+fn mk() -> Option[Node] { Some(Node { val: 3, left: Some(Node { val: 4, left: None, right: None }), right: None }) }
+fn main() {
+    let s = mk().clone();
+    let l0 = clone_offset(s, 10);
+    let l1 = clone_offset(s, 20);
+    println(f"{count_nodes(l0) + count_nodes(l1)}");
+}
+"#;
+        assert_eq!(run_program(src).as_deref(), Some("4\n"));
+    }
+
+    /// The NEIGHBOURS of B-2026-09-07-59, pinned so the niche unpack cannot be
+    /// widened into the shapes that were already correct. A Vec / String /
+    /// `Option[i64]` field, and an `Option[shared T]` field on a PLAIN struct
+    /// outer, are all conventionally laid out — only a `shared` outer's
+    /// `Option[shared T]` field is niche-encoded, which is the discriminator
+    /// the fix keys on.
+    #[test]
+    fn test_e2e_clone_of_non_niche_fields_is_unchanged() {
+        let src = r#"
+shared struct Node { val: i64 }
+struct Holder { o: Option[Node] }
+struct S { v: Vec[i64], t: String, oi: Option[i64] }
+fn main() {
+    let s = S { v: [1, 2, 3], t: "hello", oi: Some(7) };
+    println(f"{s.v.clone().len()}");
+    println(f"{s.t.clone().len()}");
+    println(f"{match s.oi.clone() { None => -1, Some(x) => x }}");
+    let h = Holder { o: Some(Node { val: 9 }) };
+    println(f"{match h.o.clone() { None => -1, Some(n) => n.val }}");
+}
+"#;
+        assert_eq!(run_program(src).as_deref(), Some("3\n5\n7\n9\n"));
+    }
+
     /// B-2026-09-07-54 — the ESCALATION half of the cloned-`Option[shared]`
     /// reuse defect, gated where it is actually visible: under the NATIVE
     /// allocator.
