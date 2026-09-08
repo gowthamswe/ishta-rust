@@ -13167,6 +13167,28 @@ impl<'ctx> super::Codegen<'ctx> {
                             let bool_t = self.context.bool_type();
                             let _ = self.builder.build_store(flag, bool_t.const_int(1, false));
                         }
+                        // B-2026-09-07-63 — the MOVE-OUT mask's re-arm, the
+                        // twin of the view flag's above and ordered by the same
+                        // argument: `emit_displaced_field_bodies` has already
+                        // read the mask and correctly declined the husk `taken`
+                        // owns, so the base may become field `one`'s owner
+                        // again for the value just stored. Without it the mask
+                        // was one-way and the REPLACEMENT's body ran nowhere.
+                        //
+                        // OUTSIDE the view-flag chain, not another arm of it:
+                        // the two masks are independent channels and a field
+                        // can be in either, so making them exclusive would drop
+                        // whichever arm compiled second. Skipped for a
+                        // param-view RHS, where the value stored is the
+                        // CALLER's to fire (B-2026-08-01-19) and re-arming
+                        // would run its body a second time here — the same
+                        // reason that arm stores `false` rather than `true`.
+                        // Itself a no-op for a field that was never moved out,
+                        // for a borrowed base, and for a store the
+                        // innermost-frame check finds conditional.
+                        if !rhs_is_param_view {
+                            self.rearm_reassigned_moved_field(&base, field);
+                        }
                     }
                     self.compile_field_store(object, field, val, rhs_is_fresh, Some(value))?;
                     // B-2026-07-15-25: `compile_field_store` now drops the OLD
@@ -20933,7 +20955,23 @@ impl<'ctx> super::Codegen<'ctx> {
         // interpreter's two, a run-vs-build divergence this row's fix would
         // otherwise have introduced. The interpreter's twin mask is not set by
         // a projection copy at all, which is the parity being restored.
-        if !hop_idxs.is_empty() {
+        // B-2026-09-07-63 — DEPTH 1 ASKS THE SAME QUESTION, and the sentence
+        // above deferring it ("a depth-1 target keeps whatever the
+        // `full_action` gate answered for it") was measured wrong: that gate
+        // answers correctly only for the shape whose masked walker came out
+        // EMPTY, which at depth 1 means a ONE-FIELD struct. Give the base a
+        // sibling and the masked walker survives, the action stays armed, and
+        // `let taken = g.one; g.one = mks(7);` ran the displaced body over the
+        // husk `taken` already owns — `dS1 dS2 t1 dS1` against `--interp`'s
+        // `dS2 dS7 t1 dS1`, on all four compiled surfaces. Exactly the
+        // generalisation B-2026-09-06-55 made one level down, one level up.
+        //
+        // A BORROWED base still declines, unchanged and for -52's reason: the
+        // mask there records a projection COPY, not a hand-over, and the copy
+        // semantics say the body IS due a second time. That is the whole of
+        // what `!base_is_ref_view` buys here — a deep chain keeps consulting
+        // regardless, which is the behaviour -55 pinned.
+        if !hop_idxs.is_empty() || !base_is_ref_view {
             let mut place: Vec<usize> = hop_idxs.clone();
             place.push(idx);
             let flat_masked = self

@@ -7804,6 +7804,117 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-07-63 — the INVERSE of [`Self::mask_moved_field_in_bodies_walk`]:
+    /// a field that was moved out and has now been given a value of its own is
+    /// the base's to drop again, so put it back in the walker.
+    ///
+    /// Without this the mask was one-way. `let taken = g.one; g.one = mks(7);`
+    /// masked field `one` out of `g`'s walk — right for the value `taken` now
+    /// owns, wrong for the REPLACEMENT the next line stores there — and the new
+    /// value's body ran nowhere: `dS1 dS2 t1 dS1` against `--interp`'s
+    /// `dS2 dS7 t1 dS1`, missing `dS7` entirely. The sibling `g.two` kept its
+    /// `dS2` throughout, which is what says the walk is masked per FIELD rather
+    /// than disarmed wholesale, so a per-field re-arm is the matching shape.
+    ///
+    /// This is the move-out twin of the `field_view_flags` re-arm in the Assign
+    /// lowering ("held a view and has just been given a value of its own",
+    /// B-2026-09-02-10), and it is ordered the same way relative to
+    /// `emit_displaced_field_bodies`: the displacement reads the mask FIRST and
+    /// correctly declines the husk, and only then does the base become an owner
+    /// again. Reversing the two would restore the double fire this row is about.
+    ///
+    /// UNCONDITIONAL STORES ONLY, and that restriction is measured rather than
+    /// defensive. The mask is compile-time state while the store may be
+    /// runtime-conditional, so re-arming for `if f { g.one = mks(7); }` would
+    /// run a body over the moved-out husk on the path where `f` is false — a
+    /// live shape today (`hazF`) that both backends currently agree on. Asking
+    /// that the base's walk live in the INNERMOST frame is what separates the
+    /// two: an assignment inside a branch, loop or nested block compiles with
+    /// that frame pushed, so it declines and keeps today's behaviour, while a
+    /// straight-line assignment in the binding's own frame re-arms. The
+    /// conditional spelling therefore keeps the missing `dS7` — narrowed, not
+    /// fixed, and filed as its own row rather than buried here.
+    ///
+    /// Declines a base whose walker was DELETED rather than masked (the
+    /// one-field struct, where masking the only field empties it): there is no
+    /// action to swap and re-registering one from here would have to guess the
+    /// frame the let-site chose. That is the depth-1 twin of the absent
+    /// re-filled body the deep-chain pins document, and it stays absent.
+    pub(super) fn rearm_reassigned_moved_field(&mut self, base: &str, field: &str) {
+        // A BORROWED base never re-arms: the mask there records a projection
+        // COPY (B-2026-09-07-52), the base is not this frame's to own, and the
+        // copy's second body is the documented semantics rather than a leak.
+        if self.borrow_vars.ref_params.contains_key(base) {
+            return;
+        }
+        let Some(struct_name) = self.var_types.var_type_names.get(base).cloned() else {
+            return;
+        };
+        let Some(idx) = self
+            .type_decls
+            .struct_field_names
+            .get(&struct_name)
+            .and_then(|ns| ns.iter().position(|n| n == field))
+        else {
+            return;
+        };
+        if !self
+            .type_decls
+            .struct_moved_field_bodies
+            .get(base)
+            .is_some_and(|s| s.contains(&idx))
+        {
+            return;
+        }
+        let unconditional = self
+            .drop_rc
+            .scope_cleanup_actions
+            .last()
+            .is_some_and(|frame| {
+                frame.iter().any(|a| {
+                    matches!(a,
+                        super::state::CleanupAction::UserDrop { binding_name, kind, .. }
+                            if binding_name == base
+                                && *kind == super::state::UserDropKind::StructFieldBodies)
+                })
+            });
+        if !unconditional {
+            return;
+        }
+        if let Some(s) = self.type_decls.struct_moved_field_bodies.get_mut(base) {
+            s.remove(&idx);
+        }
+        // Rebuild from the map rather than from `idx` alone, the same contract
+        // the masking direction states: other move-outs of this binding, and
+        // the payload / nested mask kinds, must survive an unrelated re-arm.
+        let here: std::collections::BTreeSet<usize> = self
+            .type_decls
+            .struct_moved_field_bodies
+            .get(base)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let skip = self.field_skip_tree_for_var(base, here);
+        let subst = self
+            .type_decls
+            .enum_inst_var_types
+            .get(base)
+            .cloned()
+            .map(|i| self.generic_struct_subst_from_inst(&struct_name, &i))
+            .unwrap_or_default();
+        let rebuilt = if skip.is_empty() {
+            self.emit_user_drop_field_bodies_fn(&struct_name, &subst)
+        } else {
+            self.emit_user_drop_field_bodies_fn_skipping(&struct_name, &subst, &skip)
+        };
+        if let Some(bodies) = rebuilt {
+            self.replace_user_drop_fn_for_var(
+                base,
+                super::state::UserDropKind::StructFieldBodies,
+                bodies,
+            );
+        }
+    }
+
     /// B-2026-07-30-11 — emit `__karac_dropelems_<T>(vec: *mut {ptr,len,cap})`:
     /// run the user `impl Drop` BODY of every live element of a `Vec[T]` /
     /// `VecDeque[T]`, forward over `0..len`. `None` when `T` runs no user body.

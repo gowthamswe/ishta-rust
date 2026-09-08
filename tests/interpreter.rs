@@ -46849,6 +46849,81 @@ fn test_deep_chain_field_move_then_reassign_with_siblings() {
     );
 }
 
+/// B-2026-09-07-63 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_depth1_field_move_then_reassign_rearms_new_value`, same three sources
+/// and expected strings.
+///
+/// This backend was already right on all three cells and is the reference the
+/// row names: its depth-1 gate reads `moved_out_struct_field_bodies` directly
+/// rather than asking whether an action is still armed, so the reassign
+/// displaced nothing and the newly stored value was still the base's to drop.
+/// The pin exists to keep that reference fixed while codegen's gate is taught
+/// the same question — a later change here would turn the fix into a
+/// run-vs-build divergence pointing the other way.
+#[test]
+fn test_depth1_field_move_then_reassign_rearms_new_value() {
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 let taken = g.one;\n\
+                 g.one = mks(7);\n\
+                 println(f\"t{taken.id}\");\n\
+             }\n"),
+        "dS2\ndS7\nt1\ndS1\n"
+    );
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let f = false;\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 let taken = g.one;\n\
+                 if f { g.one = mks(7); }\n\
+                 println(f\"t{taken.id}\");\n\
+             }\n"),
+        "dS2\nt1\ndS1\n"
+    );
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 let taken = g.one;\n\
+                 println(\"m2\");\n\
+                 g.two = mks(8);\n\
+                 println(\"m3\");\n\
+                 println(f\"t{taken.id}\");\n\
+             }\n"),
+        "m2\ndS2\ndS8\nm3\nt1\ndS1\n"
+    );
+}
+
 /// B-2026-08-01-19 — interpreter twin of `tests/codegen.rs`'s
 /// `e2e_param_field_store_single_caller_fire`, same source and expected
 /// string. Pre-fix the base binding's Drop slot fired the caller-retained

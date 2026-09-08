@@ -31729,6 +31729,116 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-63 — a DEPTH-1 field move-out followed by a reassign of
+    /// that same field (`let taken = g.one; g.one = mks(7);`), which was BOTH
+    /// a body too many and a body too few on every compiled surface:
+    /// `dS1 dS2 t1 dS1` against `--interp`'s `dS2 dS7 t1 dS1`.
+    ///
+    /// The `dS1` too many is the displacement firing over the husk `taken`
+    /// already owns — `emit_displaced_field_bodies` rested on the `full_action`
+    /// gate at depth 1, and since B-2026-09-06-46 a move-out REPLACES that
+    /// action with a masked walker rather than deleting it, so the gate stayed
+    /// armed and stopped discriminating. It kept answering only for a ONE-FIELD
+    /// base, whose masked walker comes out empty and is deleted outright; the
+    /// sibling `two` here is what makes the walker survive. Exactly the
+    /// accident B-2026-09-06-55 removed one level down, removed one level up.
+    ///
+    /// The `dS7` too few is the mask never being lifted: the field is masked
+    /// for the value `taken` owns and stayed masked for the REPLACEMENT stored
+    /// on the next line, so the new value's body ran nowhere. `dS2` survives
+    /// throughout, which is what says the walk is masked per FIELD.
+    ///
+    /// Cell (b) is the guard on the restriction, not a second symptom. The mask
+    /// is compile-time state while the store may be runtime-conditional, so an
+    /// unconditional re-arm would run a body over the husk on the path the
+    /// assignment never took; the re-arm asks that the base's walk live in the
+    /// INNERMOST frame, which an `if` body is not. Both backends agree here
+    /// before and after the fix, and this cell fails if the re-arm is ever
+    /// loosened to fire inside a branch.
+    ///
+    /// Cell (c) is the per-field guard: assigning the UN-moved sibling must
+    /// give `two` its new body (`dS8`) without resurrecting the masked `one`.
+    ///
+    /// Bodies only — `valgrind --leak-check=full` on cell (a) reports
+    /// `All heap blocks were freed` and `0 errors` at KARAC_OPT_LEVEL 0 and 2,
+    /// before and after. Twin of `tests/interpreter.rs`'s
+    /// `test_depth1_field_move_then_reassign_rearms_new_value`.
+    #[test]
+    fn e2e_depth1_field_move_then_reassign_rearms_new_value() {
+        // (a) the row's cell: the reassign displaces nothing and the new
+        // value is the base's to drop.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   let taken = g.one;\n\
+             \x20   g.one = mks(7);\n\
+             \x20   println(f\"t{taken.id}\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dS2\ndS7\nt1\ndS1\n");
+        // (b) CONDITIONAL store — the re-arm must decline, or the untaken
+        // path runs a body over the moved-out husk.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let f = false;\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   let taken = g.one;\n\
+             \x20   if f { g.one = mks(7); }\n\
+             \x20   println(f\"t{taken.id}\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dS2\nt1\ndS1\n");
+        // (c) the UN-moved sibling: `two` re-fills normally while `one`
+        // stays masked.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   let taken = g.one;\n\
+             \x20   println(\"m2\");\n\
+             \x20   g.two = mks(8);\n\
+             \x20   println(\"m3\");\n\
+             \x20   println(f\"t{taken.id}\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "m2\ndS2\ndS8\nm3\nt1\ndS1\n");
+    }
+
     /// B-2026-08-01-19 — storing an owned param into a local container
     /// FIELD (`o.h = h;`) fired the caller-retained value's body TWICE on
     /// both backends (o's bodies walk at its death + the caller's NLL
