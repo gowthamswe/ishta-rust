@@ -8359,13 +8359,13 @@ fn main() {
     /// value nothing reads again is invisible to every output assertion, which
     /// is the whole reason the row needed a sanitizer to find it.
     ///
-    /// ONE EXPECTATION HERE ENCODES A DEFECT DELIBERATELY: `f` expects no
-    /// `dR1`. A field assign written as `self.one = r` INSIDE a method loses
-    /// the displaced value's user `Drop` body, while the caller-side spelling
-    /// `h.one = mk(37)` in `g` runs it (`dR2`). That is not this row's leak —
-    /// it is cross-backend consistent (the interpreter prints the same lines)
-    /// and is filed as B-2026-09-07-52; whoever closes that row must add `dR1`
-    /// here.
+    /// `f` EXPECTS `dR1` SINCE B-2026-09-07-52 CLOSED. It did not when this
+    /// fixture landed: a field assign written `self.one = r` INSIDE a method
+    /// lost the displaced value's user `Drop` body, while the caller-side
+    /// spelling `h.one = mk(37)` in `g` ran it (`dR2`). That was never this
+    /// row's leak — it was cross-backend consistent, bodies-only, and the
+    /// memory here was balanced either way; it was filed separately and its
+    /// fix added the line.
     fn asan_conditionally_unstored_and_displaced_struct_values_have_an_owner() {
         assert_clean_asan_run_min_allocs(
             r#"
@@ -8393,7 +8393,7 @@ fn c_elem()  { let mut v: Vec[R] = Vec.new(); v.push(mk(3)); v[0] = mk(38); prin
 fn main() { c_cond(); c_condf(); c_conda(); c_condy(); c_condn(); c_setm(); c_setd(); c_elem(); println("end"); }
 "#,
             &[
-                "dR31", "a0", "dR32", "b0", "dR33", "c0", "d1", "dR34", "dR35", "e0", "f36",
+                "dR31", "a0", "dR32", "b0", "dR33", "c0", "d1", "dR34", "dR35", "e0", "dR1", "f36",
                 "dR36", "dR2", "g37", "dR37", "dR3", "h38", "dR38", "end",
             ],
             "b0907-20-unstored-and-displaced",
@@ -8480,7 +8480,7 @@ fn main() {
 }
 "#,
             &[
-                "a1", "dR16", "b17", "dR17", "c1", "dR18", "d1", "dR19", "e1", "dR20", "f1",
+                "a1", "dR16", "dR1", "b17", "dR17", "c1", "dR18", "d1", "dR19", "e1", "dR20", "f1",
                 "dR21", "g2", "dR22", "dR23", "h51", "dR24", "i1", "dR25", "j1", "dR26", "dR27",
                 "k0", "l1", "dR28", "m1", "dS41", "n1", "dS42", "end",
             ],

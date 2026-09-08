@@ -5903,7 +5903,7 @@ fn main() {
         );
         if let Some(out) = out {
             assert_eq!(
-                out, "a1\ndR16\nb17\ndR17\nc1\ndR18\nd1\ndR19\ne1\ndR20\nf1\ndR21\ng2\ndR22\ndR23\nh51\ndR24\ni1\ndR25\nj1\ndR26\ndR27\nk0\nl1\ndR28\nm1\ndS41\nn1\ndS42\nend\n",
+                out, "a1\ndR16\ndR1\nb17\ndR17\nc1\ndR18\nd1\ndR19\ne1\ndR20\nf1\ndR21\ng2\ndR22\ndR23\nh51\ndR24\ni1\ndR25\nj1\ndR26\ndR27\nk0\nl1\ndR28\nm1\ndS41\nn1\ndS42\nend\n",
                 "a callee that stores its by-value argument into an outliving \
                  place owns it; the caller registers a second owner only where \
                  the callee's entry copy orphaned the original; got {out:?}"
@@ -31328,6 +31328,87 @@ fn main() {
             return;
         };
         assert_eq!(out, "a\ndrop 9 z9\nheld 5\ndrop 5 y5\nend\n");
+    }
+
+    /// B-2026-09-07-52 — a field assign whose base is a BORROWED view fires
+    /// the displaced old value's Drop body, on every surface.
+    ///
+    /// Two spellings were losing it. `self.one = r` inside a method never
+    /// reached `emit_displaced_field_bodies` at all, because that emitter
+    /// flattens the target's base over `Identifier`/`FieldAccess` and `self`
+    /// parses as `SelfValue` — the same shape B-2026-08-26-18 closed in the
+    /// INDEX-assign twin. `h.one = r` over a `mut ref Bs` param DID reach it
+    /// and then failed the `full_armed` gate, which reads the ROOT's
+    /// scope-exit `UserDrop` action: a frame that only borrows the aggregate
+    /// registers none, so a borrowed base failed it unconditionally.
+    ///
+    /// Nobody else fires this body. The caller's own scope-exit drop reads the
+    /// field AFTER the store, so it covers the NEW value (`dS7` here); the
+    /// displaced one has no other owner, and design.md pins "a value is
+    /// dropped exactly once".
+    ///
+    /// `c2` is the control the row was filed against — the caller-side
+    /// spelling `b.one = mks(7)`, which has fired since B-2026-08-01-20 and
+    /// must keep firing. `c3` is the free-function param view (the `full_armed`
+    /// half alone), `c4` a method assign whose RHS is a literal rather than a
+    /// param (so B-2026-08-01-19's owned-param retraction is not what is being
+    /// measured), and `c5` the deep chain `self.inner.one = r`.
+    ///
+    /// Measured on the parent: every cell but `c2` printed no `dS1`, on
+    /// `--interp` and both compiled backends alike. Twin of
+    /// `tests/interpreter.rs`'s
+    /// `test_borrowed_base_field_assign_displaced_bodies`.
+    #[test]
+    fn e2e_borrowed_base_field_assign_displaced_bodies() {
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs { return Rs { id: i, name: f\"h{i}\" }; }\n\
+             struct Bs { mut one: Rs }\n\
+             struct Outer { mut inner: Bs }\n\
+             impl Bs {\n\
+             \x20   fn set(mut ref self, r: Rs) { self.one = r; }\n\
+             \x20   fn set_lit(mut ref self) { self.one = mks(9); }\n\
+             }\n\
+             impl Outer {\n\
+             \x20   fn set_deep(mut ref self, r: Rs) { self.inner.one = r; }\n\
+             }\n\
+             fn setf(h: mut ref Bs, r: Rs) { h.one = r; }\n\
+             fn main() {\n\
+             \x20   println(\"c1\");\n\
+             \x20   let mut a = Bs { one: mks(1) };\n\
+             \x20   a.set(mks(7));\n\
+             \x20   println(f\"o{a.one.id}\");\n\
+             \x20   println(\"c2\");\n\
+             \x20   let mut b = Bs { one: mks(1) };\n\
+             \x20   b.one = mks(7);\n\
+             \x20   println(f\"o{b.one.id}\");\n\
+             \x20   println(\"c3\");\n\
+             \x20   let mut c = Bs { one: mks(1) };\n\
+             \x20   setf(mut c, mks(7));\n\
+             \x20   println(f\"o{c.one.id}\");\n\
+             \x20   println(\"c4\");\n\
+             \x20   let mut d = Bs { one: mks(1) };\n\
+             \x20   d.set_lit();\n\
+             \x20   println(f\"o{d.one.id}\");\n\
+             \x20   println(\"c5\");\n\
+             \x20   let mut e = Outer { inner: Bs { one: mks(1) } };\n\
+             \x20   e.set_deep(mks(7));\n\
+             \x20   println(f\"o{e.inner.one.id}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "c1\ndS1\no7\ndS7\nc2\ndS1\no7\ndS7\nc3\ndS1\no7\ndS7\n\
+             c4\ndS1\no9\ndS9\nc5\ndS1\no7\ndS7\nend\n"
+        );
     }
 
     /// B-2026-08-01-30 leg B — a COMPUTED pure-scalar index (`v[base - 1] =

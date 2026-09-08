@@ -13761,7 +13761,7 @@ fn main() {
         );
         if let Some(out) = out {
             assert_eq!(
-                out, "a1\ndR16\nb17\ndR17\nc1\ndR18\nd1\ndR19\ne1\ndR20\nf1\ndR21\ng2\ndR22\ndR23\nh51\ndR24\ni1\ndR25\nj1\ndR26\ndR27\nk0\nl1\ndR28\nm1\ndS41\nn1\ndS42\nend\n",
+                out, "a1\ndR16\ndR1\nb17\ndR17\nc1\ndR18\nd1\ndR19\ne1\ndR20\nf1\ndR21\ng2\ndR22\ndR23\nh51\ndR24\ni1\ndR25\nj1\ndR26\ndR27\nk0\nl1\ndR28\nm1\ndS41\nn1\ndS42\nend\n",
                 "the store-route admission gate must hold under auto-par \
                  outlining exactly as it does sequentially; got {out:?}"
             );

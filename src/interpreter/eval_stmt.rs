@@ -7915,6 +7915,14 @@ impl<'a> super::Interpreter<'a> {
                     let chain_base = loop {
                         match &chain_cur.kind {
                             ExprKind::Identifier(root) => break Some(root.clone()),
+                            // B-2026-09-07-52 — `self.f = <new>` inside a
+                            // method: `self` parses as `SelfValue`, so this
+                            // walk declined the shape and the displaced
+                            // value's body was lost, matching the codegen
+                            // twin's gap. The receiver lives in `env` under
+                            // the name "self", so the gates and the field
+                            // walk below read it like any other base.
+                            ExprKind::SelfValue => break Some("self".to_string()),
                             ExprKind::FieldAccess {
                                 object: inner,
                                 field: mid,

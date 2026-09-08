@@ -45783,6 +45783,61 @@ fn test_deep_chain_field_assign_displaced_bodies() {
     );
 }
 
+/// B-2026-09-07-52 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_borrowed_base_field_assign_displaced_bodies`, same source and expected
+/// string. The interpreter's Assign leg flattens the target's base with the
+/// same `Identifier`/`FieldAccess` walk codegen uses, so `self.f = <new>`
+/// (parsed as `SelfValue`) declined the shape and the displaced value's body
+/// was lost here too — this is not a run-vs-build divergence but one spelling
+/// losing a body on every surface.
+#[test]
+fn test_borrowed_base_field_assign_displaced_bodies() {
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs { return Rs { id: i, name: f\"h{i}\" }; }\n\
+             struct Bs { mut one: Rs }\n\
+             struct Outer { mut inner: Bs }\n\
+             impl Bs {\n\
+                 fn set(mut ref self, r: Rs) { self.one = r; }\n\
+                 fn set_lit(mut ref self) { self.one = mks(9); }\n\
+             }\n\
+             impl Outer {\n\
+                 fn set_deep(mut ref self, r: Rs) { self.inner.one = r; }\n\
+             }\n\
+             fn setf(h: mut ref Bs, r: Rs) { h.one = r; }\n\
+             fn main() {\n\
+                 println(\"c1\");\n\
+                 let mut a = Bs { one: mks(1) };\n\
+                 a.set(mks(7));\n\
+                 println(f\"o{a.one.id}\");\n\
+                 println(\"c2\");\n\
+                 let mut b = Bs { one: mks(1) };\n\
+                 b.one = mks(7);\n\
+                 println(f\"o{b.one.id}\");\n\
+                 println(\"c3\");\n\
+                 let mut c = Bs { one: mks(1) };\n\
+                 setf(mut c, mks(7));\n\
+                 println(f\"o{c.one.id}\");\n\
+                 println(\"c4\");\n\
+                 let mut d = Bs { one: mks(1) };\n\
+                 d.set_lit();\n\
+                 println(f\"o{d.one.id}\");\n\
+                 println(\"c5\");\n\
+                 let mut e = Outer { inner: Bs { one: mks(1) } };\n\
+                 e.set_deep(mks(7));\n\
+                 println(f\"o{e.inner.one.id}\");\n\
+                 println(\"end\");\n\
+             }\n"),
+        "c1\ndS1\no7\ndS7\nc2\ndS1\no7\ndS7\nc3\ndS1\no7\ndS7\n\
+         c4\ndS1\no9\ndS9\nc5\ndS1\no7\ndS7\nend\n"
+    );
+}
+
 /// B-2026-08-01-30 leg B — interpreter twin of `tests/codegen.rs`'s
 /// `e2e_computed_index_assign_displaced_elem_bodies`, same source and
 /// expected string. The typechecker desugars `base - 1` into

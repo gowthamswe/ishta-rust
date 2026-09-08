@@ -20686,6 +20686,20 @@ impl<'ctx> super::Codegen<'ctx> {
         let base = loop {
             match &cur.kind {
                 ExprKind::Identifier(root) => break root.clone(),
+                // B-2026-09-07-52 — `self.f = <new>` inside a method. `self`
+                // parses as `SelfValue`, not `Identifier("self")`, so without
+                // this arm the loop fell through to the decline and a
+                // method-side field assign never reached this emitter at all:
+                // the displaced value's body was lost on every surface while
+                // the caller-side spelling `b.f = <new>` printed it. The
+                // binding IS registered under the name "self" (methods bind
+                // their receiver there, the same normalisation
+                // `compile_index_store` uses), so every gate below — the
+                // var-type lookup, the armed-action checks, the GEP walk —
+                // answers for the receiver exactly as it does for a `mut ref`
+                // struct param. Same shape as B-2026-08-26-18's fix in the
+                // INDEX-assign twin.
+                ExprKind::SelfValue => break "self".to_string(),
                 ExprKind::FieldAccess {
                     object: inner,
                     field: mid,
@@ -20716,10 +20730,34 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(slot) = self.variables.get(base.as_str()).copied() else {
             return;
         };
+        // B-2026-09-07-52 — a BORROWED base (`mut ref self`, or a `mut ref T`
+        // struct param) needs two things this emitter never had, because until
+        // the `SelfValue` arm above it could only ever be reached with an owned
+        // local:
+        //
+        //  * ITS SLOT HOLDS A POINTER TO THE CALLER'S STRUCT, not the struct.
+        //    GEPping `slot.ptr` would index the alloca's first 8 bytes — the
+        //    pointer value itself — and hand the field walker junk. One deref
+        //    yields the struct address, the same single load
+        //    `lower_field_access_ptr`'s `is_ref_param` arm does.
+        //  * IT CARRIES NO SCOPE-EXIT `UserDrop` ACTION IN THIS FRAME, because
+        //    this frame does not own it. That is what the `full_armed` gate
+        //    below reads, so a borrowed base failed it unconditionally and the
+        //    displaced value's body was dropped on the floor.
+        let base_is_ref_view = self.borrow_vars.ref_params.contains_key(base.as_str());
+        let deref_base_ptr = if base_is_ref_view {
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            match self.builder.build_load(ptr_ty, slot.ptr, "dispf.refbase") {
+                Ok(v) => Some(v.into_pointer_value()),
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
         // Walk the middle segments: each must be a plain non-shared,
         // non-generic struct field so the GEP chain stays offset-correct.
         let mut base_tn = root_tn.clone();
-        let mut base_ptr = slot.ptr;
+        let mut base_ptr = deref_base_ptr.unwrap_or(slot.ptr);
         // B-2026-09-06-55 — the hop INDICES alongside the GEP walk, so the
         // move-out gate below can name the assigned place the way the mask
         // maps key it.
@@ -20824,6 +20862,18 @@ impl<'ctx> super::Codegen<'ctx> {
         // the same places. DEEP CHAINS ONLY: a depth-1 target keeps whatever
         // the `full_action` gate answered for it, because that is a separate
         // question with its own pins and no measurement here.
+        // B-2026-09-07-52 — and a BORROWED base deliberately does NOT consult
+        // this mask, measured rather than assumed. The language has no
+        // move-out of a borrow: reading a non-`Copy` field off a borrowed
+        // value is an implicit COPY, which the compiler says out loud
+        // (`borrow_projection_copy`: "this binding is an independent value
+        // rather than a view … any user `Drop` body runs a second time").
+        // Codegen records that read in the same mask a real hand-over uses, so
+        // consulting it here deleted a body the copy semantics say is due —
+        // `let x = self.one; self.one = r;` printed one `dS1` against the
+        // interpreter's two, a run-vs-build divergence this row's fix would
+        // otherwise have introduced. The interpreter's twin mask is not set by
+        // a projection copy at all, which is the parity being restored.
         if !hop_idxs.is_empty() {
             let mut place: Vec<usize> = hop_idxs.clone();
             place.push(idx);
@@ -20867,7 +20917,7 @@ impl<'ctx> super::Codegen<'ctx> {
                         if *binding_ptr == slot.ptr && without != Some(*drop_fn))
             })
         });
-        if !full_armed {
+        if !full_armed && !base_is_ref_view {
             return;
         }
         let Some(st_ty) = self.type_decls.struct_types.get(&base_tn).copied() else {
