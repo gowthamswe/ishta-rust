@@ -92,7 +92,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 397 |
+| miscompile | 398 |
 | run-vs-build | 371 |
 | leak | 297 |
 | double-free | 212 |
@@ -100,17 +100,17 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen-gap | 168 |
 | diagnostics | 125 |
 | false-positive | 106 |
-| perf | 100 |
+| perf | 101 |
 | soundness | 95 |
 | other | 81 |
 | crash | 77 |
-| use-after-free | 33 |
+| use-after-free | 36 |
 
 ### By surface
 
 | surface | total |
 |---|---|
-| codegen | 1593 |
+| codegen | 1598 |
 | interp | 404 |
 | typecheck | 295 |
 | other | 75 |
@@ -164,7 +164,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
-| B-2026-09-07-40 | 2026-09-07 | other | medium | NOTHING IN THIS REPO CAN CATCH A USE-AFTER-FREE WRITE -- `tests/memory_sanitizer.rs` links `-fsanitize=address` but never INSTRUMENTS the karac-emitted object, so ASAN there is an allocator-interception gate (leaks, double/invalid free) and is blind to an invalid read or write; valgrind sees them and no harness or CI job runs valgrind | — |
 | B-2026-09-07-41 | 2026-09-07 | codegen | low | A WHOLE-VALUE REBIND OF A BY-VALUE ENUM PARAM STRANDS ITS PAYLOAD AT -O0 -- `fn rebind(w: W) -> i64 { let v = w; return match v { W.T(x) => x.a.unwrap_or(0), .. } }` loses the payload `String`, correcting B-2026-09-07-33's claim that this neighbour measures 0 errors | — |
 | B-2026-09-07-42 | 2026-09-07 | codegen | high | PERF-REGRESSION, CORPUS-WIDE AND UNNOTICED SINCE ~2026-08: 12 of the 23 map-bearing benched katas whose recorded-run binary survives execute 1.30x-4.17x MORE INSTRUCTIONS built by today's karac than by the karac that produced their published figure -- up to 7.46x on WALL CLOCK (kata:146 236 -> 1683 ms), with IPC falling too, every sink identical, and the old binaries still reproducing their recorded numbers to 2-5%; source change, lane, placement, iterator-fallback and map-capacity all ruled out, and neither key/value type nor recorded date separates the regressed half from the flat half | kata:170 results.json still publishes the pre-regression 997.08 ms | found while running B-2026-08-28-77's placement sweep, where kata:170 was the positive control and failed to fire | CAUSE: 59c8d30cd (2026-08-22), the landing half of B-2026-08-21-6 — a deliberate security fix whose cost was never measured |
 | B-2026-09-07-43 | 2026-09-07 | codegen | medium | THE IF/ELSE SPELLING OF A DISCARDED AGGREGATE LITERAL NEVER REACHES THE OWNER REGISTRAR, so an RC-boxed projection's COPY is stranded -- 190 B in 5 blocks over a five-trip loop and 38 B in 1 with the source merely read afterwards, while the same construct with no `else`, the bare-statement spelling and the read-after-loop spelling are all clean since 8f3751b15 | tests/asan-o0-known-failures.txt |
@@ -175,6 +174,11 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-50 | 2026-09-07 | codegen | medium | A CALLEE THAT READS ITS BY-VALUE PARAM AFTER A CONDITIONAL STORE LOSES THE `Drop` BODY OUTRIGHT ON THE COMPILED BACKENDS -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` at `k = false` prints no body while `--interp` prints it, and strands the param's whole heap (20 B in 2 blocks at -O0, 120 B in 12 over a six-trip loop); the same read placed BEFORE the store, or a trailing statement that does not read the param, is clean on both counts | — |
 | B-2026-09-07-51 | 2026-09-07 | codegen | medium | THE MONO LEG CARRIES NO CONDITIONAL-STORE REGISTRATION -- `fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }` at `k = false` runs NO `Drop` body on the compiled backends while `--interp` runs it, and leaks the argument's `shared` refcount block (16 B in 1 at -O0); the NON-generic spelling of the identical callee is clean on both counts, which is what isolates genericity as the whole difference | — |
 | B-2026-09-07-52 | 2026-09-07 | codegen+interp | medium | A FIELD ASSIGN WRITTEN `self.one = r` INSIDE A METHOD LOSES THE DISPLACED VALUE'S `Drop` BODY ON EVERY SURFACE -- B-2026-08-01-20's `emit_displaced_field_bodies` flattens the target's base for an `Identifier` root and `self` parses as `SelfValue`, so the caller-side spelling `h.one = mk(37)` prints the old value's body and the method-side one prints nothing, on the interpreter as well as both compiled backends; memory is unaffected, and it is the same gap B-2026-08-26-18 closed in the INDEX-assign twin | — |
+| B-2026-09-07-53 | 2026-09-07 | codegen | high | AT EQUAL HASHING kara's Map IS NOW SLOWER THAN RUST'S, INVERTING A PUBLISHED HEADLINE: on 3 of 4 re-measured map katas kara went from 3-4x AHEAD of both rustc builds to 1.2-2.4x BEHIND (kata:146 0.31x -> 2.35x vs rust_ovf), and also lost its lead over Go -- so the 2026-06-15 equal-safety claim "parity with memory-safe Rust, BEATS IT ON COLLECTIONS" rested on comparing kara's compile-time-constant-seeded FxHash against Rust's per-process SipHash-1-3, and cannot be quoted until the collection set is re-run | BENCHMARKS.md + the 16 collection/pointer kata READMEs still publish the pre-59c8d30cd collection-superiority claim | corrects the unmeasured speculation in B-2026-09-07-42's COST DECOMPOSED section |
+| B-2026-09-07-54 | 2026-09-07 | codegen | high | A REUSED `let`-BOUND `Vec[Option[shared T]]` HAS ITS ELEMENT RC DEC READ A FREED CONTROL BLOCK -- `__karac_vec_elem_rc_dec_Node` reads offset 0 of a 32-byte block `__karac_rc_drop_Node` already freed; the fixture is named `no_uaf` and could not see one | none |
+| B-2026-09-07-55 | 2026-09-07 | codegen | high | A SHARED-ENUM BOXED STRUCT PAYLOAD MOVE-OUT LEAVES `__karac_rc_drop_E` READING ITS OWN FREED 120-BYTE BLOCK -- the fixture is named `no_double_free` and there is indeed no double free, only a read of freed memory nothing could see | none |
+| B-2026-09-07-56 | 2026-09-07 | codegen | high | AN INDEX-ASSIGN OVERWRITE OF A PLAIN `shared` Vec ELEMENT READS THE ELEMENT IT JUST RELEASED -- `main` reads offset 0 of a 16-byte block `__karac_vec_elem_rc_dec_Node` freed; caught only once the object is instrumented | none |
+| B-2026-09-07-57 | 2026-09-07 | codegen | high | A DISCARDED PROJECTED-FIELD LITERAL OVER A LOOP READS 8 BYTES PAST ITS ONE STACK OBJECT -- `stack-buffer-overflow` in `go` at frame offset 40, the only NON-heap finding of the instrumented leg's first run | none |
 
 ### Relocated
 
@@ -2389,6 +2393,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-37 | other | medium | RUNNING THE GATE SUITE REPLACES THE CANONICAL RUNTIME ARCHIVE WITH A NON-DCE'D ONE -- `tests/par_codegen.rs` built it with the forbidden `cargo build… | 4bd617d8e |
 | B-2026-09-07-38 | codegen | medium | THE -O0 ASAN RATCHET IS RED ON `main`, WITH THREE UNLISTED LEAK FAILURES THAT ARRIVED WITH 6a4a86c78 -- one is that commit's OWN new fixture (`asan_b… | 8f3751b15 |
 | B-2026-09-07-39 | codegen | medium | FLOAT f-STRING INTERPOLATION IS STILL ON libc `snprintf` (spec'd holes) AND STILL ALLOCATES A `String` PER CALL (`karac_runtime_f64_to_str` / `_i128_… | 0e7ace131 |
+| B-2026-09-07-40 | other | medium | NOTHING IN THIS REPO CAN CATCH A USE-AFTER-FREE WRITE -- `tests/memory_sanitizer.rs` links `-fsanitize=address` but never INSTRUMENTS the karac-emitt… | 415f0ae86 |
 | B-2026-09-07-45 | codegen | medium | THE SPEC-RE-PARSING FORMATTER WAS LEFT AT 64 BITS WHEN ITS FAST-PATH SIBLING WAS WIDENED -- `f"{big:^44}"`, `f"{big:b}"` and `f"{big:*>44}"` on a `u1… | 4b03864d1 |
 | B-2026-09-07-46 | codegen | high | A SPEC'D FLOAT HOLE WIDER THAN ITS BUFFER PRINTS UNINITIALIZED STACK -- `f"{x:.2}"` on `f64::MAX` is 312 bytes into a 64-byte buffer, and codegen use… | 0e7ace131 |
 
