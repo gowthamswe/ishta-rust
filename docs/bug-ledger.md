@@ -92,12 +92,12 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 398 |
+| miscompile | 399 |
 | run-vs-build | 371 |
 | leak | 298 |
 | double-free | 212 |
 | missing-feature | 194 |
-| codegen-gap | 168 |
+| codegen-gap | 169 |
 | diagnostics | 125 |
 | false-positive | 106 |
 | perf | 101 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1599 |
+| codegen | 1601 |
 | interp | 404 |
 | typecheck | 295 |
 | other | 75 |
@@ -174,10 +174,11 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-51 | 2026-09-07 | codegen | medium | THE MONO LEG CARRIES NO CONDITIONAL-STORE REGISTRATION -- `fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }` at `k = false` runs NO `Drop` body on the compiled backends while `--interp` runs it, and leaks the argument's `shared` refcount block (16 B in 1 at -O0); the NON-generic spelling of the identical callee is clean on both counts, which is what isolates genericity as the whole difference | — |
 | B-2026-09-07-52 | 2026-09-07 | codegen+interp | medium | A FIELD ASSIGN WRITTEN `self.one = r` INSIDE A METHOD LOSES THE DISPLACED VALUE'S `Drop` BODY ON EVERY SURFACE -- B-2026-08-01-20's `emit_displaced_field_bodies` flattens the target's base for an `Identifier` root and `self` parses as `SelfValue`, so the caller-side spelling `h.one = mk(37)` prints the old value's body and the method-side one prints nothing, on the interpreter as well as both compiled backends; memory is unaffected, and it is the same gap B-2026-08-26-18 closed in the INDEX-assign twin | — |
 | B-2026-09-07-53 | 2026-09-07 | codegen | high | AT EQUAL HASHING kara's Map IS NOW SLOWER THAN RUST'S, INVERTING A PUBLISHED HEADLINE: on 3 of 4 re-measured map katas kara went from 3-4x AHEAD of both rustc builds to 1.2-2.4x BEHIND (kata:146 0.31x -> 2.35x vs rust_ovf), and also lost its lead over Go -- so the 2026-06-15 equal-safety claim "parity with memory-safe Rust, BEATS IT ON COLLECTIONS" rested on comparing kara's compile-time-constant-seeded FxHash against Rust's per-process SipHash-1-3, and cannot be quoted until the collection set is re-run | BENCHMARKS.md + the 16 collection/pointer kata READMEs still publish the pre-59c8d30cd collection-superiority claim | corrects the unmeasured speculation in B-2026-09-07-42's COST DECOMPOSED section |
-| B-2026-09-07-54 | 2026-09-07 | codegen | high | A REUSED `let`-BOUND `Vec[Option[shared T]]` HAS ITS ELEMENT RC DEC READ A FREED CONTROL BLOCK -- `__karac_vec_elem_rc_dec_Node` reads offset 0 of a 32-byte block `__karac_rc_drop_Node` already freed; the fixture is named `no_uaf` and could not see one | none |
 | B-2026-09-07-55 | 2026-09-07 | codegen | high | A SHARED-ENUM BOXED STRUCT PAYLOAD MOVE-OUT LEAVES `__karac_rc_drop_E` READING ITS OWN FREED 120-BYTE BLOCK -- the fixture is named `no_double_free` and there is indeed no double free, only a read of freed memory nothing could see | none |
 | B-2026-09-07-56 | 2026-09-07 | codegen | high | AN INDEX-ASSIGN OVERWRITE OF A PLAIN `shared` Vec ELEMENT READS THE ELEMENT IT JUST RELEASED -- `main` reads offset 0 of a 16-byte block `__karac_vec_elem_rc_dec_Node` freed; caught only once the object is instrumented | none |
 | B-2026-09-07-57 | 2026-09-07 | codegen | high | A DISCARDED PROJECTED-FIELD LITERAL OVER A LOOP READS 8 BYTES PAST ITS ONE STACK OBJECT -- `stack-buffer-overflow` in `go` at frame offset 40, the only NON-heap finding of the instrumented leg's first run | none |
+| B-2026-09-07-59 | 2026-09-07 | codegen | high | A `.clone()` OVER A FIELD RECEIVER RETURNS AN EMPTY CHAIN ON EVERY COMPILED BACKEND -- `let s = n.left.clone()` prints 0 against `--interp`'s 2, silently at -O2, and the match-arm spelling diverges identically | none |
+| B-2026-09-07-60 | 2026-09-07 | codegen | medium | A `.clone()` OVER A CALL RECEIVER FAILS CODEGEN OUTRIGHT -- `mk().clone()` where `mk() -> Option[shared T]` dies on `no handler for method 'clone' on non-identifier receiver` while `--interp` answers 4 | none |
 | B-2026-09-07-58 | 2026-09-08 | codegen | medium | AN RC-PROMOTED BINDING PUBLISHED THROUGH A VALUE-PRODUCING `par` BLOCK'S JOIN STILL LOSES ITS BOX -- `let (t, k) = par { let t = mkp(9); ... (t, k) }` strands 40 B + 38 B in BOTH lanes, because the outer destructuring `let` rebinds the name over the pointer-typed entry B-2026-09-07-47 installs | — |
 
 ### Relocated
@@ -2397,6 +2398,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-45 | codegen | medium | THE SPEC-RE-PARSING FORMATTER WAS LEFT AT 64 BITS WHEN ITS FAST-PATH SIBLING WAS WIDENED -- `f"{big:^44}"`, `f"{big:b}"` and `f"{big:*>44}"` on a `u1… | 4b03864d1 |
 | B-2026-09-07-46 | codegen | high | A SPEC'D FLOAT HOLE WIDER THAN ITS BUFFER PRINTS UNINITIALIZED STACK -- `f"{x:.2}"` on `f64::MAX` is 312 bytes into a 64-byte buffer, and codegen use… | 0e7ace131 |
 | B-2026-09-07-47 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lan… | b440bbe |
+| B-2026-09-07-54 | codegen | high | A REUSED `let`-BOUND `Vec[Option[shared T]]` HAS ITS ELEMENT RC DEC READ A FREED CONTROL BLOCK -- `__karac_vec_elem_rc_dec_Node` reads offset 0 of a… | 6d46e2a |
 
 </details>
 
