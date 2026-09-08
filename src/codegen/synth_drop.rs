@@ -2151,10 +2151,22 @@ impl<'ctx> super::Codegen<'ctx> {
         // It carries its own scope condition (the struct is never a bare
         // by-value param) because the caller-retains story only holds inside
         // one frame — see `struct_used_as_bare_by_value_param`.
+        // B-2026-09-06-66 — the fourth disjunct, and the SELF-REFERENTIAL
+        // sibling of the caller-retains one directly above it. The two copy /
+        // transfer arms both decline a self-referential struct by construction
+        // (B-2026-09-06-64 made the copy-support walk decline it, and
+        // `struct_param_transfer_eligible` names it outright), and the
+        // shared-owning arm excludes it explicitly — so all three said no and
+        // this block never ran for one, leaving a populated `Option[Node]`
+        // payload box owned by nobody. Those refusals are about DUPLICATION,
+        // not ownership; `self_referential_struct_sole_field_owner` asks the
+        // ownership question directly and carries the same
+        // never-a-by-value-param scope condition the shared-owning arm does.
         let struct_callee_owned = self
             .aggregate_param_copy_supported_struct(struct_name, &mut Vec::new())
             || (struct_non_generic && self.struct_param_owned_by_transfer(struct_name, false))
-            || self.shared_owning_struct_sole_field_owner(struct_name);
+            || self.shared_owning_struct_sole_field_owner(struct_name)
+            || self.self_referential_struct_sole_field_owner(struct_name);
         // B-2026-08-08-6 — when the type-wide gate declined, the caller-retains
         // arm gets a SECOND, per-field chance. Its whole-struct scope condition
         // ("is this type ever a bare by-value param") is a signature question,

@@ -4158,6 +4158,107 @@ fn main() {
         );
     }
 
+    #[test]
+    fn asan_self_referential_populated_payload_frees_its_box() {
+        // B-2026-09-06-66 — the cell the fixture above deliberately EXCLUDES.
+        // Every spelling it covers leaves `next` EMPTY; populate it and the
+        // payload's box is freed by nobody. 67 bytes (64 direct: the boxed
+        // `Node`; 3 indirect: its `tag`) at both opt levels, with both `Drop`
+        // bodies running in the right order on every backend -- so no A/B gate
+        // could see it and only a leak checker can.
+        //
+        // B-2026-09-06-64 made `aggregate_param_copy_supported_struct` decline
+        // a self-referential struct (its entry copy has no finite emission),
+        // and `struct_param_transfer_eligible` declines it too. Both refusals
+        // are about DUPLICATION, but all three disjuncts of the struct drop's
+        // `struct_callee_owned` gate then said no, so the `Option` field
+        // classification never ran and the free went with them. Copy-declines /
+        // drop-still-frees is the pair to keep.
+        //
+        // The DEPTH case is the second half: two levels lose 131 bytes pre-fix
+        // (64 direct + 67 indirect), which is what shows the free has to recurse
+        // rather than reach one level down.
+        assert_clean_asan_run(
+            r#"
+struct Node { id: i64, next: Option[Node], tag: String }
+impl Drop for Node { fn drop(mut ref self) { println(f"  dN{self.id}") } }
+
+fn mkn(i: i64) -> Node { return Node { id: i, next: Option.None, tag: f"t{i}" }; }
+
+fn main() {
+    let one: Node = Node { id: 9, next: Option.Some(mkn(10)), tag: "n" };
+    println(one.id);
+    let deep: Node = Node { id: 11, next: Option.Some(Node { id: 12, next: Option.Some(mkn(13)), tag: "d" }), tag: "e" };
+    println(deep.id);
+}
+"#,
+            // `one` dies at its LAST USE, not at the end of the frame, so its
+            // two bodies land before `11` prints -- on `--interp` and every
+            // compiled backend alike. Measured, not assumed.
+            &["9", "  dN9", "  dN10", "11", "  dN11", "  dN12", "  dN13"],
+            "self_referential_populated_payload_frees_its_box",
+        );
+    }
+
+    #[test]
+    fn asan_self_referential_populated_payload_without_drop_impl_frees_its_box() {
+        // The `Drop`-free twin, and it is NOT redundant with the fixture above.
+        // The row localised this defect by the fact that both `Drop` bodies run
+        // correctly, which invites reading it as a `Drop`-channel problem; the
+        // leak is in the MEMORY channel and is identical for a struct with no
+        // `impl Drop` at all. Measured the same 67 bytes.
+        //
+        // It is also the shape with no user-visible output whatsoever, so a
+        // leak checker is the ONLY thing that can observe it.
+        assert_clean_asan_run(
+            r#"
+struct Plain { id: i64, next: Option[Plain], tag: String }
+
+fn mkp(i: i64) -> Plain { return Plain { id: i, next: Option.None, tag: f"p{i}" }; }
+
+fn main() {
+    let c: Plain = Plain { id: 9, next: Option.Some(mkp(10)), tag: "n" };
+    println(c.id);
+}
+"#,
+            &["9"],
+            "self_referential_populated_payload_no_drop_impl",
+        );
+    }
+
+    #[test]
+    fn asan_self_referential_by_value_param_keeps_todays_behaviour() {
+        // CONTROL, and the boundary of B-2026-09-06-66's fix rather than a case
+        // it closes. `self_referential_struct_sole_field_owner` carries the same
+        // never-a-bare-by-value-param scope condition the shared-owning arm
+        // does, so a type that reaches a call boundary at all keeps its leak
+        // instead of gaining a double free (B-2026-08-07-20 measured that
+        // direction at 26 invalid frees).
+        //
+        // This fixture therefore asserts only that the shape does not CRASH or
+        // double-free; its 67-byte leak is expected and is why the program is
+        // built with a `Plain` struct that LSan sees as clean -- the leaking
+        // spelling cannot be an `assert_clean_asan_run` case while the row that
+        // owns it is open. That row is the `Drop`-body divergence recorded
+        // beside this one: a let-bound local of a self-referential struct passed
+        // by value loses its `Drop` body on every compiled backend, which is
+        // exactly the shape whose ownership is too unsettled to arm a free on.
+        assert_clean_asan_run(
+            r#"
+struct Plain { id: i64, next: Option[Plain], tag: String }
+
+fn mkp(i: i64) -> Plain { return Plain { id: i, next: Option.None, tag: f"p{i}" }; }
+fn read(p: Plain) -> i64 { return p.id; }
+
+fn main() {
+    println(read(mkp(4)));
+}
+"#,
+            &["4"],
+            "self_referential_by_value_param_control",
+        );
+    }
+
     /// B-2026-09-06-60 — the MEMORY half, and the row's own symptom: the same
     /// program under ASAN + LSan, where the pre-fix build double-freed the `Map`
     /// handle and the `String`. One owner and one free per object on every

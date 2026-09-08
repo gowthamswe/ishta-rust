@@ -2021,6 +2021,56 @@ impl<'ctx> super::Codegen<'ctx> {
             && !self.aggregate_param_copy_supported_struct(struct_name, &mut Vec::new())
     }
 
+    /// B-2026-09-06-66 — the SELF-REFERENTIAL sibling of
+    /// [`Self::shared_owning_struct_sole_field_owner`], and the third way a
+    /// frame turns out to be a struct's sole owner.
+    ///
+    /// B-2026-09-06-64 made `aggregate_param_copy_supported_struct` decline a
+    /// self-referential struct, which is right — the entry copy has no finite
+    /// emission for one — and `struct_param_transfer_eligible` declines it too.
+    /// So all three disjuncts of `emit_struct_drop_synthesis_impl`'s
+    /// `struct_callee_owned` say no, the `Option`/`Result` field classification
+    /// block below them never runs, and a `Node { next: Option.Some(..) }`
+    /// payload BOX is freed by nobody: 67 bytes at both opt levels, with both
+    /// `Drop` bodies running in the right order on every backend, so no A/B
+    /// gate sees it.
+    ///
+    /// COPY-DECLINES AND DROP-STILL-FREES IS THE PAIR TO KEEP. Those two
+    /// refusals are about duplication, not about ownership — the same reading
+    /// `shared_owning_struct_sole_field_owner` applies to its own pair of
+    /// refusals — so the ownership question gets asked directly instead of
+    /// being inferred from them.
+    ///
+    /// It carries the SAME scope condition as the shared-owning arm, for the
+    /// same reason and not by analogy: a struct the entry copy declines is
+    /// caller-retains at a call boundary, so a callee that moves the promoted
+    /// field out zeroes only ITS shallow copy and the caller's frame never sees
+    /// the write. Arming this drop for a type that reaches a call boundary at
+    /// all would double-free exactly as B-2026-08-07-20 measured. A struct that
+    /// is both let-bound and passed by value therefore keeps the leak rather
+    /// than gaining a double free.
+    ///
+    /// Non-generic for `struct_used_as_bare_by_value_param`'s reason: the drop
+    /// fn is synthesized once per struct TYPE and must be right at every death
+    /// of it, so the gate needs one answer true at every site at once.
+    pub(super) fn self_referential_struct_sole_field_owner(&self, struct_name: &str) -> bool {
+        if !self.type_decls.struct_types.contains_key(struct_name)
+            || self.type_decls.shared_types.contains_key(struct_name)
+        {
+            return false;
+        }
+        if !self
+            .type_decls
+            .struct_generic_params
+            .get(struct_name)
+            .is_none_or(|g| g.is_empty())
+        {
+            return false;
+        }
+        self.struct_is_self_referential(struct_name)
+            && !self.struct_used_as_bare_by_value_param(struct_name)
+    }
+
     /// Does ANY function, method, or `self` receiver in the program take
     /// `struct_name` as a BARE BY-VALUE parameter?
     ///
