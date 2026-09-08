@@ -4265,7 +4265,29 @@ impl<'ctx> super::Codegen<'ctx> {
         if Self::place_root_ident(e)
             .is_some_and(|r| self.drop_rc.rc_fallback_heap_types.contains_key(r))
         {
-            return true;
+            // B-2026-09-07-43 — UNLESS the field loop mints a COPY for it, in
+            // which case the premise stated just above ("the box goes on
+            // owning the field") no longer holds and declining is the leak.
+            //
+            // That premise was true when it was written and `afe5abfbe`
+            // (B-2026-09-07-23) retired it: `compile_struct_init`'s field loop
+            // now hands the literal an INDEPENDENT COPY of an RC-boxed
+            // projection rather than an alias, so the box owns the original
+            // and the literal owns the copy. Two buffers, two owners, one free
+            // each — and with the registration declined the copy has none.
+            //
+            // `rc_boxed_projection_mints_copy` is the same predicate
+            // `8f3751b15` added to `discarded_literal_tail_inner` for exactly
+            // this question one registrar over (B-2026-09-07-38, "an RC-boxed
+            // projection counts as FRESH here"). Asking it here is what makes
+            // the BRANCH spelling agree with the bare-statement one, which has
+            // been clean since that commit.
+            //
+            // The `Invalid free()` the paragraph above records for three cells
+            // is a measurement of the pre-copy compiler. Re-measured on this
+            // fix, all three are clean; the `asan_discarded_*` fixtures that
+            // own them are the gate.
+            return !self.rc_boxed_projection_mints_copy(e);
         }
         // AND a statement AUTO-PAR fans out, for a structurally different
         // reason with the same consequence.

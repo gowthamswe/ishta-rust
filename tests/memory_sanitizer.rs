@@ -65228,6 +65228,113 @@ fn main() { println(go()); }
     /// the direction that matters while the guard stands. Splitting it out
     /// keeps the other two cells of that fixture live on the `-O0` leg
     /// instead of quarantining them along with this one.
+    /// B-2026-09-07-43 — a discarded `if`/`else` whose ARMS include an RC-boxed
+    /// field projection registers an owner, on every path.
+    ///
+    /// THE DECLINE WAS PER-CONSTRUCT, NOT PER-PATH, and that is what these
+    /// cells pin. `try_track_discarded_user_drop_temp` is the only registrar a
+    /// discarded `if` reaches, and `discard_branch_tail_aliases_a_temp` gates
+    /// it by OR-ing `field_init_aliases_a_temp` across EVERY arm — so one
+    /// projecting arm declined the whole construct and whichever arm actually
+    /// RAN lost its heap. Cell (a) is the proof: its projecting arm is never
+    /// taken, and what leaked was the OTHER arm's freshly minted buffer.
+    ///
+    /// WHY (a) IS THE LOAD-BEARING CELL. The two fixtures this row was filed
+    /// against both take the PROJECTING arm, where the stranded buffer is the
+    /// copy of `t.a` — a dead allocation at `-O2`, which LLVM elides. That is
+    /// the only reason this family read as `-O0`-only and sat on the
+    /// quarantine lists. Take the MINTING arm instead and the same defect
+    /// strands a live `payload2()` buffer that no optimizer can remove:
+    /// measured on the parent at 355 B in 5 blocks at BOTH opt levels, so this
+    /// cell is red under the plain `--features llvm` leg CI already runs, not
+    /// only under `scripts/asan-o0-leg.sh`.
+    ///
+    /// The two arm strings are deliberately DIFFERENT LENGTHS (38 B vs 71 B).
+    /// That is what attributed the leak: 355 = 5 x 71 names the mint, and
+    /// 190 = 5 x 38 names the copy. With equal-length payloads both readings
+    /// are 190 B and the fixture cannot say which buffer it lost — which is
+    /// how the row came to describe this as a projecting arm poisoning its
+    /// SIBLING, when in fact the construct is unowned as a whole.
+    ///
+    /// Cell (c) pins that arm ORDER is irrelevant (the projecting arm as
+    /// `else` measures identically), and cell (d) that BOTH arms projecting is
+    /// the same defect rather than a separate one.
+    #[test]
+    fn asan_discarded_branch_projecting_arm_still_owns_every_path() {
+        // (a) The projecting arm is NOT taken — the minting sibling's buffer is
+        // what strands, at both opt levels. 355 B / 5 pre-fix.
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn payload2() -> String { f"payload2-{seed()}-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn go() -> i64 {
+    let t = mkp(9);
+    let mut i = 0i64;
+    while i < 5i64 {
+        if seed() > 99i64 { P { a: t.a, b: 1 } } else { P { a: payload2(), b: 2 } };
+        i = i + 1;
+    }
+    return t.b;
+}
+fn main() { println(go()); }
+"#,
+            &["9"],
+            "b0907-43-projecting-arm-not-taken",
+            10,
+        );
+        // (c) Arm ORDER is irrelevant: the projecting arm as `else`, the
+        // minting arm taken. Measures identically pre-fix (355 B / 5, both
+        // levels), which is what rules out a first-arm-decides resolution.
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn payload2() -> String { f"payload2-{seed()}-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn go() -> i64 {
+    let t = mkp(9);
+    let mut i = 0i64;
+    while i < 5i64 {
+        if seed() > 0i64 { P { a: payload2(), b: 2 } } else { P { a: t.a, b: 1 } };
+        i = i + 1;
+    }
+    return t.b;
+}
+fn main() { println(go()); }
+"#,
+            &["9"],
+            "b0907-43-projecting-arm-as-else",
+            10,
+        );
+        // (d) BOTH arms project — the same defect, not a separate one. 190 B / 5
+        // at `-O0` (the copy is the only heap here, so `-O2` elides it).
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct P { a: String, b: i64 }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn go() -> i64 {
+    let t = mkp(9);
+    let mut i = 0i64;
+    while i < 5i64 {
+        if seed() > 0i64 { P { a: t.a, b: 1 } } else { P { a: t.a, b: 2 } };
+        i = i + 1;
+    }
+    return t.b;
+}
+fn main() { println(go()); }
+"#,
+            &["9"],
+            "b0907-43-both-arms-project",
+            10,
+        );
+    }
+
     #[test]
     fn asan_discarded_branch_literal_field_over_a_loop_outer_local_declines() {
         assert_clean_asan_run_min_allocs(

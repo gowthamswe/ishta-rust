@@ -259,8 +259,6 @@
 # reading any codegen is what separated them.
 
 # ── 2026-09-07 (second entry of the day): two IF/ELSE spellings, one row. ──
-memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_local_declines  # B-2026-09-07-43
-memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_after_declines    # B-2026-09-07-43
 #
 # Both are the same defect at two sizes: a DISCARDED aggregate literal whose
 # tail is an `if/else` never reaches the owner registrar, so the COPY that
@@ -282,3 +280,30 @@ memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_afte
 # observable. It is split into its own `#[test]` here for the reason this file
 # keeps repeating: quarantining the function it lived in would have taken that
 # fixture's twelve SOUND cells off the leg with it.
+
+# B-2026-09-07-43 REMOVED 2026-09-08, its owning row fixed. The entries were:
+#
+#   memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_local_declines
+#   memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_after_declines
+#
+# A discarded `if`/`else` reaches exactly one registrar
+# (`try_track_discarded_user_drop_temp`), and `discard_branch_tail_aliases_a_temp`
+# gated it by OR-ing `field_init_aliases_a_temp` across EVERY arm -- so one
+# RC-boxed field projection declined the whole construct and whichever arm
+# actually RAN lost its heap. The guard's premise, that the box goes on owning
+# the projected field, was retired by `afe5abfbe`: the field loop now hands the
+# literal an independent COPY, so the box owns the original and the literal owns
+# the copy. Asking `rc_boxed_projection_mints_copy` -- the predicate `8f3751b15`
+# added to the sibling registrar for the same question -- makes the branch
+# spelling agree with the bare-statement one.
+#
+# The lesson worth keeping is about the QUARANTINE ENTRY, not the fix. Both
+# fixtures take the PROJECTING arm, where the stranded buffer is the copy of
+# `t.a` -- a dead allocation that `-O2` elides. That is the only reason this
+# family looked `-O0`-only and landed on these lists at all. The same defect with
+# the MINTING arm taken strands a live buffer at BOTH opt levels: 355 B in 5
+# allocations, red under the plain `--features llvm` leg CI already runs, and now
+# pinned by `asan_discarded_branch_projecting_arm_still_owns_every_path`. An
+# `-O0`-only quarantine entry can be a fact about which arm the fixture happens
+# to take rather than about the defect -- vary the path before believing the leg.
+#

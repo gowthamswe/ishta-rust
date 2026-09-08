@@ -42,8 +42,6 @@
 # kept this file from being born with a stale entry.
 
 # ── Carried over from the -O0 leg (allocator class; same row owns them) ──
-memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_local_declines   # B-2026-09-07-43
-memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_after_declines     # B-2026-09-07-43
 
 # ── New, and visible only under instrumentation (access class) ──
 #
@@ -83,3 +81,49 @@ memory_sanitizer_tests::asan_vec_plain_shared_index_overwrite_place_rhs_no_leak 
 # two lines above, filed separately because a stack overread is a different
 # failure mode from that row's leak.
 memory_sanitizer_tests::asan_discarded_literal_projected_field_keeps_its_owner                 # B-2026-09-07-57
+#
+# The if/else sibling of the line above, and the same stack overread. It reached
+# this list under B-2026-09-07-43, whose LEAK it also had; that leak is fixed and
+# this is what was underneath.
+memory_sanitizer_tests::asan_discarded_literal_projected_field_if_else_read_after_declines     # B-2026-09-07-57
+
+# B-2026-09-07-43's leak is fixed, so ONE of its two entries came off this list:
+#
+#   memory_sanitizer_tests::asan_discarded_branch_literal_field_over_a_loop_outer_local_declines
+#
+# The OTHER fixture stays, re-attributed below to B-2026-09-07-57 — it is a
+# different defect that this row's leak was masking. Measured both ways: on the
+# parent AND on the fix, `asan_discarded_literal_projected_field_if_else_read_-
+# after_declines` fails this leg with `stack-buffer-overflow ... READ of size 8
+# ... in go`, byte-identical in class and location, while the `-O0` allocator leg
+# is green on the fix. So the leak is gone and a pre-existing STACK overread is
+# what remains — the same finding B-2026-09-07-57 records for this fixture's
+# sibling, and `e1dcf13` localized to B-2026-09-07-48.
+#
+# THE RATCHET CAUGHT THIS, which is the point of it running in both directions.
+# The entry was removed on the strength of the `-O0` leg alone, where the fixture
+# genuinely passes; this leg sees a strictly larger error class, so a removal
+# justified by the smaller one is not justified here. Re-measure per leg before
+# taking a line off either list.
+#
+# A discarded `if`/`else` reaches exactly one registrar
+# (`try_track_discarded_user_drop_temp`), and `discard_branch_tail_aliases_a_temp`
+# gated it by OR-ing `field_init_aliases_a_temp` across EVERY arm -- so one
+# RC-boxed field projection declined the whole construct and whichever arm
+# actually RAN lost its heap. The guard's premise, that the box goes on owning
+# the projected field, was retired by `afe5abfbe`: the field loop now hands the
+# literal an independent COPY, so the box owns the original and the literal owns
+# the copy. Asking `rc_boxed_projection_mints_copy` -- the predicate `8f3751b15`
+# added to the sibling registrar for the same question -- makes the branch
+# spelling agree with the bare-statement one.
+#
+# The lesson worth keeping is about the QUARANTINE ENTRY, not the fix. Both
+# fixtures take the PROJECTING arm, where the stranded buffer is the copy of
+# `t.a` -- a dead allocation that `-O2` elides. That is the only reason this
+# family looked `-O0`-only and landed on these lists at all. The same defect with
+# the MINTING arm taken strands a live buffer at BOTH opt levels: 355 B in 5
+# allocations, red under the plain `--features llvm` leg CI already runs, and now
+# pinned by `asan_discarded_branch_projecting_arm_still_owns_every_path`. An
+# `-O0`-only quarantine entry can be a fact about which arm the fixture happens
+# to take rather than about the defect -- vary the path before believing the leg.
+#
