@@ -31411,6 +31411,61 @@ fn main() {
         );
     }
 
+    /// B-2026-09-08-6 — a field move-out inside a `while` that iterates ONCE
+    /// is the same single move as the straight-line spelling, but the loop
+    /// makes the consume and the later use dominance-INCOMPARABLE, so the
+    /// ownership pass answers with an RC-FALLBACK PROMOTION rather than a
+    /// `UseAfterMove`. A promoted binding's alloca holds the `{i64 rc, T}` box
+    /// HANDLE, and every arm of the move-out machinery is written against a
+    /// binding whose alloca holds the VALUE.
+    ///
+    /// Pre-fix: `free(): double free detected in tcache 2` on the JIT and at
+    /// -O0 (SIGABRT, rc=134, valgrind `Invalid free()`), and SIX bodies where
+    /// three are due at -O2 — one of them `dS0`, run over the husk, because the
+    /// walker the disarm re-registered GEPs a two-field struct out of the
+    /// 8-byte pointer slot. `KARAC_AUTO_PAR=0` reproduced both AOT readings.
+    ///
+    /// `c2` is the straight-line control, correct before and after, and it is
+    /// what isolates the loop as the whole difference. `c3` keeps the
+    /// `{ptr,len,cap}` shape the three sibling rows already fixed
+    /// (B-2026-09-07-23 / -29 / -30) passing, since the gap this closes is
+    /// exactly the STRUCT-shaped field their self-gate turns away.
+    #[test]
+    fn e2e_rc_promoted_base_field_move_out_in_loop() {
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs { return Rs { id: i, name: f\"h{i}\" }; }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             struct Ps { mut a: String, mut b: i64 }\n\
+             fn main() {\n\
+             \x20   println(\"c1\");\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   let mut i = 0;\n\
+             \x20   while i < 1 { let taken = g.one; println(f\"t{taken.id}\"); i = i + 1; }\n\
+             \x20   println(\"c2\");\n\
+             \x20   let mut h = Bs { one: mks(3), two: mks(4) };\n\
+             \x20   let straight = h.one;\n\
+             \x20   println(f\"t{straight.id}\");\n\
+             \x20   println(\"c3\");\n\
+             \x20   let mut p = Ps { a: \"payload\", b: 1 };\n\
+             \x20   let mut j = 0;\n\
+             \x20   while j < 2 { let s = p.a; println(f\"L{s.len()}\"); j = j + 1; }\n\
+             \x20   println(\"end\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "c1\nt1\ndS1\nc2\ndS4\nt3\ndS3\nc3\nL7\nL7\nend\ndS2\ndS1\n"
+        );
+    }
+
     /// B-2026-08-01-30 leg B — a COMPUTED pure-scalar index (`v[base - 1] =
     /// <new>`) takes the same displaced-element fire as the -21 literal /
     /// identifier shapes. The typechecker desugars `base - 1` into

@@ -9928,6 +9928,61 @@ impl<'ctx> super::Codegen<'ctx> {
                                     let leaf_moves = self
                                         .place_chain_leaf_runs_user_drop(&src_type, &segs)
                                         .unwrap_or(true);
+                                    // B-2026-09-08-6 — a projection off an
+                                    // RC-FALLBACK-PROMOTED root hands the
+                                    // destination the BOX's own field, and the
+                                    // box goes on owning it. The three
+                                    // destinations B-2026-09-07-23 / -29 / -30
+                                    // taught to copy all self-gate on the
+                                    // projected value being laid out
+                                    // `{ptr,len,cap}`
+                                    // (`rc_boxed_projection_field_copy`'s second
+                                    // line), so a STRUCT field with heap
+                                    // INTERIOR — `one: Rs` where `Rs` holds a
+                                    // `String` — passed through uncopied and
+                                    // the two shared one buffer: `free():
+                                    // double free detected in tcache 2` on the
+                                    // JIT and at -O0, SIGABRT, valgrind
+                                    // `Invalid free()`.
+                                    //
+                                    // Copying rather than declining the
+                                    // destination's registration, for the
+                                    // reason `projection_root_is_rc_boxed`
+                                    // records and the sibling sites repeat: the
+                                    // box keeps a LIVE value the next iteration
+                                    // reads, and a declined destination leaks
+                                    // the moment it is mutated.
+                                    //
+                                    // In place, after the store — a struct
+                                    // value has no `{ptr,len,cap}` overlay to
+                                    // swap the way the vecstr peers do, and
+                                    // `deep_copy_struct_heap_fields_in_place` is
+                                    // the walk that already recurses a struct's
+                                    // heap fields for the by-value param entry
+                                    // copy.
+                                    //
+                                    // DEPTH 1 ONLY, and the bound is measured
+                                    // rather than cautious. A two-hop chain
+                                    // (`let x = o.h.r`) reaches a different
+                                    // disarm route, and copying there produced
+                                    // a buffer with no owner: 15 allocs / 14
+                                    // frees and `2 bytes in 1 blocks are
+                                    // definitely lost` at -O0, against the
+                                    // parent's clean 14 / 14 on the identical
+                                    // cell. That is a leak this fix would have
+                                    // INTRODUCED, so the copy stops where the
+                                    // declines above stop. The deep chain is
+                                    // filed separately.
+                                    if segs.len() == 1 && self.projection_root_is_rc_boxed(value) {
+                                        if let Some(dslot) =
+                                            self.variables.get(var_name.as_str()).copied()
+                                        {
+                                            self.deep_copy_struct_heap_fields_in_place(
+                                                dslot.ptr,
+                                                &struct_name,
+                                            );
+                                        }
+                                    }
                                     if leaf_moves {
                                         // B-2026-09-06-55 — a DEEP chain names a
                                         // leaf INSIDE a hop, and the flat mask

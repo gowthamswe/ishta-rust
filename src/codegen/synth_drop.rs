@@ -7720,6 +7720,14 @@ impl<'ctx> super::Codegen<'ctx> {
         // B-2026-09-06-44), and a struct whose masked walker is EMPTY because
         // the moved field was its only Drop-bearing one, which is the shape
         // every pre-existing move-out test has.
+        // B-2026-09-08-6 — an RC-FALLBACK-PROMOTED source retains the field
+        // (see the twin decline in `disarm_struct_field_move_bodies`), so
+        // neither the mask below nor the whole-walker retraction under it may
+        // run: the box's value-drop is the field's one owner and the binding's
+        // own slot holds only the handle.
+        if self.drop_rc.rc_fallback_heap_types.contains_key(var_name) {
+            return;
+        }
         if !owns_body && self.mask_moved_field_in_bodies_walk(var_name, struct_name, idx) {
             return;
         }

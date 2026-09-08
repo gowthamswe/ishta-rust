@@ -9635,6 +9635,25 @@ impl<'ctx> super::Codegen<'ctx> {
         if self.borrow_vars.owned_struct_params.contains(obj.as_str()) {
             return;
         }
+        // B-2026-09-08-6 — an RC-FALLBACK-PROMOTED root is the THIRD retaining
+        // source, beside the caller-retains param just above and the param view
+        // `disarm_struct_field_bodies_at` declines one level down. All three
+        // keep owning the field, so all three must keep their bodies armed and
+        // let the DESTINATION copy — the rule `projection_root_is_rc_boxed`
+        // states and the two `rc_boxed_projection_field_copy` sites already
+        // follow. Only this one had not been told.
+        //
+        // Declining matters twice over here, because the disarm does not merely
+        // mask the wrong thing — a promoted binding's alloca holds the box
+        // HANDLE, so the walker `disarm_struct_field_bodies_at` re-registers
+        // GEPs a two-field struct out of an 8-byte pointer slot, and registers
+        // it in the CURRENT frame. Inside the loop that is the loop BODY's
+        // frame, so it also fired once per iteration, against a binding whose
+        // owner frame is outside the loop entirely (the re-register hazard
+        // `disarm_destructured_struct_field_bodies_at`'s doc spells out).
+        if self.projection_root_is_rc_boxed(value) {
+            return;
+        }
         let Some(fidx) = self
             .var_types
             .var_type_names

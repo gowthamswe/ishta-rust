@@ -8490,6 +8490,89 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-08-6 — the OWNERSHIP half of
+    /// `e2e_rc_promoted_base_field_move_out_in_loop`.
+    ///
+    /// A field move-out inside a `while` that iterates ONCE makes the consume
+    /// and the later use dominance-incomparable, so the ownership pass answers
+    /// with an RC-FALLBACK PROMOTION instead of a `UseAfterMove` — and a
+    /// promoted binding's alloca holds the `{i64 rc, T}` box HANDLE, not the
+    /// value. The three destinations already taught to copy off such a root
+    /// (B-2026-09-07-23 / -29 / -30) all self-gate on the projected value being
+    /// laid out `{ptr,len,cap}`, so a STRUCT field with heap INTERIOR was
+    /// handed the box's own buffer and both freed it.
+    ///
+    /// Parent measurement, `KARAC_OPT_LEVEL=0`, valgrind: `Invalid free() /
+    /// delete / delete[] / realloc()`, 1 error from 1 context, 24 allocs / 25
+    /// frees, and `free(): double free detected in tcache 2` with SIGABRT
+    /// (rc=134) on the JIT and both AOT lanes. After: 24/24 and 20/20 at -O0
+    /// and -O2, 0 errors.
+    ///
+    /// `c_both` moves BOTH fields out and `c_trips` runs three iterations —
+    /// each double-freed on the parent the same way, the second scaling with
+    /// the trip count. `c_str` keeps the sibling rows' `{ptr,len,cap}` shape
+    /// passing, and `c_flat` is the straight-line control that never promotes
+    /// and was correct throughout.
+    ///
+    /// DELIBERATELY OMITS the two-hop chain (`let x = o.h.r` in a loop). That
+    /// shape reaches the deep `disarm_struct_field_tuple_elem_bodies_at` route
+    /// rather than the flat one this fixes, and it is red for its OWN reason
+    /// both before and after: `t0`/`dS0` at -O0 against `t1`/`dS1` at -O2 —
+    /// byte-identical on the parent — plus 2 bytes lost in 1 block. Filed
+    /// separately rather than folded in here, which would make this fixture
+    /// assert a defect it does not close.
+    fn asan_rc_promoted_base_field_move_out_in_loop() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"s{i}" }; }
+
+struct Bs { mut one: S, mut two: S }
+struct Ps { mut a: String, mut b: i64 }
+
+fn c_loop() {
+    let mut g = Bs { one: mks(1), two: mks(2) };
+    let mut i = 0;
+    while i < 1 { let taken = g.one; println(f"t{taken.id}"); i = i + 1; }
+}
+fn c_trips() {
+    let mut g = Bs { one: mks(3), two: mks(4) };
+    let mut i = 0;
+    while i < 3 { let taken = g.one; i = i + 1; }
+    println("u");
+}
+fn c_both() {
+    let mut g = Bs { one: mks(5), two: mks(6) };
+    let mut i = 0;
+    while i < 1 { let a = g.one; let b = g.two; println(f"v{a.id}{b.id}"); i = i + 1; }
+}
+fn c_str() {
+    let mut p = Ps { a: "payload", b: 1 };
+    let mut j = 0;
+    while j < 2 { let s = p.a; println(f"L{s.len()}"); j = j + 1; }
+}
+fn c_flat() {
+    let mut h = Bs { one: mks(9), two: mks(10) };
+    let straight = h.one;
+    println(f"x{straight.id}");
+}
+
+fn main() {
+    c_loop(); c_trips(); c_both(); c_str(); c_flat();
+    println("end");
+}
+"#,
+            &[
+                "t1", "dS1", "dS2", "dS1", "dS3", "dS3", "dS3", "u", "dS4", "dS3", "v56", "dS6",
+                "dS5", "dS6", "dS5", "L7", "L7", "dS10", "x9", "dS9", "end",
+            ],
+            "b0908-6-rc-promoted-field-move-out-in-loop",
+            20,
+        );
+    }
+
+    #[test]
     /// B-2026-09-06-70 — the FREEING half of
     /// `test_e2e_method_and_assoc_arg_registrars_admit_only_when_the_result_owns_it`.
     ///
