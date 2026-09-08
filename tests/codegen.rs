@@ -151984,6 +151984,73 @@ fn main() {
         }
     }
 
+    /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
+    /// gates B-2026-08-30-28's conditional-store registration on
+    /// `func.generic_params.is_none()`, and a generic callee is compiled by
+    /// `compile_mono_function` instead, whose param loop carried the
+    /// conditional-RETURN sibling (B-2026-08-28-71) but not this one. So the
+    /// mono was one registration short and the non-storing path had no owner
+    /// anywhere: the caller stands down identically for both spellings, because
+    /// `fn_moves_param_into_outliving_place` is answered off the AST and knows
+    /// nothing about monomorphisation.
+    ///
+    /// Pre-fix `c1` printed no `dI1` on the JIT and both AOT lanes against
+    /// `--interp`'s `dI1`, and lost the argument's `shared` refcount block
+    /// (16 B in 1 at -O0, 9 allocs / 8 frees). `c5` is the NON-generic twin of
+    /// the identical callee, correct throughout, which is what isolates
+    /// genericity as the whole difference.
+    ///
+    /// `c2` is the storing path (the per-path flag must still suppress the
+    /// callee body so the container's drain is the only one), `c3` is a SECOND
+    /// monomorphisation in the same program (the flags are allocas in the
+    /// mono's own function, so they must not leak between specialisations), and
+    /// `c4` is an unconditional store, which keeps today's no-registration path.
+    #[test]
+    fn e2e_generic_conditional_store_runs_one_body_on_the_missed_path() {
+        let Some(out) = run_program(
+            "shared struct Inner { v: i64 }\n\
+             struct Ri { id: i64, inner: Inner }\n\
+             impl Drop for Ri {\n\
+             \x20   fn drop(mut ref self) { println(f\"dI{self.id}\") }\n\
+             }\n\
+             fn mki(i: i64) -> Ri { return Ri { id: i, inner: Inner { v: i } }; }\n\
+             struct Sp { id: i64, name: String }\n\
+             impl Drop for Sp {\n\
+             \x20   fn drop(mut ref self) { println(f\"dP{self.id}\") }\n\
+             }\n\
+             fn mkp(i: i64) -> Sp { return Sp { id: i, name: f\"p{i}\" }; }\n\
+             struct Vi { mut xs: Vec[Ri] }\n\
+             fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }\n\
+             fn guncond[T](v: mut ref Vec[T], x: T) { v.push(x); }\n\
+             fn fcond(b: mut ref Vi, r: Ri, k: bool) { if k { b.xs.push(r); } }\n\
+             fn main() {\n\
+             \x20   println(\"c1\");\n\
+             \x20   let mut a: Vec[Ri] = Vec.new();\n\
+             \x20   gcond(mut a, mki(1), false);\n\
+             \x20   println(\"c2\");\n\
+             \x20   gcond(mut a, mki(2), true);\n\
+             \x20   println(f\"n{a.len()}\");\n\
+             \x20   println(\"c3\");\n\
+             \x20   let mut b: Vec[Sp] = Vec.new();\n\
+             \x20   gcond(mut b, mkp(3), false);\n\
+             \x20   println(\"c4\");\n\
+             \x20   let mut c: Vec[Ri] = Vec.new();\n\
+             \x20   guncond(mut c, mki(4));\n\
+             \x20   println(f\"m{c.len()}\");\n\
+             \x20   println(\"c5\");\n\
+             \x20   let mut d = Vi { xs: Vec.new() };\n\
+             \x20   fcond(mut d, mki(5), false);\n\
+             \x20   println(\"end\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "c1\ndI1\nc2\nn1\ndI2\nc3\ndP3\nc4\nm1\ndI4\nc5\ndI5\nend\n"
+        );
+    }
+
     /// B-2026-08-30-28 — the METHOD spelling, storing into `self`, and a store
     /// NESTED two branches deep. The method reaches its stand-down by a
     /// different route than the free function (B-2026-08-29-11), so it is a

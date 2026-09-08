@@ -4400,6 +4400,96 @@ impl<'ctx> super::Codegen<'ctx> {
                     }
                 }
             }
+            // B-2026-09-07-51 — the STORE sibling of the conditional-RETURN
+            // registration directly above, and the one registration the mono
+            // prologue was still short of. `compile_function`'s copy of it is
+            // gated on `func.generic_params.is_none()`, and a generic callee
+            // never reaches that function at all, so the whole shape had no
+            // owner on the non-storing path:
+            //
+            //     fn gcond[T](v: mut ref Vec[T], x: T, k: bool) {
+            //         if k { v.push(x); }
+            //     }
+            //     gcond(mut v, mki(7), false);
+            //
+            // printed `end` on the JIT and both AOT lanes against `--interp`'s
+            // `dI7 end`, and lost the argument's `shared` refcount block (16 B
+            // in 1 at -O0, 9 allocs / 8 frees). The NON-generic spelling of the
+            // identical callee is `dI7 end` and 10 / 10, which is what isolates
+            // genericity as the whole difference — the caller stands down the
+            // same way for both, because `fn_moves_param_into_outliving_place`
+            // is answered off the AST and knows nothing about monomorphisation.
+            //
+            // Every safety property is the non-generic site's; see
+            // `compile_function` for the full argument, and the conditional
+            // -return block above for why the prologue's flag/tail seeding has
+            // to be in place first.
+            //
+            // SUBSTITUTED param type, for B-2026-09-02-3's reason one block up
+            // and not as a precaution: this row's own repro declares the stored
+            // param as bare `x: T`, so the raw AST path reads "T",
+            // `drop_method_keys` is asked about a type of that name and says
+            // no, and the registration silently does not happen. The return
+            // sibling was shipped once without this and had exactly that hole.
+            if !self.is_coroutine_compiled(&func.name)
+                && (crate::ast::fn_conditionally_moves_param_into_outliving_place(func, i)
+                    || self.program_snapshot.as_deref().is_some_and(|p| {
+                        crate::ast::fn_conditionally_hands_param_to_flip_callee(p, func, i)
+                    }))
+            {
+                let param_ty_resolved = self.subst_monomorph_type_params(&param.ty);
+                if let TypeKind::Path(path) = &param_ty_resolved.kind {
+                    if let Some(struct_name) = path.segments.first() {
+                        let has_user_drop = self
+                            .program_snapshot
+                            .as_deref()
+                            .map(|p| p.drop_method_keys.contains_key(struct_name))
+                            .unwrap_or(false);
+                        if has_user_drop
+                            && !self
+                                .type_decls
+                                .shared_types
+                                .contains_key(struct_name.as_str())
+                        {
+                            // B-2026-09-07-20's memory half, on the same
+                            // admitted set the non-generic site uses.
+                            let owns_memory = self
+                                .struct_param_memory_stays_with_caller(struct_name)
+                                && self
+                                    .type_decls
+                                    .struct_generic_params
+                                    .get(struct_name.as_str())
+                                    .is_none_or(|g| g.is_empty());
+                            if owns_memory {
+                                self.track_user_drop_var(struct_name, &param_name, alloca);
+                                let _ = self.cond_move_drop_flag_for(&param_name);
+                                self.drop_rc
+                                    .cond_store_flag_params
+                                    .insert(param_name.clone());
+                            } else if let Some(bodies) =
+                                self.emit_struct_user_drop_bodies_only_fn(struct_name)
+                            {
+                                self.track_user_drop_var_with_fn(
+                                    "",
+                                    &param_name,
+                                    alloca,
+                                    bodies,
+                                    crate::codegen::state::UserDropKind::StructFieldBodies,
+                                );
+                                // EAGERLY, for the two reasons the non-generic
+                                // site spells out: the guard only engages when
+                                // the flag exists, and `cond_move_drop_flags`
+                                // IS the admitted set `arm_conditional_store_flag`
+                                // looks itself up in.
+                                let _ = self.cond_move_drop_flag_for(&param_name);
+                                self.drop_rc
+                                    .cond_store_flag_params
+                                    .insert(param_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
             self.variables.insert(
                 param_name,
                 VarSlot {

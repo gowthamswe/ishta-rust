@@ -8411,6 +8411,62 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-51 — the OWNERSHIP half of
+    /// `e2e_generic_conditional_store_runs_one_body_on_the_missed_path`.
+    ///
+    /// The mono param loop carried no conditional-store registration, so on the
+    /// path where the store does not happen the value died with no owner in any
+    /// frame — the caller had already stood down. That is a lost `Drop` body
+    /// AND a leak: 16 B in 1 block at -O0 (9 allocs / 8 frees), the argument's
+    /// `shared` field refcount block. The non-generic twin of the identical
+    /// callee measured 10 / 10 clean on the same tree.
+    ///
+    /// Balanced at both opt levels after the fix, which matters because the
+    /// leak is small and `-O2` can delete a dead allocation outright — a check
+    /// at one level only would not have separated "owned" from "optimised
+    /// away".
+    fn asan_generic_conditional_store_owns_the_missed_path() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+shared struct Inner { v: i64 }
+struct Ri { id: i64, inner: Inner }
+impl Drop for Ri { fn drop(mut ref self) { println(f"dI{self.id}") } }
+fn mki(i: i64) -> Ri { return Ri { id: i, inner: Inner { v: i } }; }
+struct Sp { id: i64, name: String }
+impl Drop for Sp { fn drop(mut ref self) { println(f"dP{self.id}") } }
+fn mkp(i: i64) -> Sp { return Sp { id: i, name: f"p{i}" }; }
+struct Vi { mut xs: Vec[Ri] }
+
+fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }
+fn guncond[T](v: mut ref Vec[T], x: T) { v.push(x); }
+fn fcond(b: mut ref Vi, r: Ri, k: bool) { if k { b.xs.push(r); } }
+
+fn main() {
+    let mut a: Vec[Ri] = Vec.new();
+    gcond(mut a, mki(1), false);
+    gcond(mut a, mki(2), true);
+    println(f"n{a.len()}");
+    let mut b: Vec[Sp] = Vec.new();
+    gcond(mut b, mkp(3), false);
+    let mut c: Vec[Ri] = Vec.new();
+    guncond(mut c, mki(4));
+    println(f"m{c.len()}");
+    let mut d = Vi { xs: Vec.new() };
+    fcond(mut d, mki(5), false);
+    let mut i = 0;
+    while i < 3 { gcond(mut a, mki(i), false); i = i + 1; }
+    println("end");
+}
+"#,
+            &[
+                "dI1", "n1", "dP3", "m1", "dI4", "dI5", "dI0", "dI1", "dI2", "dI2", "end",
+            ],
+            "b0907-51-generic-conditional-store",
+            18,
+        );
+    }
+
+    #[test]
     /// B-2026-09-07-20 — a struct value that is DISPLACED by a store, or handed
     /// to a callee whose store does not happen, has an owner in some frame.
     ///
