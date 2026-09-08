@@ -47027,6 +47027,75 @@ fn test_cond_move_then_reassign_displaces_on_the_untaken_path() {
     );
 }
 
+/// B-2026-09-08-5 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_deeper_frame_reassign_rearms_the_new_value`, same three sources and
+/// expected strings. This backend has no per-frame cleanup list for an inner
+/// scope to drain, so a reassign inside a branch or block re-owns the field on
+/// the path that runs and leaves it moved on the path that does not — which is
+/// the reference the codegen side is now matched to.
+#[test]
+fn test_deeper_frame_reassign_rearms_the_new_value() {
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let f = true;\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 let taken = g.one;\n\
+                 if f { g.one = mks(7); }\n\
+                 println(f\"t{taken.id}\");\n\
+             }\n"),
+        "dS2\ndS7\nt1\ndS1\n"
+    );
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let f = false;\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 let taken = g.one;\n\
+                 if f { g.one = mks(7); }\n\
+                 println(f\"t{taken.id}\");\n\
+             }\n"),
+        "dS2\nt1\ndS1\n"
+    );
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 let taken = g.one;\n\
+                 { g.one = mks(7); }\n\
+                 println(f\"t{taken.id}\");\n\
+             }\n"),
+        "dS2\ndS7\nt1\ndS1\n"
+    );
+}
+
 /// B-2026-08-01-19 — interpreter twin of `tests/codegen.rs`'s
 /// `e2e_param_field_store_single_caller_fire`, same source and expected
 /// string. Pre-fix the base binding's Drop slot fired the caller-retained

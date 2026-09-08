@@ -32112,6 +32112,105 @@ fn main() {
         assert_eq!(out, "t1\ndS1\ndS2\ndS7\nm3\n");
     }
 
+    /// B-2026-09-08-5 — a reassign compiled ONE FRAME DEEPER than the moved-out
+    /// binding lost the new value's body: `let taken = g.one; if f { g.one =
+    /// mks(7); }` printed `dS2 t1 dS1` against `--interp`'s
+    /// `dS2 dS7 t1 dS1`. The bare-block spelling read identically, so the
+    /// trigger was the pushed frame rather than the branch.
+    ///
+    /// B-2026-09-07-63's re-arm lifts the move-out mask when a field is given a
+    /// value of its own, but only in the binding's OWN frame — the mask is
+    /// compile-time state and a deeper store is a runtime condition, so
+    /// re-arming statically would run the field's body over the moved-out husk
+    /// on the path that never stored. The row that split this out priced the
+    /// fix as needing "a second walker selected at runtime, which does not
+    /// exist". B-2026-09-08-4 built exactly that, so the re-arm now mints the
+    /// field's flag with a `false` entry-block initializer — inverted, because
+    /// the move-out already ran on every path reaching the store — stores
+    /// `true` where the assignment compiles, and un-masks the registered walker
+    /// so the death-site tree has both arms to pick between.
+    ///
+    /// Cell (b) is the whole reason the static re-arm was restricted, and it
+    /// fails if the inverted initializer is ever dropped: with `f` false
+    /// nothing stored, so `one`'s body must NOT run over the husk `taken` owns.
+    /// Cell (c) pins the bare block, the spelling that shows this is about the
+    /// frame and not the condition.
+    ///
+    /// Twin of `tests/interpreter.rs`'s
+    /// `test_deeper_frame_reassign_rearms_the_new_value`.
+    #[test]
+    fn e2e_deeper_frame_reassign_rearms_the_new_value() {
+        // (a) branch that RUNS — the new value is the base's to drop.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let f = true;\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   let taken = g.one;\n\
+             \x20   if f { g.one = mks(7); }\n\
+             \x20   println(f\"t{taken.id}\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dS2\ndS7\nt1\ndS1\n");
+        // (b) branch that does NOT run — nothing stored, so no body over the
+        // husk. This is the cell the inverted initializer exists for.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let f = false;\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   let taken = g.one;\n\
+             \x20   if f { g.one = mks(7); }\n\
+             \x20   println(f\"t{taken.id}\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dS2\nt1\ndS1\n");
+        // (c) BARE BLOCK — a pushed frame with no condition at all.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   let taken = g.one;\n\
+             \x20   { g.one = mks(7); }\n\
+             \x20   println(f\"t{taken.id}\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "dS2\ndS7\nt1\ndS1\n");
+    }
+
     /// B-2026-08-01-19 — storing an owned param into a local container
     /// FIELD (`o.h = h;`) fired the caller-retained value's body TWICE on
     /// both backends (o's bodies walk at its death + the caller's NLL

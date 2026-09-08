@@ -7874,6 +7874,101 @@ impl<'ctx> super::Codegen<'ctx> {
         true
     }
 
+    /// B-2026-09-08-5 — the RUNTIME half of
+    /// [`Self::rearm_reassigned_moved_field`], for a store compiled one frame
+    /// deeper than the binding's walk (`if f { g.one = mks(7); }`, or a bare
+    /// block).
+    ///
+    /// Mints the field's `field_view_flags` bit with a `false` entry-block
+    /// initializer — the inverse of `field_view_flag_for`, because here the
+    /// move-out has ALREADY run unconditionally and the field is re-armed only
+    /// by the store — then stores `true` at the store's own block and un-masks
+    /// the registered walker so `emit_field_view_leaf_tree` has both arms to
+    /// choose between.
+    ///
+    /// Declines when a bit already exists: that one was minted `true` by a
+    /// field VIEW or by a conditional move-out, and its polarity is the other
+    /// question. Declines past [`Self::FIELD_VIEW_SELECT_MAX`] for the reason
+    /// the sibling does — the tree gives up and calls the walker UNMASKED past
+    /// it, which here would run a body over the husk.
+    fn rearm_reassigned_moved_field_at_runtime(
+        &mut self,
+        base: &str,
+        struct_name: &str,
+        field: &str,
+        idx: usize,
+    ) {
+        let flags = self.drop_rc.field_view_flags.get(base);
+        if flags.is_some_and(|m| m.contains_key(field)) {
+            return;
+        }
+        if flags.map(|m| m.len()).unwrap_or(0) + 1 > Self::FIELD_VIEW_SELECT_MAX {
+            return;
+        }
+        let Some(fn_val) = self.current_fn else {
+            return;
+        };
+        let Some(entry) = fn_val.get_first_basic_block() else {
+            return;
+        };
+        let bool_t = self.context.bool_type();
+        let b = self.context.create_builder();
+        match entry.get_terminator() {
+            Some(term) => b.position_before(&term),
+            None => b.position_at_end(entry),
+        }
+        let Ok(slot) = b.build_alloca(bool_t, &format!("rearmflag.{base}.{field}")) else {
+            return;
+        };
+        if b.build_store(slot, bool_t.const_int(0, false)).is_err() {
+            return;
+        }
+        if self
+            .builder
+            .build_store(slot, bool_t.const_int(1, false))
+            .is_err()
+        {
+            return;
+        }
+        self.drop_rc
+            .field_view_flags
+            .entry(base.to_string())
+            .or_default()
+            .insert(field.to_string(), slot);
+        // Un-mask the registered walker for THIS field only; any other masked
+        // field of the same binding keeps its mask, which is what rebuilding
+        // from the map (minus this index) gives.
+        if let Some(set) = self.type_decls.struct_moved_field_bodies.get_mut(base) {
+            set.remove(&idx);
+        }
+        let here: std::collections::BTreeSet<usize> = self
+            .type_decls
+            .struct_moved_field_bodies
+            .get(base)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let skip = self.field_skip_tree_for_var(base, here);
+        let subst = self
+            .type_decls
+            .enum_inst_var_types
+            .get(base)
+            .cloned()
+            .map(|i| self.generic_struct_subst_from_inst(struct_name, &i))
+            .unwrap_or_default();
+        let rebuilt = if skip.is_empty() {
+            self.emit_user_drop_field_bodies_fn(struct_name, &subst)
+        } else {
+            self.emit_user_drop_field_bodies_fn_skipping(struct_name, &subst, &skip)
+        };
+        if let Some(bodies) = rebuilt {
+            self.replace_user_drop_fn_for_var(
+                base,
+                super::state::UserDropKind::StructFieldBodies,
+                bodies,
+            );
+        }
+    }
+
     /// B-2026-09-06-46 — mask ONE moved-out field in `var_name`'s live
     /// `StructFieldBodies` walker, leaving every other field's body armed.
     /// Returns whether a masked walker was installed; `false` means the caller
@@ -8000,7 +8095,30 @@ impl<'ctx> super::Codegen<'ctx> {
                 })
             });
         if !unconditional {
-            return;
+            // B-2026-09-08-5 — a store one frame DEEPER than the binding's walk
+            // converts the field to a RUNTIME re-arm instead of declining.
+            //
+            // The static mask cannot express this: the mask is compile-time and
+            // the store is a runtime condition, so re-arming statically would
+            // run the field's body over the moved-out husk on the path that
+            // never stored. That is why this declined, and why the decline was
+            // one-directional (a body too few, never one too many).
+            //
+            // The row that split this out priced the fix as "a second walker
+            // selected at runtime, which does not exist". It exists now:
+            // B-2026-09-08-4 taught the death site to pick a walker masked to
+            // whichever fields are false in `field_view_flags`, so all this
+            // needs is a bit with the OPPOSITE initial value. The move-out
+            // already happened unconditionally on every path reaching here, so
+            // the field starts NOT re-armed (`false` in the entry block) and
+            // this store is what arms it on the path that runs.
+            //
+            // Dropping the map entry alongside is what un-masks the registered
+            // walker so the tree has something to select; the readers that ask
+            // "did this field move" are guarded by the same bit since
+            // B-2026-09-08-14, so they follow the runtime answer rather than
+            // the compile-time one.
+            return self.rearm_reassigned_moved_field_at_runtime(base, &struct_name, field, idx);
         }
         if let Some(s) = self.type_decls.struct_moved_field_bodies.get_mut(base) {
             s.remove(&idx);
