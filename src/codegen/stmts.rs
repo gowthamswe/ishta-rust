@@ -11797,6 +11797,37 @@ impl<'ctx> super::Codegen<'ctx> {
                         self.suppress_place_field_struct_move_source(value);
                     }
                 }
+                // B-2026-09-08-15 — the TUPLE-INDEX twin of the classifier
+                // above, for the EAGER FREE only.
+                //
+                // `s = t.0;` in a loop orphaned the destination's previous
+                // buffer on every trip after the first: three trips leaked
+                // 76 B in 2 blocks (20 allocs / 18 frees), while the struct
+                // spelling `s = p.a;` was clean at the same trip count. The
+                // reason is only that `rhs_is_place_field_move` is set inside a
+                // `FieldAccess` arm and `t.0` is an `ExprKind::TupleIndex`, a
+                // separate node the rest of this file routinely pairs with it
+                // — so `trigger_eager_free` never fired and nothing reclaimed
+                // the displaced buffer. It reads clean at ONE trip because the
+                // value displaced there is the empty `String.new()`.
+                //
+                // THE EAGER FREE ONLY, deliberately: the `FieldAccess` arm also
+                // runs the move suppressors and the bodies disarm, and the
+                // tuple path needs neither — it is otherwise ASAN-clean, so the
+                // source keeps its own ownership and adding a suppressor here
+                // would trade this leak for a double free. Measured: the leak
+                // is the whole delta between the two spellings.
+                //
+                // The aliasing neutralization the field arm applies is likewise
+                // not extended here, because the hazard it guards is a source
+                // this path cap-zeroes INTO the destination, which only the
+                // suppressed field spelling does.
+                let rhs_is_place_tuple_elem_move = target_is_heap_local
+                    && matches!(&value.kind, ExprKind::TupleIndex { object, .. }
+                    if matches!(
+                        &object.kind,
+                        ExprKind::Identifier(_) | ExprKind::SelfValue
+                    ));
                 // B-2026-07-31-17 (Assign twin of the Let guard): a RHS that
                 // TERMINATES the current block (`x = { return 5; };`) leaves
                 // no live insertion point — emitting the store would place
@@ -12258,7 +12289,9 @@ impl<'ctx> super::Codegen<'ctx> {
                             || rhs_is_fresh
                             || rhs_is_staged_freshtemp_field
                             || rhs_is_heap_vec_index
-                            || rhs_is_place_field_move);
+                            || rhs_is_place_field_move
+                            // B-2026-09-08-15
+                            || rhs_is_place_tuple_elem_move);
                     if trigger_eager_free {
                         if let Some(slot) = self.variables.get(name).copied() {
                             // B-2026-08-12-4 — the place-field-move arm is the
