@@ -36604,6 +36604,125 @@ fn main() { println(go()); }
         }
     }
 
+    /// B-2026-09-08-2 — a `mut ref` ARGUMENT whose place projects off an
+    /// RC-FALLBACK-PROMOTED local silently discarded the write, and through a
+    /// NESTED projection stored through a wild pointer.
+    ///
+    /// `mut_ref_place_root_ptr` ended `Some(slot)` for any root that is not a
+    /// `ref` param. A promoted binding's slot holds a `{i64 rc, T}` box HANDLE,
+    /// so the callee was handed a pointer to an rvalue COPY (cells 1-2, write
+    /// lost) or — once a second GEP compounded the error — an address that is
+    /// not the program's at all (cell 3).
+    ///
+    /// SIBLING OF B-2026-09-07-48 AT A SECOND RESOLVER. That row fixed the READ
+    /// receiver (`lower_field_access_ptr`); a `mut ref` argument resolves its
+    /// pointer independently, so its fix does not reach here. A THIRD resolver
+    /// shares the shape and deliberately keeps the old policy:
+    /// `field_chain_place_ptr`'s drop-suppression callers must NOT follow the
+    /// handle (`projection_root_is_rc_boxed` records why), which is why the
+    /// walk is parameterised rather than widened.
+    ///
+    /// CELL 3 IS THE ONE THAT MATTERS MOST. Its parent values are not merely
+    /// wrong, they are not even stable — measured -2305843009213693952
+    /// compiled, and 8070450532247928832 then 6917529027641081856 on two JIT
+    /// runs of the same program — because the store lands wherever the walked-off
+    /// GEP points. Cell 5 pins that the write reaches a STABLE place: two
+    /// increments must compose to 11, which a fresh copy per call cannot do.
+    #[test]
+    fn e2e_mut_ref_arg_place_off_a_promoted_local_reaches_the_box() {
+        const PRE: &str = r#"struct Inner { v: i64 }
+struct P { a: String, b: i64 }
+struct Outer { q: Inner, a: String }
+fn seed() -> i64 { env.args().len() }
+fn payload() -> String { f"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }
+fn mko() -> Outer { return Outer { q: Inner { v: 5 }, a: payload() }; }
+fn bump(s: mut ref String) { s.push_str("XY"); }
+fn bumpi(v: mut ref i64) { v = v + 1; }
+"#;
+        // (source tail, expected stdout, cell name)
+        let cells: [(&str, &str, &str); 6] = [
+            // 1 — heap field. Parent: 0 compiled, 38 on the JIT (call a no-op).
+            (
+                r#"fn go() -> i64 { let mut t = mkp(9); let mut i = 0i64;
+  while i < 2i64 { let s = t.a; i = i + 1; }
+  bump(mut t.a); return t.a.len(); }
+fn main() { println(go()); }
+"#,
+                "40",
+                "heap_field_write_lands",
+            ),
+            // 2 — NON-heap field off the same promoted binding. Rules out
+            // anything String-specific: the write is lost just as completely.
+            // Parent: 9 on all three compiled backends.
+            (
+                r#"fn go() -> i64 { let mut t = mkp(9); let mut i = 0i64;
+  while i < 2i64 { let s = t.a; i = i + 1; }
+  bumpi(mut t.b); return t.b; }
+fn main() { println(go()); }
+"#,
+                "10",
+                "non_heap_field_write_lands",
+            ),
+            // 3 — NESTED projection. Parent stores through a wild pointer and
+            // the value is not reproducible between runs.
+            (
+                r#"fn go() -> i64 { let mut t = mko(); let mut i = 0i64;
+  while i < 2i64 { let s = t.a; i = i + 1; }
+  bumpi(mut t.q.v); return t.q.v; }
+fn main() { println(go()); }
+"#,
+                "6",
+                "nested_projection_write_lands",
+            ),
+            // 4 — CONTROL: no loop, so no promotion and no box. The plain slot
+            // is the correct place here; the new arm must not divert it.
+            (
+                r#"fn go() -> i64 { let mut t = mkp(9); bumpi(mut t.b); return t.b; }
+fn main() { println(go()); }
+"#,
+                "10",
+                "control_no_promotion",
+            ),
+            // 5 — the place must be STABLE, not merely written once: two
+            // increments through the same projection compose only if both
+            // reached the box. A per-call rvalue copy yields 10.
+            (
+                r#"fn go() -> i64 { let mut t = mkp(9); let mut i = 0i64;
+  while i < 2i64 { let s = t.a; i = i + 1; }
+  bumpi(mut t.b); bumpi(mut t.b); return t.b; }
+fn main() { println(go()); }
+"#,
+                "11",
+                "repeated_write_composes",
+            ),
+            // 6 — CONTROL: the projection READ that B-2026-09-07-48 fixed, kept
+            // beside the write so a regression in either direction is visible
+            // in one fixture.
+            (
+                r#"fn go() -> i64 { let t = mkp(9); let mut i = 0i64; let mut n = 0i64;
+  while i < 3i64 { let s = t.a; n = n + s.len(); i = i + 1; }
+  return n + t.a.len(); }
+fn main() { println(go()); }
+"#,
+                "152",
+                "control_read_path_still_correct",
+            ),
+        ];
+        for (tail, want, name) in cells {
+            let Some(cap) = run_program_capturing(&format!("{PRE}{tail}")) else {
+                return;
+            };
+            assert_eq!(cap.stdout.trim(), want, "cell {name}: stdout");
+            assert!(
+                cap.status.success(),
+                "cell {name}: exited {:?}; stderr={:?}",
+                cap.status,
+                cap.stderr
+            );
+        }
+    }
+
     /// B-2026-09-07-29 — a WHOLE consume inside a loop that actually RUNS
     /// double-frees an RC-fallback-promoted local. No projection is involved:
     /// `takep(t)` takes the entire binding and there is no `t.a` in the

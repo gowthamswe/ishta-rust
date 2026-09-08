@@ -9076,6 +9076,39 @@ impl<'ctx> super::Codegen<'ctx> {
     /// a (possibly deeply nested) enum field in its source, including an enum
     /// field of a Vec element whose buffer the Vec's own drop now frees.
     pub(super) fn field_chain_place_ptr(&mut self, expr: &Expr) -> Option<PointerValue<'ctx>> {
+        // `false`: the drop-suppression callers must NOT follow an RC-fallback
+        // box handle. See `field_chain_place_ptr_ex`.
+        self.field_chain_place_ptr_ex(expr, false)
+    }
+
+    /// [`Self::field_chain_place_ptr`] with the RC-fallback root policy made
+    /// explicit, because the callers genuinely disagree about it
+    /// (B-2026-09-08-2).
+    ///
+    /// An RC-FALLBACK-PROMOTED binding's slot holds a `{i64 rc, T}` box HANDLE
+    /// rather than the aggregate, so GEP-ing it as the struct walks off an
+    /// 8-byte alloca — the same slot-shape hazard the `ref` param arm below
+    /// bails on.
+    ///
+    /// `follow_rc_box == false` (every pre-existing caller, via the wrapper)
+    /// keeps the raw slot and therefore today's behaviour exactly. That is
+    /// deliberate, not an oversight: the DISARM callers must not reach the
+    /// box's field at all. `projection_root_is_rc_boxed` records why — zeroing
+    /// the box's cap to neutralize a source would blank a value the next loop
+    /// iteration still reads, so those neutralize the DESTINATION instead, and
+    /// a promoted root is expected to fall out of their `slot.ty` shape test.
+    ///
+    /// `follow_rc_box == true` (the `mut ref` argument path) resolves through
+    /// the box, because a `mut ref` argument needs the real PLACE: the callee
+    /// writes to the binding's value, and for a promoted binding that value
+    /// lives in the box. Handing it the raw slot instead pointed it at an
+    /// rvalue copy, so the write was silently discarded — and through a NESTED
+    /// projection the compounded GEP produced a wild pointer and a wild store.
+    pub(super) fn field_chain_place_ptr_ex(
+        &mut self,
+        expr: &Expr,
+        follow_rc_box: bool,
+    ) -> Option<PointerValue<'ctx>> {
         match &expr.kind {
             // A `ref`/`mut ref` param root (incl. a `ref self` receiver): the
             // variable slot holds a POINTER to the caller's value, not the
@@ -9093,11 +9126,22 @@ impl<'ctx> super::Codegen<'ctx> {
                 if self.borrow_vars.ref_params.contains_key(name.as_str()) {
                     return None;
                 }
+                if follow_rc_box
+                    && self
+                        .drop_rc
+                        .rc_fallback_heap_types
+                        .contains_key(name.as_str())
+                {
+                    return self.get_data_ptr(name.as_str());
+                }
                 self.variables.get(name.as_str()).map(|s| s.ptr)
             }
             ExprKind::SelfValue => {
                 if self.borrow_vars.ref_params.contains_key("self") {
                     return None;
+                }
+                if follow_rc_box && self.drop_rc.rc_fallback_heap_types.contains_key("self") {
+                    return self.get_data_ptr("self");
                 }
                 self.variables.get("self").map(|s| s.ptr)
             }
@@ -9164,7 +9208,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 self.vec_index_elem_ptr(&vec_var, index).ok()
             }
             ExprKind::FieldAccess { object, field } => {
-                let base_ptr = self.field_chain_place_ptr(object)?;
+                let base_ptr = self.field_chain_place_ptr_ex(object, follow_rc_box)?;
                 let obj_ty = self.place_chain_type_name(object)?;
                 let st = *self.type_decls.struct_types.get(obj_ty.as_str())?;
                 let idx = self
@@ -9180,7 +9224,7 @@ impl<'ctx> super::Codegen<'ctx> {
             // #21 — a tuple-index hop (`<place>.field.N`, the `match h.pe.0`
             // scrutinee). GEP element `index` of the tuple at `object` in place.
             ExprKind::TupleIndex { object, index } => {
-                let base_ptr = self.field_chain_place_ptr(object)?;
+                let base_ptr = self.field_chain_place_ptr_ex(object, follow_rc_box)?;
                 let tuple_ty = self.place_chain_aggregate_llvm_type(object)?;
                 self.builder
                     .build_struct_gep(tuple_ty, base_ptr, *index as u32, "match.chain.tupidx.p")

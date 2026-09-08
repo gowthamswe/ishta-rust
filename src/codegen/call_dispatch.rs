@@ -7262,7 +7262,16 @@ impl<'ctx> super::Codegen<'ctx> {
             ExprKind::SelfValue => "self",
             // A nested projection (`g.q.v`) or a `vec[i]` root — resolved by
             // the shared walk, which handles those and bails on the rest.
-            _ => return self.field_chain_place_ptr(expr),
+            //
+            // B-2026-09-08-2 — `follow_rc_box: true`. A `mut ref` argument
+            // needs the real PLACE, so an RC-promoted root on the way down must
+            // resolve through its box exactly as the bare-root arm below does.
+            // Without it the compounded GEP walked off the 8-byte handle slot
+            // and `bumpi(mut t.q.v)` stored through a WILD pointer (-2305843009213693952
+            // compiled, 8070450532247928832 on the JIT, against the
+            // interpreter's 6). The suppression callers keep `false` — see
+            // `field_chain_place_ptr_ex`.
+            _ => return self.field_chain_place_ptr_ex(expr, true),
         };
         let slot = self.variables.get(name)?.ptr;
         if self.borrow_vars.ref_params.contains_key(name) {
@@ -7272,6 +7281,22 @@ impl<'ctx> super::Codegen<'ctx> {
                 .build_load(ptr_ty, slot, "mutref.arg.root")
                 .ok()
                 .map(|v| v.into_pointer_value());
+        }
+        // B-2026-09-08-2 — the bare-root half of the same rule. A promoted
+        // binding's slot holds a `{i64 rc, T}` box handle, so returning it
+        // handed the callee a pointer to an rvalue COPY and the write was
+        // silently discarded: `bump(mut t.a)` read 40 on the interpreter and
+        // 0 / 38 compiled and JIT. `get_data_ptr` resolves the value inside the
+        // box, which is the place the callee is entitled to write.
+        //
+        // This is the same missing slot shape B-2026-09-07-48 fixed one
+        // resolver over, at `lower_field_access_ptr`; that row's own fix does
+        // not reach here, because a READ receiver and a `mut ref` argument
+        // resolve their pointers independently.
+        if self.drop_rc.rc_fallback_heap_types.contains_key(name) {
+            if let Some(p) = self.get_data_ptr(name) {
+                return Some(p);
+            }
         }
         Some(slot)
     }
