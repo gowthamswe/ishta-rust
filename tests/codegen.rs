@@ -153329,6 +153329,73 @@ fn main() {
             "mid\ndR3\ndR2\ndR1\nv=5\none\nmid\ndR6\ndR5\ndR4\nv=11\ntwo\ndR8\ndR9\nmid\ndR7\nv=1\nthree\nend\n"
         );
     }
+
+    /// B-2026-09-08-8 — the OUTPUT twin of
+    /// `asan_par_join_tuple_destructure_owns_its_heap_leaves`.
+    ///
+    /// The leak that row records is silent: every one of these spellings prints
+    /// correctly on all four surfaces both before and after the fix, which is
+    /// why it needed valgrind to find and why an output test alone would never
+    /// have caught it. These cells exist to pin the other half — that teaching
+    /// `finish_owned_tuple_destructure` to own a `par` join's leaves did not
+    /// change what any of them computes.
+    ///
+    /// The last cell is the FAIL-CLOSED one: its join tail hands out an OUTER
+    /// binding, so the admission declines it and it still leaks 38 B. Its
+    /// output is pinned here precisely because the leak is left open — a
+    /// later widening that admits this shape must keep this answer, and the
+    /// hazard being guarded against (handing a leaf storage that stays readable
+    /// past the join) would show up here first as a wrong or crashing read.
+    #[test]
+    fn par_join_tuple_destructure_output_is_unchanged() {
+        const PRE: &str = "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n";
+        // One heap-bearing leaf through the join.
+        assert_eq!(
+            run_program(&format!(
+                "{PRE}fn go() -> i64 {{\n\
+                 \x20 let (t, k) = par {{ let t = mkp(9); let k = payload().len(); (t, k) }};\n\
+                 \x20 return t.a.len() + k; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            )),
+            Some("76\n".to_string())
+        );
+        // Two heap-bearing leaves.
+        assert_eq!(
+            run_program(&format!(
+                "{PRE}fn go() -> i64 {{\n\
+                 \x20 let (t, u) = par {{ let t = mkp(9); let u = mkp(10); (t, u) }};\n\
+                 \x20 return t.a.len() + u.a.len(); }}\n\
+                 fn main() {{ println(go()); }}\n"
+            )),
+            Some("76\n".to_string())
+        );
+        // A scalar-literal element beside a heap leaf — admitted as inert, and
+        // measured clean, so the mixed tuple still owns its heap leaf.
+        assert_eq!(
+            run_program(&format!(
+                "{PRE}fn go() -> i64 {{\n\
+                 \x20 let (t, k) = par {{ let t = mkp(9); (t, 5) }};\n\
+                 \x20 return t.a.len() + k; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            )),
+            Some("43\n".to_string())
+        );
+        // FAIL-CLOSED: the join tail hands out an OUTER binding. Declined by the
+        // admission, still leaking, and its READ must stay correct.
+        assert_eq!(
+            run_program(&format!(
+                "{PRE}fn go() -> i64 {{\n\
+                 \x20 let outer = mkp(1);\n\
+                 \x20 let (t, k) = par {{ let k = payload().len(); (outer, k) }};\n\
+                 \x20 return t.a.len() + k; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            )),
+            Some("76\n".to_string())
+        );
+    }
 }
 
 #[cfg(feature = "llvm")]

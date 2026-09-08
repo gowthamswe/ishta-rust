@@ -15856,6 +15856,58 @@ impl<'ctx> super::Codegen<'ctx> {
     /// freed by its source, so tracking here would double-free. The general
     /// move-out suppression keys on the leaf slot, so a leaf later returned or
     /// moved into a sink is suppressed exactly like a simple `let` binding.
+    /// B-2026-09-08-8 — a value-producing `par` block whose JOIN mints the
+    /// tuple a destructure is taking apart.
+    ///
+    /// `let (t, k) = par { let t = mkp(9); let k = payload().len(); (t, k) };`
+    /// left every heap-bearing leaf with NO owner: the general predicate admits
+    /// only `Call` / `MethodCall`, a `par` block is neither, and it is not a
+    /// place either, so the destructure reached neither branch of
+    /// `finish_owned_tuple_destructure` and nothing freed the leaves. Measured
+    /// 56 allocs / 32 frees, 38 B definitely lost, against 24 / 24 and zero for
+    /// the identical destructure off a plain call — with NO RC-fallback
+    /// promotion anywhere in the program, so this is not B-2026-09-07-58's box.
+    ///
+    /// This is the population B-2026-08-29-27 widened the WRAPPER sibling for —
+    /// "a value-position construct whose tail mints a fresh owned temp" — with
+    /// `par` as a member nobody added.
+    ///
+    /// FAIL-CLOSED ON EVERY ELEMENT, and that discipline is the reason this is
+    /// not a one-line `matches!`. A join tail can name an OUTER binding as
+    /// readily as a branch-declared one, and an outer binding stays READABLE
+    /// after the join — handing its storage to a leaf would turn a bounded leak
+    /// into a use-after-free at every gate that frees at the use site. So an
+    /// element resolves only two ways: a block-local `let` the par block itself
+    /// declared (no later reader by construction — B-2026-08-30-12's rule), or
+    /// an expression that mints outright. Anything else, an outer identifier
+    /// included, declines the WHOLE tuple.
+    ///
+    /// Widened HERE rather than in `expr_yields_fresh_owned_temp`, for the
+    /// reason B-2026-08-28-1 gives for the tuple-literal widening beside it:
+    /// that predicate is asked by many sites whose freshness question is a
+    /// different one, and this site's leaf frees are cap-guarded.
+    fn par_join_mints_owned_tuple(&self, value: &Expr) -> bool {
+        let ExprKind::Par(b) = &value.kind else {
+            return false;
+        };
+        let Some(tail) = b.final_expr.as_deref() else {
+            return false;
+        };
+        let ExprKind::Tuple(elems) = &tail.kind else {
+            return false;
+        };
+        if elems.is_empty() {
+            return false;
+        }
+        elems.iter().all(|el| {
+            let producer = self.block_local_binding_tail_rhs(b, el).unwrap_or(el);
+            matches!(
+                self.branch_tail_class(producer, true),
+                BranchTailClass::Mints | BranchTailClass::InertLiteral
+            )
+        })
+    }
+
     fn finish_owned_tuple_destructure(
         &mut self,
         pattern: &Pattern,
@@ -15884,8 +15936,9 @@ impl<'ctx> super::Codegen<'ctx> {
         // holds a rodata element. This site's leaf frees are cap-guarded, so a
         // rodata element is a no-op here; that is a property of these drops, not
         // of every consumer.
-        let fresh =
-            self.expr_yields_fresh_owned_temp(value) || matches!(&value.kind, ExprKind::Tuple(_));
+        let fresh = self.expr_yields_fresh_owned_temp(value)
+            || matches!(&value.kind, ExprKind::Tuple(_))
+            || self.par_join_mints_owned_tuple(value);
         if !fresh {
             // #21 — a PLACE source (`let (t, n) = h.pe`): the source struct's
             // `NestedTuple` drop now frees the tuple's enum / nested-struct

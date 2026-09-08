@@ -82342,4 +82342,93 @@ fn main() {
             "b49_destructure_proj_one_trip",
         );
     }
+
+    /// B-2026-09-08-8 — A VALUE-PRODUCING `par` BLOCK IS NOT A FRESH OWNED TEMP
+    /// AT THE DESTRUCTURE, so every heap-bearing leaf of
+    /// `let (t, k) = par { … (t, k) }` is left with no owner.
+    ///
+    /// `finish_owned_tuple_destructure` hands its leaves scope-exit cleanup
+    /// only when the RHS is a fresh owned temp, and `expr_yields_fresh_owned_temp`
+    /// admits exactly `Call | MethodCall`. A `par` block is neither, and it is
+    /// not a PLACE either, so the destructure reached neither branch and nothing
+    /// freed the leaves.
+    ///
+    /// Measured on the parent (x86_64 Linux, valgrind, archives current), with
+    /// NO RC-fallback promotion anywhere in the program — so B-2026-09-07-58's
+    /// box is not involved — against the identical destructure off a plain call:
+    ///
+    /// ```text
+    ///                              parent              with the fix
+    ///   par join, one heap leaf    56/32, 38 B lost    59/36, zero
+    ///   par join, two heap leaves  2 x 38 B lost       56/33, zero
+    ///   plain call (control)       24/24, zero         24/24, zero
+    /// ```
+    ///
+    /// BOTH LANES, because `KARAC_AUTO_PAR=0` disables AUTO-par only and an
+    /// explicit `par` block still fans out — the same reason B-2026-09-07-58's
+    /// cells are asserted under both.
+    ///
+    /// THE RC-PROMOTED SPELLING IS CELL 4, and it is here because the row filing
+    /// this named it as a trap to MEASURE rather than reason about: when the
+    /// leaf is promoted, B-2026-09-07-58's pin makes the parent free the box,
+    /// and that box carries a value-drop fn that frees the same `String`.
+    /// Registering a leaf cleanup beside it would be a double free — the shape
+    /// B-2026-09-07-30's history records for the sibling unification. Measured
+    /// clean in both lanes: zero lost, no invalid free.
+    ///
+    /// ONE SHAPE IS DELIBERATELY LEFT LEAKING and is NOT asserted here, because
+    /// this harness has no leak-EXPECTING helper and a clean-run assertion on it
+    /// would be false. A join tail that hands out an OUTER binding
+    /// (`par { let k = …; (outer, k) }`) is declined by the admission and still
+    /// loses its 38 B, measured. That is B-2026-08-29-27's fail-closed
+    /// discipline rather than an oversight: an outer binding stays readable past
+    /// the join, so handing its storage to a leaf would turn a bounded leak into
+    /// a use-after-free at every gate that frees at the use site. Its OUTPUT is
+    /// pinned in the `codegen.rs` twin; the leak is recorded on B-2026-09-08-8
+    /// so that widening the admission has to confront that argument first.
+    #[test]
+    fn asan_par_join_tuple_destructure_owns_its_heap_leaves() {
+        const PRE: &str = "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n";
+        // 1 — the row's cell A: one heap-bearing leaf through the join.
+        let one_leaf = format!(
+            "{PRE}fn go() -> i64 {{\n\
+             \x20 let (t, k) = par {{ let t = mkp(9); let k = payload().len(); (t, k) }};\n\
+             \x20 return t.a.len() + k; }}\n\
+             fn main() {{ println(go()); }}\n"
+        );
+        assert_clean_asan_run_no_auto_par(&one_leaf, &["76"], "b8-one-leaf-noautopar");
+        assert_clean_asan_run_min_allocs_auto_par(&one_leaf, &["76"], "b8-one-leaf-autopar", 6);
+        // 2 — two heap-bearing leaves: the leak scales per leaf.
+        let two_leaves = format!(
+            "{PRE}fn go() -> i64 {{\n\
+             \x20 let (t, u) = par {{ let t = mkp(9); let u = mkp(10); (t, u) }};\n\
+             \x20 return t.a.len() + u.a.len(); }}\n\
+             fn main() {{ println(go()); }}\n"
+        );
+        assert_clean_asan_run_no_auto_par(&two_leaves, &["76"], "b8-two-leaves-noautopar");
+        assert_clean_asan_run_min_allocs_auto_par(&two_leaves, &["76"], "b8-two-leaves-autopar", 6);
+        // 3 — CONTROL: the identical destructure off a plain call, clean before
+        // and after. A failure here means the probe, not the par path.
+        let plain_call = format!(
+            "{PRE}fn pair() -> (P, i64) {{ return (mkp(9), payload().len()); }}\n\
+             fn go() -> i64 {{ let (t, k) = pair(); return t.a.len() + k; }}\n\
+             fn main() {{ println(go()); }}\n"
+        );
+        assert_clean_asan_run_no_auto_par(&plain_call, &["76"], "b8-plain-call-control");
+        // 4 — the RC-PROMOTED leaf: the double-free trap, measured not reasoned.
+        let promoted = format!(
+            "{PRE}fn take(p: P) -> i64 {{ return p.a.len(); }}\n\
+             fn go() -> i64 {{\n\
+             \x20 let (t, k) = par {{ let t = mkp(9); let k = payload().len(); (t, k) }};\n\
+             \x20 let mut n = 0i64; let mut i = 0i64;\n\
+             \x20 while i < 3i64 {{ n = n + take(t); i = i + 1; }}\n\
+             \x20 return n + k; }}\n\
+             fn main() {{ println(go()); }}\n"
+        );
+        assert_clean_asan_run_no_auto_par(&promoted, &["152"], "b8-promoted-noautopar");
+        assert_clean_asan_run_min_allocs_auto_par(&promoted, &["152"], "b8-promoted-autopar", 6);
+    }
 }
