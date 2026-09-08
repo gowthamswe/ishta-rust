@@ -8591,6 +8591,67 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-08-9 — the OWNERSHIP half of
+    /// `e2e_rc_promoted_deep_chain_field_move_out_in_loop`, and the one leg
+    /// that actually reported a memory error on the parent.
+    ///
+    /// A two-hop move-out off an RC-promoted root GEP'd the whole aggregate out
+    /// of the root's eight-byte box-handle alloca and stored zeros past its
+    /// end. Under the JIT that landed on a live pointer: `free(): double free
+    /// detected in tcache 2`. Under AOT it landed on the destination's own
+    /// slot, which valgrind scored 0 errors at BOTH opt levels — the clobber
+    /// zeroed the destination's cap, so its buffer was simply never freed
+    /// rather than freed twice.
+    ///
+    /// That accident is also what forced B-2026-09-08-6 to gate its
+    /// destination copy to depth 1: ungated, the copy's buffer was the thing
+    /// the clobber then orphaned, measuring 15 allocs / 14 frees with 2 bytes
+    /// lost. With the wild store gone the copy is correct at any depth and the
+    /// gate is lifted, which is why `c_deep3` (three trips) balances here.
+    fn asan_rc_promoted_deep_chain_field_move_out_in_loop() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+struct S { id: i64, name: String }
+impl Drop for S { fn drop(mut ref self) { println(f"dS{self.id}") } }
+fn mks(i: i64) -> S { return S { id: i, name: f"s{i}" }; }
+
+struct In { mut r: S, mut q: S }
+struct Ou { mut h: In, mut k: i64 }
+struct Bs { mut one: S, mut two: S }
+
+fn c_deep() {
+    let mut o = Ou { h: In { r: mks(1), q: mks(2) }, k: 5 };
+    let mut i = 0;
+    while i < 1 { let x = o.h.r; println(f"t{x.id}"); i = i + 1; }
+}
+fn c_deep3() {
+    let mut o = Ou { h: In { r: mks(3), q: mks(4) }, k: 5 };
+    let mut i = 0;
+    while i < 3 { let x = o.h.r; i = i + 1; }
+    println("u");
+}
+fn c_flat() {
+    let mut g = Bs { one: mks(5), two: mks(6) };
+    let mut i = 0;
+    while i < 1 { let y = g.one; println(f"v{y.id}"); i = i + 1; }
+}
+fn c_straight() {
+    let mut o = Ou { h: In { r: mks(7), q: mks(8) }, k: 5 };
+    let x = o.h.r;
+    println(f"w{x.id}");
+}
+fn main() { c_deep(); c_deep3(); c_flat(); c_straight(); println("end"); }
+"#,
+            &[
+                "t1", "dS1", "dS2", "dS1", "dS3", "dS3", "dS3", "u", "dS4", "dS3", "v5", "dS5",
+                "dS6", "dS5", "dS8", "w7", "dS7", "end",
+            ],
+            "b0908-9-rc-promoted-deep-chain-move-out",
+            18,
+        );
+    }
+
+    #[test]
     /// B-2026-09-08-6 — the OWNERSHIP half of
     /// `e2e_rc_promoted_base_field_move_out_in_loop`.
     ///

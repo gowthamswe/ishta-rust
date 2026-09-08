@@ -31411,6 +31411,70 @@ fn main() {
         );
     }
 
+    /// B-2026-09-08-9 — the DEEP sibling of
+    /// `e2e_rc_promoted_base_field_move_out_in_loop`. A two-hop chain
+    /// (`let x = o.h.r`) off an RC-fallback-promoted root reaches the move-out
+    /// suppression through `field_chain_place_ptr`, whose arms GEP with a type
+    /// resolved from the DECLARED struct name and never consult `slot.ty`. A
+    /// promoted root's slot is an eight-byte `alloca ptr`, so the suppression
+    /// GEP'd a 72-byte `Ou` out of it and stored zeros at offsets 16 and 24 —
+    /// off the end, into the neighbouring destination alloca.
+    ///
+    /// Pre-fix, all three consequences of one wild store: `t0`/`dS0` at -O0
+    /// (the clobber landed on the destination's `id`), `t1`/`dS1` at -O2, and
+    /// `free(): double free detected in tcache 2` under the JIT, whose frame
+    /// layout put a live pointer where the zeros went. valgrind read 0 errors
+    /// at both AOT levels throughout, which is why an ASAN-only check would
+    /// have called the AOT legs clean while they were reading a clobbered
+    /// value.
+    ///
+    /// `c_flat` is B-2026-09-08-6's shape, which must stay fixed, and
+    /// `c_straight` is the un-promoted control that was correct throughout.
+    #[test]
+    fn e2e_rc_promoted_deep_chain_field_move_out_in_loop() {
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs { return Rs { id: i, name: f\"h{i}\" }; }\n\
+             struct In { mut r: Rs, mut q: Rs }\n\
+             struct Ou { mut h: In, mut k: i64 }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn c_deep() {\n\
+             \x20   let mut o = Ou { h: In { r: mks(1), q: mks(2) }, k: 5 };\n\
+             \x20   let mut i = 0;\n\
+             \x20   while i < 1 { let x = o.h.r; println(f\"t{x.id}\"); i = i + 1; }\n\
+             }\n\
+             fn c_deep3() {\n\
+             \x20   let mut o = Ou { h: In { r: mks(3), q: mks(4) }, k: 5 };\n\
+             \x20   let mut i = 0;\n\
+             \x20   while i < 3 { let x = o.h.r; i = i + 1; }\n\
+             \x20   println(\"u\");\n\
+             }\n\
+             fn c_flat() {\n\
+             \x20   let mut g = Bs { one: mks(5), two: mks(6) };\n\
+             \x20   let mut i = 0;\n\
+             \x20   while i < 1 { let y = g.one; println(f\"v{y.id}\"); i = i + 1; }\n\
+             }\n\
+             fn c_straight() {\n\
+             \x20   let mut o = Ou { h: In { r: mks(7), q: mks(8) }, k: 5 };\n\
+             \x20   let x = o.h.r;\n\
+             \x20   println(f\"w{x.id}\");\n\
+             }\n\
+             fn main() { c_deep(); c_deep3(); c_flat(); c_straight(); println(\"end\"); }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "t1\ndS1\ndS2\ndS1\ndS3\ndS3\ndS3\nu\ndS4\ndS3\nv5\ndS5\ndS6\ndS5\n\
+             dS8\nw7\ndS7\nend\n"
+        );
+    }
+
     /// B-2026-09-08-6 — a field move-out inside a `while` that iterates ONCE
     /// is the same single move as the straight-line spelling, but the loop
     /// makes the consume and the later use dominance-INCOMPARABLE, so the

@@ -9091,12 +9091,26 @@ impl<'ctx> super::Codegen<'ctx> {
     /// bails on.
     ///
     /// `follow_rc_box == false` (every pre-existing caller, via the wrapper)
-    /// keeps the raw slot and therefore today's behaviour exactly. That is
-    /// deliberate, not an oversight: the DISARM callers must not reach the
-    /// box's field at all. `projection_root_is_rc_boxed` records why — zeroing
-    /// the box's cap to neutralize a source would blank a value the next loop
-    /// iteration still reads, so those neutralize the DESTINATION instead, and
-    /// a promoted root is expected to fall out of their `slot.ty` shape test.
+    /// BAILS on a promoted root. The DISARM callers must not reach the box's
+    /// field at all — `projection_root_is_rc_boxed` records why: zeroing the
+    /// box's cap to neutralize a source would blank a value the next loop
+    /// iteration still reads, so those neutralize the DESTINATION instead.
+    ///
+    /// B-2026-09-08-9 — this arm used to hand back the RAW SLOT there, on the
+    /// stated expectation that "a promoted root falls out of their `slot.ty`
+    /// shape test". That holds for the FLAT suppressor
+    /// (`suppress_struct_field_move_by_name` opens with
+    /// `let BasicTypeEnum::StructType(agg_ty) = slot.ty else { return; }`) and
+    /// is FALSE for every caller reached through a chain hop here, because the
+    /// arms below GEP with a type resolved from the DECLARED struct name and
+    /// never consult `slot.ty` at all. `let x = o.h.r` in a loop therefore
+    /// GEP'd a 72-byte `Ou` out of an eight-byte `alloca ptr` and stored zeros
+    /// at offsets 16 and 24 — off the end, into the neighbouring `x` alloca:
+    /// `t0`/`dS0` at -O0 where -O2 read `t1`/`dS1`, and `free(): double free
+    /// detected in tcache 2` under the JIT, whose different frame layout put a
+    /// live pointer where the zeros landed. Bailing makes the expectation true
+    /// by construction, exactly as the `ref` param arm above already does for
+    /// the identical 8-byte-slot hazard.
     ///
     /// `follow_rc_box == true` (the `mut ref` argument path) resolves through
     /// the box, because a `mut ref` argument needs the real PLACE: the callee
@@ -9126,13 +9140,12 @@ impl<'ctx> super::Codegen<'ctx> {
                 if self.borrow_vars.ref_params.contains_key(name.as_str()) {
                     return None;
                 }
-                if follow_rc_box
-                    && self
-                        .drop_rc
-                        .rc_fallback_heap_types
-                        .contains_key(name.as_str())
+                if self
+                    .drop_rc
+                    .rc_fallback_heap_types
+                    .contains_key(name.as_str())
                 {
-                    return self.get_data_ptr(name.as_str());
+                    return follow_rc_box.then(|| self.get_data_ptr(name.as_str()))?;
                 }
                 self.variables.get(name.as_str()).map(|s| s.ptr)
             }
@@ -9140,8 +9153,8 @@ impl<'ctx> super::Codegen<'ctx> {
                 if self.borrow_vars.ref_params.contains_key("self") {
                     return None;
                 }
-                if follow_rc_box && self.drop_rc.rc_fallback_heap_types.contains_key("self") {
-                    return self.get_data_ptr("self");
+                if self.drop_rc.rc_fallback_heap_types.contains_key("self") {
+                    return follow_rc_box.then(|| self.get_data_ptr("self"))?;
                 }
                 self.variables.get("self").map(|s| s.ptr)
             }

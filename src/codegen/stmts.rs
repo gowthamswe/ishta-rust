@@ -9961,19 +9961,27 @@ impl<'ctx> super::Codegen<'ctx> {
                                     // heap fields for the by-value param entry
                                     // copy.
                                     //
-                                    // DEPTH 1 ONLY, and the bound is measured
-                                    // rather than cautious. A two-hop chain
-                                    // (`let x = o.h.r`) reaches a different
-                                    // disarm route, and copying there produced
-                                    // a buffer with no owner: 15 allocs / 14
-                                    // frees and `2 bytes in 1 blocks are
-                                    // definitely lost` at -O0, against the
-                                    // parent's clean 14 / 14 on the identical
-                                    // cell. That is a leak this fix would have
-                                    // INTRODUCED, so the copy stops where the
-                                    // declines above stop. The deep chain is
-                                    // filed separately.
-                                    if segs.len() == 1 && self.projection_root_is_rc_boxed(value) {
+                                    // ANY DEPTH. B-2026-09-08-6 gated this to
+                                    // `segs.len() == 1` on a measurement: a
+                                    // two-hop chain copied here lost the copy's
+                                    // buffer, 15 allocs / 14 frees with 2 bytes
+                                    // definitely lost at -O0 where the parent
+                                    // was a clean 14 / 14.
+                                    //
+                                    // B-2026-09-08-9 found the cause and it was
+                                    // not the copy. `field_chain_place_ptr`
+                                    // handed the deep suppression the promoted
+                                    // root's eight-byte box-handle alloca, and
+                                    // the zeros it stored past the end of it
+                                    // landed on the copy's own cap — so the
+                                    // buffer was orphaned by a wild store, not
+                                    // by a missing owner. With that store gone
+                                    // the copy balances at every depth
+                                    // (measured 40 / 40 at -O0 and 37 / 37 at
+                                    // -O2 over a one-hop, a two-hop and a
+                                    // three-trip cell), so the gate is lifted
+                                    // rather than kept as a standing bound.
+                                    if self.projection_root_is_rc_boxed(value) {
                                         if let Some(dslot) =
                                             self.variables.get(var_name.as_str()).copied()
                                         {
