@@ -39852,6 +39852,61 @@ impl BuildHasher for SumBuild {\n\
         run_program_capturing(src).map(|c| c.stdout)
     }
 
+    #[test]
+    fn test_e2e_rebound_vec_shared_param_keeps_every_element_alive() {
+        // B-2026-09-07-56 — value half. The copy made for `let mut work = xs`
+        // must co-own the elements, so reading them back through EITHER
+        // container gives the same answer on every pass.
+        let src = r#"
+shared struct Node { val: i64 }
+
+fn probe(xs: Vec[Node]) -> i64 {
+    let mut work = xs;
+    work[0].val + work[1].val
+}
+
+fn main() {
+    let a = Node { val: 7 };
+    let b = Node { val: 9 };
+    let mut v: Vec[Node] = Vec.new();
+    v.push(a);
+    v.push(b);
+    println(probe(v));
+    println(probe(v));
+    println(v[0].val);
+}
+"#;
+        assert_eq!(run_program(src), Some("16\n16\n7\n".to_string()));
+    }
+
+    #[test]
+    fn test_e2e_owned_struct_param_vec_shared_field_move_reads_back() {
+        // CONTROL — passes with and without the fix. A `Vec[shared T]` field
+        // moved out of a by-value struct param is balanced by the entry-copy
+        // machinery and never reaches the copy helper's element chain; this
+        // pins that the new retain arm leaves it alone.
+        let src = r#"
+shared struct Node { val: i64 }
+struct Bag { kids: Vec[Node] }
+
+fn probe(p: Bag) -> i64 {
+    let ks = p.kids;
+    ks[0].val + ks[1].val
+}
+
+fn main() {
+    let a = Node { val: 7 };
+    let b = Node { val: 9 };
+    let mut v: Vec[Node] = Vec.new();
+    v.push(a);
+    v.push(b);
+    let bag = Bag { kids: v };
+    println(probe(bag));
+}
+"#;
+        assert_eq!(run_program(src), Some("16\n".to_string()));
+    }
+
     /// B-2026-09-07-59 — the VALUE half. A `.clone()` whose receiver is a
     /// niche-encoded `Option[shared T]` field returned an empty chain on every
     /// compiled backend while `--interp` returned the real one.

@@ -4039,6 +4039,68 @@ impl<'ctx> super::Codegen<'ctx> {
         Some(drop_fn)
     }
 
+    /// B-2026-09-07-56 — the RETAIN twin of [`Self::emit_vec_elem_rc_dec_fn`]:
+    /// `__karac_vec_elem_rc_inc_<T>`, called with a pointer to one element SLOT
+    /// of a `Vec[shared T]`, loading the RC handle, null-checking, and rc-INCing
+    /// through `T`'s heap layout.
+    ///
+    /// It exists so a duplicated `Vec[shared T]` buffer can be given the same
+    /// per-element ownership its eventual drain will take away, WITH THE SAME
+    /// DISPATCH: both go through the `heap_type`-keyed `emit_refcount_*_by_type`
+    /// pair, so a `par` element's atomic discipline (and a headerless type's
+    /// no-op) is matched by construction rather than by two call sites agreeing.
+    /// A hand-rolled inc at the copy site is what lets those drift apart.
+    ///
+    /// Null-checked for the same reason the dec is: a moved-out slot holds a
+    /// null sentinel, and an unguarded inc would GEP the refcount word off it.
+    /// Memoized by symbol name.
+    pub(super) fn emit_vec_elem_rc_inc_fn(
+        &mut self,
+        type_name: &str,
+        heap_ty: StructType<'ctx>,
+    ) -> Option<inkwell::values::FunctionValue<'ctx>> {
+        let fn_name = format!("__karac_vec_elem_rc_inc_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            return Some(f);
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let void_ty = self.context.void_type();
+        let saved_bb = self.builder.get_insert_block();
+        let saved_fn = self.current_fn;
+        let fn_ty = void_ty.fn_type(&[ptr_ty.into()], false);
+        let inc_fn =
+            self.module
+                .add_function(&fn_name, fn_ty, Some(inkwell::module::Linkage::Internal));
+        self.current_fn = Some(inc_fn);
+        let entry = self.context.append_basic_block(inc_fn, "entry");
+        self.builder.position_at_end(entry);
+        let slot_ptr = inc_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let inner = self
+            .builder
+            .build_load(ptr_ty, slot_ptr, "vecelem.rcinc.ptr")
+            .unwrap()
+            .into_pointer_value();
+        let is_null = self
+            .builder
+            .build_is_null(inner, "vecelem.rcinc.isnull")
+            .unwrap();
+        let do_bb = self.context.append_basic_block(inc_fn, "vecelem.rcinc.do");
+        let ret_bb = self.context.append_basic_block(inc_fn, "vecelem.rcinc.ret");
+        self.builder
+            .build_conditional_branch(is_null, ret_bb, do_bb)
+            .unwrap();
+        self.builder.position_at_end(do_bb);
+        self.emit_refcount_inc_by_type(heap_ty, inner);
+        self.builder.build_unconditional_branch(ret_bb).unwrap();
+        self.builder.position_at_end(ret_bb);
+        self.builder.build_return(None).unwrap();
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        self.current_fn = saved_fn;
+        Some(inc_fn)
+    }
+
     /// Vec-store slice (B-2026-06-22-2): synthesize (or fetch) the per-element
     /// drop fn for a `Vec[Fn]` that OWNS heap-env closure environments. The
     /// `FreeVecBuffer` drain calls it once per live element with a pointer to the
@@ -4970,6 +5032,81 @@ impl<'ctx> super::Codegen<'ctx> {
                 idx_phi.add_incoming(&[(&next, body_bb)]);
 
                 self.builder.position_at_end(exit_bb);
+            } else if let Some((shared_name, shared_heap)) = match &inner_te.kind {
+                TypeKind::Path(p) => p.segments.first().and_then(|n| {
+                    self.type_decls
+                        .shared_types
+                        .get(n.as_str())
+                        .map(|i| (n.clone(), i.heap_type))
+                }),
+                _ => None,
+            } {
+                // B-2026-09-07-56 — a BARE `shared T` element. The flat memcpy
+                // copied each element's RC HANDLE, so the copy and the source
+                // now name the same boxes while BOTH keep a per-element rc-dec
+                // drain: two decs against one count. The arms above all reach
+                // the same conclusion by cloning, which for an RC leaf is a
+                // retain — `emit_vec_elem_rc_inc_fn`, the exact twin of the
+                // drain's `__karac_vec_elem_rc_dec_<T>`.
+                //
+                // Nothing above catches it: `type_expr_has_drop_heap` is false
+                // for a shared leaf by design (its memory rides the refcount,
+                // not a drop walk), the slot is one pointer rather than a
+                // `{ptr,len,cap}`, and it is not a Map/Set handle. So the whole
+                // chain fell through and the element loop was simply not
+                // emitted. `Option[shared T]` was never affected — it reaches
+                // the aggregate arm above via `te_owns_option_heap_payload` and
+                // clones through `karac_clone_Option_<T>`, which rc-incs.
+                //
+                // MEASURED on `fn probe(xs: Vec[Node]) -> i64 { let mut work =
+                // xs; work[0].val }` over a two-element `Vec[shared Node]`: the
+                // callee's copy and the caller's original each drained both
+                // handles, driving each box to 0 while the other container
+                // still held it, and the caller's own binding dec then read AND
+                // WROTE the freed refcount word. The row filed it under an
+                // index-assign (`work[0] = work[1]`), but that statement is not
+                // load-bearing — the rebind alone reproduces it identically.
+                //
+                // `weak T` is excluded for free: it is `TypeKind::Weak`, not a
+                // `Path`, so the match below never sees it and a weak element
+                // keeps its non-owning semantics.
+                if let Some(inc_fn) = self.emit_vec_elem_rc_inc_fn(&shared_name, shared_heap) {
+                    let loop_bb = self.context.append_basic_block(fn_val, "dcopy.rc.loop");
+                    let body_bb = self.context.append_basic_block(fn_val, "dcopy.rc.body");
+                    let exit_bb = self.context.append_basic_block(fn_val, "dcopy.rc.exit");
+                    let pre_bb = self.builder.get_insert_block().unwrap();
+                    self.builder.build_unconditional_branch(loop_bb).unwrap();
+
+                    self.builder.position_at_end(loop_bb);
+                    let idx_phi = self.builder.build_phi(i64_t, "dcopy.rc.i").unwrap();
+                    idx_phi.add_incoming(&[(&i64_t.const_int(0, false), pre_bb)]);
+                    let idx = idx_phi.as_basic_value().into_int_value();
+                    let in_range = self
+                        .builder
+                        .build_int_compare(inkwell::IntPredicate::ULT, idx, len, "dcopy.rc.cmp")
+                        .unwrap();
+                    self.builder
+                        .build_conditional_branch(in_range, body_bb, exit_bb)
+                        .unwrap();
+
+                    self.builder.position_at_end(body_bb);
+                    // One pointer-width RC handle per slot — stride by
+                    // `elem_ty`, not the 24-byte `vec_ty`.
+                    let slot = unsafe {
+                        self.builder
+                            .build_gep(elem_ty, buf, &[idx], "dcopy.rc.slot")
+                            .unwrap()
+                    };
+                    self.builder.build_call(inc_fn, &[slot.into()], "").unwrap();
+                    let next = self
+                        .builder
+                        .build_int_add(idx, i64_t.const_int(1, false), "dcopy.rc.next")
+                        .unwrap();
+                    self.builder.build_unconditional_branch(loop_bb).unwrap();
+                    idx_phi.add_incoming(&[(&next, body_bb)]);
+
+                    self.builder.position_at_end(exit_bb);
+                }
             }
         }
 

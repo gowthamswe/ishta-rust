@@ -3322,14 +3322,33 @@ impl<'ctx> super::Codegen<'ctx> {
             let copied = self.emit_vecstr_defensive_copy(cur, elem_ty, elem_te.as_ref());
             let _ = self.builder.build_store(slot_ptr, copied);
         }
-        if is_view_field {
-            if let Some(heap_type) = elem_te
-                .as_ref()
-                .and_then(|te| self.shared_heap_type_for_type_expr(te))
-            {
-                self.rc_inc_vec_shared_elements(slot_ptr, heap_type);
-            }
-        }
+        // B-2026-09-07-56 — the per-element rc-INC that used to stand HERE, for
+        // the view-field branch only, now rides `emit_vecstr_defensive_copy`
+        // itself: a `shared T` element is retained by the same chain that
+        // deep-clones a String / Map / heap-aggregate element, for the same
+        // reason (the source keeps its own per-element drain, so the copy needs
+        // ownership of its own).
+        //
+        // REMOVED BY SUBSUMPTION, not by measurement, and the distinction
+        // matters because no fixture in the tree reaches this code with a
+        // `Vec[shared]` destination — both candidate shapes (`let ks = p.kids`
+        // off a by-value struct param, and the shared-enum-payload view
+        // `let a = c.args`) turn out to be handled by the entry-copy machinery
+        // instead, emitting its `viewvsh` / `p14a.shvec` retains and never the
+        // copy helper's element chain. So this cannot be justified by a green
+        // test; it is justified by the CONDITIONS being identical. The
+        // hand-rolled call fired on `shared_heap_type_for_type_expr(elem_te)`,
+        // and the new arm fires when the copy above is handed that same
+        // `elem_te` and it names a shared type. Whenever one would run the
+        // other does, with the same effect — so keeping both would inc twice
+        // and leak every element, exactly the "double-inc'd against other
+        // per-site inc paths" failure `rc_inc_vec_shared_elements`'s doc
+        // records from the first attempt at this arm.
+        //
+        // The over-retain that would result is also the hard one to notice: the
+        // boxes stay reachable from a live container, so it reports as
+        // valgrind "still reachable" rather than a leak, and neither the
+        // default leak-check nor LSan says a word.
     }
 
     /// B-2026-07-04-17: deep-copy the field(s) of a just-bound aggregate at
@@ -6745,14 +6764,16 @@ impl<'ctx> super::Codegen<'ctx> {
                         //
                         //     Only the receiver spellings that actually LOWER are
                         //     resolved (see `option_shared_info_for_clone_receiver`):
-                        //     an Index and a tracked Identifier. A FieldAccess
-                        //     receiver is deliberately excluded — it miscompiles
-                        //     independently of the refcount (`n.left.clone()` prints
-                        //     0 against the interpreter's 2, B-2026-09-07-59), and a
-                        //     call receiver does not compile at all
-                        //     (B-2026-09-07-60). Registering a binding whose value is
-                        //     already wrong would queue a dec against a handle the
-                        //     clone never produced.
+                        //     a tracked Identifier, an Index, a FieldAccess and a
+                        //     Call. The last two were excluded while their VALUES
+                        //     were wrong — `n.left.clone()` printed 0 against the
+                        //     interpreter's 2 (B-2026-09-07-59) and a call receiver
+                        //     did not compile at all (B-2026-09-07-60) — because
+                        //     registering a binding whose value is already wrong
+                        //     queues a dec against a handle the clone never
+                        //     produced. Both are fixed, so both are registered; the
+                        //     rule the exclusion encoded is unchanged, it just no
+                        //     longer excludes anything.
                         if shared_option_info.is_none() {
                             if let ExprKind::MethodCall {
                                 object,

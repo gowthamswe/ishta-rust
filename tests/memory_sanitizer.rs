@@ -46892,6 +46892,144 @@ fn main() {
     }
 
     #[test]
+    fn asan_rebound_vec_shared_param_co_owns_its_elements() {
+        // B-2026-09-07-56 — the MINIMAL shape, and the one the row missed.
+        // `let mut work = xs` over a by-value `Vec[shared T]` param deep-copies
+        // the buffer (the caller keeps the original's scope-exit drain), but the
+        // copy is a flat memcpy of RC HANDLES: both containers then drain the
+        // same boxes. Each element's count goes one below its true owner set,
+        // so the caller's own binding dec reads — and writes — a freed refcount
+        // word. No index-assign is involved; the row's fixture just happened to
+        // carry one.
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64 }
+
+fn probe(xs: Vec[Node]) -> i64 {
+    let mut work = xs;
+    work[0].val
+}
+
+fn main() {
+    let a = Node { val: 7 };
+    let b = Node { val: 9 };
+    let mut v: Vec[Node] = Vec.new();
+    v.push(a);
+    v.push(b);
+    println(probe(v));
+}
+"#,
+            &["7"],
+            "rebound_vec_shared_param_co_owns_its_elements",
+        );
+    }
+
+    #[test]
+    fn asan_rebound_vec_shared_param_survives_repeated_passes() {
+        // The escalation the quarantine file warns about: a single pass drives
+        // each count to -1 (one bad read+write), and each further pass frees a
+        // box the other container still holds. Three passes is a double free,
+        // not a stray read — proof that the count is genuinely restored rather
+        // than the fixture's traffic happening to land back on zero.
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64 }
+
+fn probe(xs: Vec[Node]) -> i64 {
+    let mut work = xs;
+    work[0].val
+}
+
+fn main() {
+    let a = Node { val: 7 };
+    let b = Node { val: 9 };
+    let mut v: Vec[Node] = Vec.new();
+    v.push(a);
+    v.push(b);
+    let mut total = 0;
+    total = total + probe(v);
+    total = total + probe(v);
+    total = total + probe(v);
+    println(total);
+}
+"#,
+            &["21"],
+            "rebound_vec_shared_param_repeated_passes",
+        );
+    }
+
+    #[test]
+    fn asan_owned_struct_param_vec_shared_field_move_co_owns() {
+        // CONTROL, and labelled as one because it passes BOTH WITH AND WITHOUT
+        // the fix. `let ks = p.kids` moving a `Vec[shared T]` FIELD out of a
+        // by-value struct param was already balanced: its IR shows the
+        // entry-copy machinery's `viewvsh` / `p14a.shvec` retain loops and NO
+        // `dcopy.rc` loop, i.e. it never reaches
+        // `emit_vecstr_defensive_copy`'s element chain at all.
+        //
+        // It earns its place anyway, on the hazard rather than the bug: an
+        // over-retain here would keep each box alive but STILL REACHABLE from a
+        // live container, which valgrind's default leak-check and LSan both
+        // stay silent about. Pinning the shape is how a future widening of the
+        // new arm gets caught.
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64 }
+struct Bag { kids: Vec[Node] }
+
+fn probe(p: Bag) -> i64 {
+    let ks = p.kids;
+    ks[0].val + ks[1].val
+}
+
+fn main() {
+    let a = Node { val: 7 };
+    let b = Node { val: 9 };
+    let mut v: Vec[Node] = Vec.new();
+    v.push(a);
+    v.push(b);
+    let bag = Bag { kids: v };
+    println(probe(bag));
+}
+"#,
+            &["16"],
+            "owned_struct_param_vec_shared_field_move",
+        );
+    }
+
+    #[test]
+    fn asan_vec_option_shared_param_rebind_is_unchanged() {
+        // Control. An `Option[shared T]` element was never affected: it reaches
+        // the aggregate arm through `te_owns_option_heap_payload` and clones via
+        // `karac_clone_Option_<T>`, which already rc-incs. This has to stay
+        // exactly one retain — the new bare-`shared` arm must not also fire.
+        assert_clean_asan_run(
+            r#"
+shared struct Node { val: i64 }
+
+fn probe(xs: Vec[Option[Node]]) -> i64 {
+    let mut work = xs;
+    match work[0] {
+        Option.Some(n) => n.val,
+        Option.None => 0,
+    }
+}
+
+fn main() {
+    let a = Node { val: 7 };
+    let b = Node { val: 9 };
+    let mut v: Vec[Option[Node]] = Vec.new();
+    v.push(Option.Some(a));
+    v.push(Option.Some(b));
+    println(probe(v));
+}
+"#,
+            &["7"],
+            "vec_option_shared_param_rebind_unchanged",
+        );
+    }
+
+    #[test]
     fn asan_owned_string_param_let_move_grow() {
         // String sibling with a realloc after the move — without the
         // deep copy the caller frees a stale (realloc-moved) pointer.

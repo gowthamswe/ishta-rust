@@ -72,9 +72,24 @@
 # inside the same generated drop.
 memory_sanitizer_tests::asan_shared_enum_boxed_struct_payload_moveout_no_double_free           # B-2026-09-07-55
 #
-# `v[i] = <place>` releases the old element, then `main` reads through the
-# released 16-byte handle. Read is in `main`, not in a teardown helper.
-memory_sanitizer_tests::asan_vec_plain_shared_index_overwrite_place_rhs_no_leak                # B-2026-09-07-56
+# B-2026-09-07-56 REMOVED 2026-09-08, its owning row fixed. The entry read:
+#
+#   `v[i] = <place>` releases the old element, then `main` reads through the
+#   released 16-byte handle. Read is in `main`, not in a teardown helper.
+#   memory_sanitizer_tests::asan_vec_plain_shared_index_overwrite_place_rhs_no_leak
+#
+# The read really was in `main`, and that is what made the entry misleading: it
+# was read as "the index-assign lowering itself", and the index-assign turned
+# out to be innocent. `let mut work = xs` over a by-value `Vec[shared T]` param
+# deep-copies the buffer -- correctly, the caller keeps the original's drain --
+# but the copy was a flat memcpy of RC HANDLES with no retain, so both
+# containers drained the same boxes. Deleting the fixture's `work[0] = work[1]`
+# line reproduces the identical read at the identical address.
+#
+# The lesson is the file's own, one row on: a quarantine entry records WHERE a
+# report landed, which is not the same as where the defect is. `main` was the
+# honest answer to "which frame read freed memory" and the wrong answer to
+# "which lowering is wrong".
 #
 # The one NON-heap finding: `stack-buffer-overflow`, a read at offset 40 of a
 # frame that has exactly one object. Same fixture family as B-2026-09-07-43's
