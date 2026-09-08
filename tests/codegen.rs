@@ -40537,6 +40537,49 @@ fn main() {
         assert_eq!(run_program(src), Some("-1\n".to_string()));
     }
 
+    #[test]
+    fn test_e2e_nested_vec_weak_read_is_stable_and_still_expires() {
+        // B-2026-09-08-7 — the SEMANTICS half, and as with B-2026-09-08-1 it is
+        // NOT the regression guard: every fixture in that row printed the right
+        // values before and after the fix, which is exactly why the family
+        // survived so long. `tests/memory_sanitizer.rs` is the guard.
+        //
+        // What this pins is the direction the fix could go wrong. Two of the
+        // three gaps added COUNTS -- a per-slot weak drain and a balancing
+        // acquire on a nested-index read -- and a weak count must not change
+        // what a slot observes. So: reading the same nested slot twice must
+        // give the same answer (the acquire is balanced, not accumulating), and
+        // a container whose strong owner died with the frame that built it must
+        // still read `None` (a weak count keeps the CONTROL BLOCK addressable,
+        // never the payload).
+        let src = r#"
+shared struct N { v: i64 }
+
+fn build() -> Vec[Vec[weak N]] {
+    let a: N = N { v: 7 };
+    let mut inner: Vec[weak N] = Vec.new();
+    inner.push(a);
+    let mut outer: Vec[Vec[weak N]] = Vec.new();
+    outer.push(inner);
+    outer
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut inner: Vec[weak N] = Vec.new();
+    inner.push(a);
+    let mut outer: Vec[Vec[weak N]] = Vec.new();
+    outer.push(inner);
+    match outer[0][0] { Some(x) => { println(x.v) } None => { println(0 - 1) } }
+    match outer[0][0] { Some(y) => { println(y.v) } None => { println(0 - 1) } }
+    let dead = build();
+    match dead[0][0] { Some(z) => { println(z.v) } None => { println(0 - 1) } }
+    println(a.v);
+}
+"#;
+        assert_eq!(run_program(src), Some("7\n7\n-1\n7\n".to_string()));
+    }
+
     /// B-2026-09-07-59 — the VALUE half. A `.clone()` whose receiver is a
     /// niche-encoded `Option[shared T]` field returned an empty chain on every
     /// compiled backend while `--interp` returned the real one.

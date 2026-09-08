@@ -42,6 +42,20 @@ impl<'ctx> super::Codegen<'ctx> {
             return f;
         }
         match &te.kind {
+            // B-2026-09-08-7 — a `weak T` leaf, and the CLONE-side twin of the
+            // drop arm below. Without it the fallback emitted a bare pointer
+            // copy (`karac_clone_unknown`: load, store, return), so a cloned
+            // `Vec[weak T]` aliased the source's weak handles while BOTH
+            // containers went on to drain them.
+            //
+            // It is the same rule B-2026-09-08-1 established one copy site
+            // over: whatever hands out an independent owner has to hand out an
+            // independent COUNT. `__karac_weak_slot_downgrade` is the same
+            // per-slot helper the defensive-copy arm uses, and it takes a
+            // pointer to the slot, which is exactly this family's (src, dst)
+            // ABI with dst already holding the copied handle -- so the clone
+            // stores first and downgrades the DESTINATION, never the source.
+            TypeKind::Weak(_) => self.emit_weak_slot_clone_fn(),
             TypeKind::Tuple(elems) if !elems.is_empty() => self.emit_tuple_clone_fn(elems),
             TypeKind::Path(p) => {
                 let head = p.segments.first().map(String::as_str);
@@ -2067,6 +2081,7 @@ impl<'ctx> super::Codegen<'ctx> {
             return f;
         }
         match &te.kind {
+            TypeKind::Weak(_) => self.emit_weak_slot_drop_fn(),
             TypeKind::Tuple(elems) if !elems.is_empty() => self.emit_tuple_drop_fn(elems),
             TypeKind::Path(p) => {
                 let head = p.segments.first().map(String::as_str);

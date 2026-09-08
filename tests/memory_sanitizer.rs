@@ -47324,6 +47324,189 @@ fn main() {
     }
 
     #[test]
+    fn asan_nested_vec_weak_container_drains_every_slot() {
+        // B-2026-09-08-7 — the row's minimal reproducer, and note it takes NO
+        // function parameter at all: this family is reachable with none of the
+        // caller-retains machinery B-2026-09-08-1 was about, which is what made
+        // the two separate rows rather than one bug seen twice.
+        //
+        // `te_recursive_drop_fully_supported` answered false for a
+        // `TypeKind::Weak` leaf (the `_ => false` catch-all), so a
+        // `Vec[Vec[weak T]]` took the one-level buffer-only fast path and no
+        // weak slot inside it was ever drained. 24 bytes per slot, at both opt
+        // levels.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut inner: Vec[weak N] = Vec.new();
+    inner.push(a);
+    let mut outer: Vec[Vec[weak N]] = Vec.new();
+    outer.push(inner);
+    match outer[0][0] { Some(x) => { println(x.v) } None => { println(0 - 1) } }
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "nested_vec_weak_container_drains_every_slot",
+        );
+    }
+
+    #[test]
+    fn asan_nested_vec_weak_container_without_any_read_drains() {
+        // The SAME container, never read. This fixture is why the row could be
+        // split from the two defects sitting on top of it: with the read gone,
+        // the drain gap is the only thing left, and this went leak -> clean on
+        // the drain fix ALONE. The fixture above stayed red at that point and
+        // would have made a correct fix look wrong.
+        //
+        // Worth keeping as its own case rather than folding into the one above:
+        // a future regression in either half is distinguishable by which of the
+        // two goes red.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut inner: Vec[weak N] = Vec.new();
+    inner.push(a);
+    let mut outer: Vec[Vec[weak N]] = Vec.new();
+    outer.push(inner);
+    println(a.v);
+}
+"#,
+            &["7"],
+            "nested_vec_weak_container_without_read",
+        );
+    }
+
+    #[test]
+    fn asan_nested_index_weak_read_takes_a_balancing_acquire() {
+        // The read half, isolated one nesting level deeper so the chained index
+        // is the only variable. `expr_is_weak_field_read` decides whether a
+        // weak read needs the balancing acquire that matches the
+        // `RcDecOption` its binding queues, and it resolved the receiver only
+        // through a bare identifier (`v[i]`) or a struct field (`a.ns[i]`) --
+        // `_ => None` for a nested `Index`. So `outer[0][0]` took the dec
+        // without the inc and over-released the referent by exactly one, the
+        // identical failure B-2026-07-21-21 measured for the field spelling and
+        // B-2026-08-08-28 for the field-rooted element one.
+        //
+        // Three levels rather than two so the resolver's RECURSION is what is
+        // pinned, not a single hard-coded extra level.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut lvl0: Vec[weak N] = Vec.new();
+    lvl0.push(a);
+    let mut lvl1: Vec[Vec[weak N]] = Vec.new();
+    lvl1.push(lvl0);
+    let mut lvl2: Vec[Vec[Vec[weak N]]] = Vec.new();
+    lvl2.push(lvl1);
+    match lvl2[0][0][0] { Some(x) => { println(x.v) } None => { println(0 - 1) } }
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "nested_index_weak_read_balancing_acquire",
+        );
+    }
+
+    #[test]
+    fn asan_cloned_row_of_nested_vec_weak_co_owns_its_slots() {
+        // The clone half. `emit_clone_fn_for_type_expr` had no `TypeKind::Weak`
+        // arm, so a weak leaf fell to the primitive fallback whose body is
+        // load-store-return -- a flat ALIAS of the source's handle, handed to a
+        // destination that runs its own `__karac_weak_slot_drop`.
+        //
+        // Same rule as B-2026-09-08-1 one copy site over: whatever hands out an
+        // independent owner has to hand out an independent count.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut inner: Vec[weak N] = Vec.new();
+    inner.push(a);
+    let mut outer: Vec[Vec[weak N]] = Vec.new();
+    outer.push(inner);
+    let row: Vec[weak N] = outer[0].clone();
+    match row[0] { Some(x) => { println(x.v) } None => { println(0 - 1) } }
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "cloned_row_of_nested_vec_weak_co_owns",
+        );
+    }
+
+    #[test]
+    fn asan_map_of_vec_weak_param_stash_drains_every_slot() {
+        // The shape B-2026-09-08-1's fix REGRESSED, now correct. It was green
+        // before that fix by CANCELLATION rather than by correctness -- the
+        // copy failed to retain (that row) and this nested destination failed
+        // to drain (this one) -- so the two errors summed to zero, and removing
+        // one exposed the other.
+        //
+        // Kept as its own fixture because a cancelling pair reports as a clean
+        // run: nothing but a deliberate case records that the pair existed.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn stash(xs: Vec[weak N]) -> i64 {
+    let mut m: Map[i64, Vec[weak N]] = Map.new();
+    m.insert(1, xs);
+    match m.get(1) { Some(inner) => { match inner[0] { Some(x) => { x.v } None => { 0 - 1 } } } None => { 0 - 2 } }
+}
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut w: Vec[weak N] = Vec.new();
+    w.push(a);
+    println(stash(w));
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "map_of_vec_weak_param_stash",
+        );
+    }
+
+    #[test]
+    fn asan_nested_vec_option_shared_read_is_unchanged() {
+        // CONTROL — the non-weak peer of the read fixture above, clean before
+        // and after. `Option[shared N]` reaches the chained index through the
+        // ordinary owned-payload path rather than through a weak upgrade, so it
+        // never needed the balancing acquire and must not gain one. Pins that
+        // the resolver widening did not spill into the strong tier.
+        assert_clean_asan_run(
+            r#"
+shared struct N { v: i64 }
+
+fn main() {
+    let a: N = N { v: 7 };
+    let mut inner: Vec[Option[N]] = Vec.new();
+    inner.push(Option.Some(a));
+    let mut outer: Vec[Vec[Option[N]]] = Vec.new();
+    outer.push(inner);
+    match outer[0][0] { Some(x) => { println(x.v) } None => { println(0 - 1) } }
+    println(a.v);
+}
+"#,
+            &["7", "7"],
+            "nested_vec_option_shared_read_unchanged",
+        );
+    }
+
+    #[test]
     fn asan_owned_string_param_let_move_grow() {
         // String sibling with a realloc after the move — without the
         // deep copy the caller frees a stale (realloc-moved) pointer.

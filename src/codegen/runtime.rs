@@ -3610,6 +3610,7 @@ impl<'ctx> super::Codegen<'ctx> {
     /// (one-level fast) path rather than a wrong no-op.
     pub(super) fn te_recursive_drop_fully_supported(&self, te: &TypeExpr) -> bool {
         match &te.kind {
+            TypeKind::Weak(_) => true,
             TypeKind::Tuple(elems) => elems
                 .iter()
                 .all(|e| self.te_recursive_drop_fully_supported(e)),
@@ -4323,6 +4324,56 @@ impl<'ctx> super::Codegen<'ctx> {
         }
         self.current_fn = saved_fn;
         drop_fn
+    }
+
+    /// Clone one `weak T` slot: copy the handle, then take a weak count on the
+    /// DESTINATION. B-2026-09-08-7.
+    ///
+    /// Signature is the clone family's `(*const src, *mut dst)`, so it drops
+    /// into `emit_clone_fn_for_type_expr`'s dispatch beside the String / Vec /
+    /// Map arms. Before this existed a weak leaf fell to the primitive
+    /// fallback, whose body is load-store-return — a flat alias of the source's
+    /// handle, against a destination that will run its own
+    /// `__karac_weak_slot_drop`.
+    ///
+    /// Downgrading the DESTINATION after the store (rather than the source
+    /// before it) is what keeps a src == dst call sound, which the Map/Vec
+    /// element arms rely on: they clone slot-to-slot in place, so a source-side
+    /// count would be the same count and the pair would still be one short.
+    pub(super) fn emit_weak_slot_clone_fn(&mut self) -> inkwell::values::FunctionValue<'ctx> {
+        let fn_name = "__karac_weak_slot_clone";
+        if let Some(f) = self.module.get_function(fn_name) {
+            return f;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let void_ty = self.context.void_type();
+        let saved_bb = self.builder.get_insert_block();
+        let saved_fn = self.current_fn;
+        let fn_ty = void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+        let clone_fn =
+            self.module
+                .add_function(fn_name, fn_ty, Some(inkwell::module::Linkage::Internal));
+        self.current_fn = Some(clone_fn);
+        let entry = self.context.append_basic_block(clone_fn, "entry");
+        self.builder.position_at_end(entry);
+        let src = clone_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let dst = clone_fn.get_nth_param(1).unwrap().into_pointer_value();
+        let handle = self
+            .builder
+            .build_load(ptr_ty, src, "weakslot.clone.src")
+            .unwrap()
+            .into_pointer_value();
+        self.builder.build_store(dst, handle).unwrap();
+        let downgrade = self.weak_runtime_fn("karac_weak_downgrade", true);
+        self.builder
+            .build_call(downgrade, &[handle.into()], "")
+            .unwrap();
+        self.builder.build_return(None).unwrap();
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        self.current_fn = saved_fn;
+        clone_fn
     }
 
     /// Per-slot WEAK-COUNT RETAIN for a `weak T` container slot — the exact

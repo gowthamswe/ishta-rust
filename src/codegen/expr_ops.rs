@@ -1871,6 +1871,28 @@ impl<'ctx> super::Codegen<'ctx> {
                     .get(idx)?;
                 super::helpers::vec_inner_type_expr(fte)
             }
+            // B-2026-09-08-7 — a NESTED index receiver (`outer[0][0]` on a
+            // `Vec[Vec[weak N]]`). The third spelling of the same place, and it
+            // fails the same way the first two did: without an arm here the
+            // read is not recognised as a weak borrow, gets no balancing
+            // acquire, and the `RcDecOption` the binding still queues
+            // over-releases the referent by exactly one.
+            //
+            // It stayed hidden because the nested container ALSO failed to
+            // drain its weak slots, so the box was never reclaimed and the
+            // stray dec wrote into memory that was still live -- wrong, but
+            // unreportable. Fixing the drain in the same commit is what turned
+            // it into an `Invalid read of size 8` + `Invalid write of size 8`,
+            // which is why the two halves land together.
+            //
+            // Resolving recursively rather than one level deep is what makes
+            // `Vec[Vec[Vec[weak N]]]` and deeper work for free: each `Index`
+            // peels one `Vec[..]` off whatever the receiver resolves to, and
+            // the base cases stay the identifier and field arms above.
+            ExprKind::Index { object: inner, .. } => {
+                let inner_elem = self.index_receiver_elem_type_expr(inner)?;
+                super::helpers::vec_inner_type_expr(&inner_elem)
+            }
             _ => None,
         }
     }
