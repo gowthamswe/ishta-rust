@@ -19,6 +19,25 @@ use inkwell::{AddressSpace, AtomicOrdering, AtomicRMWBinOp, IntPredicate};
 
 use super::state::{CleanupAction, UserDropKind, VarSlot};
 
+/// Which of its two answers the ownership pass gave when asked whether a move
+/// source outlives the move — see [`super::Codegen::source_outlives_move`],
+/// whose doc comment carries the measurements and the reason the RESPONSE is
+/// deliberately not unified along with the question (B-2026-09-07-49).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SourceOutlivesMove {
+    /// The pass found no later use: this move is the source's last use.
+    No,
+    /// The pass reported `UseAfterMove` — the source is read again past this
+    /// move and keeps its own cleanup, so a site that hands the destination
+    /// this buffer must give it an independent one.
+    UseAfterMove,
+    /// The pass RC-FALLBACK PROMOTED the root instead, reporting nothing but a
+    /// `perf[rc-fallback]` note. The value lives in a `{i64 rc, T}` box that
+    /// goes on owning it, so every source disarm — each of which GEPs the
+    /// binding's slot — bails on the slot's shape and neutralizes nothing.
+    RcPromoted,
+}
+
 impl<'ctx> super::Codegen<'ctx> {
     /// Allocate a new RC heap object: `malloc(sizeof(heap_type))`, store refcount = 1.
     /// Returns a pointer to the heap object.
@@ -6140,12 +6159,60 @@ impl<'ctx> super::Codegen<'ctx> {
     /// True when a PLACE expression's root is a flagged use-after-move consume
     /// site. The one lookup all three place readers share, so none of them can
     /// drift back onto the node's own span.
-    pub(super) fn uam_consume_site_at_root(&self, expr: &Expr) -> bool {
+    fn uam_consume_site_at_root(&self, expr: &Expr) -> bool {
         Self::uam_consume_root_span(expr).is_some_and(|sp| {
             self.span_tables
                 .uam_consume_sites
                 .contains(&(sp.offset, sp.length))
         })
+    }
+
+    /// B-2026-09-07-49 — the ownership pass's answer to ONE question, asked of
+    /// a place expression: **does this source outlive the move being made from
+    /// it?**
+    ///
+    /// The pass has TWO ways of saying yes, and they are recorded in different
+    /// tables:
+    ///
+    ///   * it reports `UseAfterMove`, landing the consume in
+    ///     `uam_consume_sites`; or
+    ///   * it RC-FALLBACK PROMOTES the root and reports nothing but a
+    ///     `perf[rc-fallback]` note — which is what it does for a consume
+    ///     inside a LOOP, the single most common spelling of the situation.
+    ///
+    /// Three rows in a row were one mechanism reading the first table and
+    /// being blind to the second: B-2026-09-07-23 (the `let` and
+    /// struct-literal destinations), -29 (the whole-program transfer gate) and
+    /// -30 (the `Vec.push` argument and the assignment target). Each was found
+    /// by a double free or a leak in a ten-line program and fixed by a
+    /// separate hand-written arm.
+    ///
+    /// THE UNIFICATION IS OF THE QUESTION, NOT OF THE RESPONSE, and that
+    /// distinction is measured rather than stylistic. A `UseAfterMove` source
+    /// keeps its own cleanup and needs a defensive copy so the LATER READ stays
+    /// valid; an RC-promoted source is owned by a box whose release is an
+    /// `RcDec`, so a site may need a copy there for a different reason and must
+    /// NOT disarm. B-2026-09-07-30's own history is the warning: routing the
+    /// RC-boxed copy through the shared argument disarm STACKED a second copy
+    /// on the destinations -23 had already fixed and leaked 114 B. So this
+    /// returns WHICH answer the pass gave and leaves the response to the site.
+    ///
+    /// Every caller matches exhaustively, which is the point: a new consult
+    /// cannot read the `UseAfterMove` half and silently fall through on the
+    /// RC-promoted one, because there is no boolean to fall through with.
+    /// `uam_consume_site_at_root` is private to this module for the same
+    /// reason — outside it, this is the only way to ask.
+    pub(super) fn source_outlives_move(&self, expr: &Expr) -> SourceOutlivesMove {
+        if self.uam_consume_site_at_root(expr) {
+            return SourceOutlivesMove::UseAfterMove;
+        }
+        let rc_promoted = self.projection_root_is_rc_boxed(expr)
+            || matches!(&expr.kind, ExprKind::Identifier(n)
+                if self.drop_rc.rc_fallback_heap_types.contains_key(n.as_str()));
+        if rc_promoted {
+            return SourceOutlivesMove::RcPromoted;
+        }
+        SourceOutlivesMove::No
     }
 
     /// B-2026-08-13-14 — the field-bind half of [`Self::uam_defensive_copy`].
@@ -6171,8 +6238,12 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::FieldAccess { object, field } = &expr.kind else {
             return None;
         };
-        if !self.uam_consume_site_at_root(expr) {
-            return None;
+        match self.source_outlives_move(expr) {
+            SourceOutlivesMove::UseAfterMove => {}
+            // B-2026-09-07-23 handles the promoted root at the DESTINATION —
+            // `deep_copy_owned_struct_param_field_move`'s RC-boxed arm — so a
+            // copy here would be the second one and the first would leak.
+            SourceOutlivesMove::RcPromoted | SourceOutlivesMove::No => return None,
         }
         // Root at a named local or `self` — the same two spellings the source
         // disarm (`suppress_struct_field_move_into_literal`) resolves, so the
@@ -6410,8 +6481,13 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::FieldAccess { object, field } = &arg_expr.kind else {
             return false;
         };
-        if !self.uam_consume_site_at_root(arg_expr) {
-            return false;
+        match self.source_outlives_move(arg_expr) {
+            SourceOutlivesMove::UseAfterMove => {}
+            // B-2026-09-07-30 copies the promoted root at each DESTINATION's
+            // own lowering instead. Routing it through this shared reclone —
+            // which ~59 call sites funnel through — stacked a second copy on
+            // the destinations -23 had fixed and leaked 114 B in 3 blocks.
+            SourceOutlivesMove::RcPromoted | SourceOutlivesMove::No => return false,
         }
         // The same two receiver spellings the disarm below resolves, so the
         // copy and the skip are defined over one set of shapes.
@@ -6547,8 +6623,15 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::TupleIndex { object, index } = &expr.kind else {
             return None;
         };
-        if !self.uam_consume_site_at_root(expr) {
-            return None;
+        match self.source_outlives_move(expr) {
+            SourceOutlivesMove::UseAfterMove => {}
+            // A promoted tuple root keeps today's behaviour, and that is a
+            // MEASUREMENT rather than an omission: the RC-boxed tuple's own
+            // element registration (B-2026-09-07-28) already owns the element,
+            // so the three destinations measure ASAN-clean at 1 and 3 trips —
+            // `v.push(t.0)`, `s = t.0` and `let s = t.0` off a promoted `t`.
+            // See `rc_boxed_tuple_index_destinations_stay_clean`.
+            SourceOutlivesMove::RcPromoted | SourceOutlivesMove::No => return None,
         }
         // Root of the place CHAIN, not just a bare identifier object — the
         // disarm this pairs with (`suppress_tuple_index_move_source`) resolves

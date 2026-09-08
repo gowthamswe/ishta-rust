@@ -82221,4 +82221,125 @@ fn main() {
             "asan-call-receiver-option-shared-clone",
         );
     }
+
+    /// B-2026-09-07-49 — the TUPLE-INDEX twin of the three destinations
+    /// B-2026-09-07-23 / -30 fixed for `FieldAccess`, pinned CLEAN.
+    ///
+    /// `uam_defensive_copy_tuple_elem` is one of the three place readers that
+    /// consult the `UseAfterMove` half of "does this source outlive the move",
+    /// and it DIVERGES from the RC-fallback half: instrumenting the predicate
+    /// across the whole `memory_sanitizer` + `codegen` + `par_codegen` corpus
+    /// found this site answering "not a consume site" for an RC-PROMOTED root
+    /// (1 occurrence, against 61 at `uam_reclone_source_field` and 45 at
+    /// `uam_defensive_copy_field`, the two sites -30 and -23 fixed).
+    ///
+    /// The divergence is real and the shape is nonetheless CLEAN, which is why
+    /// this is a pin and not a fix. The RC-boxed tuple's own element
+    /// registration (B-2026-09-07-28) already owns the element, so all three
+    /// destinations measure clean at 1 and 3 trips. Copying here as well would
+    /// be the second owner — the 114 B stack B-2026-09-07-30 measured when the
+    /// RC-boxed copy was routed through a shared disarm.
+    ///
+    /// Cell 4 is the `FieldAccess` control -30 fixed: it must stay clean, so a
+    /// failure there means the probe is wrong rather than the tuple path.
+    #[test]
+    fn rc_boxed_tuple_index_destinations_stay_clean() {
+        const OWN: &str = "fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkt(n: i64) -> (String, i64) { return (payload(), n); }\n\
+             fn main() { println(go()); }\n";
+        // 1 — push destination, tuple twin of the -30 `push` cell.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkt(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ v.push(t.0); i = i + 1; }}\n\
+                 \x20 return v.len(); }}\n"
+            ),
+            &["3"],
+            "b49_tuple_push_three_trips",
+        );
+        // 2 — assignment destination, tuple twin of the -30 `assign` cell.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkt(9); let mut s = String.new(); let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ s = t.0; i = i + 1; }}\n\
+                 \x20 return s.len(); }}\n"
+            ),
+            &["38"],
+            "b49_tuple_assign_three_trips",
+        );
+        // 3 — `let` destination, tuple twin of the -23 cell.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let t = mkt(9); let mut n = 0i64; let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let s = t.0; n = n + s.len(); i = i + 1; }}\n\
+                 \x20 return n; }}\n"
+            ),
+            &["114"],
+            "b49_tuple_let_three_trips",
+        );
+        // 4 — CONTROL: the FieldAccess push cell -30 already fixed. Must stay
+        // clean, so a regression here means the probe itself is wrong.
+        assert_clean_asan_run_no_auto_par(
+            "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn go() -> i64 { let t = mkp(9); let mut v: Vec[String] = Vec.new(); let mut i = 0i64;\n\
+             \x20 while i < 3i64 { v.push(t.a); i = i + 1; }\n\
+             \x20 return v.len(); }\n\
+             fn main() { println(go()); }\n",
+            &["3"],
+            "b49_control_field_push",
+        );
+    }
+
+    /// B-2026-09-07-49 — a DESTRUCTURE whose source PROJECTS off an
+    /// RC-fallback-promoted local, pinned CLEAN.
+    ///
+    /// This shape reaches both consults in `finish_owned_struct_destructure`
+    /// (`moved_projection_src`'s gate and `src_read_is_copy`), each of which
+    /// answers "not a consume site" for a promoted root and so takes the
+    /// TRANSFER rather than treating the read as a copy.
+    ///
+    /// It is pinned because the corpus does not otherwise reach it: the
+    /// instrumented census found ZERO divergences at either `stmts.rs` consult
+    /// across every `memory_sanitizer`, `codegen` and `par_codegen` program,
+    /// while this ten-line fixture hits one. An untested divergence is exactly
+    /// how B-2026-09-07-23 / -29 / -30 each stayed hidden until a double free
+    /// in a small program found it.
+    ///
+    /// Clean on all four surfaces at 1 and 3 trips — the transfer is correct
+    /// here because the leaves take the box's field and the box's own `RcDec`
+    /// is what releases it; registering a leaf owner as well would be the
+    /// second one.
+    #[test]
+    fn rc_promoted_projection_destructure_stays_clean() {
+        const OWN: &str = "struct Inner { a: String, b: String }\n\
+             struct W { inner: Inner, n: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkw(n: i64) -> W { return W { inner: Inner { a: payload(), b: payload() }, n: n }; }\n\
+             fn main() { println(go()); }\n";
+        // 3 trips over a destructure of `w.inner`, `w` promoted by the loop.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let w = mkw(9); let mut n = 0i64; let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ let Inner {{ a, b }} = w.inner; n = n + a.len() + b.len(); i = i + 1; }}\n\
+                 \x20 return n; }}\n"
+            ),
+            &["228"],
+            "b49_destructure_proj_three_trips",
+        );
+        // 1 trip — the smallest cell.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{OWN}fn go() -> i64 {{ let w = mkw(9); let mut n = 0i64; let mut i = 0i64;\n\
+                 \x20 while i < 1i64 {{ let Inner {{ a, b }} = w.inner; n = n + a.len() + b.len(); i = i + 1; }}\n\
+                 \x20 return n; }}\n"
+            ),
+            &["76"],
+            "b49_destructure_proj_one_trip",
+        );
+    }
 }

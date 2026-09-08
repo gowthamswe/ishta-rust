@@ -14625,9 +14625,19 @@ impl<'ctx> super::Codegen<'ctx> {
         let projection_root_runs_bodies = matches!(&place_body_path, Some((root, _))
             if self.fn_ctx.current_fn_param_names.contains(root.as_str())
                 || self.payload_vars.param_view_locals.contains(root.as_str()));
+        // B-2026-09-07-49 — both of the ownership pass's answers reach this
+        // gate, and only `UseAfterMove` suppresses the transfer. A promoted
+        // root keeps the transfer, which is a MEASUREMENT: a destructure of a
+        // projection off a promoted local (`let w = mkw(); while .. { let
+        // Inner { a, b } = w.inner; .. }`) is ASAN-clean at 1 and 3 trips on
+        // every surface — see `rc_promoted_projection_destructure_stays_clean`.
         let moved_projection_src: Option<PointerValue<'ctx>> = match &place_body_path {
             Some((root, path))
-                if !projection_root_runs_bodies && !self.uam_consume_site_at_root(value) =>
+                if !projection_root_runs_bodies
+                    && !matches!(
+                        self.source_outlives_move(value),
+                        super::runtime::SourceOutlivesMove::UseAfterMove
+                    ) =>
             {
                 self.projection_place_ptr(root, path)
             }
@@ -14644,7 +14654,15 @@ impl<'ctx> super::Codegen<'ctx> {
         // spelling that reads `w` again allocates TWO MORE buffers than a
         // matched control and frees the same number (20/18 against 18/18), so
         // the copy is real and one owner per leaf was missing.
-        let src_read_is_copy = self.uam_consume_site_at_root(value);
+        //
+        // B-2026-09-07-49 — the RC-promoted answer is deliberately NOT a copy
+        // here. The promoted root's box owns the field and the leaves take the
+        // transfer above; treating promotion as a copy would register a second
+        // owner per leaf. Pinned by the same fixture the gate above names.
+        let src_read_is_copy = matches!(
+            self.source_outlives_move(value),
+            super::runtime::SourceOutlivesMove::UseAfterMove
+        );
 
         // B-2026-09-03-24 — does the SOURCE's own owner already run this
         // struct's field bodies, so a leaf registration below would fire them a
