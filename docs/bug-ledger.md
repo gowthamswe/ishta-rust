@@ -93,9 +93,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 402 |
-| run-vs-build | 373 |
+| run-vs-build | 374 |
 | leak | 302 |
-| double-free | 213 |
+| double-free | 214 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
 | diagnostics | 125 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1612 |
-| interp | 406 |
+| codegen | 1613 |
+| interp | 407 |
 | typecheck | 295 |
 | other | 75 |
 | ownership | 74 |
@@ -175,9 +175,10 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
 | B-2026-09-08-4 | 2026-09-08 | codegen | medium | A FIELD MOVE-OUT INSIDE AN `if` THAT NEVER RUNS SILENCES THE BASE'S ENTIRE `Drop` BODIES WALK -- `if f { let taken = g.one; }` with `f` false prints nothing on the JIT and all four AOT surfaces against `--interp`'s `dS2 dS1`, losing the UN-MOVED sibling's body too; the bare-block spelling of the same move is correct, so the trigger is the condition and not the pushed frame, and `karac check` says nothing | — |
 | B-2026-09-08-5 | 2026-09-08 | codegen | low | THE B-2026-09-07-63 RE-ARM IS INNERMOST-FRAME ONLY, so a reassign one frame deeper still loses the new value's `Drop` body -- `if f { g.one = mks(7); }` and the bare-block `{ g.one = mks(7); }` alike print no `dS7` on the compiled backends against `--interp`'s, the documented remainder of that row's fix | — |
-| B-2026-09-08-6 | 2026-09-08 | codegen | high | THE FOURTH `use_after_move_consume_sites` BLIND-SPOT SITE B-2026-09-07-49 PREDICTED, found the way it said it would be: a field move-out inside a `while` THAT ITERATES ONCE double-frees on the JIT and at -O0 (SIGABRT, valgrind `Invalid free()`) and runs SIX `Drop` bodies where three are due at -O2, one of them over the zeroed husk -- while the straight-line spelling of the identical single move is correct on every surface | — |
 | B-2026-09-08-7 | 2026-09-08 | codegen | medium | A `Vec[weak T]` NESTED INSIDE ANOTHER CONTAINER NEVER DRAINS ITS WEAK SLOTS -- `te_recursive_drop_fully_supported` answers false for a `TypeKind::Weak` leaf, so `Vec[Vec[weak T]]` / `Map[K, Vec[weak T]]` take the one-level buffer-only path; 24 B per slot at both opt levels, reachable with no function parameter at all, and the obvious two-line fix turns the leak into a use-after-free | none |
 | B-2026-09-08-8 | 2026-09-08 | codegen | medium | A VALUE-PRODUCING `par` BLOCK IS NOT A FRESH OWNED TEMP AT THE DESTRUCTURE, so every heap-bearing leaf of `let (t, k) = par { ... (t, k) }` is left with no owner -- 38 B per leaf, measured with NO RC promotion anywhere in the program and clean off an identical destructure from a plain call | none |
+| B-2026-09-08-9 | 2026-09-08 | codegen | medium | A TWO-HOP FIELD MOVE-OUT IN A LOOP OFF AN RC-PROMOTED ROOT DOUBLE-FREES ON THE JIT AND READS A JUNK LEAF AT -O0 -- `while i < 1 { let x = o.h.r; }` aborts under `karac run`, prints `t0 dS0` at -O0 against -O2's `t1 dS1`, and is UNCHANGED in every measurement by B-2026-09-08-6, whose two declines and destination copy are both confined to the FLAT route this shape does not take | — |
+| B-2026-09-08-10 | 2026-09-08 | interp | medium | `--interp` NEVER DESTROYS THE FIELD AN RC-PROMOTED BASE RETAINS, so it hands out N live copies and runs N bodies where N+1 values exist -- `while i < 3 { let taken = g.one; }` prints `t1` on every trip (the source stays live) and `dS2` alone at `g`'s death, losing `g.one`'s body outright, against every compiled backend's `dS2 dS1`; the interpreter has no access to the ownership pass's `rc_values` at all | — |
 
 ### Relocated
 
@@ -2409,6 +2410,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-1 | codegen | medium | A REBIND OF A BY-VALUE `Vec[weak T]` PARAM LEAKS ONE BOX PER ELEMENT -- `let work = xs` copies the weak handles without a weak-count inc, so both con… | cfd16635e |
 | B-2026-09-07-63 | codegen+interp | high | A CALLER-SIDE MOVE-OUT OF A FIELD IS INVISIBLE TO THE DISPLACEMENT GATE, SO A LATER ASSIGN TO THAT FIELD FIRES A BODY THE MOVER ALREADY OWNS -- `let… | 993ee36 |
 | B-2026-09-08-2 | codegen | high | A `mut ref` ARGUMENT PROJECTING OFF AN RC-PROMOTED LOCAL SILENTLY DISCARDS THE WRITE -- `bump(mut t.a)` after a loop that consumed `t.a` gives 40 on… | 08ab81b2f |
+| B-2026-09-08-6 | codegen | high | THE FOURTH `use_after_move_consume_sites` BLIND-SPOT SITE B-2026-09-07-49 PREDICTED, found the way it said it would be: a field move-out inside a `wh… | 3dd9f19 |
 
 </details>
 
