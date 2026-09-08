@@ -10373,6 +10373,65 @@ impl<'ctx> super::Codegen<'ctx> {
                             || self.is_nonshared_struct_value_map_get_unwrap(value);
                         if let Some(slot) = self.variables.get(var_name.as_str()) {
                             let alloca = slot.ptr;
+                            // B-2026-09-07-55 — a nested struct read out of a
+                            // by-value VIEW of a shared enum's boxed payload
+                            // (`let tb = nd.then_block`) is a COPY, not a move,
+                            // so its shared children each need a ref of their
+                            // own. The two disarms a few lines above DO fire for
+                            // this shape and cannot help: they GEP the view's
+                            // private alloca while the box's rc-drop walks the
+                            // BOX, so the leaf stays an alias and both sides dec
+                            // one ref — the second dec reading a block the first
+                            // freed. Emitted HERE rather than at the suppressor
+                            // because the leaf's slot does not exist yet there.
+                            // See `rc_inc_struct_shared_children_in_place` for
+                            // why the box may not be neutralized instead, and
+                            // why the buffers are deliberately left uncopied.
+                            if let ExprKind::FieldAccess { object, field } = &value.kind {
+                                let obj_name = match &object.kind {
+                                    ExprKind::Identifier(o) => Some(o.clone()),
+                                    ExprKind::SelfValue => Some("self".to_string()),
+                                    _ => None,
+                                };
+                                if let Some(obj) = obj_name {
+                                    if self
+                                        .payload_vars
+                                        .shared_enum_payload_view_vars
+                                        .contains_key(obj.as_str())
+                                    {
+                                        let leaf = self
+                                            .var_types
+                                            .var_type_names
+                                            .get(obj.as_str())
+                                            .cloned()
+                                            .and_then(|sn| {
+                                                let idx = self
+                                                    .type_decls
+                                                    .struct_field_names
+                                                    .get(&sn)?
+                                                    .iter()
+                                                    .position(|n| n == field)?;
+                                                match &self
+                                                    .type_decls
+                                                    .struct_field_type_exprs
+                                                    .get(&sn)?
+                                                    .get(idx)?
+                                                    .kind
+                                                {
+                                                    TypeKind::Path(pth) => {
+                                                        pth.segments.last().cloned()
+                                                    }
+                                                    _ => None,
+                                                }
+                                            });
+                                        if let Some(leaf) = leaf {
+                                            self.rc_inc_struct_shared_children_in_place(
+                                                alloca, &leaf,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             // A shared struct's user `impl Drop` is fired by the
                             // RC path (`track_rc_var` → `emit_rc_dec` →
                             // `__karac_rc_drop_<T>`, which calls the body at

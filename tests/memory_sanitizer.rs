@@ -50351,6 +50351,101 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-55 — a nested struct read out of a by-value VIEW of a
+    /// shared enum's boxed payload is a COPY, so its shared children each get a
+    /// ref of their own.
+    ///
+    /// `nd` is a view: the match binds the box's inline `IfNode` by value into a
+    /// local alloca. `let tb = nd.then_block` then hands `tb` the SAME
+    /// `Option[shared]` handle the box holds, with no inc.
+    /// `suppress_struct_field_move_by_name` does fire for this shape — measured,
+    /// `view=true` — and cannot help: it GEPs the VIEW's private alloca while
+    /// the box's `emit_nested_struct_shared_rc_decs_ex` walk reads the BOX, so
+    /// the neutralization lands where nothing looks. Both sides then dec one
+    /// ref and the second dec reads the block the first freed.
+    ///
+    /// WHY ONLY THE INSTRUMENTED LEG SEES IT. The count never reaches zero
+    /// twice, so there is no double free and no leak — the fixture this row was
+    /// filed against is even named `no_double_free` and is correct about that.
+    /// It is a READ of freed memory, which is not an allocator event
+    /// (B-2026-09-07-40). Measured on the parent: green on the default and `-O0`
+    /// legs, `heap-use-after-free ... in __karac_rc_drop_E` under
+    /// `KARAC_SANITIZE_ADDRESS=1`. valgrind at `-O0` also reports it
+    /// (`Invalid read of size 8`), which is what made the reduction iterable.
+    ///
+    /// THE BUFFER IS DELIBERATELY NOT COPIED and this fixture is where that
+    /// stays honest. The box's walker runs with `nested_buffer_free =
+    /// Some(false)` and never frees a nested struct's `Vec`/`String`, so the
+    /// moved-out leaf is their only owner — one free, correct. Case (b) is that
+    /// control: the same move with NO shared grandchild is clean before the fix
+    /// and after it, so a future change that starts deep-copying buffers here
+    /// (stranding the box's originals) fails it. The mirror-image defect — the
+    /// walker freeing nothing when the leaf is NEVER moved out — is a leak, is
+    /// B-2026-09-07-62, and is deliberately still open: this fix does not touch
+    /// it and its 32 B cells measure identically before and after.
+    ///
+    /// SCOPE OF THE NEW WALKER, stated plainly. It mirrors
+    /// `emit_nested_struct_shared_rc_decs_ex`'s two arms so the inc and the dec
+    /// cannot classify a field differently, but only the `Option[shared]` arm
+    /// has a cell that is RED on the parent. A nested struct with a DIRECT
+    /// `shared` field measures clean on the parent as well as on the fix, so it
+    /// is not pinned here — the arm exists for symmetry with the dec walker, not
+    /// because a known defect needs it.
+    #[test]
+    fn asan_shared_enum_view_field_move_incs_the_leaf_shared_children() {
+        // (a) The defect: nested struct moved out of a view, carrying an
+        // `Option[shared]` grandchild that the box's walk also decs.
+        assert_clean_asan_run(
+            r#"
+struct Span { a: i64, b: i64, c: i64, d: i64 }
+shared enum E { Lit(i64), Iff(IfNode), Blk(Block) }
+struct Block { stmts: Vec[i64], tail: Option[E], span: Span }
+struct IfNode { cond: E, then_block: Block, span: Span }
+fn mk_block(first: i64, sp: i64) -> Block {
+    let mut s: Vec[i64] = Vec.new();
+    s.push(first); s.push(first + 1);
+    Block { stmts: s, tail: Some(E.Lit(99)), span: Span { a: sp, b: 0, c: 0, d: 0 } }
+}
+fn main() {
+    let ife = E.Iff(IfNode { cond: E.Lit(7), then_block: mk_block(20, 2), span: Span { a: 5, b: 0, c: 0, d: 0 } });
+    match ife {
+        Lit(n) => println(n),
+        Iff(nd) => { println(nd.span.a); let tb = nd.then_block; println(tb.span.a); println(tb.stmts[0]); }
+        Blk(_) => println(-9)
+    }
+}
+"#,
+            &["5", "2", "20"],
+            "b0907-55-view-field-move-option-shared-child",
+        );
+        // (b) The buffer control: the same move with NO shared grandchild. Clean
+        // before the fix and after — it fails if the leaf ever starts
+        // deep-copying the nested buffer the box does not free.
+        assert_clean_asan_run(
+            r#"
+struct Span { a: i64, b: i64, c: i64, d: i64 }
+shared enum E { Lit(i64), Iff(IfNode), Blk(Block) }
+struct Block { stmts: Vec[i64], tail: Option[E], span: Span }
+struct IfNode { cond: E, then_block: Block, span: Span }
+fn mk_block_novec(first: i64, sp: i64) -> Block {
+    let mut s: Vec[i64] = Vec.new();
+    s.push(first);
+    Block { stmts: s, tail: None, span: Span { a: sp, b: 0, c: 0, d: 0 } }
+}
+fn main() {
+    let ife = E.Iff(IfNode { cond: E.Lit(7), then_block: mk_block_novec(20, 2), span: Span { a: 5, b: 0, c: 0, d: 0 } });
+    match ife {
+        Lit(n) => println(n),
+        Iff(nd) => { println(nd.span.a); let tb = nd.then_block; println(tb.span.a); println(tb.stmts[0]); }
+        Blk(_) => println(-9)
+    }
+}
+"#,
+            &["5", "2", "20"],
+            "b0907-55-view-field-move-no-shared-child-control",
+        );
+    }
+
     #[test]
     fn asan_shared_enum_boxed_struct_payload_moveout_no_double_free() {
         // B-2026-06-20: a shared-enum variant whose struct payload is heap-BOXED

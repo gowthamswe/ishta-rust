@@ -68,9 +68,25 @@
 # records what one program did on one leg -- it is not a characterization of the
 # bug, and reading it as one costs the escalation.
 #
-# `__karac_rc_drop_E` frees a 120-byte block and reads it again — both ends
-# inside the same generated drop.
-memory_sanitizer_tests::asan_shared_enum_boxed_struct_payload_moveout_no_double_free           # B-2026-09-07-55
+# B-2026-09-07-55 REMOVED 2026-09-08, its owning row fixed. The entry read:
+#
+#   `__karac_rc_drop_E` frees a 120-byte block and reads it again — both ends
+#   inside the same generated drop.
+#   memory_sanitizer_tests::asan_shared_enum_boxed_struct_payload_moveout_no_double_free
+#
+# Both ends were in one drop because the leaf and the box held the SAME handle.
+# `let tb = nd.then_block` off a by-value view of a shared enum's boxed payload
+# aliased the box's `Option[shared]` child with no inc; the box's walk and the
+# leaf's own value-drop then dec'd one ref, and the second dec read the freed
+# block. The leaf now takes a ref of its own — the copy semantics
+# `finish_owned_struct_destructure` already applied to the DESTRUCTURE spelling
+# of the same move, which the field-access spelling never got.
+#
+# The 32 B leak at the same line is NOT this entry and is still open
+# (B-2026-09-07-62): the walker frees no nested buffer even when the leaf is
+# never moved out. Its cells measure identically before and after this fix,
+# which is deliberate — copying the buffer here would strand the box's original
+# and trade the use-after-free for that leak.
 #
 # B-2026-09-07-56 REMOVED 2026-09-08, its owning row fixed. The entry read:
 #

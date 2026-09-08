@@ -4223,6 +4223,104 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-07-55 — rc-INC every `shared` / `Option[shared]` CHILD of a
+    /// struct moved out of a shared-enum payload VIEW, so the leaf and the box
+    /// each own a ref.
+    ///
+    /// `let tb = nd.then_block` where `nd` is a by-value view of a shared
+    /// enum's boxed payload (`shared_enum_payload_view_vars`) reads the nested
+    /// struct as an ALIAS: `tb` gets the same handles the box holds, with no
+    /// inc. `suppress_struct_field_move_by_name` does fire for it, and cannot
+    /// help — it zeroes the field in the VIEW's private alloca while the box's
+    /// rc-drop walks the BOX, so the neutralization lands somewhere nothing
+    /// reads. The box's `emit_nested_struct_shared_rc_decs_ex` walk then decs
+    /// the child and `tb`'s own value-drop decs it again: two decs against one
+    /// ref, the second reading a block the first freed — no double free, since
+    /// the count never reaches zero twice, which is why only the instrumented
+    /// leg could see it.
+    ///
+    /// NEUTRALIZING THE BOX IS NOT AN OPTION HERE, which is what leaves the inc.
+    /// `record_deboxed_payload_box` refuses a shared enum's payload box on
+    /// purpose — "that box lives inside an RC node other handles can still
+    /// read, so a cap/len zero there is corruption rather than neutralization"
+    /// — so the mirror that fixes this for other containers is deliberately
+    /// unavailable. If the box may not be neutralized, the read is a COPY, and a
+    /// copy of a shared handle incs. That is the same conclusion B-2026-09-05-1
+    /// reached for a direct `shared` field, and what
+    /// `finish_owned_struct_destructure` already does for the DESTRUCTURE
+    /// spelling of this very move via `shared_enum_payload_view_vars` — this is
+    /// that duplication, for the field-access spelling that never got it.
+    ///
+    /// BUFFERS ARE DELIBERATELY NOT COPIED, and the asymmetry is measured rather
+    /// than assumed. The box's walker runs with `nested_buffer_free =
+    /// Some(false)`, so it never frees a nested struct's `Vec`/`String`
+    /// buffers — the moved-out leaf is their only owner and one free is
+    /// correct. Deep-copying them here would strand the box's originals
+    /// instead. (That the walker frees nothing for a leaf which is NEVER moved
+    /// out is a separate defect at the same line, B-2026-09-07-62; it is a leak,
+    /// this is the use-after-free, and they want different halves.)
+    ///
+    /// The two arms mirror `emit_nested_struct_shared_rc_decs_ex`'s exactly —
+    /// direct `shared T` through `shared_heap_type_for_type_expr`, then
+    /// `Option[shared T]` through `option_inner_shared_type_for_type_expr` — so
+    /// the inc and the dec cannot classify a field differently.
+    pub(super) fn rc_inc_struct_shared_children_in_place(
+        &mut self,
+        struct_ptr: PointerValue<'ctx>,
+        struct_name: &str,
+    ) {
+        let Some(&st) = self.type_decls.struct_types.get(struct_name) else {
+            return;
+        };
+        let Some(ftes) = self
+            .type_decls
+            .struct_field_type_exprs
+            .get(struct_name)
+            .cloned()
+        else {
+            return;
+        };
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let Some(fn_val) = self.current_fn else {
+            return;
+        };
+        for (idx, fte) in ftes.iter().enumerate() {
+            if let Some(heap_ty) = self.shared_heap_type_for_type_expr(fte) {
+                let Ok(field_ptr) = self
+                    .builder
+                    .build_struct_gep(st, struct_ptr, idx as u32, "b55.sh.p")
+                else {
+                    continue;
+                };
+                let inner = self
+                    .builder
+                    .build_load(ptr_ty, field_ptr, "b55.sh.ptr")
+                    .unwrap()
+                    .into_pointer_value();
+                let is_null = self.builder.build_is_null(inner, "b55.sh.isnull").unwrap();
+                let do_bb = self.context.append_basic_block(fn_val, "b55.sh.do");
+                let skip_bb = self.context.append_basic_block(fn_val, "b55.sh.skip");
+                self.builder
+                    .build_conditional_branch(is_null, skip_bb, do_bb)
+                    .unwrap();
+                self.builder.position_at_end(do_bb);
+                self.emit_refcount_inc_by_type(heap_ty, inner);
+                self.builder.build_unconditional_branch(skip_bb).unwrap();
+                self.builder.position_at_end(skip_bb);
+                continue;
+            }
+            if let Some((_, inner_info)) = self.option_inner_shared_type_for_type_expr(fte) {
+                let Ok(field_ptr) = self
+                    .builder
+                    .build_struct_gep(st, struct_ptr, idx as u32, "b55.os.p")
+                else {
+                    continue;
+                };
+                self.rc_inc_option_inline_shared_payload_in_place(field_ptr, inner_info.heap_type);
+            }
+        }
+    }
+
     /// B-2026-07-03-28 shared leg — rc-INC an `Option[shared]` FIELD's inline
     /// box pointer (word 1, ptrtoint) when Some, so a callee-owned by-value
     /// aggregate param holds an independent ref to the shared box. The exact
