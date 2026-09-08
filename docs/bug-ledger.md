@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 399 |
 | run-vs-build | 371 |
-| leak | 298 |
+| leak | 299 |
 | double-free | 212 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1602 |
+| codegen | 1603 |
 | interp | 404 |
 | typecheck | 295 |
 | other | 75 |
@@ -179,6 +179,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-57 | 2026-09-07 | codegen | high | A DISCARDED PROJECTED-FIELD LITERAL OVER A LOOP READS 8 BYTES PAST ITS ONE STACK OBJECT -- `stack-buffer-overflow` in `go` at frame offset 40, the only NON-heap finding of the instrumented leg's first run | none |
 | B-2026-09-07-61 | 2026-09-07 | codegen | high | AUTO-PAR SILENTLY STOPPED FIRING on kata:133's `for _` reduction: the par-lane binary emits NO karac_par_* symbol and runs single-threaded (0.32 real / 0.31 user against the preserved 2026-08-08 artifact's 0.03 / 0.46), so the lane collapsed onto seq -- 35.82 -> 327.88 ms, from 0.98x rayon to 8.98x. NOT a cost-model decline: KARAC_COST_DEBUG emits no decision of any kind for the loop, so the recogniser no longer matches the shape. Source unchanged since 2026-06-05; kata:895 and kata:288 still auto-par, so the pass is alive | kata:133 README + results.json publish a par figure of 35.88 ms (edges rayon) that does not reproduce | ~20 auto-par katas in BENCHMARKS.md are unchecked for the same silence |
 | B-2026-09-07-58 | 2026-09-08 | codegen | medium | AN RC-PROMOTED BINDING PUBLISHED THROUGH A VALUE-PRODUCING `par` BLOCK'S JOIN STILL LOSES ITS BOX -- `let (t, k) = par { let t = mkp(9); ... (t, k) }` strands 40 B + 38 B in BOTH lanes, because the outer destructuring `let` rebinds the name over the pointer-typed entry B-2026-09-07-47 installs | — |
+| B-2026-09-07-62 | 2026-09-08 | codegen | medium | A BOXED SHARED-ENUM PAYLOAD'S NESTED STRUCT FIELD NEVER HAS ITS BUFFERS FREED UNLESS THAT FIELD IS MOVED OUT -- 32 B leaked with no move-out and with a SIBLING field moved out, the opposite direction of B-2026-09-07-55's use-after-free at the same line | — |
 
 ### Relocated
 
