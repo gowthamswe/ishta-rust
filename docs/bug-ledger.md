@@ -100,7 +100,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen-gap | 169 |
 | diagnostics | 125 |
 | false-positive | 106 |
-| perf | 101 |
+| perf | 102 |
 | soundness | 95 |
 | other | 81 |
 | crash | 77 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1601 |
+| codegen | 1602 |
 | interp | 404 |
 | typecheck | 295 |
 | other | 75 |
@@ -177,8 +177,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-55 | 2026-09-07 | codegen | high | A SHARED-ENUM BOXED STRUCT PAYLOAD MOVE-OUT LEAVES `__karac_rc_drop_E` READING ITS OWN FREED 120-BYTE BLOCK -- the fixture is named `no_double_free` and there is indeed no double free, only a read of freed memory nothing could see | none |
 | B-2026-09-07-56 | 2026-09-07 | codegen | high | AN INDEX-ASSIGN OVERWRITE OF A PLAIN `shared` Vec ELEMENT READS THE ELEMENT IT JUST RELEASED -- `main` reads offset 0 of a 16-byte block `__karac_vec_elem_rc_dec_Node` freed; caught only once the object is instrumented | none |
 | B-2026-09-07-57 | 2026-09-07 | codegen | high | A DISCARDED PROJECTED-FIELD LITERAL OVER A LOOP READS 8 BYTES PAST ITS ONE STACK OBJECT -- `stack-buffer-overflow` in `go` at frame offset 40, the only NON-heap finding of the instrumented leg's first run | none |
-| B-2026-09-07-59 | 2026-09-07 | codegen | high | A `.clone()` OVER A FIELD RECEIVER RETURNS AN EMPTY CHAIN ON EVERY COMPILED BACKEND -- `let s = n.left.clone()` prints 0 against `--interp`'s 2, silently at -O2, and the match-arm spelling diverges identically | none |
-| B-2026-09-07-60 | 2026-09-07 | codegen | medium | A `.clone()` OVER A CALL RECEIVER FAILS CODEGEN OUTRIGHT -- `mk().clone()` where `mk() -> Option[shared T]` dies on `no handler for method 'clone' on non-identifier receiver` while `--interp` answers 4 | none |
+| B-2026-09-07-61 | 2026-09-07 | codegen | high | AUTO-PAR SILENTLY STOPPED FIRING on kata:133's `for _` reduction: the par-lane binary emits NO karac_par_* symbol and runs single-threaded (0.32 real / 0.31 user against the preserved 2026-08-08 artifact's 0.03 / 0.46), so the lane collapsed onto seq -- 35.82 -> 327.88 ms, from 0.98x rayon to 8.98x. NOT a cost-model decline: KARAC_COST_DEBUG emits no decision of any kind for the loop, so the recogniser no longer matches the shape. Source unchanged since 2026-06-05; kata:895 and kata:288 still auto-par, so the pass is alive | kata:133 README + results.json publish a par figure of 35.88 ms (edges rayon) that does not reproduce | ~20 auto-par katas in BENCHMARKS.md are unchecked for the same silence |
 | B-2026-09-07-58 | 2026-09-08 | codegen | medium | AN RC-PROMOTED BINDING PUBLISHED THROUGH A VALUE-PRODUCING `par` BLOCK'S JOIN STILL LOSES ITS BOX -- `let (t, k) = par { let t = mkp(9); ... (t, k) }` strands 40 B + 38 B in BOTH lanes, because the outer destructuring `let` rebinds the name over the pointer-typed entry B-2026-09-07-47 installs | — |
 
 ### Relocated
@@ -2399,6 +2398,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-46 | codegen | high | A SPEC'D FLOAT HOLE WIDER THAN ITS BUFFER PRINTS UNINITIALIZED STACK -- `f"{x:.2}"` on `f64::MAX` is 312 bytes into a 64-byte buffer, and codegen use… | 0e7ace131 |
 | B-2026-09-07-47 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lan… | b440bbe |
 | B-2026-09-07-54 | codegen | high | A REUSED `let`-BOUND `Vec[Option[shared T]]` HAS ITS ELEMENT RC DEC READ A FREED CONTROL BLOCK -- `__karac_vec_elem_rc_dec_Node` reads offset 0 of a… | 6d46e2a |
+| B-2026-09-07-59 | codegen | high | A `.clone()` OVER A FIELD RECEIVER RETURNS AN EMPTY CHAIN ON EVERY COMPILED BACKEND -- `let s = n.left.clone()` prints 0 against `--interp`'s 2, sile… | 89e9db306 |
+| B-2026-09-07-60 | codegen | medium | A `.clone()` OVER A CALL RECEIVER FAILS CODEGEN OUTRIGHT -- `mk().clone()` where `mk() -> Option[shared T]` dies on `no handler for method 'clone' on… | 89e9db306 |
 
 </details>
 
