@@ -93,7 +93,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 402 |
-| run-vs-build | 374 |
+| run-vs-build | 375 |
 | leak | 302 |
 | double-free | 214 |
 | missing-feature | 194 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1614 |
+| codegen | 1615 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 76 |
@@ -159,7 +159,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-65 | 2026-09-06 | interp+codegen | low | A PLAIN OWNED-`self` METHOD ON A FRESH TEMP RUNS THE RECEIVER'S `Drop` BODY BEFORE THE CALL'S RESULT IS PRINTED ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `println(f"v={mk(4).plain()}")` over `fn plain(self) -> i64 { return self.id; }` prints `dR4 v=4` under --interp and `v=4 dR4` on jit / aot / -O0, a stdout-visible A/B divergence with no memory difference | — |
 | B-2026-09-06-67 | 2026-09-06 | codegen | low | A BOXED USER *ENUM* PAYLOAD OF A BY-VALUE PARAM IS STILL UNOWNED, ON BOTH SEEDED ENUMS -- `fn show(x: Result[K, i64])` matched `Ok(K.A(r))` leaks 240 B in 3 blocks plus 81 B indirect, and the `Option` spelling measures identically, because both caller-side arms filter the payload name through `struct_types` | — |
 | B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
-| B-2026-09-06-66 | 2026-09-07 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Option[Node], tag: String }` loses 67 bytes (64 direct, 3 indirect) in 1 block at both opt levels, while every EMPTY-`next` spelling of the same type is clean; both `Drop` bodies run, so it is the boxed payload's memory alone | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
@@ -180,6 +179,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-10 | 2026-09-08 | interp | medium | `--interp` NEVER DESTROYS THE FIELD AN RC-PROMOTED BASE RETAINS, so it hands out N live copies and runs N bodies where N+1 values exist -- `while i < 3 { let taken = g.one; }` prints `t1` on every trip (the source stays live) and `dS2` alone at `g`'s death, losing `g.one`'s body outright, against every compiled backend's `dS2 dS1`; the interpreter has no access to the ownership pass's `rc_values` at all | — |
 | B-2026-09-08-11 | 2026-09-08 | codegen | low | `display_mangle_te` RENDERS EVERY UNNAMEABLE TYPE AS `unknown`, SO THEY SHARE ONE MANGLED SYMBOL AND ONE DROP/CLONE CACHE ENTRY -- `Vec[weak A]` and `Vec[weak B]` both emit `karac_drop_Vec_unknown` / `karac_clone_unknown` and the second requested gets the first's function; benign for `weak` ONLY because every weak-slot operation is slot-type-agnostic, and the fallback is not weak-only | none |
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
+| B-2026-09-08-13 | 2026-09-08 | codegen | medium | A LET-BOUND LOCAL OF A SELF-REFERENTIAL STRUCT PASSED BY VALUE LOSES ITS `Drop` BODY ON EVERY COMPILED BACKEND -- `let c = mkn(10); read(c)` prints the body under `--interp` and nothing under the JIT, `-O0`, `-O2` and `KARAC_AUTO_PAR=0`; passing the SAME value as a temporary agrees, which is the only variable, and is why six existing fixtures for this type all miss it | none |
 
 ### Relocated
 
@@ -2359,6 +2359,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-69 | codegen | high | A CONDITIONAL HAND-BACK OF A REBOUND BY-VALUE PARAM DOUBLE-FREES -- `fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(9); }` over a… | 6ef13bb |
 | B-2026-09-06-70 | codegen | high | THE METHOD AND ASSOC-FN ARGUMENT REGISTRARS HAVE NO ADMISSION GATE AT ALL, so a fresh-temp argument a passthrough callee hands straight back double-f… | c76f658 |
 | B-2026-09-06-71 | codegen | high | A NAMED-LOCAL ARGUMENT TO A PASSTHROUGH FREE FUNCTION DOUBLE-FREES -- `let a = mk(15); let z = f(a);` over `fn f(r: R) -> R { return r; }` and a stru… | 6b21fe8 |
+| B-2026-09-06-66 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Optio… | 19c96f62e |
 | B-2026-09-07-2 | codegen | medium | A DISCARDED ASSOCIATED-FUNCTION CALL REGISTERS NO OWNER AT ALL, so its returned value's `Drop` body runs on NO compiled backend and its heap leaks --… | c76f658 |
 | B-2026-09-07-3 | codegen | medium | THE FREE-FUNCTION ARGUMENT ADMISSION GATE STANDS THE CALLER DOWN ON A MIXED-PATH CALLEE AND LEAKS THE DIES-INSIDE LEG -- `fn pick3(r: R, k: bool) ->… | 6ef13bb |
 | B-2026-09-07-4 | codegen | high | A METHOD OR ASSOC-FN ARGUMENT ON A MIXED-PATH CALLEE STILL DOUBLE-FREES ON ITS ESCAPING LEG -- `impl Hold { fn pick(ref self, r: R, k: bool) -> R { i… | 13ae5a0 |
