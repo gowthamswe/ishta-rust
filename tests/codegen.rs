@@ -31839,6 +31839,85 @@ fn main() {
         assert_eq!(out, "m2\ndS2\ndS8\nm3\nt1\ndS1\n");
     }
 
+    /// B-2026-09-08-4 — a field MOVE-OUT compiled inside an `if` BODY left the
+    /// base's field-bodies walk registered in the BRANCH's frame, so it drained
+    /// when that frame popped rather than at the base's own death.
+    ///
+    /// `disarm_struct_field_bodies_at` retracted the walk and re-registered it
+    /// masked, a pair that is correct only when it runs in the same frame the
+    /// action lives in — `replace_user_drop_fn_for_var`'s stated rule
+    /// (B-2026-08-29-33), and false for any move-out inside an `if`, a `match`
+    /// arm or a loop body. It swaps in place now. The defect hid outside a
+    /// nested construct because there the innermost frame IS the owning one,
+    /// which is why every straight-line move-out pin passed either way; a frame
+    /// dump showed the action in frame0 before the disarm and frame1 after.
+    ///
+    /// This pins the TAKEN path, which the fix makes fully correct on all five
+    /// surfaces: pre-fix the compiled backends printed `t1 dS1 m3`, losing the
+    /// un-moved sibling `g.two`'s body to a drain inside the branch.
+    ///
+    /// The UNTAKEN path is deliberately NOT pinned here and B-2026-09-08-4
+    /// stays open for it: the mask is compile-time state applied on every path,
+    /// so `f = false` still skips `one`'s body although the move never ran —
+    /// `dS2 m3` against `--interp`'s `dS2 dS1 m3`. That is a second, independent
+    /// defect needing a runtime per-field flag, and pinning today's reading for
+    /// it would pin a known-wrong output. Cell (b) pins only what IS settled
+    /// there: the sibling's body comes back on the untaken path too.
+    ///
+    /// Twin of `tests/interpreter.rs`'s
+    /// `test_cond_field_move_walk_stays_in_the_owning_frame`.
+    #[test]
+    fn e2e_cond_field_move_walk_stays_in_the_owning_frame() {
+        // (a) TAKEN path — correct on every surface after the fix.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let f = true;\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   if f { let taken = g.one; println(f\"t{taken.id}\"); }\n\
+             \x20   println(\"m3\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(out, "t1\ndS1\ndS2\nm3\n");
+        // (b) UNTAKEN path — the sibling's body is back; `one`'s is still
+        // missing (B-2026-09-08-4's remaining half) and is NOT asserted.
+        let Some(out) = run_program(
+            "struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+             \x20   fn drop(mut ref self) {\n\
+             \x20       println(f\"dS{self.id}\")\n\
+             \x20   }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+             \x20   return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+             \x20   let f = false;\n\
+             \x20   let mut g = Bs { one: mks(1), two: mks(2) };\n\
+             \x20   if f { let taken = g.one; println(f\"t{taken.id}\"); }\n\
+             \x20   println(\"m3\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert!(
+            out.contains("dS2"),
+            "the un-moved sibling's body must survive the untaken branch: {out:?}"
+        );
+    }
+
     /// B-2026-08-01-19 — storing an owned param into a local container
     /// FIELD (`o.h = h;`) fired the caller-retained value's body TWICE on
     /// both backends (o's bodies walk at its death + the caller's NLL

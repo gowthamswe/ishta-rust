@@ -9803,17 +9803,45 @@ impl<'ctx> super::Codegen<'ctx> {
         {
             return;
         }
-        self.suppress_struct_field_bodies_for_var(var_name);
-        if let Some(bodies) =
-            self.emit_user_drop_field_bodies_fn_skipping(&struct_name, &subst, &skip)
-        {
-            self.track_user_drop_var_with_fn(
-                &struct_name,
-                var_name,
-                slot.ptr,
-                bodies,
-                UserDropKind::StructFieldBodies,
-            );
+        // B-2026-09-08-4 — SWAP THE WALKER IN PLACE when the binding already
+        // holds one, instead of retracting it and re-registering. The pair
+        // below is correct only when this runs in the SAME frame the action
+        // lives in, which is `replace_user_drop_fn_for_var`'s stated rule
+        // (B-2026-08-29-33) and false for every move-out compiled inside an
+        // `if` body, a `match` arm or a loop body: the re-registration lands in
+        // the INNERMOST frame, so the base's walk drains when that frame pops
+        // instead of at the base's own death.
+        //
+        // `if f { let taken = g.one; }` with `f` false then printed nothing at
+        // all where `--interp` printed `dS2 dS1` -- the walk had already been
+        // drained inside a branch the program never entered, so neither the
+        // moved field's sibling nor the field itself ran a body. It hides
+        // outside a nested construct because there the innermost frame IS the
+        // owning one, which is why every straight-line move-out test passes
+        // either way: the probe that found it dumped the action in frame0
+        // before the disarm and frame1 after the statement.
+        //
+        // Falling back to the old pair is still right for a binding that holds
+        // no walk yet -- the `$keep` mint the callers above admit -- and an
+        // EMPTY masked walker still retracts outright, exactly as before.
+        match self.emit_user_drop_field_bodies_fn_skipping(&struct_name, &subst, &skip) {
+            Some(bodies) => {
+                if !self.replace_user_drop_fn_for_var(
+                    var_name,
+                    UserDropKind::StructFieldBodies,
+                    bodies,
+                ) {
+                    self.suppress_struct_field_bodies_for_var(var_name);
+                    self.track_user_drop_var_with_fn(
+                        &struct_name,
+                        var_name,
+                        slot.ptr,
+                        bodies,
+                        UserDropKind::StructFieldBodies,
+                    );
+                }
+            }
+            None => self.suppress_struct_field_bodies_for_var(var_name),
         }
     }
 

@@ -46924,6 +46924,61 @@ fn test_depth1_field_move_then_reassign_rearms_new_value() {
     );
 }
 
+/// B-2026-09-08-4 — interpreter twin of `tests/codegen.rs`'s
+/// `e2e_cond_field_move_walk_stays_in_the_owning_frame`, same two sources.
+///
+/// This backend was already right on both paths and is the reference the row
+/// names: it has no per-frame cleanup list for a branch to drain early, so a
+/// field move-out inside an `if` leaves the base's remaining bodies to fire at
+/// the base's own live-range end on either path. The pin keeps that reference
+/// fixed while codegen's frame placement is corrected.
+///
+/// The UNTAKEN cell asserts the FULL correct string here, including the `dS1`
+/// the compiled backends still lose — which is exactly the asymmetry
+/// B-2026-09-08-4 stays open for, and the reason its codegen twin asserts only
+/// the sibling.
+#[test]
+fn test_cond_field_move_walk_stays_in_the_owning_frame() {
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let f = true;\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 if f { let taken = g.one; println(f\"t{taken.id}\"); }\n\
+                 println(\"m3\");\n\
+             }\n"),
+        "t1\ndS1\ndS2\nm3\n"
+    );
+    assert_eq!(
+        run("struct Rs { id: i64, name: String }\n\
+             impl Drop for Rs {\n\
+                 fn drop(mut ref self) {\n\
+                     println(f\"dS{self.id}\")\n\
+                 }\n\
+             }\n\
+             fn mks(i: i64) -> Rs {\n\
+                 return Rs { id: i, name: f\"h{i}\" };\n\
+             }\n\
+             struct Bs { mut one: Rs, mut two: Rs }\n\
+             fn main() {\n\
+                 let f = false;\n\
+                 let mut g = Bs { one: mks(1), two: mks(2) };\n\
+                 if f { let taken = g.one; println(f\"t{taken.id}\"); }\n\
+                 println(\"m3\");\n\
+             }\n"),
+        "dS2\ndS1\nm3\n"
+    );
+}
+
 /// B-2026-08-01-19 — interpreter twin of `tests/codegen.rs`'s
 /// `e2e_param_field_store_single_caller_fire`, same source and expected
 /// string. Pre-fix the base binding's Drop slot fired the caller-retained
