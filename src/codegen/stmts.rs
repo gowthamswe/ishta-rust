@@ -14014,6 +14014,13 @@ impl<'ctx> super::Codegen<'ctx> {
                 // (`scope_cleanup_actions`), not re-derived from these maps at
                 // drain time, so the old binding still drops after its
                 // name-metadata is forgotten.
+                // B-2026-09-07-58 — the comment above is true for every
+                // cleanup keyed by an alloca, and NOT for `RcDec`, which
+                // resolves by NAME at drain time and falls back to a
+                // registered pointer that (for a par-join slot transfer) is a
+                // stack slot, not the box. Pin it to the handle before the
+                // name stops meaning the box; see `pin_rc_dec_before_rebind`.
+                self.pin_rc_dec_before_rebind(name);
                 if !self.suppress_shadow_metadata_purge && self.variables.contains_key(name) {
                     self.forget_var_metadata(name);
                 }

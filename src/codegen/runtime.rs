@@ -1671,6 +1671,82 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-07-58 — pin a pending `RcDec` to the box it owns, at the
+    /// moment its NAME stops designating that box.
+    ///
+    /// `CleanupAction::RcDec` resolves its target by NAME at drain time,
+    /// reloading the handle from `variables[name]` so a reassignment
+    /// (`e = other_shared`) drops the live value, and falling back to the
+    /// `ptr` captured at registration when the name's current slot is not
+    /// pointer-typed (B-2026-07-12-6's guard against an `i64` shadow). That
+    /// fallback is sound only for the registration sites that pass a VALUE
+    /// pointer (`track_rc_var("__owned_tmp", val.into_pointer_value(), …)`
+    /// and friends). The sites that pass an ALLOCA — a `let`-bound shared
+    /// local, and the par-join slot transfer in
+    /// `register_one_slot_ownership` — hand the drain a stack ADDRESS, which
+    /// it then decrements as if it were the box's refcount: no crash, and the
+    /// box plus everything it owns is never freed.
+    ///
+    /// The reload keeps that sound as long as the name still means the box.
+    /// A DESTRUCTURING `let` breaks exactly that: `let (t, k) = par { … (t, k) }`
+    /// binds `t` pointer-typed at `compile_par_block`'s Step 6 (the
+    /// `joined_slot_var_type` re-typing B-2026-09-07-47 added), the join
+    /// expression loads the struct out of the box to build the tuple, and the
+    /// outer destructure then rebinds `t` to a fresh struct-typed alloca and
+    /// purges its RC metadata. Measured on the row's cell: 54 allocs / 29
+    /// frees, 40 B direct + 38 B indirect stranded, in BOTH lanes
+    /// (`KARAC_AUTO_PAR=0` disables auto-par only — an explicit `par` block
+    /// still fans out), against a byte-identical sequential control that is
+    /// clean. The instrumented drain reads `ptr_typed=false, rc_box=false` on
+    /// the par spelling and `ptr_typed=true, rc_box=true` on the control.
+    ///
+    /// So capture the handle HERE, where the box is still reachable by name,
+    /// and rewrite the pending action to carry it. The drain's existing
+    /// fallback then does the right thing without a new variant: the guard
+    /// still declines the (now struct-typed) slot, and `*ptr` is the box.
+    /// Dominance holds by construction — the action is registered at the par
+    /// join and this runs in the same block, so every drain of it is emitted
+    /// after this load, on every path that can reach one.
+    ///
+    /// Deliberately keyed on BOTH the name and the registered slot, so an
+    /// unrelated same-named `RcDec` registered with a value pointer (a shared
+    /// param's, an `__owned_tmp`'s) is left alone; and gated on the outgoing
+    /// slot being pointer-typed, so it fires only for a binding that really
+    /// does hold a handle.
+    pub(super) fn pin_rc_dec_before_rebind(&mut self, name: &str) {
+        if !self.drop_rc.rc_fallback_heap_types.contains_key(name) {
+            return;
+        }
+        let Some(slot) = self.variables.get(name).copied() else {
+            return;
+        };
+        if !slot.ty.is_pointer_type() {
+            return;
+        }
+        let pinned = self.drop_rc.scope_cleanup_actions.iter().flatten().any(
+            |a| matches!(a, CleanupAction::RcDec { name: n, ptr, .. } if n == name && *ptr == slot.ptr),
+        );
+        if !pinned {
+            return;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let handle = self
+            .builder
+            .build_load(ptr_ty, slot.ptr, &format!("{name}.rcbox.pin"))
+            .unwrap()
+            .into_pointer_value();
+        for action in self.drop_rc.scope_cleanup_actions.iter_mut().flatten() {
+            if let CleanupAction::RcDec {
+                name: n, ptr: p, ..
+            } = action
+            {
+                if n == name && *p == slot.ptr {
+                    *p = handle;
+                }
+            }
+        }
+    }
+
     /// Phase-B1 cluster-root sibling of `track_rc_var`: queues the
     /// link-following free-walk. The member's recursive drop fn is
     /// still lazily synthesized — fresh-node and cursor bindings keep

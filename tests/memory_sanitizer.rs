@@ -66773,6 +66773,168 @@ fn main() { println(go()); }
         );
     }
 
+    /// B-2026-09-07-58 — AN RC-PROMOTED BINDING PUBLISHED THROUGH A
+    /// VALUE-PRODUCING `par` BLOCK'S JOIN STILL LOSES ITS BOX, because the
+    /// outer destructuring `let` rebinds the name over the pointer-typed entry
+    /// `compile_par_block`'s Step 6 installs.
+    ///
+    /// The sibling of B-2026-09-07-47, reached by a path that fix does not
+    /// cover. That row re-typed the joined variable at the bind-back
+    /// (`joined_slot_var_type`), which is what makes the scope-exit `RcDec`'s
+    /// `slot.ty.is_pointer_type()` reload guard pass. For a VALUE-PRODUCING
+    /// `par` block the bind-back's entry does not survive: Step 6 binds `t`
+    /// pointer-typed and correctly, the join expression `(t, u)` loads each
+    /// struct out of its box to build the tuple, and the OUTER
+    /// `let (t, u) = …` destructure then rebinds both names to fresh
+    /// struct-typed allocas and purges their RC metadata. The transferred
+    /// `RcDec` reloads BY NAME at drain time, fails the pointer guard on the
+    /// destructure's binding, and falls back to the pointer captured at
+    /// registration — the parent's ALLOCA — which it decrements as if it were
+    /// the refcount.
+    ///
+    /// THE MECHANISM WAS MEASURED, NOT INFERRED. An instrumented drain reads
+    /// `ptr_typed=false, rc_box=false` on the par spelling and
+    /// `ptr_typed=true, rc_box=true` on the byte-identical sequential control
+    /// (cell 5) — the two states the guard discriminates on, one per spelling.
+    ///
+    /// Measured on the parent, x86_64 Linux, valgrind, archives current, on
+    /// these exact heap-free cells (a `{i64 rc, Q{i64,i64}}` box is 24 B):
+    ///
+    /// ```text
+    ///                       parent              with the fix
+    ///   cell 1 (one box)    51/27, 24 B lost    51/28, zero
+    ///   cell 2 (two boxes)  52/27, 48 B in 2    52/29, zero
+    ///   cell 3 (reordered)  51/27, 24 B lost    51/28, zero
+    ///   cell 4 (zero-trip)  counts VARY         counts VARY, zero (6 runs)
+    ///   cell 5 (control)    53/30, zero         53/30, zero
+    /// ```
+    ///
+    /// On cells 1, 2, 3 and 5: the SAME allocations either way, and exactly ONE
+    /// MORE FREE PER BOX — which is what says the fix releases a box that was
+    /// stranded, rather than changing what the program allocates.
+    ///
+    /// CELL 4'S COUNTS ARE NOT A STABLE QUANTITY and are deliberately not
+    /// quoted: the zero-trip shape measures anywhere in 51/28 … 54/31 across
+    /// runs of ONE binary, always balanced. Its VERDICT is stable — 24 B lost
+    /// before, zero after on six consecutive runs, output `9` on every one — so
+    /// the cell discriminates, but a reader who took a single alloc count off
+    /// it and compared would be reading noise. (Cells 1, 2, 3 and 5 were
+    /// re-run three times each and do not move.)
+    ///
+    /// IT LEAKS IN BOTH LANES, which is what separates it from B-2026-09-07-47
+    /// and is why the row was split out rather than folded in:
+    /// `KARAC_AUTO_PAR=0` disables AUTO-par only, and an explicit `par` block
+    /// still fans out. So that row's distinguishing test — clean when BUILT
+    /// with auto-par off — does not hold here, and cells 1 and 2 below are
+    /// asserted under BOTH lanes rather than one.
+    ///
+    /// EVERY CELL'S BOXED STRUCT OWNS NO HEAP, deliberately. The row's own
+    /// `struct P { a: String, b: i64 }` cell also loses a 38 B `String` per
+    /// leaf, and that half is NOT this defect: the same 38 B goes missing from
+    /// a par-join destructure with no RC promotion anywhere in the program
+    /// (nothing consumed in a loop), while the identical destructure off a
+    /// plain CALL is clean — `finish_owned_tuple_destructure` gates leaf
+    /// cleanup on `expr_yields_fresh_owned_temp`, which admits `Call` and
+    /// `MethodCall` and not a `par` block. That is its own row. A heap-free
+    /// box makes the box the ONLY thing these cells can lose, so a regression
+    /// here can only be this defect.
+    ///
+    /// THE FIX IS NOT IN THE PAR PATH. `pin_rc_dec_before_rebind` runs at
+    /// `bind_pattern`'s rebind choke point, capturing the handle while the
+    /// name still means the box and rewriting the pending action to carry it.
+    /// That is the general statement of the defect: `RcDec` resolves by NAME,
+    /// and its registered-pointer fallback is a stack slot for every site that
+    /// registers an alloca rather than a value. A destructuring `let` is
+    /// simply the first rebind found that reaches it.
+    #[test]
+    fn asan_rc_promoted_binding_through_a_par_join_tuple_still_frees_its_box() {
+        const PRE: &str = "struct Q { b: i64, c: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn mkq(n: i64) -> Q { return Q { b: n, c: seed() }; }\n\
+             impl Q { fn take(self) -> i64 { return self.b; } }\n";
+
+        // Cell 1 — one promoted slot and a scalar sibling, so exactly one box
+        // is in play. Both lanes.
+        let one_box = format!(
+            "{PRE}fn go() -> i64 {{\n\
+             \x20 let (t, k) = par {{ let t = mkq(9); let k = seed() * 0i64; (t, k) }};\n\
+             \x20 let mut i = 0i64;\n\
+             \x20 while i < 3i64 {{ t.take(); i = i + 1; }}\n\
+             \x20 return t.b + k; }}\n\
+             fn main() {{ println(go()); }}\n"
+        );
+        assert_clean_asan_run_min_allocs_auto_par(&one_box, &["9"], "b58-one-box-autopar", 6);
+        assert_clean_asan_run_min_allocs(&one_box, &["9"], "b58-one-box-noautopar", 6);
+
+        // Cell 2 — TWO promoted bindings across one join. The parent loses one
+        // box PER promoted slot, so a fix that pins only the first slot's
+        // action fails here and passes cell 1. Both lanes.
+        let two_boxes = format!(
+            "{PRE}fn go() -> i64 {{\n\
+             \x20 let (t, u) = par {{ let t = mkq(9); let u = mkq(10); (t, u) }};\n\
+             \x20 let mut i = 0i64;\n\
+             \x20 while i < 3i64 {{ t.take(); u.take(); i = i + 1; }}\n\
+             \x20 return t.b + u.b; }}\n\
+             fn main() {{ println(go()); }}\n"
+        );
+        assert_clean_asan_run_min_allocs_auto_par(&two_boxes, &["19"], "b58-two-boxes-autopar", 6);
+        assert_clean_asan_run_min_allocs(&two_boxes, &["19"], "b58-two-boxes-noautopar", 6);
+
+        // Cell 3 — the promoted binding SECOND in the tuple. The defect is the
+        // rebind, not the element index, so reordering must not change it.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}fn go() -> i64 {{\n\
+                 \x20 let (k, t) = par {{ let k = seed() * 0i64; let t = mkq(9); (k, t) }};\n\
+                 \x20 let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ t.take(); i = i + 1; }}\n\
+                 \x20 return t.b + k; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["9"],
+            "b58-promoted-slot-second",
+            6,
+        );
+
+        // Cell 4 — ZERO trips. The box is minted at the branch's `let`, not in
+        // the loop, and it is the JOIN that strands it; a loop that never runs
+        // loses the same box. (Same discriminator as B-2026-09-07-47's cell 3,
+        // and it holds for the same reason.)
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}fn go() -> i64 {{\n\
+                 \x20 let (t, k) = par {{ let t = mkq(9); let k = seed() * 0i64; (t, k) }};\n\
+                 \x20 let mut i = 0i64;\n\
+                 \x20 while i < 0i64 {{ t.take(); i = i + 1; }}\n\
+                 \x20 return t.b + k; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["9"],
+            "b58-zero-trip-loop",
+            6,
+        );
+
+        // Cell 5 — the SEQUENTIAL control: cell 2 with the `par` block spelled
+        // as two plain `let`s. It was clean before this fix and is clean after,
+        // so it proves nothing about the fix on its own — it is here because it
+        // is the ORACLE the fix restores parity with, and because a change that
+        // broke the reload path (the half that keeps this shape clean) would
+        // show up here and nowhere else in this test.
+        assert_clean_asan_run_min_allocs_auto_par(
+            &format!(
+                "{PRE}fn go() -> i64 {{\n\
+                 \x20 let t = mkq(9); let u = mkq(10);\n\
+                 \x20 let mut i = 0i64;\n\
+                 \x20 while i < 3i64 {{ t.take(); u.take(); i = i + 1; }}\n\
+                 \x20 return t.b + u.b; }}\n\
+                 fn main() {{ println(go()); }}\n"
+            ),
+            &["19"],
+            "b58-sequential-control",
+            6,
+        );
+    }
+
     /// B-2026-09-07-23 — a heap field PROJECTED out of an RC-FALLBACK-PROMOTED
     /// local was freed by the destination AND by the box, once per loop
     /// iteration.
