@@ -94,8 +94,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 402 |
 | run-vs-build | 378 |
-| leak | 306 |
-| double-free | 214 |
+| leak | 307 |
+| double-free | 215 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
 | diagnostics | 125 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1623 |
+| codegen | 1625 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 80 |
@@ -152,7 +152,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-63 | 2026-09-06 | interp+codegen | low | A CALLEE THAT WRAPS A `Drop`-BEARING ARGUMENT IN ANOTHER `Drop`-BEARING TYPE LOSES THE WRAPPER'S OWN BODY -- `fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }` called as `let h = wrap_bodied(r)` prints the `R`'s body once and the `H`'s never, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; the view mark that keeps the `R` correct is what suppresses the `H` | — |
 | B-2026-09-06-65 | 2026-09-06 | interp+codegen | low | A PLAIN OWNED-`self` METHOD ON A FRESH TEMP RUNS THE RECEIVER'S `Drop` BODY BEFORE THE CALL'S RESULT IS PRINTED ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `println(f"v={mk(4).plain()}")` over `fn plain(self) -> i64 { return self.id; }` prints `dR4 v=4` under --interp and `v=4 dR4` on jit / aot / -O0, a stdout-visible A/B divergence with no memory difference | — |
-| B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
@@ -167,6 +166,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-9 | 2026-09-09 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` over `Option[Array[Vec[String], 2]]` fails with `codegen: nested indexed read on 't' -- element TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, the eighth base shape in a family whose other seven are fixed | none |
 | B-2026-09-09-10 | 2026-09-09 | codegen | low | A BOXED USER ENUM PAYLOAD'S INTERIOR IS STILL UNOWNED WHEN THE ARM BINDS THROUGH A NESTED PATTERN -- `match x { Some(K.A(r)) => .. }` over `fn show(x: Option[K])` leaks 81 B in 9 blocks after B-2026-09-06-67 closed the envelope half, and the fix cannot simply register it because the WHOLE-PAYLOAD spelling `Some(k)` double-frees if it does | — |
 | B-2026-09-09-12 | 2026-09-09 | runtime | medium | kara's MAP PROBE WALKS ONE CONTROL BYTE PER STEP WITH A DATA-DEPENDENT BRANCH, and an 8-byte SWAR group scan is 2.03x FASTER IN CYCLES WHILE EXECUTING 30% MORE INSTRUCTIONS (36.0 -> 17.7 cyc/lookup, IPC 1.15 -> 3.05) -- the cost is mispredicts, not work, which is why no instruction-count fix on B-2026-09-07-53 reached it. Prototyped and validated against the reference walk on every key; not shipped, because the win needs the same scan in find_insert_slot and in the CODEGEN MONO probes, not just the runtime's lookup | docs/investigations/hash-cost/README.md |
+| B-2026-09-09-13 | 2026-09-09 | codegen | medium | 99f54104e REGRESSED AN IN-TREE FIXTURE INTO A DOUBLE FREE, and both ASAN ratchet legs are red on origin/main because of it -- `fn f(value: Option[Val]) -> i64 { let mut vv = value; .. }` over a boxed user-enum payload aborts with `AddressSanitizer: double-free` at -O0 while the default -O2 gate set, both clippy legs and `cargo test --features llvm` are all green. Bisected: 99f54104e~1 passes, 99f54104e fails | — |
+| B-2026-09-09-14 | 2026-09-09 | codegen | low | SIX MORE POSITIONS STILL LOSE THE `shared` FIELD'S REFCOUNT BLOCK after B-2026-09-06-72 -- the aggregate as a struct FIELD, as a by-value PARAM, as a `Vec` ELEMENT, DISCARDED at statement level, `Option[R]` as a field, and `Option[(R, i64)]`, each 16 B in 1 block at -O0 (19 B in 2 for the discarded one). `Vec[R]` DIRECT is clean, so the walker exists and what is missing is per-channel wiring. Plus a body divergence in the last cell: `--interp` runs the `Drop` body zero times where the compiled backend runs it early | — |
 
 ### Relocated
 
@@ -2352,6 +2353,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-69 | codegen | high | A CONDITIONAL HAND-BACK OF A REBOUND BY-VALUE PARAM DOUBLE-FREES -- `fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(9); }` over a… | 6ef13bb |
 | B-2026-09-06-70 | codegen | high | THE METHOD AND ASSOC-FN ARGUMENT REGISTRARS HAVE NO ADMISSION GATE AT ALL, so a fresh-temp argument a passthrough callee hands straight back double-f… | c76f658 |
 | B-2026-09-06-71 | codegen | high | A NAMED-LOCAL ARGUMENT TO A PASSTHROUGH FREE FUNCTION DOUBLE-FREES -- `let a = mk(15); let z = f(a);` over `fn f(r: R) -> R { return r; }` and a stru… | 6b21fe8 |
+| B-2026-09-06-72 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9… | 2c3c14f56 |
 | B-2026-09-06-66 | codegen | medium | A POPULATED SELF-REFERENTIAL PAYLOAD LEAKS ITS BOX -- `Node { id: 9, next: Option.Some(mkn(10)), tag: "n" }` over `struct Node { id: i64, next: Optio… | 19c96f62e |
 | B-2026-09-07-2 | codegen | medium | A DISCARDED ASSOCIATED-FUNCTION CALL REGISTERS NO OWNER AT ALL, so its returned value's `Drop` body runs on NO compiled backend and its heap leaks --… | c76f658 |
 | B-2026-09-07-3 | codegen | medium | THE FREE-FUNCTION ARGUMENT ADMISSION GATE STANDS THE CALLER DOWN ON A MIXED-PATH CALLEE AND LEAKS THE DIES-INSIDE LEG -- `fn pick3(r: R, k: bool) ->… | 6ef13bb |
