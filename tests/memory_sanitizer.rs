@@ -83928,4 +83928,124 @@ fn main() {{
             "b72-no-user-drop",
         );
     }
+
+    /// B-2026-09-09-13 — a by-value param whose boxed payload the CALLER owns,
+    /// REBOUND to a local by the callee, is freed twice.
+    ///
+    /// The arg-site arm that gives a boxed param payload's box a caller-scope
+    /// owner reasons that "params register no drop of their own, so the caller
+    /// is the only frame that can own it". True of params and not of LOCALS: a
+    /// bare rebind (`let mut vv = value;`) gives `vv` a full `BoxedEnumDrop` at
+    /// its let site, and the rebind's disarm targets its SOURCE — which, for a
+    /// param, is nothing to disarm. Both frames then free the box. A callee
+    /// cannot reach its caller's registration, so the stand-down is at the call
+    /// site: `callee_rebinds_param_to_local`.
+    ///
+    /// TWO DIFFERENT HISTORIES, which is why both spellings are here:
+    ///
+    ///   * the ENUM payload is a REGRESSION. 99f54104e widened the arm to admit
+    ///     one; measured clean at its parent, `Invalid free` at it and on every
+    ///     commit after. It is what turned both ASAN ratchet legs red on main.
+    ///   * the STRUCT payload was ALREADY broken, before that commit and
+    ///     independent of it — measured `Invalid free` at 99f54104e~1 too. The
+    ///     existing `boxed-struct-payload` cell of
+    ///     `asan_reassigning_a_moved_in_boxed_payload_frees_the_envelope` binds
+    ///     its source from a LOCAL, so the param axis had no cell at all.
+    ///
+    /// Both abort with `free(): double free detected in tcache 2` rather than
+    /// leaking, so the failure is loud once a fixture exists to hear it.
+    ///
+    /// NO STRING-BEARING NO-ALIAS CELL, deliberately. That shape still loses its
+    /// payload interior (B-2026-09-09-10, open and held elsewhere), so it cannot
+    /// assert clean; the POD control below covers the no-rebind path instead,
+    /// which is the axis this fix turns on. The gate does not fire without a
+    /// rebind, so that row's shape is untouched by this change — measured
+    /// identical (68 B) before and after.
+    #[test]
+    fn asan_caller_owned_boxed_param_payload_rebound_to_a_local_is_freed_once() {
+        const ENUM_PRE: &str = "enum Val { Nothing, Ident(String) }\n\
+             fn ident_len(v: Val) -> i64 { match v { Val.Ident(s) => s.len(), Val.Nothing => 0 } }\n\
+             fn val_none() -> Option[Val] { Option.None }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-moved-in-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mk_val() -> Option[Val] { Option.Some(Val.Ident(payload())) }\n";
+        const STRUCT_PRE: &str = "struct R2 { s: String, t: String, u: String, a: i64, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn mkr(i: i64) -> R2 { return R2 { s: f\"ssssssss{i}{seed()}\", t: f\"tttttttt{i}\", u: f\"uuuuuuuu{i}\", a: 1, b: 2 }; }\n\
+             fn r2_none() -> Option[R2] { Option.None }\n";
+
+        // 1 — the REGRESSION: boxed user ENUM payload, param rebound to a local.
+        assert_clean_asan_run(
+            &format!(
+                "{ENUM_PRE}\
+                 fn f(value: Option[Val]) -> i64 {{ let mut vv = value; let mut acc = 0;\n\
+                 \x20  while let Some(v) = vv {{ acc = acc + ident_len(v); vv = val_none(); }} acc }}\n\
+                 fn main() {{ println(f(mk_val())); }}\n"
+            ),
+            &["45"],
+            "b13-enum-payload-param-rebind",
+        );
+
+        // 2 — the PRE-EXISTING one: boxed user STRUCT payload, same rebind.
+        //     Broken at 99f54104e~1 as well, so this cell is not a regression
+        //     guard but first coverage of the param axis for a struct payload.
+        assert_clean_asan_run(
+            &format!(
+                "{STRUCT_PRE}\
+                 fn f(value: Option[R2]) -> i64 {{ let mut vv = value; let mut acc = 0;\n\
+                 \x20  while let Some(r) = vv {{ acc = acc + r.s.len(); vv = r2_none(); }} acc }}\n\
+                 fn main() {{ println(f(Option.Some(mkr(1)))); }}\n"
+            ),
+            &["10"],
+            "b13-struct-payload-param-rebind",
+        );
+
+        // 3 — the `Result` spelling. Clean on every commit measured, including
+        //     both sides of the regression, so this pins the arm the fix also
+        //     gates rather than guarding a known break: the two arg-site arms
+        //     ask the same question and must keep answering it the same way.
+        assert_clean_asan_run(
+            &format!(
+                "{ENUM_PRE}\
+                 fn val_err() -> Result[Val, i64] {{ Result.Err(7) }}\n\
+                 fn f(value: Result[Val, i64]) -> i64 {{ let mut vv = value; let mut acc = 0;\n\
+                 \x20  while let Ok(v) = vv {{ acc = acc + ident_len(v); vv = val_err(); }} acc }}\n\
+                 fn main() {{ println(f(Result.Ok(Val.Ident(payload())))); }}\n"
+            ),
+            &["45"],
+            "b13-result-payload-param-rebind",
+        );
+
+        // 4 — the LOCAL-source control. Both registrations are then in one
+        //     frame, where the rebind disarms its source, so this was clean
+        //     throughout and must stay clean: it is what says the axis is the
+        //     source being a PARAM and not the rebind itself.
+        assert_clean_asan_run(
+            &format!(
+                "{ENUM_PRE}\
+                 fn f() -> i64 {{ let value = mk_val(); let mut vv = value; let mut acc = 0;\n\
+                 \x20  while let Some(v) = vv {{ acc = acc + ident_len(v); vv = val_none(); }} acc }}\n\
+                 fn main() {{ println(f()); }}\n"
+            ),
+            &["45"],
+            "b13-local-source-control",
+        );
+
+        // 5 — the NO-REBIND control, POD payload so the interior residual of
+        //     B-2026-09-09-10 cannot muddy it. The callee reads the param
+        //     directly, no local is created, and the caller must KEEP its
+        //     registration: a fix that stood down unconditionally would leak
+        //     the box here instead, which is the error direction this cell
+        //     exists to catch.
+        assert_clean_asan_run(
+            "struct W { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn w_none() -> Option[W] { Option.None }\n\
+             fn f(value: Option[W]) -> i64 { let mut acc = 0;\n\
+             \x20  while let Some(w) = value { acc = acc + w.a + w.f; value = w_none(); } acc }\n\
+             fn main() { println(f(Option.Some(W { a: seed(), b: 2, c: 3, d: 4, e: 5, f: 6 }))); }\n",
+            &["7"],
+            "b13-no-rebind-pod-control",
+        );
+    }
 }

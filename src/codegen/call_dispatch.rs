@@ -3150,12 +3150,7 @@ impl<'ctx> super::Codegen<'ctx> {
         // `register_boxed_payload_alias`, so its callee-side local does not free
         // the box and the caller is still the only owner. Widening this to
         // structs would re-open the leak B-2026-09-06-56 closed.
-        if !self
-            .type_decls
-            .struct_types
-            .contains_key(struct_name.as_str())
-            && self.callee_rebinds_param_whole(name, i)
-        {
+        if self.callee_rebinds_param_whole(name, i) {
             return None;
         }
         self.option_payload_is_boxed(payload_te)
