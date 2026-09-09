@@ -1190,7 +1190,24 @@ impl<'ctx> super::Codegen<'ctx> {
                 // Recurse FIRST — the sub-emitter may switch the builder's
                 // insert block; capture the per-element drop fn before we open
                 // the loop blocks in THIS function.
-                let elem_drop = self.vec_elem_agg_drop_for_type_expr(&elem_te);
+                // B-2026-09-07-62 — `vec_element_drain_fn`, not the bare
+                // `vec_elem_agg_drop_for_type_expr`. The aggregate resolver
+                // answers `None` for a DIRECT `String` / `Map` / `Set` /
+                // nested-`Vec` element, so this arm freed the outer buffer and
+                // dropped every such element on the floor — one leak per
+                // element, at EVERY level (measured on a `Vec[String]` field of
+                // the boxed payload struct ITSELF, not only of a nested one:
+                // 9 bytes in 3 blocks for three heap strings). The combined
+                // resolver falls back to `emit_drop_fn_for_type_expr` for
+                // exactly the `elem_te_needs_direct_recursive_drain` set, which
+                // is the set the entry-copy can duplicate — so routing through
+                // it is what restores copy-depth == drop-depth here, the same
+                // reason `emit_struct_drop_synthesis`'s VecOrString arm uses it.
+                //
+                // A string LITERAL element hides this: it is static with
+                // `cap == 0`, so an outer-only free looks correct. Only an
+                // f-string / built element shows the loss.
+                let elem_drop = self.vec_element_drain_fn(&elem_te);
                 let data_pp = self
                     .builder
                     .build_struct_gep(vec_ty, field_ptr, 0, "nstr.vec.data.pp")
@@ -6127,22 +6144,33 @@ impl<'ctx> super::Codegen<'ctx> {
                         // the boxed struct's DIRECT Vec/String buffers
                         // (`owns_buffer_free=true`) and rc-decs its shared /
                         // `Option[shared]` children; then free the heap box itself.
-                        // `nested_buffer_free = Some(false)`: a nested heap STRUCT
-                        // field of the boxed payload (`IfNode.then_block: Block`)
-                        // may be MOVED OUT by the match binding (`let tb =
-                        // nd.then_block`), whose own value-drop frees that struct's
-                        // BUFFERS — re-freeing them here double-frees (the
-                        // regression that surfaced
-                        // `test_e2e_shared_enum_payload_with_nested_heap_struct_field`).
-                        // So recurse to rc-dec the nested struct's RC children (the
-                        // value-drop does NOT) while leaving its buffers to the
-                        // move-out owner: no double-free, no stranded RC child.
+                        //
+                        // B-2026-09-07-62 — `nested_buffer_free` is `Some(true)`:
+                        // the box owns a NESTED struct field's buffers too, on
+                        // every spelling. It used to be `Some(false)`, deferring
+                        // them to a move-out owner, and that was correct in
+                        // exactly ONE of the four spellings the row measured:
+                        //
+                        //   no move-out            nobody frees      32 B lost
+                        //   SIBLING move-out       nobody frees      32 B lost
+                        //   destructure move-out   leaf owns a COPY  32 B lost
+                        //   field-access move-out  leaf owns the ORIGINAL   ok
+                        //
+                        // Only the last one has an owner, because only there does
+                        // the leaf alias the box's own buffer. Flipping this alone
+                        // would turn that spelling into a double free, so the
+                        // caller-side half moves with it: the field-access move-out
+                        // now DUPLICATES the nested struct's buffers
+                        // (`stmts.rs`, B-2026-09-07-55's site), exactly as the
+                        // destructure spelling already did. With every moved-out
+                        // leaf owning a copy, the box can own its originals
+                        // unconditionally and all four spellings balance.
                         self.emit_nested_struct_shared_rc_decs_ex(
                             box_ptr,
                             &sname,
                             drop_fn,
                             true,
-                            Some(false),
+                            Some(true),
                         );
                         self.builder
                             .build_call(self.runtime_fns.free_fn, &[box_ptr.into()], "")

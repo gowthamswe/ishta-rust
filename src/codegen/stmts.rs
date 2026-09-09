@@ -10447,9 +10447,19 @@ impl<'ctx> super::Codegen<'ctx> {
                             // one ref — the second dec reading a block the first
                             // freed. Emitted HERE rather than at the suppressor
                             // because the leaf's slot does not exist yet there.
-                            // See `rc_inc_struct_shared_children_in_place` for
-                            // why the box may not be neutralized instead, and
-                            // why the buffers are deliberately left uncopied.
+                            // NEUTRALIZING THE BOX IS NOT AN OPTION HERE,
+                            // which is what leaves the copy:
+                            // `record_deboxed_payload_box` refuses a shared
+                            // enum's payload box on purpose — "that box lives
+                            // inside an RC node other handles can still read, so
+                            // a cap/len zero there is corruption rather than
+                            // neutralization". If the box may not be
+                            // neutralized, the read IS a copy, and a copy of a
+                            // shared handle incs. B-2026-09-05-1 reached the
+                            // same conclusion for a direct `shared` field, and
+                            // `finish_owned_struct_destructure` already does
+                            // this for the DESTRUCTURE spelling of the very same
+                            // move; this is the field-access spelling of it.
                             if let ExprKind::FieldAccess { object, field } = &value.kind {
                                 let obj_name = match &object.kind {
                                     ExprKind::Identifier(o) => Some(o.clone()),
@@ -10488,9 +10498,45 @@ impl<'ctx> super::Codegen<'ctx> {
                                                 }
                                             });
                                         if let Some(leaf) = leaf {
-                                            self.rc_inc_struct_shared_children_in_place(
+                                            // B-2026-09-07-62 — DUPLICATE the
+                                            // leaf's buffers as well as rc-INCing
+                                            // its shared children, so the box can
+                                            // own its originals on every spelling
+                                            // (`synth_drop.rs`'s boxed arm, now
+                                            // `nested_buffer_free = Some(true)`).
+                                            // Leaving them aliased was right only
+                                            // for THIS spelling and leaked 32 B on
+                                            // the other three; the destructure
+                                            // spelling already copied.
+                                            //
+                                            // `deep_copy_struct_heap_fields_in_place`
+                                            // under `deep_copy_rc_inc_bare_shared`
+                                            // performs the SAME two incs this used
+                                            // to, not merely equivalent ones:
+                                            // `deep_copy_one_aggregate_field`'s
+                                            // first branch is gated on
+                                            // `shared_heap_type_for_type_expr` and
+                                            // its `Option` arm on
+                                            // `option_inner_shared_type_for_type_expr`
+                                            // — the two predicates
+                                            // B-2026-09-07-55's now-removed
+                                            // `rc_inc_struct_shared_children_in_place`
+                                            // walked — and the latter dispatches to
+                                            // `rc_inc_option_inline_shared_payload_in_place`,
+                                            // the identical call. So the
+                                            // classification stays in step with
+                                            // `emit_nested_struct_shared_rc_decs_ex`'s
+                                            // dec, which is what B-2026-09-07-55
+                                            // required and why calling BOTH helpers
+                                            // would be wrong: the duplicator
+                                            // already incs bare shared children, so
+                                            // pairing them double-incs.
+                                            let saved = self.drop_rc.deep_copy_rc_inc_bare_shared;
+                                            self.drop_rc.deep_copy_rc_inc_bare_shared = true;
+                                            self.deep_copy_struct_heap_fields_in_place(
                                                 alloca, &leaf,
                                             );
+                                            self.drop_rc.deep_copy_rc_inc_bare_shared = saved;
                                         }
                                     }
                                 }

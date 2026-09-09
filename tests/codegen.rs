@@ -152220,6 +152220,99 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-62 — the OUTPUT twin of
+    /// `memory_sanitizer.rs::asan_boxed_shared_enum_nested_struct_field_has_one_owner`.
+    ///
+    /// The row is a leak, so the leak checker is the fixture that pins it; this
+    /// one pins that the ownership change is otherwise INVISIBLE — the four
+    /// move-out spellings, the three classifier-parity nested-child shapes and
+    /// the `Vec[String]` element case all print exactly what they printed
+    /// before, on every backend. A duplicator that copied the wrong field, or a
+    /// walker that freed a buffer still in use, would show up here as changed
+    /// or missing output rather than as a leak.
+    #[test]
+    fn e2e_boxed_shared_enum_nested_struct_field_output_is_unchanged() {
+        fn prog(extra: &str, init: &str, use_expr: &str) -> String {
+            format!(
+                "struct Sp4n {{ a: i64, b: i64, c: i64, d: i64 }}\n\
+                 shared struct Sh {{ v: i64 }}\n\
+                 shared enum E {{ Lit(i64), Iff(IfNode), Blk(Block) }}\n\
+                 struct Block {{ stmts: Vec[i64], {extra} pad: Option[String], sp: Sp4n }}\n\
+                 struct IfNode {{ cond: E, then_block: Block, sp: Sp4n }}\n\
+                 fn mk_block(first: i64, s: i64) -> Block {{\n\
+                 \x20   let mut v: Vec[i64] = Vec.new(); v.push(first); v.push(first + 1);\n\
+                 \x20   let mut w: Vec[String] = Vec.new(); w.push(f\"t{{first}}\");\n\
+                 \x20   return Block {{ stmts: v, {init} pad: Option.Some(f\"p{{first}}\"), sp: Sp4n {{ a: s, b: 0, c: 0, d: 0 }} }};\n\
+                 }}\n\
+                 fn mk() -> E {{ return E.Iff(IfNode {{ cond: E.Lit(7), then_block: mk_block(20, 2), sp: Sp4n {{ a: 5, b: 0, c: 0, d: 0 }} }}); }}\n\
+                 fn main() {{\n\
+                 \x20   let ife = mk();\n\
+                 \x20   match ife {{ E.Lit(n) => println(f\"{{n}}\"), E.Iff(nd) => {{ {use_expr} }}, E.Blk(_) => println(\"-9\") }}\n\
+                 \x20   println(\"end\");\n\
+                 }}\n"
+            )
+        }
+        const NONE: &str = "println(f\"v{nd.sp.a}\");";
+        const SIB: &str = "let c = nd.cond; println(f\"v{nd.sp.a}\");";
+        const FA: &str = "let tb = nd.then_block; println(f\"v{tb.stmts.len()}\");";
+        const DE: &str =
+            "let Block { stmts, pad, sp } = nd.then_block; println(f\"v{stmts.len()}\");";
+
+        for (label, extra, init, u, want) in [
+            ("no-moveout", "", "", NONE, "v5\nend\n"),
+            ("sibling-moveout", "", "", SIB, "v5\nend\n"),
+            ("fieldaccess-moveout", "", "", FA, "v2\nend\n"),
+            ("destructure-moveout", "", "", DE, "v2\nend\n"),
+            (
+                "parity-bare-shared",
+                "sh: Sh,",
+                "sh: Sh { v: 3 },",
+                NONE,
+                "v5\nend\n",
+            ),
+            (
+                "parity-bare-shared-fa",
+                "sh: Sh,",
+                "sh: Sh { v: 3 },",
+                FA,
+                "v2\nend\n",
+            ),
+            (
+                "parity-option-shared",
+                "osh: Option[Sh],",
+                "osh: Option.Some(Sh { v: 4 }),",
+                NONE,
+                "v5\nend\n",
+            ),
+            (
+                "parity-both",
+                "sh: Sh, osh: Option[Sh],",
+                "sh: Sh { v: 3 }, osh: Option.Some(Sh { v: 4 }),",
+                FA,
+                "v2\nend\n",
+            ),
+            (
+                "vecstring",
+                "tags: Vec[String],",
+                "tags: w,",
+                NONE,
+                "v5\nend\n",
+            ),
+            (
+                "vecstring-fa",
+                "tags: Vec[String],",
+                "tags: w,",
+                FA,
+                "v2\nend\n",
+            ),
+        ] {
+            let Some(out) = run_program(&prog(extra, init, u)) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by

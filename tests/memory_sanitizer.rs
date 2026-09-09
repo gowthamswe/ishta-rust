@@ -83368,4 +83368,155 @@ fn main() {{
             "b13-cond-store-hazard",
         );
     }
+    /// B-2026-09-07-62 — a BOXED shared-enum payload's NESTED struct field had
+    /// no owner for its buffers unless that exact field was moved out by a
+    /// FIELD-ACCESS `let`.
+    ///
+    /// `emit_shared_enum_field_drop`'s boxed arm walked the nested struct with
+    /// `nested_buffer_free = Some(false)`, deferring its Vec/String buffers to
+    /// a move-out owner. That is right in exactly ONE of four spellings —
+    /// measured, `-O0` and `-O2`, valgrind, on the row's own type:
+    ///
+    ///     no move-out            nobody frees             32 B lost
+    ///     SIBLING move-out       nobody frees             32 B lost
+    ///     destructure move-out   leaf owns a COPY         32 B lost
+    ///     field-access move-out  leaf owns the ORIGINAL   clean
+    ///
+    /// The walker is now `Some(true)` and the field-access move-out DUPLICATES
+    /// the nested struct's buffers (`stmts.rs`, B-2026-09-07-55's site), so the
+    /// box owns its originals on every spelling and each moved-out leaf owns a
+    /// copy. Flipping the walker alone would have turned the one clean spelling
+    /// into a double free, which is why cells 3 and 4 are here: on Linux CI
+    /// LSan pins the leak, and a double free aborts on every platform at any
+    /// opt level.
+    ///
+    /// The nested field shapes are the classifier-PARITY cells the row named as
+    /// its blocker. The caller-side duplicator must classify a nested field the
+    /// same way the box's rc-dec walker does, or the two disagree and
+    /// B-2026-09-07-55's use-after-free returns. It does, and not by
+    /// coincidence: `deep_copy_one_aggregate_field`'s bare-`shared` branch is
+    /// gated on `shared_heap_type_for_type_expr` and its `Option` arm on
+    /// `option_inner_shared_type_for_type_expr` — the two predicates
+    /// `rc_inc_struct_shared_children_in_place` walks — and the latter
+    /// dispatches to `rc_inc_option_inline_shared_payload_in_place`, the
+    /// identical call. Cells 5-7 exercise a bare `shared` child, an
+    /// `Option[shared]` child, and both at once, in the BOXED regime.
+    ///
+    /// A NOTE ON REACHING THAT REGIME, because it is easy to miss and makes a
+    /// fixture vacuous: the payload is boxed only when it exceeds the enum's
+    /// 3-word inline area. A nested struct carrying just a `Vec` and a `String`
+    /// stays INLINE, takes a different arm entirely, and was clean before and
+    /// after. Every cell here carries an `Option[String]` field for the sole
+    /// purpose of forcing the box.
+    #[test]
+    fn asan_boxed_shared_enum_nested_struct_field_has_one_owner() {
+        // `EXTRA`/`INIT` vary the nested struct's child classes; `pad` forces
+        // the payload to be BOXED (see the note above).
+        fn prog(extra: &str, init: &str, use_expr: &str) -> String {
+            format!(
+                "struct Sp4n {{ a: i64, b: i64, c: i64, d: i64 }}\n\
+                 shared struct Sh {{ v: i64 }}\n\
+                 shared enum E {{ Lit(i64), Iff(IfNode), Blk(Block) }}\n\
+                 struct Block {{ stmts: Vec[i64], {extra} pad: Option[String], sp: Sp4n }}\n\
+                 struct IfNode {{ cond: E, then_block: Block, sp: Sp4n }}\n\
+                 fn mk_block(first: i64, s: i64) -> Block {{\n\
+                 \x20   let mut v: Vec[i64] = Vec.new(); v.push(first); v.push(first + 1);\n\
+                 \x20   let mut w: Vec[String] = Vec.new(); w.push(f\"t{{first}}\");\n\
+                 \x20   return Block {{ stmts: v, {init} pad: Option.Some(f\"p{{first}}\"), sp: Sp4n {{ a: s, b: 0, c: 0, d: 0 }} }};\n\
+                 }}\n\
+                 fn mk() -> E {{ return E.Iff(IfNode {{ cond: E.Lit(7), then_block: mk_block(20, 2), sp: Sp4n {{ a: 5, b: 0, c: 0, d: 0 }} }}); }}\n\
+                 fn main() {{\n\
+                 \x20   let ife = mk();\n\
+                 \x20   match ife {{ E.Lit(n) => println(f\"{{n}}\"), E.Iff(nd) => {{ {use_expr} }}, E.Blk(_) => println(\"-9\") }}\n\
+                 \x20   println(\"end\");\n\
+                 }}\n"
+            )
+        }
+        const NONE: &str = "println(f\"v{nd.sp.a}\");";
+        const SIB: &str = "let c = nd.cond; println(f\"v{nd.sp.a}\");";
+        const FA: &str = "let tb = nd.then_block; println(f\"v{tb.stmts.len()}\");";
+
+        // 1-2 — the row's own cells: no move-out, and a SIBLING move-out.
+        for (label, u) in [("b62-no-moveout", NONE), ("b62-sibling-moveout", SIB)] {
+            assert_clean_asan_run_no_auto_par(&prog("", "", u), &["v5", "end"], label);
+        }
+        // 3 — DESTRUCTURE move-out: the leaf already took a copy, so the box's
+        //     original was stranded. Same leak, different reason.
+        assert_clean_asan_run_no_auto_par(
+            &prog(
+                "",
+                "",
+                "let Block { stmts, pad, sp } = nd.then_block; println(f\"v{stmts.len()}\");",
+            ),
+            &["v2", "end"],
+            "b62-destructure-moveout",
+        );
+        // 4 — HAZARD / the one clean spelling: field-access move-out. Before
+        //     this change the leaf ALIASED the box's buffer; it now owns a copy.
+        //     A missing copy here is a double free, not a leak.
+        assert_clean_asan_run_no_auto_par(
+            &prog("", "", FA),
+            &["v2", "end"],
+            "b62-fieldaccess-moveout",
+        );
+        // 5-7 — classifier PARITY, in the boxed regime: a bare `shared` child,
+        //       an `Option[shared]` child, and both. A duplicator that
+        //       classified either differently from the box's rc-dec walker
+        //       would double-dec and abort (B-2026-09-07-55's use-after-free).
+        for (label, extra, init) in [
+            ("b62-parity-bare-shared", "sh: Sh,", "sh: Sh { v: 3 },"),
+            (
+                "b62-parity-option-shared",
+                "osh: Option[Sh],",
+                "osh: Option.Some(Sh { v: 4 }),",
+            ),
+            (
+                "b62-parity-both",
+                "sh: Sh, osh: Option[Sh],",
+                "sh: Sh { v: 3 }, osh: Option.Some(Sh { v: 4 }),",
+            ),
+        ] {
+            for u in [NONE, FA] {
+                let want = if u == NONE { "v5" } else { "v2" };
+                assert_clean_asan_run_no_auto_par(&prog(extra, init, u), &[want, "end"], label);
+            }
+        }
+        // 8 — the SECOND half of this fix: the walker's `Vec[T]` arm resolved
+        //     its per-element drop through `vec_elem_agg_drop_for_type_expr`,
+        //     which answers `None` for a DIRECT `String` element, so every
+        //     element was dropped on the floor. Pre-existing and level-
+        //     INDEPENDENT — reproduced on a `Vec[String]` field of the boxed
+        //     payload struct itself, with no nesting involved. It surfaces here
+        //     because the field-access copy above stops the moved-out leaf from
+        //     incidentally draining the box's originals.
+        //
+        //     A string LITERAL element hides it (static, `cap == 0`), so these
+        //     build their elements with f-strings deliberately.
+        for (label, u) in [
+            ("b62-vecstring-nested", NONE),
+            ("b62-vecstring-nested-fa", FA),
+        ] {
+            assert_clean_asan_run_no_auto_par(
+                &prog("tags: Vec[String],", "tags: w,", u),
+                &[if u == NONE { "v5" } else { "v2" }, "end"],
+                label,
+            );
+        }
+        assert_clean_asan_run_no_auto_par(
+            "struct Sp4n { a: i64, b: i64, c: i64, d: i64 }\n\
+             shared enum E { Lit(i64), Iff(IfNode) }\n\
+             struct IfNode { cond: E, tags: Vec[String], pad: Option[String], sp: Sp4n }\n\
+             fn mk() -> E {\n\
+             \x20   let mut w: Vec[String] = Vec.new(); w.push(f\"t{20}\"); w.push(f\"u{21}\");\n\
+             \x20   return E.Iff(IfNode { cond: E.Lit(7), tags: w, pad: Option.Some(f\"p{1}\"), sp: Sp4n { a: 5, b: 0, c: 0, d: 0 } });\n\
+             }\n\
+             fn main() {\n\
+             \x20   let ife = mk();\n\
+             \x20   match ife { E.Lit(n) => println(f\"{n}\"), E.Iff(nd) => { println(f\"v{nd.sp.a}\"); } }\n\
+             \x20   println(\"end\");\n\
+             }\n",
+            &["v5", "end"],
+            "b62-vecstring-direct-field",
+        );
+    }
 }
