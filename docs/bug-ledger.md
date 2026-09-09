@@ -93,8 +93,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 402 |
-| run-vs-build | 377 |
-| leak | 305 |
+| run-vs-build | 378 |
+| leak | 306 |
 | double-free | 214 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1621 |
+| codegen | 1623 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 80 |
@@ -153,7 +153,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-63 | 2026-09-06 | interp+codegen | low | A CALLEE THAT WRAPS A `Drop`-BEARING ARGUMENT IN ANOTHER `Drop`-BEARING TYPE LOSES THE WRAPPER'S OWN BODY -- `fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }` called as `let h = wrap_bodied(r)` prints the `R`'s body once and the `H`'s never, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; the view mark that keeps the `R` correct is what suppresses the `H` | — |
 | B-2026-09-06-65 | 2026-09-06 | interp+codegen | low | A PLAIN OWNED-`self` METHOD ON A FRESH TEMP RUNS THE RECEIVER'S `Drop` BODY BEFORE THE CALL'S RESULT IS PRINTED ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `println(f"v={mk(4).plain()}")` over `fn plain(self) -> i64 { return self.id; }` prints `dR4 v=4` under --interp and `v=4 dR4` on jit / aot / -O0, a stdout-visible A/B divergence with no memory difference | — |
-| B-2026-09-06-67 | 2026-09-06 | codegen | low | A BOXED USER *ENUM* PAYLOAD OF A BY-VALUE PARAM IS STILL UNOWNED, ON BOTH SEEDED ENUMS -- `fn show(x: Result[K, i64])` matched `Ok(K.A(r))` leaks 240 B in 3 blocks plus 81 B indirect, and the `Option` spelling measures identically, because both caller-side arms filter the payload name through `struct_types` | — |
 | B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
@@ -168,6 +167,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-7 | 2026-09-09 | other | medium | A FULL DISK FAILS THE GATE SET AS AN LLVM CRASH, A LINKER BUS ERROR, OR A LOST OUTPUT STREAM -- never as a named test -- and it hit ELEVEN times across seven unrelated slices in one session. The session allowance is ~38 GiB (df's '252G size' is the host volume and is meaningless), ONE leg of `cargo test --no-run` costs 19.6 GiB in test binaries (134 executables x ~250 MiB at the default debug=2), so the SECOND feature leg cannot start. The obvious suspect is wrong: both clippy legs together cost 1.19 GiB. `CARGO_PROFILE_TEST_DEBUG=line-tables-only` cuts a test binary 252 -> 97 MiB and makes both legs fit | — |
 | B-2026-09-09-8 | 2026-09-09 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-49 STILL LEAKS ITS INLINE-BUILT `Array` INTERIOR -- `plainR(Result.Ok([f"a{i}", f"b{i}"]))` over `Result[Array[String, 2], i64]` loses 54 B in 6 blocks after the Option half was fixed, because the param-site arm that owns the payload reads it through `option_generic_arg_type_expr` and no `Result` sibling exists | none |
 | B-2026-09-09-9 | 2026-09-09 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` over `Option[Array[Vec[String], 2]]` fails with `codegen: nested indexed read on 't' -- element TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, the eighth base shape in a family whose other seven are fixed | none |
+| B-2026-09-09-10 | 2026-09-09 | codegen | low | A BOXED USER ENUM PAYLOAD'S INTERIOR IS STILL UNOWNED WHEN THE ARM BINDS THROUGH A NESTED PATTERN -- `match x { Some(K.A(r)) => .. }` over `fn show(x: Option[K])` leaks 81 B in 9 blocks after B-2026-09-06-67 closed the envelope half, and the fix cannot simply register it because the WHOLE-PAYLOAD spelling `Some(k)` double-frees if it does | — |
+| B-2026-09-09-11 | 2026-09-09 | codegen | medium | A `shared enum` WITH A BOXED STRUCT PAYLOAD PRINTS NOTHING ON EVERY COMPILED BACKEND AND STACK-OVERFLOWS THE JIT, while `--interp` prints the right three lines -- `shared enum Ks { A(R2), B }` matched out of a by-value `Option[Ks]` param exits 0 with EMPTY stdout at -O0 and -O2, auto-par on and off, so the program is silently wrong rather than failing | — |
 
 ### Relocated
 
@@ -2348,6 +2349,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-61 | codegen | high | RETURNING A WHOLE REBIND OF A DECLINED-COPY PARAM DOUBLE-FREES -- `fn rebret(r: R) -> R { let m = r; return m; }` over a struct with a `shared` field… | b8c2a02 |
 | B-2026-09-06-62 | codegen | high | THE OWNED-`self` RECEIVER SPELLING OF B-2026-09-06-52 IS STILL RED -- `impl R { fn take(self) -> i64 { let m = self; return m.inner.v; } }` over a st… | 96efdca |
 | B-2026-09-06-64 | codegen | high | A SELF-REFERENTIAL STRUCT CRASHES `karac build` WITH A COMPILER STACK OVERFLOW -- `struct Node { id: i64, next: Option[Node], tag: String }` plus a `… | ed5335c |
+| B-2026-09-06-67 | codegen | low | A BOXED USER *ENUM* PAYLOAD OF A BY-VALUE PARAM IS STILL UNOWNED, ON BOTH SEEDED ENUMS -- `fn show(x: Result[K, i64])` matched `Ok(K.A(r))` leaks 240… | 99f5410 |
 | B-2026-09-06-69 | codegen | high | A CONDITIONAL HAND-BACK OF A REBOUND BY-VALUE PARAM DOUBLE-FREES -- `fn f(r: R, c: bool) -> R { let m = r; if c { return m; } return mk(9); }` over a… | 6ef13bb |
 | B-2026-09-06-70 | codegen | high | THE METHOD AND ASSOC-FN ARGUMENT REGISTRARS HAVE NO ADMISSION GATE AT ALL, so a fresh-temp argument a passthrough callee hands straight back double-f… | c76f658 |
 | B-2026-09-06-71 | codegen | high | A NAMED-LOCAL ARGUMENT TO A PASSTHROUGH FREE FUNCTION DOUBLE-FREES -- `let a = mk(15); let z = f(a);` over `fn f(r: R) -> R { return r; }` and a stru… | 6b21fe8 |
