@@ -83762,6 +83762,138 @@ fn main() {{
         );
     }
 
+    /// B-2026-09-09-10 — THE INTERIOR of a boxed enum payload reached through a
+    /// by-value param, which B-2026-09-06-67 closed the ENVELOPE half of and
+    /// deliberately left.
+    ///
+    /// `fn show(x: Option[K])` over `enum K { A(R2), B }` with a
+    /// `String`-bearing `R2` leaked 81 B in 9 blocks over three calls at `-O0`
+    /// (23 allocs / 14 frees) — `R2`'s three buffers. The `Result` spelling
+    /// measured identically. The sibling fixture above uses a POD payload, so
+    /// it pins the box and can never see this.
+    ///
+    /// THE CALLER COULD NOT REGISTER THE INTERIOR UNTIL THE DISARM WORKED, and
+    /// that is the whole shape of the row. Registering it alone fixes the
+    /// nested arm and turns the WHOLE-PAYLOAD arm into 9 invalid frees in 3
+    /// contexts (23 allocs / 32 frees), because there the callee's own
+    /// bindings already own the interior. The disarm that should have stood
+    /// them down — `register_boxed_payload_alias` — tested only
+    /// `boxed_enum_payload_vars`, the set of what a frame OWNS, and a PARAM is
+    /// never in it (measured: `in_owned_set=false in_param_reach_set=true`).
+    /// It now also accepts `boxed_struct_payload_param_vars`, the companion set
+    /// that grants reach, so the alias is recorded and both spellings have
+    /// exactly one owner.
+    ///
+    /// The cells are the two directions plus the controls that must not move:
+    ///   - `nested` / `nestedres`: the reported leak, both seeded enums;
+    ///   - `whole` / `wholeres`: the DOUBLE-FREE direction — the callee binds
+    ///     the payload whole and matches it again, so its bindings own the
+    ///     interior and the caller's registration must be disarmed;
+    ///   - `wildcard`: binds nothing, so the caller's drop is the only owner
+    ///     and must SURVIVE;
+    ///   - `structpay`: a struct payload, whose interior already travelled —
+    ///     byte-for-byte unchanged by this row;
+    ///   - `passthru`: the param flows into the return, so the caller-side
+    ///     registration must not happen at all and the local `y` owns it;
+    ///   - `handsout`: the arm binds the payload and passes it to a CONSUMING
+    ///     call. It leaked 81 B before this fix and is clean after, and it is
+    ///     pinned because it LOOKS like the double-free direction and is not —
+    ///     the arm's own retraction already covers a transfer out of the arm.
+    ///
+    /// THE INTERIOR IS GATED ON THE CALLEE KEEPING THE PARAM IN ITS FRAME, and
+    /// the shape that forced that gate is not an arm shape at all: `let y = x;`
+    /// moves the param into a LOCAL whose let site registers its own owner, so
+    /// a caller-side interior becomes a second one — 23 allocs / 35 frees, 11
+    /// invalid frees, and it is what turned
+    /// `asan_reassigning_a_moved_in_boxed_payload_frees_the_envelope`'s
+    /// `param-alias` cell red on the first attempt.
+    /// `by_value_nonescaping_param_names` separates it from every cell above: a
+    /// scrutinee use and a read-only hole keep the payload in frame, a move
+    /// into another binding does not.
+    ///
+    /// DELIBERATELY NOT A CELL: `let y = x; match y { .. }` over this same type
+    /// is a PRE-EXISTING double free — 1 invalid free, 23 allocs / 26 frees,
+    /// measured identically on the tree before this fix and after it, so this
+    /// row neither caused nor repairs it. It is filed on its own row; pinning
+    /// it here would fail this fixture for a defect it does not own.
+    #[test]
+    fn asan_boxed_enum_payload_param_owns_its_interior() {
+        assert_clean_asan_run(
+            r#"
+struct R2 { s: String, t: String, u: String }
+struct W2 { s: String, t: String, u: String }
+enum K { A(R2), B }
+fn mkr(i: i64) -> R2 { return R2 { s: f"ssssssss{i}", t: f"tttttttt{i}", u: f"uuuuuuuu{i}" }; }
+fn mkw(i: i64) -> W2 { return W2 { s: f"wwwwwwww{i}", t: f"tttttttt{i}", u: f"uuuuuuuu{i}" }; }
+
+fn nested(x: Option[K]) {
+    match x { Option.Some(K.A(r)) => { println(f"n:{r.s}"); } Option.Some(K.B) => {} Option.None => {} }
+}
+fn nestedres(x: Result[K, i64]) {
+    match x { Result.Ok(K.A(r)) => { println(f"nr:{r.s}"); } Result.Ok(K.B) => {} Result.Err(e) => {} }
+}
+fn whole(x: Option[K]) {
+    match x { Option.Some(k) => { match k { K.A(r) => { println(f"w:{r.s}"); } K.B => {} } } Option.None => {} }
+}
+fn wholeres(x: Result[K, i64]) {
+    match x { Result.Ok(k) => { match k { K.A(r) => { println(f"wr:{r.s}"); } K.B => {} } } Result.Err(e) => {} }
+}
+fn wildcard(x: Option[K]) { match x { Option.Some(_) => { println("wc"); } Option.None => {} } }
+fn structpay(x: Option[W2]) { match x { Option.Some(w) => { println(f"s:{w.s}"); } Option.None => {} } }
+fn passthru(x: Option[K]) -> Option[K] { return x; }
+fn eat(r: R2) -> i64 { if r.s.contains("ssss") { return r.s.len(); } return 0; }
+fn handsout(x: Option[K]) {
+    match x { Option.Some(K.A(r)) => { println(f"h:{eat(r)}"); } Option.Some(K.B) => {} Option.None => {} }
+}
+
+fn main() {
+    let mut i = 0;
+    while i < 3 {
+        nested(Option.Some(K.A(mkr(i))));
+        nestedres(Result.Ok(K.A(mkr(i))));
+        whole(Option.Some(K.A(mkr(i))));
+        wholeres(Result.Ok(K.A(mkr(i))));
+        wildcard(Option.Some(K.A(mkr(i))));
+        structpay(Option.Some(mkw(i)));
+        handsout(Option.Some(K.A(mkr(i))));
+        let y = passthru(Option.Some(K.A(mkr(i))));
+        match y { Option.Some(K.A(r)) => { println(f"p:{r.s}"); } Option.Some(K.B) => {} Option.None => {} }
+        i = i + 1;
+    }
+    println("end");
+}
+"#,
+            &[
+                "n:ssssssss0",
+                "nr:ssssssss0",
+                "w:ssssssss0",
+                "wr:ssssssss0",
+                "wc",
+                "s:wwwwwwww0",
+                "h:9",
+                "p:ssssssss0",
+                "n:ssssssss1",
+                "nr:ssssssss1",
+                "w:ssssssss1",
+                "wr:ssssssss1",
+                "wc",
+                "s:wwwwwwww1",
+                "h:9",
+                "p:ssssssss1",
+                "n:ssssssss2",
+                "nr:ssssssss2",
+                "w:ssssssss2",
+                "wr:ssssssss2",
+                "wc",
+                "s:wwwwwwww2",
+                "h:9",
+                "p:ssssssss2",
+                "end",
+            ],
+            "asan_boxed_enum_payload_param_owns_its_interior",
+        );
+    }
+
     /// B-2026-09-06-72 — a `shared` FIELD's 16-byte refcount block when the
     /// owning struct travels out of a function inside an AGGREGATE.
     ///

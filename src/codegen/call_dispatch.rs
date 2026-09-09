@@ -2137,9 +2137,30 @@ impl<'ctx> super::Codegen<'ctx> {
                 && self.expr_yields_fresh_owned_temp(&a.value)
                 && self.owned_boxed_option_param_struct(&name, i).is_some()
             {
-                let inner_struct = self
-                    .owned_boxed_option_param_struct(&name, i)
-                    .filter(|n| self.type_decls.struct_types.contains_key(n.as_str()));
+                // B-2026-09-09-10 — the interior travels for an ENUM payload
+                // too. This filtered the resolved name through `struct_types`,
+                // leaving `Option[K]` over `enum K { A(R2), B }` with a box the
+                // caller owned and an interior nobody did: 81 B in 9 blocks
+                // over three calls, `R2`'s three `String`s.
+                //
+                // The filter was right until the DISARM worked. A callee arm
+                // written `Some(k)` binds the whole payload and its own
+                // bindings free the interior, so registering here was a second
+                // owner — 23 allocs against 32 frees.
+                // `register_boxed_payload_alias` tested only the OWNERSHIP set,
+                // which never contains a param, so it silently did nothing for
+                // exactly the shape that needed it; it now also accepts the
+                // param REACH set.
+                //
+                // `callee_keeps_param_payload_in_frame` is the other half, and
+                // it is about a different escape than the envelope's
+                // `callee_rebinds_param_whole`: that one asks who owns the BOX
+                // when the param is rebound to a mutable local, this one keeps
+                // the INTERIOR home when the param reaches any other binding.
+                let inner_struct = self.owned_boxed_option_param_struct(&name, i).filter(|n| {
+                    self.type_decls.struct_types.contains_key(n.as_str())
+                        || self.callee_keeps_param_payload_in_frame(&name, i)
+                });
                 let cur_fn = self
                     .builder
                     .get_insert_block()
@@ -2192,11 +2213,15 @@ impl<'ctx> super::Codegen<'ctx> {
                     self.create_entry_alloca(cur_fn, &format!("resbox_arg_tmp{i}"), val.get_type());
                 self.builder.build_store(slot, val).unwrap();
                 for (variant, struct_name) in &result_boxed {
-                    let inner = self
+                    // B-2026-09-09-10 — the `Option` arm's twin, widened for
+                    // the same reason; the `Result` spelling measured
+                    // identically (81 B in 9 blocks).
+                    let inner = (self
                         .type_decls
                         .struct_types
                         .contains_key(struct_name.as_str())
-                        .then_some(struct_name.as_str());
+                        || self.callee_keeps_param_payload_in_frame(&name, i))
+                    .then_some(struct_name.as_str());
                     self.track_boxed_enum_var(
                         &format!("__resbox_arg_tmp{i}_{variant}"),
                         slot,
@@ -3062,6 +3087,48 @@ impl<'ctx> super::Codegen<'ctx> {
                 .enum_layouts
                 .get(payload)
                 .is_some_and(|l| !l.is_shared)
+    }
+
+    /// B-2026-09-09-10 — does the callee keep param `i` IN ITS OWN FRAME, so a
+    /// caller-side INTERIOR registration stays the only owner?
+    ///
+    /// Narrower in purpose than [`Self::callee_rebinds_param_whole`] beside it
+    /// and deliberately not merged with it: that one answers who owns the
+    /// ENVELOPE and returns `None` for the whole registration, while this one
+    /// only decides whether the interior may travel. Measured, `Option[K]` over
+    /// `enum K { A(R2), B }`:
+    ///
+    ///   match x { Some(K.A(r)) => eat(r) }   the arm hands the payload to a
+    ///                                        CONSUMING call — clean, 32/32;
+    ///                                        the arm's own retraction covers it.
+    ///   let y = x; match y { .. }            the param is handed to another
+    ///                                        BINDING, which owns it too.
+    ///
+    /// So the question is whether the param reaches another binding, which is
+    /// exactly what the escape sets answer. `by_value_nonescaping_param_names`
+    /// is the right one: a read-only interpolation hole cannot move the box,
+    /// while `let y = x` is an escape under both.
+    ///
+    /// Conservative when the callee cannot be resolved (indirect call, method,
+    /// generic, no snapshot): the interior stays behind, which leaks rather
+    /// than double-frees.
+    fn callee_keeps_param_payload_in_frame(&self, name: &str, i: usize) -> bool {
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return false;
+        };
+        let Some(func) = program.items.iter().find_map(|item| match item {
+            Item::Function(f) if f.name == name => Some(f),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let Some(param) = func.params.get(i) else {
+            return false;
+        };
+        let crate::ast::PatternKind::Binding(pname) = &param.pattern.kind else {
+            return false;
+        };
+        crate::result_escape::by_value_nonescaping_param_names(func).contains(pname.as_str())
     }
 
     /// B-2026-09-09-13 — does the callee REBIND parameter `arg_index` whole

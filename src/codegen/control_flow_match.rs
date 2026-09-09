@@ -2148,10 +2148,29 @@ impl<'ctx> super::Codegen<'ctx> {
         let ExprKind::Identifier(src) = &scrutinee.kind else {
             return;
         };
+        // B-2026-09-09-10 — a PARAM is in the reach set, never the ownership
+        // one, and testing only the latter is why the disarm never ran for a
+        // by-value param. `boxed_enum_payload_vars` is what this frame OWNS; a
+        // param owns nothing, so it bailed here exactly as B-2026-09-06-50's
+        // destructure disarmer did before that row widened it.
+        // `boxed_struct_payload_param_vars` is the companion set that grants
+        // REACH, populated for precisely these params, and recording an alias
+        // IS a reach operation: it says the binding names the same buffer the
+        // box holds, which is true regardless of which frame frees it.
+        //
+        // Measured: `fn show(x: Option[K])` matched `Some(k)` printed
+        // `in_owned_set=false in_param_reach_set=true` for `x`, so no alias was
+        // recorded and the inner `match k` disarmed nothing — which is what
+        // made the caller's interior registration a second owner rather than
+        // the only one.
         if !self
             .payload_vars
             .boxed_enum_payload_vars
             .contains(src.as_str())
+            && !self
+                .payload_vars
+                .boxed_struct_payload_param_vars
+                .contains(src.as_str())
         {
             return;
         }
