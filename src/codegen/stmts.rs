@@ -10587,6 +10587,48 @@ impl<'ctx> super::Codegen<'ctx> {
                                     .param_view_locals
                                     .insert(var_name.to_string());
                             }
+                            // B-2026-09-06-63 — a call result that is a param
+                            // VIEW still owns its OWN `Drop` body when the
+                            // callee WRAPPED the argument in a `Drop`-bearing
+                            // type: `fn wrap_bodied(r: R) -> H` hands back an
+                            // `H` whose fields are the argument owner's but
+                            // whose `dH` body is nobody's. The view mark defers
+                            // everything to that owner, which runs the
+                            // ARGUMENT's body and never the wrapper's — `v=9
+                            // dR9` where a locally built `H` gives `v=9 dH3
+                            // dR9`.
+                            //
+                            // OWN BODY ONLY, which is the whole reason this is
+                            // a separate walker. B-2026-09-06-58's gate could
+                            // have declined the view outright instead, and that
+                            // was measured: it gives the binding a full
+                            // ownership walk and prints `dH3 dR9 dR9` — the
+                            // wrapper recovered by doubling the argument. Here
+                            // the fields stay the argument owner's and only the
+                            // wrapper's own body is added.
+                            //
+                            // Restricted to the CALL form (`call_src`): a bare
+                            // `let m = r;` rebind is a view of the SAME type,
+                            // so its body is the param's own and already fires.
+                            if let Some(cs) = call_src.as_deref() {
+                                if let Some(tn) = self.call_result_wrapper_own_drop_type(value, cs)
+                                {
+                                    if let Some(slot) =
+                                        self.variables.get(var_name.as_str()).copied()
+                                    {
+                                        if let Some(f) = self.emit_struct_own_drop_body_only_fn(&tn)
+                                        {
+                                            self.track_user_drop_var_with_fn(
+                                                &tn,
+                                                var_name.as_str(),
+                                                slot.ptr,
+                                                f,
+                                                crate::codegen::state::UserDropKind::StructFieldBodies,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             if self
                                 .drop_rc
                                 .rc_fallback_heap_types

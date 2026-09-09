@@ -3872,6 +3872,63 @@ impl<'ctx> super::Codegen<'ctx> {
     /// owner holds (a heap-boxed `Option`/`Result` payload owned by the box
     /// drop), this is the only registration that cannot double-free.
     /// `None` when the type carries no user Drop work at all.
+    /// B-2026-09-06-63 — a walker that runs a type's OWN `impl Drop` body and
+    /// NOTHING else: no field bodies, no enum payload bodies, no memory.
+    ///
+    /// The narrow sibling of [`Self::emit_struct_user_drop_bodies_only_fn`],
+    /// which despite its name runs the own body AND the field/payload bodies
+    /// beneath it. That breadth is exactly wrong for the one caller here: a
+    /// call RESULT that is a param VIEW (`let h = wrap_bodied(r)`) owns its own
+    /// `Drop` body but not its fields — the fields are still the argument
+    /// owner's, and the caller keeps firing them. Using the broader walker
+    /// gives `dH3 dR9 dR9`, the wrapper's body recovered at the price of
+    /// doubling the argument's, which B-2026-09-06-63 measured and declined.
+    ///
+    /// `<T>.drop` is the user's `fn drop(mut ref self)` itself — the wrapper
+    /// `karac_drop_<T>` is what adds the memory walk on top — so calling it
+    /// directly is the whole of "own body, nothing else". Returns `None` for a
+    /// type with no `impl Drop`, which the caller reads as "register nothing".
+    pub(super) fn emit_struct_own_drop_body_only_fn(
+        &mut self,
+        struct_name: &str,
+    ) -> Option<FunctionValue<'ctx>> {
+        if !self
+            .program_snapshot
+            .as_deref()
+            .is_some_and(|p| p.drop_method_keys.contains_key(struct_name))
+        {
+            return None;
+        }
+        // A `shared` parent drops through the RC machinery against a heap box
+        // with a refcount header, so a plain-pointer call here would be a
+        // wrong-offset read. Declining keeps that structurally impossible, the
+        // same refusal `emit_user_drop_field_bodies_fn_skipping` makes.
+        if self.type_decls.shared_types.contains_key(struct_name) {
+            return None;
+        }
+        let body = self.module.get_function(&format!("{struct_name}.drop"))?;
+        let fn_name = format!("__karac_dropselfbody_{struct_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            return Some(f);
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let saved = self.builder.get_insert_block();
+        let walker = self.module.add_function(
+            &fn_name,
+            self.context.void_type().fn_type(&[ptr_ty.into()], false),
+            Some(Linkage::Internal),
+        );
+        let entry = self.context.append_basic_block(walker, "entry");
+        self.builder.position_at_end(entry);
+        let p = walker.get_nth_param(0).unwrap().into_pointer_value();
+        self.builder.build_call(body, &[p.into()], "").unwrap();
+        self.builder.build_return(None).unwrap();
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+        Some(walker)
+    }
+
     pub(super) fn emit_struct_user_drop_bodies_only_fn(
         &mut self,
         struct_name: &str,

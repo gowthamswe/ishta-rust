@@ -774,6 +774,14 @@ pub struct Interpreter<'a> {
     /// adopts it, which is before a single statement has run, so it cannot
     /// answer "is this name one of ours" later. This set can, and it is the
     /// interpreter's half of codegen's `cond_store_flag_params`.
+    /// B-2026-09-06-63 — bindings whose `let` took a call-result param VIEW
+    /// from a callee that WRAPPED the argument in a `Drop`-bearing type. The
+    /// view defers the fields to the argument's owner, correctly, but the
+    /// WRAPPER's own body is then nobody's; these run it, and only it, when
+    /// their drop slot drains. Codegen's twin is
+    /// `emit_struct_own_drop_body_only_fn`, registered at its `let` param-view
+    /// arm.
+    pub(crate) own_body_only_view_bindings: std::collections::HashMap<String, String>,
     pub(crate) cond_store_param_names: std::collections::HashSet<String>,
     /// B-2026-07-30-11 (Map-values leg) — the resolved `Map[K, V]`
     /// instantiation per let-bound variable, recorded through the SAME
@@ -1148,6 +1156,7 @@ impl<'a> Interpreter<'a> {
             taken_branch_tail: None,
             pending_arm_drop_bindings: Vec::new(),
             pending_param_drop_bindings: Vec::new(),
+            own_body_only_view_bindings: std::collections::HashMap::new(),
             cond_store_param_names: std::collections::HashSet::new(),
             map_val_bodies_tes: HashMap::new(),
             captured_let_values: HashMap::new(),

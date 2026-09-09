@@ -2552,6 +2552,52 @@ pub fn type_expr_is_owned_scalar(ty: &TypeExpr) -> bool {
 /// Bare declared paths on both sides. A generic return (`Option[R]`) names
 /// `Option`, which declares no `Drop`, so those keep today's behaviour — the
 /// same per-monomorph coverage limit the neighbouring predicates carry.
+/// B-2026-09-06-63 — does `f` WRAP argument `arg_index` in a DIFFERENT type
+/// that declares its own `impl Drop`?
+///
+/// [`fn_return_carries_own_drop_beyond_param`] without its final clause, and
+/// that omission is the whole point. That predicate refuses a parameter which
+/// itself carries a `Drop`, because its consumer declines the VIEW outright and
+/// doing so for such a parameter trades a lost body for a doubled one
+/// (`dH2 dR43 dR43`) — the remainder it filed as this row. This one is asked by
+/// a consumer that keeps the view and adds only the wrapper's OWN body, for
+/// which a `Drop`-bearing parameter is exactly the case that needs serving.
+///
+/// The IDENTITY exclusion is kept and is load-bearing: `fn keeps(r: R) -> R`
+/// hands the same object back, so its body is the parameter's own and the
+/// caller already fires it. Admitting it doubles that body — measured
+/// `v=9 dR9 dR9` while building this, on both backends.
+///
+/// Its OWN `Drop`, via `drop_method_keys`, rather than
+/// `type_carries_user_drop`'s reachable-inside sense: the consumer registers
+/// `<T>.drop`, which exists only for a type that declares one. A wrapper that
+/// merely CONTAINS a `Drop` field has no body of its own to add, and its
+/// field's body is the argument owner's.
+pub fn fn_return_wraps_param_in_own_drop_type(
+    program: &crate::Program,
+    f: &Function,
+    arg_index: usize,
+) -> Option<String> {
+    let ret = f.return_type.as_ref()?;
+    let crate::ast::TypeKind::Path(rp) = &ret.kind else {
+        return None;
+    };
+    let [ret_name] = rp.segments.as_slice() else {
+        return None;
+    };
+    if !program.drop_method_keys.contains_key(ret_name.as_str()) {
+        return None;
+    }
+    let param = f.params.get(arg_index)?;
+    let crate::ast::TypeKind::Path(pp) = &param.ty.kind else {
+        return None;
+    };
+    if pp.segments.last() == Some(ret_name) {
+        return None;
+    }
+    Some(ret_name.clone())
+}
+
 pub fn fn_return_carries_own_drop_beyond_param(
     program: &crate::Program,
     f: &Function,

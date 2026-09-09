@@ -7823,6 +7823,39 @@ impl<'ctx> super::Codegen<'ctx> {
     /// returns a fresh value on the others, and a view mark would lose that
     /// value's body. The interpreter's twin is
     /// `let_call_result_param_view_source`; the two let-sites move together.
+    /// B-2026-09-06-63 — the WRAPPER type name of a call whose result is a
+    /// param view, when the callee wrapped the argument in a different type
+    /// that declares its own `impl Drop`.
+    ///
+    /// The codegen twin of the interpreter's `call_result_own_drop_type_name`;
+    /// both resolve through `fn_return_wraps_param_in_own_drop_type` so the two
+    /// backends cannot disagree about which results gain a body.
+    pub(super) fn call_result_wrapper_own_drop_type(
+        &self,
+        e: &Expr,
+        view_src: &str,
+    ) -> Option<String> {
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return None;
+        };
+        let key = match &callee.kind {
+            ExprKind::Identifier(n) => n.clone(),
+            ExprKind::Path { segments, .. } => segments.join("."),
+            _ => return None,
+        };
+        let program = self.program_snapshot.as_deref()?;
+        let f = super::declarations::find_function_ast(program, &key)?;
+        if f.self_param.is_some() {
+            return None;
+        }
+        // ONLY the argument the view was taken from — see the interpreter twin
+        // for the `mixed_args` measurement that forced this.
+        let idx = args
+            .iter()
+            .position(|a| matches!(&a.value.kind, ExprKind::Identifier(n) if n == view_src))?;
+        crate::ast::fn_return_wraps_param_in_own_drop_type(program, f, idx)
+    }
+
     pub(super) fn call_result_param_view_source(&self, e: &Expr) -> Option<String> {
         let ExprKind::Call { callee, args } = &e.kind else {
             return None;

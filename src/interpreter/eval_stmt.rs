@@ -372,10 +372,26 @@ impl<'a> super::Interpreter<'a> {
                     top.insert(n.clone());
                 }
             }
+            let own_body_only_before = self.own_body_only_view_bindings.len();
             if !self.let_destructures_owned_param(stmt)
                 && !Self::let_binds_borrowed_container_elem(stmt)
             {
                 push_drops_for_stmt_except(stmt, &mut cleanup, &view_leaves);
+            } else if self.own_body_only_view_bindings.len() > own_body_only_before {
+                // B-2026-09-06-63 — the one view that still needs a slot. The
+                // binding stays a view (its FIELDS are the argument owner's,
+                // which is what the branch above is right about), but the
+                // WRAPPER's own body is nobody else's, so it gets a slot the
+                // drain narrows to that body alone.
+                if let StmtKind::Let { pattern, .. } = &stmt.kind {
+                    if let PatternKind::Binding(bname) = &pattern.kind {
+                        if self.own_body_only_view_bindings.contains_key(bname) {
+                            cleanup.push(CleanupAction::Drop {
+                                name: bname.clone(),
+                            });
+                        }
+                    }
+                }
             }
             // NLL placement: fire any Drop slot whose binding's last
             // use was this statement, then remove it from `cleanup`
@@ -904,6 +920,18 @@ impl<'a> super::Interpreter<'a> {
                     let _ = self.eval_block_inner(body);
                 }
                 CleanupAction::Drop { name } => {
+                    // B-2026-09-06-63 — a call-result param VIEW over a
+                    // `Drop`-bearing WRAPPER owns its own body and NOT its
+                    // fields: those are still the argument owner's, and the
+                    // caller fires them. `invoke_user_drop_if_applicable` would
+                    // walk both and double the argument's body (`dH3 dR9 dR9`).
+                    if let Some(tn) = self.own_body_only_view_bindings.get(name).cloned() {
+                        if let Some(v) = self.env.get(name) {
+                            self.run_user_drop_body_only(&tn, v);
+                        }
+                        self.drop_trace.push(name.clone());
+                        continue;
+                    }
                     // Phase 7 user-`impl Drop` dispatch Prereq.4 — fire
                     // the user-defined drop body BEFORE recording the
                     // trace so observable side effects (e.g. println
@@ -1094,6 +1122,23 @@ impl<'a> super::Interpreter<'a> {
                 let action = cleanup.remove(i);
                 match action {
                     CleanupAction::Drop { name } => {
+                        // B-2026-09-06-63 — the NLL endpoint needs the same
+                        // narrowing the scope-exit drain got, and needs it for
+                        // a sharper reason: this is where a
+                        // `let h = wrap_bodied(r)` slot actually fires, since
+                        // `h`'s last use is the statement after the `let`.
+                        // Missing it here ran the FULL walk — the wrapper's own
+                        // body AND its fields — so `dR9` printed once from the
+                        // walk and once from the argument owner, which is the
+                        // `dH3 dR9 dR9` this row refused. Measured exactly that
+                        // way while building the fix.
+                        if let Some(tn) = self.own_body_only_view_bindings.get(&name).cloned() {
+                            if let Some(v) = self.env.get(&name) {
+                                self.run_user_drop_body_only(&tn, v);
+                            }
+                            self.drop_trace.push(name);
+                            continue;
+                        }
                         // Phase 7 user-`impl Drop` dispatch Prereq.4 — fire
                         // the user body at NLL endpoint before pushing the
                         // trace record, mirroring the scope-exit drain
@@ -2575,6 +2620,41 @@ impl<'a> super::Interpreter<'a> {
     /// SOME exits returns a fresh value on the others, and a view mark would
     /// lose that value's body. Codegen's twin is
     /// `call_result_param_view_source`.
+    /// B-2026-09-06-63 — the RESULT type name of a call whose result is a
+    /// param view, when that type carries its own `impl Drop`.
+    ///
+    /// `Some(name)` exactly when the view mark would otherwise lose a body:
+    /// the callee WRAPPED its argument in a `Drop`-bearing type, so the
+    /// wrapper's own body belongs to the result binding while its fields stay
+    /// the argument owner's. `None` — the overwhelmingly common case, a callee
+    /// that hands the same type straight back — leaves the view untouched,
+    /// because there the body is the parameter's own and the caller fires it.
+    fn call_result_own_drop_type_name(&self, value: &Expr, view_src: &str) -> Option<String> {
+        let ExprKind::Call { callee, args } = &value.kind else {
+            return None;
+        };
+        let key = match &callee.kind {
+            ExprKind::Identifier(n) => n.clone(),
+            ExprKind::Path { segments, .. } => segments.join("."),
+            _ => return None,
+        };
+        let f = self.program.items.iter().find_map(|item| match item {
+            crate::ast::Item::Function(f) if f.name == key => Some(f),
+            _ => None,
+        })?;
+        // ONLY the argument the view was taken from. Scanning every index
+        // instead lets a callee's SECOND, unrelated parameter answer for the
+        // first: `mixed_args`, which takes an owned `R` and a scalar, matched
+        // on the scalar — its type merely differs from the return type, which
+        // is all the type-level predicate asks — and the result gained a body
+        // it does not own (`dR15 dR15`). Caught by
+        // `test_scalar_argument_does_not_make_the_result_a_view`.
+        let idx = args
+            .iter()
+            .position(|a| matches!(&a.value.kind, ExprKind::Identifier(n) if n == view_src))?;
+        crate::ast::fn_return_wraps_param_in_own_drop_type(self.program, f, idx)
+    }
+
     fn let_call_result_param_view_source(&self, value: &Expr) -> Option<String> {
         let ExprKind::Call { callee, args } = &value.kind else {
             return None;
@@ -3155,6 +3235,31 @@ impl<'a> super::Interpreter<'a> {
                 if let Some(src) = self.let_call_result_param_view_source(value) {
                     if self.cond_store_param_names.contains(src.as_str()) {
                         return false;
+                    }
+                    // B-2026-09-06-63 — the view is right about the FIELDS and
+                    // wrong about the wrapper's OWN body. `fn wrap_bodied(r: R)
+                    // -> H` hands back an `H` whose fields are the argument
+                    // owner's — the caller runs `dR` — but whose `dH` is
+                    // nobody's, so `let h = wrap_bodied(r)` printed `v=9 dR9`
+                    // where a locally built `H` prints `v=9 dH3 dR9`.
+                    //
+                    // Recorded rather than turned into a full slot: a slot
+                    // would walk the fields too and double the argument's body
+                    // (`dH3 dR9 dR9`), which is the trade B-2026-09-06-63
+                    // measured and refused. The drain runs
+                    // `run_user_drop_body_only`, the exact peer of codegen's
+                    // `__karac_dropselfbody_<T>`.
+                    if let Some(tn) = self.call_result_own_drop_type_name(value, src.as_str()) {
+                        // Recorded, and the VIEW is kept (`true` below): the
+                        // statement loop pushes a slot for exactly these names
+                        // after this predicate answers, and the drain narrows
+                        // it to the own body. Returning `false` here instead —
+                        // letting `push_drops_for_stmt` register an ordinary
+                        // slot — was measured and is wrong twice over: the
+                        // binding stops being a view, so the argument owner
+                        // fires a second time (`dH3 dR9 dR9`, the very trade
+                        // this row refused).
+                        self.own_body_only_view_bindings.insert(bname.clone(), tn);
                     }
                     let bname = bname.clone();
                     if let Some(top) = self.owned_param_names_stack.last_mut() {

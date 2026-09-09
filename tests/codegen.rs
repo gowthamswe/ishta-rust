@@ -35770,9 +35770,14 @@ end
     /// carries no user `Drop` ANYWHERE inside it. A parameter that does carry
     /// one keeps the view, because declining there gives the result binding a
     /// full walk that runs the wrapped value's body beside the argument owner's
-    /// (measured `dH3 dR9 dR9` on `fn wrap_bodied(r: R) -> H`). That shape needs
-    /// an own-body-without-fields split and keeps today's behaviour here — its
-    /// `wrap_bodied_control` cell shows the `H`'s own body still missing.
+    /// (measured `dH3 dR9 dR9` on `fn wrap_bodied(r: R) -> H`).
+    ///
+    /// B-2026-09-06-63 built the own-body-without-fields split that shape
+    /// needed, so its `wrap_bodied_control` cell now shows `dH3` before `dR9` —
+    /// the wrapper's own body added WITHOUT the doubling above. The view is
+    /// still kept for that parameter class; what changed is that the result
+    /// binding additionally owns its own body. Every other cell here is
+    /// unchanged, which is what says the split is scoped to the one shape.
     ///
     /// Twin of `tests/interpreter.rs`'s `test_drop_free_argument_does_not_make_the_result_a_view`, pinned to the same string.
     #[test]
@@ -35861,6 +35866,7 @@ wrap_control
   dR8
 wrap_bodied_control
   v=9
+  dH3
   dR9
 scalar_control
   v=10
@@ -152473,6 +152479,136 @@ fn main() {
             ),
         ] {
             let Some(out) = run_program(&src) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
+    /// B-2026-09-06-63 — a callee that WRAPS a `Drop`-bearing argument in
+    /// another `Drop`-bearing type lost the WRAPPER's own body.
+    ///
+    /// `let h = wrap_bodied(r)` makes `h` a param VIEW of `r`, which is right
+    /// about the FIELDS — they are the argument owner's and the caller fires
+    /// them — and wrong about the wrapper: `dH3` was nobody's, so the cell
+    /// printed `v=9 dR9` where a locally built `H` prints `v=9 dH3 dR9`.
+    ///
+    /// The obvious repair is to decline the view, and B-2026-09-06-58 measured
+    /// that: the binding then takes a FULL ownership walk and prints
+    /// `dH3 dR9 dR9` — the wrapper recovered by doubling the argument. So the
+    /// fix adds the OWN body only (`__karac_dropselfbody_<T>` /
+    /// `run_user_drop_body_only`), keeping the fields with the argument owner.
+    ///
+    /// Cells 4-6 are the hazards, and cell 4 is the one that caught a real
+    /// mistake while this was built: an IDENTITY callee (`fn keeps(r: R) -> R`)
+    /// returns a `Drop`-bearing type too, and a first version keyed only on
+    /// that printed `v=9 dR9 dR9` on both backends. The admitting predicate
+    /// therefore asks whether the callee wraps in a DIFFERENT type, not merely
+    /// whether the result has a body.
+    ///
+    /// Cell 7 pins the NLL endpoint, which is where the slot actually fires:
+    /// `h`'s last use is the statement after its `let`, so a narrowing applied
+    /// only at scope exit would leave the full walk running here — measured, it
+    /// gave the same `dH3 dR9 dR9`.
+    #[test]
+    fn e2e_wrapped_argument_result_runs_the_wrappers_own_body() {
+        const PRE: &str = "struct R { id: i64, name: String }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             struct H { r: R, n: i64 }\n\
+             impl Drop for H { fn drop(mut ref self) { println(f\"dH{self.n}\") } }\n\
+             fn mkr(i: i64) -> R { return R { id: i, name: f\"n{i}\" }; }\n\
+             fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }\n";
+        for (label, body, want) in [
+            // 1 — the row's cell.
+            (
+                "wrapped",
+                "fn f(r: R) { let h = wrap_bodied(r); println(f\"v={h.r.id}\"); }\n\
+                 fn main() { f(mkr(9)); println(\"end\") }\n",
+                "v=9\ndH3\ndR9\nend\n",
+            ),
+            // 2 — the ORACLE: the same `H` built locally, no callee. This is
+            //     what says `dH3 dR9` is the target rather than a guess.
+            (
+                "built-locally-oracle",
+                "fn f(r: R) { let h = H { r: r, n: 3 }; println(f\"v={h.r.id}\"); }\n\
+                 fn main() { f(mkr(9)); println(\"end\") }\n",
+                "v=9\ndH3\ndR9\nend\n",
+            ),
+            // 3 — the wrapper handed onward: the caller's binding owns it, and
+            //     the body must still fire exactly once.
+            (
+                "returned-onward",
+                "fn f(r: R) -> H { let h = wrap_bodied(r); println(f\"v={h.r.id}\"); return h; }\n\
+                 fn main() { let g = f(mkr(9)); println(f\"g={g.n}\"); println(\"end\") }\n",
+                "v=9\ng=3\ndH3\ndR9\nend\n",
+            ),
+            // 4 — HAZARD: an IDENTITY callee. Same object back, so its body is
+            //     the parameter's own and the caller already fires it.
+            (
+                "identity-callee-hazard",
+                "fn keeps(r: R) -> R { return r; }\n\
+                 fn f(r: R) { let w = keeps(r); println(f\"v={w.id}\"); }\n\
+                 fn main() { f(mkr(9)); println(\"end\") }\n",
+                "v=9\ndR9\nend\n",
+            ),
+            // 5 — HAZARD: a wrapper with NO body of its own. Nothing to add,
+            //     and its `Drop` field stays the argument owner's.
+            (
+                "bodyless-wrapper-hazard",
+                "struct H3 { r: R }\n\
+                 fn wrap_free(r: R) -> H3 { return H3 { r: r }; }\n\
+                 fn f(r: R) { let h = wrap_free(r); println(f\"v={h.r.id}\"); }\n\
+                 fn main() { f(mkr(9)); println(\"end\") }\n",
+                "v=9\ndR9\nend\n",
+            ),
+            // 6 — HAZARD: a SCALAR argument (B-2026-09-06-53's class), which is
+            //     not a view at all and must keep its ordinary full drop.
+            (
+                "scalar-argument-hazard",
+                "fn mkUses(i: i64) -> R { return R { id: i, name: f\"u{i}\" }; }\n\
+                 fn f() { let x = mkUses(4); println(f\"v={x.id}\"); }\n\
+                 fn main() { f(); println(\"end\") }\n",
+                "v=4\ndR4\nend\n",
+            ),
+            // 7 — the NLL endpoint: `h` is never read, so its slot fires at the
+            //     `let` itself, before the `println`.
+            (
+                "nll-endpoint",
+                "fn f(r: R) { let h = wrap_bodied(r); println(\"x\"); }\n\
+                 fn main() { f(mkr(9)); println(\"end\") }\n",
+                "dH3\nx\ndR9\nend\n",
+            ),
+            // 9 — HAZARD, and the one the hand probes missed: a callee taking
+            //     BOTH the viewed argument and an unrelated second parameter.
+            //     A first version scanned every argument index, so the SCALAR
+            //     answered for the owned one — its type differs from the return
+            //     type, which is all the type-level predicate asks — and the
+            //     result gained a body it does not own. Caught by the existing
+            //     `scalar_argument_does_not_make_the_result_a_view` pins on
+            //     both backends (`dR15 dR15`), not by this file.
+            (
+                "mixed-args-hazard",
+                "fn wrap_mixed(r: R, k: i64) -> H { return H { r: r, n: k }; }\n                 fn f(r: R) { let h = wrap_mixed(r, 5); println(f\"v={h.r.id}\"); }\n                 fn main() { f(mkr(9)); println(\"end\") }\n",
+                "v=9\ndH5\ndR9\nend\n",
+            ),
+            // 10 — the same callee shape where the SCALAR is the viewed
+            //      argument's neighbour on the other side, so an index-order
+            //      accident cannot pass both.
+            (
+                "mixed-args-scalar-first",
+                "fn wrap_first(k: i64, r: R) -> H { return H { r: r, n: k }; }\n                 fn f(r: R) { let h = wrap_first(6, r); println(f\"v={h.r.id}\"); }\n                 fn main() { f(mkr(9)); println(\"end\") }\n",
+                "v=9\ndH6\ndR9\nend\n",
+            ),
+            // 8 — two wrappers in one frame, so a single shared registration
+            //     keyed on the type rather than the binding would show up.
+            (
+                "two-wrappers",
+                "fn f(a: R, b: R) { let h = wrap_bodied(a); let k = wrap_bodied(b); println(f\"v={h.r.id}{k.r.id}\"); }\n\
+                 fn main() { f(mkr(1), mkr(2)); println(\"end\") }\n",
+                "v=12\ndH3\ndH3\ndR2\ndR1\nend\n",
+            ),
+        ] {
+            let Some(out) = run_program(&format!("{PRE}{body}")) else {
                 return;
             };
             assert_eq!(out, want, "[{label}]");

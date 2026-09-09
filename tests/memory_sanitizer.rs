@@ -4097,6 +4097,9 @@ fn main() {
                 "  dR8",
                 "wrap_bodied_control",
                 "  v=9",
+                // B-2026-09-06-63 — the wrapper's OWN body, which this cell
+                // pinned as MISSING while that row was open.
+                "  dH3",
                 "  dR9",
                 "scalar_control",
                 "  v=10",
