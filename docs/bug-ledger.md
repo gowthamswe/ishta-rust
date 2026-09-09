@@ -100,7 +100,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen-gap | 169 |
 | diagnostics | 125 |
 | false-positive | 106 |
-| perf | 103 |
+| perf | 104 |
 | soundness | 95 |
 | other | 88 |
 | crash | 78 |
@@ -118,7 +118,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | cli | 72 |
 | autopar | 56 |
 | parser | 46 |
-| runtime | 41 |
+| runtime | 42 |
 | effect | 29 |
 | resolver | 29 |
 | lexer | 8 |
@@ -161,12 +161,12 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
 | B-2026-09-08-11 | 2026-09-08 | codegen | low | `display_mangle_te` RENDERS EVERY UNNAMEABLE TYPE AS `unknown`, SO THEY SHARE ONE MANGLED SYMBOL AND ONE DROP/CLONE CACHE ENTRY -- `Vec[weak A]` and `Vec[weak B]` both emit `karac_drop_Vec_unknown` / `karac_clone_unknown` and the second requested gets the first's function; benign for `weak` ONLY because every weak-slot operation is slot-type-agnostic, and the fallback is not weak-only | none |
 | B-2026-09-09-5 | 2026-09-09 | other | low | THREE LOAD-SENSITIVE TESTS IN THE REQUIRED GATE SET ARE STILL UNEXPLAINED after B-2026-09-09-1's named one turned out NOT to be flaky -- that one was a deterministic watchdog race that never armed (fixed 32223a5a6, 2-in-6 permanent orphans under load -> 0 in 8), so its resolution transfers no conclusion to the rest. Leading hypothesis for the ASAN pair is the vacuous-fixture floor: n=102 against a per-process HOST FLOOR of 90 measured on a box running dozens of concurrent ASAN processes, a 12-allocation margin that a drifting floor would trip with nothing wrong in the compiler -- with the counter-argument that a shared OnceLock floor should fail many fixtures at once, and only one failed | — |
-| B-2026-09-09-6 | 2026-09-09 | runtime | low | A PER-THREAD SMALL-BLOCK FREE LIST would take kara off macOS libmalloc's shared per-size-class state, which B-2026-09-05-22 measured as a hard ceiling: two concurrent allocators holding one small block live each are 8.3x SLOWER than one thread on this host (113.83ms -> 948.96ms, 49.15ms at three), and kara's compiled parallel probes allocate in exactly that shape -- worth up to 6x for a parallel region whose iter_total is 2, nothing on Linux, and narrow enough that it is filed low rather than inheriting -22's severity | docs/investigations/autopar-alloc-scaling.md, "The M5 answer" section |
+| B-2026-09-09-6 | 2026-09-09 | runtime | low | A PER-THREAD SMALL-BLOCK FREE LIST is 5.8-6.8x on B-2026-09-05-22's probes and 2.76x SLOWER on kata:288 at a 99.2% hit rate -- REFUTED IN THIS FORM, and the blocker is isolated: the TLS ACCESS costs 2.09x on that kata with recycling switched off entirely, so Rust's `thread_local!` + `try_with` per alloc and per free costs more than the malloc it replaces except where libmalloc is contending. The idea needs a pool reached WITHOUT a per-call TLS lookup; the probes oversold it 6x because they are contention-dominated and the katas are not | docs/investigations/autopar-alloc-scaling.md, "The M5 answer" section |
 | B-2026-09-09-7 | 2026-09-09 | other | medium | A FULL DISK FAILS THE GATE SET AS AN LLVM CRASH, A LINKER BUS ERROR, OR A LOST OUTPUT STREAM -- never as a named test -- and it hit ELEVEN times across seven unrelated slices in one session. The session allowance is ~38 GiB (df's '252G size' is the host volume and is meaningless), ONE leg of `cargo test --no-run` costs 19.6 GiB in test binaries (134 executables x ~250 MiB at the default debug=2), so the SECOND feature leg cannot start. The obvious suspect is wrong: both clippy legs together cost 1.19 GiB. `CARGO_PROFILE_TEST_DEBUG=line-tables-only` cuts a test binary 252 -> 97 MiB and makes both legs fit | — |
 | B-2026-09-09-8 | 2026-09-09 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-49 STILL LEAKS ITS INLINE-BUILT `Array` INTERIOR -- `plainR(Result.Ok([f"a{i}", f"b{i}"]))` over `Result[Array[String, 2], i64]` loses 54 B in 6 blocks after the Option half was fixed, because the param-site arm that owns the payload reads it through `option_generic_arg_type_expr` and no `Result` sibling exists | none |
 | B-2026-09-09-9 | 2026-09-09 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` over `Option[Array[Vec[String], 2]]` fails with `codegen: nested indexed read on 't' -- element TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, the eighth base shape in a family whose other seven are fixed | none |
 | B-2026-09-09-10 | 2026-09-09 | codegen | low | A BOXED USER ENUM PAYLOAD'S INTERIOR IS STILL UNOWNED WHEN THE ARM BINDS THROUGH A NESTED PATTERN -- `match x { Some(K.A(r)) => .. }` over `fn show(x: Option[K])` leaks 81 B in 9 blocks after B-2026-09-06-67 closed the envelope half, and the fix cannot simply register it because the WHOLE-PAYLOAD spelling `Some(k)` double-frees if it does | — |
-| B-2026-09-09-11 | 2026-09-09 | codegen | medium | A `shared enum` WITH A BOXED STRUCT PAYLOAD PRINTS NOTHING ON EVERY COMPILED BACKEND AND STACK-OVERFLOWS THE JIT, while `--interp` prints the right three lines -- `shared enum Ks { A(R2), B }` matched out of a by-value `Option[Ks]` param exits 0 with EMPTY stdout at -O0 and -O2, auto-par on and off, so the program is silently wrong rather than failing | — |
+| B-2026-09-09-12 | 2026-09-09 | runtime | medium | kara's MAP PROBE WALKS ONE CONTROL BYTE PER STEP WITH A DATA-DEPENDENT BRANCH, and an 8-byte SWAR group scan is 2.03x FASTER IN CYCLES WHILE EXECUTING 30% MORE INSTRUCTIONS (36.0 -> 17.7 cyc/lookup, IPC 1.15 -> 3.05) -- the cost is mispredicts, not work, which is why no instruction-count fix on B-2026-09-07-53 reached it. Prototyped and validated against the reference walk on every key; not shipped, because the win needs the same scan in find_insert_slot and in the CODEGEN MONO probes, not just the runtime's lookup | docs/investigations/hash-cost/README.md |
 
 ### Relocated
 
@@ -2428,6 +2428,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-2 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push… | 33c5c25 |
 | B-2026-09-09-3 | codegen | low | B-2026-09-06-66's BY-VALUE REMAINDER IS STILL OPEN AFTER B-2026-09-08-13 CLOSED ITS PRECONDITION -- a self-referential struct's `Option` payload box… | 4ef36450e |
 | B-2026-09-09-4 | other | low | THE `rc_fb_twin_shape_both_boxed` VACUITY GUARD FAILS INTERMITTENTLY ON A GREEN TREE -- `min_allocs = 60` against an x86_64-Linux count of 65-72 that… | fb05f38 |
+| B-2026-09-09-11 | codegen | medium | A `shared enum` WITH A BOXED STRUCT PAYLOAD PRINTS NOTHING ON EVERY COMPILED BACKEND AND STACK-OVERFLOWS THE JIT, while `--interp` prints the right t… | 768a9be |
 
 </details>
 
