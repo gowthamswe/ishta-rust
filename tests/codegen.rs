@@ -41672,6 +41672,63 @@ fn main() { let a = mkbag([\"x\",\"y\",\"z\"]).inner(); println(a[0]); let b = m
         );
     }
 
+    /// Every integer key WIDTH round-trips through the compiled map, including
+    /// the negative values, after B-2026-09-07-42 moved integer keys off the
+    /// byte path onto `karac_hash_int`.
+    ///
+    /// The new path hands the key over as a VALUE, so it has to reconstruct the
+    /// exact bytes the pointer path used to hash: zero-extend (a negative `i8`
+    /// presents `0xff`, not a sign-extended word carrying seven bytes the key
+    /// does not have) and mask to the key's own width. Get either wrong and the
+    /// damage is not a crash — `-1i8` and `-1i32` would hash alike, or a key
+    /// would hash one way on insert and another on lookup, and the map would
+    /// simply MISS. Both directions are asserted for that reason: every key
+    /// inserted is found with its own value, and a neighbouring key that was
+    /// never inserted still misses.
+    #[test]
+    fn integer_key_widths_round_trip_through_the_register_hash() {
+        // One map per width, each holding the extremes of its own range plus a
+        // few interior values, then probed for hits AND for misses.
+        let cases: [(&str, &str); 5] = [
+            ("i8", "-128, -1, 0, 1, 127"),
+            ("i16", "-32768, -1, 0, 1, 32767"),
+            ("i32", "-2147483648, -1, 0, 1, 2147483647"),
+            ("i64", "-9223372036854775807, -1, 0, 1, 9223372036854775807"),
+            ("u8", "0, 1, 127, 128, 255"),
+        ];
+        for (ty, keys) in cases {
+            let src = format!(
+                "fn main() {{\n\
+                     let mut m: Map[{ty}, i64] = Map.new();\n\
+                     let ks: Vec[{ty}] = vec![{keys}];\n\
+                     let mut i = 0;\n\
+                     while i < ks.len() {{\n\
+                         let _ = m.insert(ks[i], (i as i64) + 100);\n\
+                         i = i + 1;\n\
+                     }}\n\
+                     let mut hits = 0;\n\
+                     let mut i2 = 0;\n\
+                     while i2 < ks.len() {{\n\
+                         match m.get(ks[i2]) {{\n\
+                             Some(v) => {{ if v == (i2 as i64) + 100 {{ hits = hits + 1; }} }}\n\
+                             None => {{}}\n\
+                         }}\n\
+                         i2 = i2 + 1;\n\
+                     }}\n\
+                     println(f\"{{hits}} {{m.len()}}\");\n\
+                 }}\n"
+            );
+            let Some(out) = run_program(&src) else { return };
+            assert_eq!(
+                out.trim(),
+                "5 5",
+                "every {ty} key must be found with its own value and the map must \
+                 hold exactly the 5 distinct keys inserted; a wrong extend or mask \
+                 in the register hash path collapses or loses them"
+            );
+        }
+    }
+
     /// B-2026-07-26-2: the bucket control byte carries a 7-bit hash tag, and
     /// `src/codegen/mono.rs` emits its own probe loops against that encoding —
     /// so the runtime and the emitted code have to agree. They cannot be

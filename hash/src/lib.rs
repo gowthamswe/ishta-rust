@@ -198,6 +198,71 @@ pub fn hash_bytes_with_key(bytes: &[u8], k0: u64, k1: u64) -> u64 {
     sip::<1, 3>(bytes, k0, k1)
 }
 
+/// SipHash-1-3 of the low `nbytes` (1..=8) bytes of `v`, little-endian — the
+/// FIXED-WIDTH entry point compiled integer keys take.
+///
+/// Identical by construction to [`hash_bytes`] over those same bytes: it
+/// drives the SAME [`State`] through the same rounds, and only the way the
+/// message words are ASSEMBLED differs — a width known to the caller instead
+/// of a slice walked at run time. `sip_int_matches_sip_bytes` asserts that
+/// equality across every width and a spread of values, so the two entry points
+/// cannot drift into two permutations; the permutation itself still lives in
+/// exactly one place, which is the rule the Arrow IPC twin and
+/// `String.normalize` follow.
+///
+/// WHY IT EXISTS. `hash_bytes` reaches the same 5 rounds through
+/// `as_chunks::<8>()` plus a trailing-byte loop, and codegen had to SPILL the
+/// key to a stack slot to have an address to pass. Measured on an 8-byte key
+/// (callgrind, 2M iterations, loop overhead differenced out): 97 instructions
+/// through the slice path against 74 for Rust std's SipHash-1-3 on the same
+/// input — a 1.31x gap that is all bookkeeping, since the round count is
+/// identical. See B-2026-09-07-42.
+///
+/// Taking the value in a REGISTER also makes the digest independent of host
+/// byte order. The old path hashed the key's MEMORY IMAGE, so a big-endian
+/// target would have bucketed the same integer differently; this hashes the
+/// value's little-endian bytes on every host.
+#[inline]
+pub fn hash_int(v: u64, nbytes: u32) -> u64 {
+    let (k0, k1) = seed();
+    hash_int_with_key(v, nbytes, k0, k1)
+}
+
+/// [`hash_int`] at the ONE width that dominates every corpus map: a full
+/// 8-byte integer key.
+///
+/// Not a convenience wrapper — a specialization that exists to be compiled.
+/// `hash_int` takes its width as a run-time argument, so across the FFI
+/// boundary the callee must keep BOTH arms and the clamp; pinning the width
+/// here folds it to the straight-line two-round form. Measured in situ on
+/// kata:170 (callgrind): 117 instructions per probe through the byte path,
+/// 106 through `karac_hash_int`, 95 through this. B-2026-09-07-42.
+#[inline]
+pub fn hash_u64(v: u64) -> u64 {
+    let (k0, k1) = seed();
+    hash_int_with_key(v, 8, k0, k1)
+}
+
+/// [`hash_int`] with an explicit key — the pinned-key form the equality test
+/// and the KATs use.
+#[inline]
+pub fn hash_int_with_key(v: u64, nbytes: u32, k0: u64, k1: u64) -> u64 {
+    let mut st = State::<1, 3>::new(k0, k1);
+    let n = nbytes as u64;
+    // The length byte occupies the top byte of the FINAL word, exactly as in
+    // `sip`. A full 8-byte key fills one whole message word, so its length
+    // word carries no key bytes at all; a narrower key shares one word with
+    // the length byte, which is why this is a branch and not a mask.
+    if nbytes >= 8 {
+        st.round_msg(v);
+        st.round_msg(n << 56);
+    } else {
+        let keep = (1u64 << (8 * nbytes)) - 1;
+        st.round_msg((n << 56) | (v & keep));
+    }
+    st.finish()
+}
+
 /// SipHash-**2-4** with an explicit 128-bit key — the STABLE digest behind
 /// `StableHash.siphash24(bytes, k0, k1)` (design.md § `Hash` and `Hasher`,
 /// stability policy).
@@ -549,6 +614,68 @@ mod tests {
                 seen.insert(hash_bytes_with_key(&input, 7, 9)),
                 "length {n} collided with a shorter prefix"
             );
+        }
+    }
+
+    /// `hash_int` and `hash_bytes` are ONE permutation reached two ways, and
+    /// this is what holds them together. If someone ever "optimizes" the
+    /// fixed-width arm into a different mixing schedule, every integer-keyed
+    /// compiled `Map` silently re-buckets against the interpreter's and
+    /// against its own past builds; nothing else in the tree would catch it,
+    /// because a hash that is merely DIFFERENT still looks like a working hash.
+    #[test]
+    fn sip_int_matches_sip_bytes() {
+        let (k0, k1) = (0x0706_0504_0302_0100u64, 0x0f0e_0d0c_0b0a_0908u64);
+        let values: [u64; 12] = [
+            0,
+            1,
+            2,
+            0xff,
+            0x100,
+            0xdead_beef,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+            0x0123_4567_89ab_cdef,
+            42,
+            1_000_003,
+        ];
+        for nbytes in 1u32..=8 {
+            for &v in &values {
+                let bytes = v.to_le_bytes();
+                let want = hash_bytes_with_key(&bytes[..nbytes as usize], k0, k1);
+                let got = hash_int_with_key(v, nbytes, k0, k1);
+                assert_eq!(
+                    want, got,
+                    "hash_int diverged from hash_bytes at nbytes={nbytes} v={v:#x}"
+                );
+                // The pinned-width specialization is the same permutation as
+                // the general one it folds, or the compiled 8-byte arm and
+                // everything else disagree.
+                if nbytes == 8 {
+                    assert_eq!(
+                        want,
+                        hash_int_with_key(v, 8, k0, k1),
+                        "the 8-byte specialization diverged at v={v:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The seeded entry points agree too, so the process-seed plumbing is the
+    /// same on both arms rather than only the pinned-key form being equal.
+    #[test]
+    fn seeded_hash_int_matches_seeded_hash_bytes() {
+        for nbytes in 1u32..=8 {
+            for v in [0u64, 7, 0xabcd_ef01, u64::MAX] {
+                let bytes = v.to_le_bytes();
+                assert_eq!(
+                    hash_bytes(&bytes[..nbytes as usize]),
+                    hash_int(v, nbytes),
+                    "seeded arms diverged at nbytes={nbytes} v={v:#x}"
+                );
+            }
         }
     }
 }

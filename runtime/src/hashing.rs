@@ -28,6 +28,45 @@ pub unsafe extern "C" fn karac_hash_bytes(ptr: *const u8, len: usize) -> u64 {
     karac_hash::hash_bytes(bytes)
 }
 
+/// `karac_hash_int(v, nbytes) -> u64` — SipHash-1-3 of the low `nbytes`
+/// (1..=8) bytes of `v` under the process seed. The entry point compiled
+/// INTEGER keys take.
+///
+/// Same digest as [`karac_hash_bytes`] over those bytes — `karac-hash`'s
+/// `sip_int_matches_sip_bytes` proves it — but the key arrives in a REGISTER
+/// instead of behind a pointer. That is the whole point: codegen had to spill
+/// every integer key to a stack slot purely to have an address to pass, and
+/// the callee then walked a run-time-length slice through `as_chunks::<8>()`
+/// to re-discover a width the caller knew all along. Measured per 8-byte hash
+/// (callgrind, loop overhead differenced): 97 instructions through the slice
+/// path, 89 through this one, against 74 for Rust std's SipHash-1-3 on the
+/// same input. See B-2026-09-07-42.
+///
+/// `nbytes` is CLAMPED to 8 rather than checked: this is an FFI boundary, and
+/// a wider width would silently read key bytes that do not exist.
+///
+/// # Safety
+/// Nothing is dereferenced; the value arrives by value. `unsafe` only for ABI
+/// consistency with its siblings.
+#[no_mangle]
+pub unsafe extern "C" fn karac_hash_int(v: u64, nbytes: u64) -> u64 {
+    karac_hash::hash_int(v, nbytes.min(8) as u32)
+}
+
+/// `karac_hash_u64(v) -> u64` — [`karac_hash_int`] at the dominant width, with
+/// the width pinned so the callee folds to straight-line code instead of
+/// carrying both arms and the clamp across the FFI boundary. Measured on
+/// kata:170: 106 instructions per probe through `karac_hash_int`, 95 through
+/// this. B-2026-09-07-42.
+///
+/// # Safety
+/// Nothing is dereferenced; `unsafe` only for ABI consistency with its
+/// siblings.
+#[no_mangle]
+pub unsafe extern "C" fn karac_hash_u64(v: u64) -> u64 {
+    karac_hash::hash_u64(v)
+}
+
 /// `karac_hash_bytes_fx(ptr, len) -> u64` — FxHash of `len` bytes at `ptr`,
 /// UNSEEDED. The `Map[K, V, FxBuildHasher]` opt-out; see
 /// [`karac_hash::fx_hash_bytes`] for what is being given up.

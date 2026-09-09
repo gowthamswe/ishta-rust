@@ -289,6 +289,8 @@ pub fn __preserve_no_mangle_symbols() -> usize {
     keep!(
         hashing::karac_hash_bytes,
         hashing::karac_hash_bytes_fx,
+        hashing::karac_hash_int,
+        hashing::karac_hash_u64,
         hashing::karac_stable_siphash24,
         hashing::karac_hash_seed
     );

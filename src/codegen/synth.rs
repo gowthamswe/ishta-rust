@@ -146,6 +146,64 @@ impl<'ctx> super::Codegen<'ctx> {
             .into_int_value()
     }
 
+    /// Emit `call @karac_hash_int(value, nbytes)` for an integer key already
+    /// loaded into a register — the same SipHash-1-3 digest as
+    /// [`Self::emit_hash_bytes_call`] over that key's little-endian bytes.
+    ///
+    /// Returns `None` when the container's hasher is not the seeded default,
+    /// and the caller must then fall back to the byte path: `FxBuildHasher`
+    /// and a user `impl Hasher` have their own entry points, and there is no
+    /// integer-shaped sibling for either.
+    ///
+    /// WHY A SECOND ENTRY POINT rather than a cheaper `karac_hash_bytes`. The
+    /// byte path takes a POINTER, so an integer key that lives happily in a
+    /// register had to be spilled to a stack slot purely to have an address —
+    /// and the callee then walked a run-time-length slice to re-derive a width
+    /// this side knew as a constant. Neither cost is the hash. Measured per
+    /// 8-byte key (callgrind, loop overhead differenced): 97 instructions
+    /// through the slice path against 89 here, and 74 for Rust std's
+    /// SipHash-1-3 on the same input — the remainder is the per-call process
+    /// seed load, which std hoists out of its loop and a `hash_fn` reached
+    /// through a function pointer cannot. B-2026-09-07-42.
+    fn emit_hash_int_call(&mut self, value: IntValue<'ctx>, nbytes: u64) -> Option<IntValue<'ctx>> {
+        if !matches!(self.hash_hasher, crate::hasher_kind::HasherKind::SipHash13) {
+            return None;
+        }
+        let i64_t = self.context.i64_type();
+        // ZERO-extend: the digest is defined over the key's low `nbytes`
+        // bytes, so a negative `i8` must present 0xff, not a sign-extended
+        // 0xffff_ffff_ffff_ffff that would carry bytes the key does not have.
+        let widened = if value.get_type().get_bit_width() < 64 {
+            self.builder
+                .build_int_z_extend(value, i64_t, "hash.int.zext")
+                .unwrap()
+        } else {
+            value
+        };
+        // A full-width key takes the pinned-width entry point, which folds to
+        // straight-line code in the callee; every narrower key carries its
+        // width as an argument.
+        let (f, args) = if nbytes >= 8 {
+            (
+                self.module.get_function("karac_hash_u64")?,
+                vec![widened.into()],
+            )
+        } else {
+            (
+                self.module.get_function("karac_hash_int")?,
+                vec![widened.into(), i64_t.const_int(nbytes, false).into()],
+            )
+        };
+        Some(
+            self.builder
+                .build_call(f, &args, "hash.int")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_int_value(),
+        )
+    }
+
     /// The per-key-type EQUALITY function for a type carrying a hand-written
     /// `impl PartialEq` plus the `Eq` marker, or `None` (B-2026-08-26-10).
     ///
@@ -582,15 +640,26 @@ impl<'ctx> super::Codegen<'ctx> {
                     .build_load(int_ty, key_ptr, "fx.prim.raw")
                     .unwrap()
                     .into_int_value();
-                // The loaded value is unused now that the hash reads the
-                // key's BYTES in place rather than its numeric value.
-                let _ = raw;
                 // Exactly the integer's own bytes: no store, no widening. Two
                 // keys of one monomorphic K always present the same byte
                 // count, and a width mixed into the digest would be
                 // meaningless across maps that can never share a key type.
-                let nbytes = i64_t.const_int(u64::from(bit_width).div_ceil(8), false);
-                let hash = self.emit_hash_bytes_call(key_ptr, nbytes);
+                let nbyte_count = u64::from(bit_width).div_ceil(8);
+                // The key is ALREADY in a register here, so hand it over as a
+                // value. Until B-2026-09-07-42 this load was made and then
+                // discarded (`let _ = raw`) while the key was re-read through
+                // a pointer by the callee — the spill, the pointer and the
+                // run-time-length slice walk were all pure overhead over a
+                // width known right here.
+                let hash = match self.emit_hash_int_call(raw, nbyte_count) {
+                    Some(h) => h,
+                    // `FxBuildHasher` / a user `impl Hasher`: no integer-shaped
+                    // entry point, so the key's bytes it is.
+                    None => {
+                        let nbytes = i64_t.const_int(nbyte_count, false);
+                        self.emit_hash_bytes_call(key_ptr, nbytes)
+                    }
+                };
                 self.builder.build_return(Some(&hash)).unwrap();
             } else {
                 // Wider integers (i128 / u128): fall back to byte loop.

@@ -5984,6 +5984,17 @@ impl<'ctx> Codegen<'ctx> {
             hash_bytes_ty,
             Some(Linkage::External),
         );
+        // `karac_hash_int(v, nbytes) -> u64` — the same SipHash-1-3, for an
+        // INTEGER key arriving in a register rather than behind a pointer.
+        // Same digest as `karac_hash_bytes` over the key's little-endian
+        // bytes; `karac-hash`'s `sip_int_matches_sip_bytes` is what keeps the
+        // two entry points one permutation (B-2026-09-07-42).
+        let hash_int_ty = i64_type.fn_type(&[i64_ty, i64_ty], false);
+        module.add_function("karac_hash_int", hash_int_ty, Some(Linkage::External));
+        // The 8-byte specialization of the same call, which is what an `i64`
+        // / `u64` key — the dominant width in the corpus — actually takes.
+        let hash_u64_ty = i64_type.fn_type(&[i64_ty], false);
+        module.add_function("karac_hash_u64", hash_u64_ty, Some(Linkage::External));
 
         // `StableHash.siphash24(bytes, k0, k1)` (B-2026-08-25-22) — the same
         // byte-oriented shape plus the caller's 128-bit key, which is what
