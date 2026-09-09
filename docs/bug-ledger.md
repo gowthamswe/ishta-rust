@@ -103,14 +103,14 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | perf | 102 |
 | soundness | 95 |
 | other | 84 |
-| crash | 77 |
+| crash | 78 |
 | use-after-free | 36 |
 
 ### By surface
 
 | surface | total |
 |---|---|
-| codegen | 1617 |
+| codegen | 1618 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 76 |
@@ -163,7 +163,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
 | B-2026-09-07-42 | 2026-09-07 | codegen | high | PERF-REGRESSION, CORPUS-WIDE AND UNNOTICED SINCE ~2026-08: 12 of the 23 map-bearing benched katas whose recorded-run binary survives execute 1.30x-4.17x MORE INSTRUCTIONS built by today's karac than by the karac that produced their published figure -- up to 7.46x on WALL CLOCK (kata:146 236 -> 1683 ms), with IPC falling too, every sink identical, and the old binaries still reproducing their recorded numbers to 2-5%; source change, lane, placement, iterator-fallback and map-capacity all ruled out, and neither key/value type nor recorded date separates the regressed half from the flat half | kata:170 results.json still publishes the pre-regression 997.08 ms | found while running B-2026-08-28-77's placement sweep, where kata:170 was the positive control and failed to fire | CAUSE: 59c8d30cd (2026-08-22), the landing half of B-2026-08-21-6 — a deliberate security fix whose cost was never measured |
 | B-2026-09-07-44 | 2026-09-07 | codegen | low | A FRESH-TEMP ENUM SCRUTINEE WHOSE CONSUMING ARM BINDS A COPY-DECLINED STRUCT PAYLOAD LEAKS THE PAYLOAD'S INTERIOR -- `match W.T(mkx(1)) { W.T(x) => .. }` loses 2 B while the `let`-bound scrutinee and the `W.T(_)` arm of the same program are clean | none |
-| B-2026-09-07-50 | 2026-09-07 | codegen | medium | A CALLEE THAT READS ITS BY-VALUE PARAM AFTER A CONDITIONAL STORE LOSES THE `Drop` BODY OUTRIGHT ON THE COMPILED BACKENDS -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` at `k = false` prints no body while `--interp` prints it, and strands the param's whole heap (20 B in 2 blocks at -O0, 120 B in 12 over a six-trip loop); the same read placed BEFORE the store, or a trailing statement that does not read the param, is clean on both counts | — |
 | B-2026-09-07-53 | 2026-09-07 | codegen | high | AT EQUAL HASHING kara's Map IS NOW SLOWER THAN RUST'S, INVERTING A PUBLISHED HEADLINE: on 3 of 4 re-measured map katas kara went from 3-4x AHEAD of both rustc builds to 1.2-2.4x BEHIND (kata:146 0.31x -> 2.35x vs rust_ovf), and also lost its lead over Go -- so the 2026-06-15 equal-safety claim "parity with memory-safe Rust, BEATS IT ON COLLECTIONS" rested on comparing kara's compile-time-constant-seeded FxHash against Rust's per-process SipHash-1-3, and cannot be quoted until the collection set is re-run | BENCHMARKS.md + the 16 collection/pointer kata READMEs still publish the pre-59c8d30cd collection-superiority claim | corrects the unmeasured speculation in B-2026-09-07-42's COST DECOMPOSED section |
 | B-2026-09-07-62 | 2026-09-08 | codegen | medium | A BOXED SHARED-ENUM PAYLOAD'S NESTED STRUCT FIELD NEVER HAS ITS BUFFERS FREED UNLESS THAT FIELD IS MOVED OUT -- 32 B leaked with no move-out and with a SIBLING field moved out, the opposite direction of B-2026-09-07-55's use-after-free at the same line | — |
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
@@ -171,6 +170,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
 | B-2026-09-08-13 | 2026-09-08 | codegen | medium | A LET-BOUND LOCAL OF A SELF-REFERENTIAL STRUCT PASSED BY VALUE LOSES ITS `Drop` BODY ON EVERY COMPILED BACKEND -- `let c = mkn(10); read(c)` prints the body under `--interp` and nothing under the JIT, `-O0`, `-O2` and `KARAC_AUTO_PAR=0`; passing the SAME value as a temporary agrees, which is the only variable, and is why six existing fixtures for this type all miss it | none |
 | B-2026-09-09-1 | 2026-09-09 | cli | low | `signalling_karac_run_does_not_orphan_the_jit_runner` FAILS UNDER LOAD IN THE REQUIRED GATE SET -- 1 failure in 5 runs of the full `--test cli` binary on one tree, at the 15-SECOND watchdog assert (the runner outlived the signal), while the same test passes in ISOLATION in 2.8s and the four other full-binary runs were 738/738; either the window is too short for a loaded debug container or B-2026-09-05-24's orphan is intermittent rather than fixed, and the two readings need different remedies | — |
+| B-2026-09-09-2 | 2026-09-09 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` called with `k = true` dies with SIGSEGV (rc=139) on the JIT and at both opt levels, valgrind `Invalid read of size 8 / Address 0x8 is not stack'd, malloc'd or (recently) free'd` -- a NULL box handle GEP'd at field 1 -- while `--interp` prints `s100 n1 dR100 end` correctly; the `k = false` half of the same callee is B-2026-09-07-50 and is a lost body, not a crash | — |
 
 ### Relocated
 
@@ -2396,6 +2396,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-47 | codegen | medium | AN RC-FALLBACK BOX MINTED INSIDE A `__par_branch_*` WORKER IS NEVER RELEASED -- 40 B (plus its payload) stranded per program on the DEFAULT build lan… | b440bbe |
 | B-2026-09-07-48 | codegen | high | READING AN RC-PROMOTED LOCAL'S PROJECTED FIELD AFTER THE LOOP DIVERGES THREE WAYS -- `let s = t.a` in a loop then `t.a.len()` prints 152 on the inter… | 9ee19bbd2 |
 | B-2026-09-07-49 | codegen | medium | EVERY MECHANISM THAT ASKS `use_after_move_consume_sites` IS BLIND TO THE RC-FALLBACK PROMOTION, WHICH IS THE OWNERSHIP PASS'S OTHER ANSWER TO THE SAM… | acdcf5009 |
+| B-2026-09-07-50 | codegen | medium | A CALLEE THAT READS ITS BY-VALUE PARAM AFTER A CONDITIONAL STORE LOSES THE `Drop` BODY OUTRIGHT ON THE COMPILED BACKENDS -- `fn m(mut ref self, r: R,… | dff25b7 |
 | B-2026-09-07-51 | codegen | medium | THE MONO LEG CARRIES NO CONDITIONAL-STORE REGISTRATION -- `fn gcond[T](v: mut ref Vec[T], x: T, k: bool) { if k { v.push(x); } }` at `k = false` runs… | c06c332 |
 | B-2026-09-07-52 | codegen+interp | medium | A FIELD ASSIGN WRITTEN `self.one = r` INSIDE A METHOD LOSES THE DISPLACED VALUE'S `Drop` BODY ON EVERY SURFACE -- B-2026-08-01-20's `emit_displaced_f… | 202d8fe |
 | B-2026-09-07-54 | codegen | high | A REUSED `let`-BOUND `Vec[Option[shared T]]` HAS ITS ELEMENT RC DEC READ A FREED CONTROL BLOCK -- `__karac_vec_elem_rc_dec_Node` reads offset 0 of a… | 6d46e2a |
