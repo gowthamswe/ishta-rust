@@ -102,7 +102,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | false-positive | 106 |
 | perf | 102 |
 | soundness | 95 |
-| other | 86 |
+| other | 87 |
 | crash | 78 |
 | use-after-free | 36 |
 
@@ -113,7 +113,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen | 1619 |
 | interp | 407 |
 | typecheck | 295 |
-| other | 78 |
+| other | 79 |
 | ownership | 74 |
 | cli | 72 |
 | autopar | 56 |
@@ -164,8 +164,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
 | B-2026-09-08-11 | 2026-09-08 | codegen | low | `display_mangle_te` RENDERS EVERY UNNAMEABLE TYPE AS `unknown`, SO THEY SHARE ONE MANGLED SYMBOL AND ONE DROP/CLONE CACHE ENTRY -- `Vec[weak A]` and `Vec[weak B]` both emit `karac_drop_Vec_unknown` / `karac_clone_unknown` and the second requested gets the first's function; benign for `weak` ONLY because every weak-slot operation is slot-type-agnostic, and the fallback is not weak-only | none |
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
-| B-2026-09-09-1 | 2026-09-09 | cli | low | `signalling_karac_run_does_not_orphan_the_jit_runner` FAILS UNDER LOAD IN THE REQUIRED GATE SET -- 1 failure in 5 runs of the full `--test cli` binary on one tree, at the 15-SECOND watchdog assert (the runner outlived the signal), while the same test passes in ISOLATION in 2.8s and the four other full-binary runs were 738/738; either the window is too short for a loaded debug container or B-2026-09-05-24's orphan is intermittent rather than fixed, and the two readings need different remedies | — |
 | B-2026-09-09-4 | 2026-09-09 | other | low | THE `rc_fb_twin_shape_both_boxed` VACUITY GUARD FAILS INTERMITTENTLY ON A GREEN TREE -- `min_allocs = 60` against an x86_64-Linux count of 65-72 that MOVES BY 7 BETWEEN RUNS of one binary, so the full suite reports 1561/1 and a re-run of the same binary reports 1562/0; the threshold was justified from macOS (183) and arm64 Linux (75), neither of which bounds this host | — |
+| B-2026-09-09-5 | 2026-09-09 | other | low | THREE LOAD-SENSITIVE TESTS IN THE REQUIRED GATE SET ARE STILL UNEXPLAINED after B-2026-09-09-1's named one turned out NOT to be flaky -- that one was a deterministic watchdog race that never armed (fixed 32223a5a6, 2-in-6 permanent orphans under load -> 0 in 8), so its resolution transfers no conclusion to the rest. Leading hypothesis for the ASAN pair is the vacuous-fixture floor: n=102 against a per-process HOST FLOOR of 90 measured on a box running dozens of concurrent ASAN processes, a 12-allocation margin that a drifting floor would trip with nothing wrong in the compiler -- with the counter-argument that a shared OnceLock floor should fail many fixtures at once, and only one failed | — |
 
 ### Relocated
 
@@ -2419,6 +2419,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-14 | codegen | low | A CONDITIONAL MOVE-OUT FOLLOWED BY AN UNCONDITIONAL REASSIGN LOSES THE DISPLACED VALUE'S `Drop` BODY -- `if f { let taken = g.one; } g.one = mks(7);`… | 1606c18 |
 | B-2026-09-08-15 | codegen | high | BOTH -O0 ASAN RATCHETS ARE RED ON `main` -- `rc_boxed_tuple_index_destinations_stay_clean` leaks 76 B in 2 objects on its `b49_tuple_assign_three_tri… | 3130242 |
 | B-2026-09-08-16 | other | high | THE ASAN VACUOUS-FIXTURE GUARD WAS ITSELF VACUOUS ON EVERY HOST -- `min_allocs` compared ASAN's RAW process-wide count against thresholds smaller tha… | 6e23fe215 |
+| B-2026-09-09-1 | cli | low | `signalling_karac_run_does_not_orphan_the_jit_runner` FAILS UNDER LOAD IN THE REQUIRED GATE SET -- 1 failure in 5 runs of the full `--test cli` binar… | 32223a5a6 |
 | B-2026-09-09-2 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push… | 33c5c25 |
 | B-2026-09-09-3 | codegen | low | B-2026-09-06-66's BY-VALUE REMAINDER IS STILL OPEN AFTER B-2026-09-08-13 CLOSED ITS PRECONDITION -- a self-referential struct's `Option` payload box… | 4ef36450e |
 
