@@ -6902,29 +6902,33 @@ fn main() {
 
     /// B-2026-09-01-23 — the arm-owner slot is ONE PER CONSTRUCT and reset each
     /// pass, so a construct inside a loop whose owner frame lives OUTSIDE the
-    /// loop frees only the LAST pass's value. Pinned at its leaking value.
+    /// loop used to free only the LAST pass's value. Pinned CLEAN.
     ///
-    /// It still leaks, and the point of the pin is that no fix in this family
-    /// turned it into a memory ERROR — `run_under_asan_no_leak_check` is
-    /// therefore the right runner: a clean exit means no use-after-free and no
-    /// double free, and the leak is the known remainder.
+    /// LEAK-CHECKED, and the switch of runner is the point. This fixture ran
+    /// under `run_under_asan_no_leak_check` while the shape still leaked, so it
+    /// could only assert the remainder had not become a memory ERROR. The
+    /// remainder is gone: each pass's escaping value is now reclaimed at the
+    /// reset — the last instant it is still reachable — when the borrowed owner
+    /// frame lives below `LoopFrame::cleanup_depth` and therefore cannot drain
+    /// between two passes. So the leak-checking runner is the honest one, and a
+    /// regression to the old behaviour fails here rather than passing quietly.
     ///
-    /// B-2026-08-30-11 improved this shape without closing it (measured on the
-    /// three-iteration fixture below: 57 B in 3 blocks before, 42 B in 2
-    /// after; five iterations leave 72 B in 4). The owner slot now
-    /// exists for the minting arm, but `reset_vec_slot_at_block_end` makes it
-    /// mean "THIS pass's escaping value" and the frame holding its cleanup
-    /// drains once, after the loop — so each pass overwrites the previous
-    /// pass's header and only the survivor is freed. The sibling binding's own
-    /// value is stranded the same way, which is why the count is
-    /// `iterations - 1` rather than `iterations - 2`.
+    /// The history it pins: B-2026-08-30-11 improved this shape without closing
+    /// it (three iterations 57 B in 3 blocks before, 42 B in 2 after; five
+    /// iterations 72 B in 4), because the owner slot existed for the minting arm
+    /// but `reset_vec_slot_at_block_end` made it mean "THIS pass's escaping
+    /// value" while the frame holding its cleanup drained once, after the loop.
+    /// The sibling binding's own value was stranded the same way, which is why
+    /// the count was `iterations - 1` rather than `iterations - 2`.
     ///
-    /// `s1` is the CONTROL that isolates the frame choice as the cause: the
-    /// same branch with the sibling binding declared INSIDE the loop body is
-    /// clean, because the borrowed frame is then the body's and drains every
-    /// pass.
+    /// `s1` is the CONTROL that isolated the frame choice as the cause and is
+    /// kept: the same branch with the sibling binding declared INSIDE the loop
+    /// body was always clean, because the borrowed frame is then the body's and
+    /// drains every pass. It must stay clean, so it also guards against the
+    /// reclaim firing where a per-pass drain already freed the value — the
+    /// double free B-2026-08-30-2 measured.
     #[test]
-    fn asan_loop_arm_owner_slot_keeps_only_the_last_pass() {
+    fn asan_loop_arm_owner_slot_reclaims_every_pass() {
         if !asan_available() {
             eprintln!("[asan_loop_arm_owner_slot] ASAN unavailable — skipping");
             return;
@@ -6954,17 +6958,16 @@ fn main() {
     }
 }
 "#;
-        let Some((stdout, _stderr, status)) =
-            run_under_asan_no_leak_check(src, "asan_loop_arm_owner_slot")
-        else {
+        let Some((stdout, status)) = run_under_asan(src, "asan_loop_arm_owner_slot") else {
             eprintln!("[asan_loop_arm_owner_slot] setup failed — skipping");
             return;
         };
         assert!(
             status.success(),
-            "[asan_loop_arm_owner_slot] ASAN reported a memory error (exit {:?}). \
-             The remaining leak must stay a LEAK, not become a dangling read or \
-             a double free.\nstdout:\n{stdout}",
+            "[asan_loop_arm_owner_slot] ASAN reported an error (exit {:?}). A LEAK \
+             here means a pass's escaping value was stranded again; a double free \
+             means the reclaim fired where a per-pass drain already took it.\n\
+             stdout:\n{stdout}",
             status.code()
         );
         for want in [

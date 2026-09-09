@@ -5674,6 +5674,76 @@ impl<'ctx> super::Codegen<'ctx> {
         let _ = b.build_store(slot, self.vec_struct_type().const_zero());
     }
 
+    /// B-2026-09-01-23 — free whatever a branch-owner slot holds, at the END of
+    /// `bb`, WITHOUT branching.
+    ///
+    /// `emit_free_vec_buffer_if_owned` is the ordinary form and cannot be used
+    /// here: it appends its own `ov.free` / `ov.after` blocks, and `bb` already
+    /// carries its terminator, so inserting it there orphans the tail —
+    /// measured as `Basic Block in function 'main' does not have terminator!`.
+    ///
+    /// The guard is a `select` instead. `karac_free_buf` returns immediately on
+    /// a null pointer, so handing it `owned ? data : null` frees exactly the
+    /// owned case and no-ops otherwise, in straight-line code that is legal
+    /// before a terminator. The `bytes_hint` multiply rides along on the
+    /// not-owned path and is harmless — the runtime never reads it after the
+    /// null check.
+    fn free_vec_slot_branchless_at_block_end(
+        &mut self,
+        slot: PointerValue<'ctx>,
+        elem_ty: Option<inkwell::types::BasicTypeEnum<'ctx>>,
+        bb: inkwell::basic_block::BasicBlock<'ctx>,
+    ) {
+        let saved = self.builder.get_insert_block();
+        match bb.get_terminator() {
+            Some(term) => self.builder.position_before(&term),
+            None => self.builder.position_at_end(bb),
+        }
+        let vec_ty = self.vec_struct_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let emit = |me: &mut Self| -> Option<()> {
+            let data_pp = me
+                .builder
+                .build_struct_gep(vec_ty, slot, 0, "bo.rc.data.pp")
+                .ok()?;
+            let cap_pp = me
+                .builder
+                .build_struct_gep(vec_ty, slot, 2, "bo.rc.cap.pp")
+                .ok()?;
+            let data = me
+                .builder
+                .build_load(ptr_ty, data_pp, "bo.rc.data")
+                .ok()?
+                .into_pointer_value();
+            let cap = me
+                .builder
+                .build_load(i64_t, cap_pp, "bo.rc.cap")
+                .ok()?
+                .into_int_value();
+            let owned = me.sso_string_is_owned_heap(cap);
+            let safe = me
+                .builder
+                .build_select(owned, data, ptr_ty.const_null(), "bo.rc.ptr")
+                .ok()?
+                .into_pointer_value();
+            // Recycling hint only; 1 is exact for a `String`, whose cap IS bytes.
+            let elem_abi_size = match elem_ty {
+                Some(t) => me
+                    .ensure_target_data()
+                    .map(|td| td.get_abi_size(&t))
+                    .unwrap_or(0),
+                None => 1,
+            };
+            me.emit_free_buf_call(safe, cap, elem_abi_size);
+            Some(())
+        };
+        let _ = emit(self);
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+    }
+
     /// B-2026-08-30-2 — the span-explicit core of [`Self::own_branch_merged_clone`].
     ///
     /// Registering an owner for a value that escaped its producer is one act
@@ -5776,6 +5846,41 @@ impl<'ctx> super::Codegen<'ctx> {
             return;
         };
         let slot = self.create_entry_alloca(fn_val, "branchown", self.vec_struct_type().into());
+        // B-2026-09-01-23 — RECLAIM THE PREVIOUS PASS'S VALUE, for a slot whose
+        // owner frame lives OUTSIDE the innermost loop.
+        //
+        // The slot is one per CONSTRUCT and the reset makes it mean "this
+        // pass's escaping value, if any". When the borrowed owner frame is
+        // inside the loop it drains every pass and that is the whole story.
+        // When the sibling binding was declared OUTSIDE the loop the borrowed
+        // frame drains ONCE, after the loop, so every pass overwrote the header
+        // the previous pass stored and only the survivor was ever freed —
+        // stranding `iterations - 1` values (42 B in 2 blocks at 3 iterations,
+        // 72 B in 4 at 5, unbounded).
+        //
+        // The reset block is the ONLY point where the previous pass's value is
+        // still reachable; by the time the arms store again it is gone. So the
+        // reclaim goes there, immediately before the zeroing store.
+        //
+        // NOT A DOUBLE FREE. `LoopFrame::cleanup_depth` is the frame floor at
+        // loop entry, so an owner frame BELOW it cannot drain between two
+        // executions of this reset block, and the value being freed is one
+        // nothing else will ever see. Freeing unconditionally would re-free
+        // what a per-pass drain already took — the double free B-2026-08-30-2
+        // measured and the reason the reset exists — which is exactly the
+        // INNER-frame case this test declines.
+        //
+        // The frame the owner is REGISTERED in is untouched, so the
+        // wrapped-branch shape B-2026-08-30-11 recorded as double-freeing under
+        // an innermost-frame owner is unaffected: the survivor is still freed by
+        // the same frame as before.
+        let reclaim_per_pass = owning_frame.is_some_and(|f| {
+            self.fn_ctx
+                .loop_stack
+                .last()
+                .is_some_and(|lf| f < lf.cleanup_depth)
+        });
+
         // The store goes on the path whose value this is. `store_bb` names that
         // path explicitly for a deferred registration; the block already has
         // its terminator by then, so the store must go BEFORE it rather than
@@ -5799,6 +5904,9 @@ impl<'ctx> super::Codegen<'ctx> {
             None => self.track_vec_var(slot, elem_ty),
         }
         if let Some(bb) = reset_bb {
+            if reclaim_per_pass {
+                self.free_vec_slot_branchless_at_block_end(slot, elem_ty, bb);
+            }
             self.reset_vec_slot_at_block_end(slot, bb);
         }
         self.branch_tail_owner_slots
