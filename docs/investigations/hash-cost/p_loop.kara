@@ -1,0 +1,15 @@
+// The loop floor for p_get.kara: PRNG, key, sink, no map.
+fn main() {
+    let key_range = 4096;
+    let ops = 32000000;
+    let mut sink = 0;
+    let mut state = 12345;
+    let mut t = 0;
+    while t < ops {
+        state = (state * 1103515245 + 12345) & 2147483647;
+        let key = (state / 65536) % key_range;
+        sink = sink + key;
+        t = t + 1;
+    }
+    println(sink);
+}

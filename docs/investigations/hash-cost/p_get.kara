@@ -1,0 +1,28 @@
+// Pure LOOKUP cost, kara side. 1024 live entries in a key range of 4096, so
+// the hit rate (~25%) matches kata:146's, and NOTHING mutates the map during
+// the measured loop -- no inserts, no removes, no tombstones, no rehash. That
+// isolates get_or from the churn machinery the kata mixes it with.
+fn main() {
+    let key_range = 4096;
+    let live = 1024;
+    let ops = 32000000;
+
+    let mut map: Map[i64, i64] = Map.new();
+    let mut i = 0;
+    while i < live {
+        map.insert(i * 4, i);
+        i = i + 1;
+    }
+
+    let mut sink = 0;
+    let mut state = 12345;
+    let mut t = 0;
+    while t < ops {
+        state = (state * 1103515245 + 12345) & 2147483647;
+        let key = (state / 65536) % key_range;
+        let idx = map.get_or(key, 0 - 1);
+        sink = sink + idx + 1;
+        t = t + 1;
+    }
+    println(sink);
+}

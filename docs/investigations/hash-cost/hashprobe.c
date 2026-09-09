@@ -1,3 +1,17 @@
+/* SUPERSEDED as a COMPARATOR (2026-09-09). Read README.md first.
+ *
+ * This harness calls each hash through an opaque pointer so nothing inlines --
+ * which is right for kara, whose map really does call its hash that way, and
+ * WRONG for Rust, whose hasher is inlined into the probe. Measuring Rust here
+ * gave 102.8-118.8 instr/hash against an in-situ 54.5, and a ledger entry and a
+ * kata README briefly carried the conclusion that kara's hash was the cheaper
+ * of the two. It is not.
+ *
+ * The kara side of this file is still sound and still the number README.md
+ * quotes for kara's hash in isolation. Do not compare it against a Rust number
+ * produced by rusthash.rs.
+ */
+
 /* Per-hash cost of kara's integer hash, in the shape the map actually uses.
  *
  * B-2026-09-07-53 sizes the hash in INSTRUCTIONS on x86 and its own rule says

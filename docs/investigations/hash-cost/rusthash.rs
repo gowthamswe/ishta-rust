@@ -1,3 +1,16 @@
+// SUPERSEDED (2026-09-09). Read README.md first, and do not quote these numbers.
+//
+// Every mode here measures Rust's hasher in a shape Rust never uses: `inline`
+// still feeds its result to a black-boxed accumulator rather than to a bucket
+// index, so LLVM keeps the keys and the four SipHash constants inside the loop
+// instead of hoisting them. That inflates Rust's hash from an in-situ 54.5
+// instructions to 102.8, and briefly produced the conclusion that kara's hash
+// was cheaper than Rust's.
+//
+// The measurement that replaces it is `p_get.rs` minus `p_hash.rs` -- the same
+// loop with and without the lookup, so the difference is the hash and nothing
+// else. Kept only because the correction is easier to follow next to it.
+
 // Rust's side of the same measurement, in the same call shape.
 //
 // B-2026-09-07-53 compares kara's integer hash to Rust's in INSTRUCTIONS
