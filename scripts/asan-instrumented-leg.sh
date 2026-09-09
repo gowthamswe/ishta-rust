@@ -89,6 +89,38 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export KARAC_SANITIZE_ADDRESS=1
+
+# B-2026-09-09-15 — WITHOUT THIS THE LEG CANNOT LINK ON macOS, and it fails in
+# the shape most likely to be misread. The `asan` pass stamps a call to
+# `__asan_version_mismatch_check_v<N>` naming the compiler-rt ABI karac's
+# bundled LLVM expects; the runtime actually linked is whatever
+# `cc -fsanitize=address` picks, which on macOS is Xcode's
+# `libclang_rt.asan_osx_dynamic.dylib` and does not export that symbol. Every
+# fixture then dies at the LINK step:
+#
+#     Undefined symbols for architecture arm64:
+#       "___asan_version_mismatch_check_v8", referenced from:
+#           _asan.module_ctor in karac_asan_*.o
+#
+# Measured before this line existed: 12 passed / 1555 failed in 41 s, against
+# the -O0 leg's 1567 / 0 in 396 s. A near-total failure that finishes an order
+# of magnitude FASTER than the passing leg is a build failure, not a
+# memory-error storm — the fixtures never ran — but the ratchet's own diagnostic
+# says "these are real, fix the codegen defect or quarantine them", so it reads
+# as a catastrophic regression.
+#
+# WHAT TURNING IT OFF GIVES UP, stated because it is a real check and not
+# ceremony: the guard exists to catch a pass/runtime version SKEW, and skew is
+# exactly what this configuration has. It is disabled here rather than in
+# `apply_address_sanitizer` for that reason — a leg that knowingly mixes karac's
+# pass with the host's runtime opts out for itself, and an ordinary
+# `KARAC_SANITIZE_ADDRESS=1` build still gets the check. The ratchet is what
+# keeps this honest: it fails if a QUARANTINED fixture starts passing, so a
+# run that instrumented nothing cannot report green.
+#
+# Appended rather than assigned, so a caller's own -mllvm flags survive.
+export KARAC_LLVM_ARGS="${KARAC_LLVM_ARGS:+$KARAC_LLVM_ARGS }-asan-guard-against-version-mismatch=0"
+
 export ASAN_LEG_NAME="instrumented -O0"
 export ASAN_LEG_OPT_LEVEL="${ASAN_LEG_OPT_LEVEL:-0}"
 export ASAN_LEG_EXPECTED="${ASAN_LEG_EXPECTED:-$HERE/../tests/asan-instrumented-known-failures.txt}"
