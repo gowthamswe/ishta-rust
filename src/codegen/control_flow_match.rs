@@ -7648,16 +7648,21 @@ impl<'ctx> super::Codegen<'ctx> {
                 continue;
             };
             // The rebuilt inner value is the enum's `{ tag, payload... }`
-            // struct; its tag is field 0. Compare against the
-            // qualified-path-resolved expected tag.
-            let BasicValueEnum::StructValue(inner_sv) = inner else {
+            // struct — or, for a SHARED enum, its RC HANDLE (B-2026-09-09-11).
+            // `extract_enum_tag` is the one place that knows both shapes
+            // (extractvalue 0 for the struct, GEP-to-index-1 load through the
+            // handle), so asking it here keeps the nested path from
+            // re-deriving a layout it got wrong.
+            let inner_variant_name = match &sub.kind {
+                PatternKind::TupleVariant { path, .. } | PatternKind::Struct { path, .. } => {
+                    path.last().cloned().unwrap_or_default()
+                }
+                PatternKind::Binding(n) => n.rsplit('.').next().unwrap_or(n.as_str()).to_string(),
+                _ => String::new(),
+            };
+            let Ok(actual_tag) = self.extract_enum_tag(inner, &inner_variant_name) else {
                 continue;
             };
-            let actual_tag = self
-                .builder
-                .build_extract_value(inner_sv, 0, "ncond.tag")
-                .unwrap()
-                .into_int_value();
             let expected = self.context.i64_type().const_int(expected_tag, false);
             let tag_eq = self
                 .builder
@@ -8186,6 +8191,31 @@ impl<'ctx> super::Codegen<'ctx> {
         // to the single-word path below and binds the raw tag word,
         // leaving the inner binding unset ("Undefined variable 'c'").
         // (phase-7-codegen.md — nested enum-payload bind.)
+        // B-2026-09-09-11 — a SHARED enum sub-pattern is an RC HANDLE, not an
+        // inline `{tag, words…}` aggregate, so it must not take the rebuild
+        // below. `pattern_payload_llvm_type` has said so since B-2026-07-15-5
+        // ("Shared enums stay a single RC pointer") and this arm never asked:
+        // it rebuilt `{i64, i64}` out of the payload words, putting the HANDLE
+        // where the tag belongs. The nested tag test then compared a pointer
+        // against a small integer, which is false for every variant, so
+        // `match x { Option.Some(Ks.A(r)) => …, Option.Some(Ks.B) => …,
+        // Option.None => … }` fell through BOTH `Some` arms to `None` — a
+        // silently wrong program, exit 0, on every compiled backend, while
+        // `--interp` was correct.
+        //
+        // Returning the handle lets `extract_enum_tag` do the GEP-to-index-1
+        // load it already does for a top-level shared scrutinee, which is why
+        // the bare `match k { Ks.A(r) => … }` spelling was always correct: only
+        // the NESTED path re-derived the layout instead of asking.
+        if let Some(name) = self.variant_pattern_enum_name(sub_pat) {
+            if self.type_decls.shared_types.contains_key(&name) {
+                let handle = self
+                    .builder
+                    .build_int_to_ptr(field_words[0], ptr_ty, "sharedenum.h")
+                    .unwrap();
+                return Ok(handle.into());
+            }
+        }
         if let Some(enum_ty) = self.enum_layout_type_for_variant_pattern(sub_pat) {
             let n = enum_ty.count_fields() as usize;
             let mut agg = enum_ty.get_undef();

@@ -152380,6 +152380,105 @@ fn main() {
         }
     }
 
+    /// B-2026-09-09-11 — a nested pattern over a SHARED enum inside
+    /// `Option`/`Result` matched NOTHING, so the arm fell through to `None` and
+    /// the program was silently wrong on every compiled backend.
+    ///
+    /// `reconstruct_payload_value`'s nested-variant arm rebuilt an inline
+    /// `{tag, words…}` aggregate out of the enclosing payload words. For a
+    /// shared enum that word is an RC HANDLE, so the handle landed where the
+    /// tag belongs and the nested test compared a pointer against a small
+    /// integer — false for every variant. `pattern_payload_llvm_type` had said
+    /// "Shared enums stay a single RC pointer" since B-2026-07-15-5; this arm
+    /// simply never asked.
+    ///
+    /// WHAT THE PROBE MATRIX ESTABLISHED, because three plausible causes were
+    /// wrong and the cells are the argument:
+    ///
+    ///   `Some(_)` / `is_some()`   correct  — the OPTION tag test was fine
+    ///   `Some(k)` then `match k`  correct  — the shared enum matched fine ALONE
+    ///   the same nested pattern, NON-shared enum   correct
+    ///   `Option.Some(Kn.A(n))`, shared            fell through to `None`
+    ///
+    /// and a single-`i64` payload (NOT boxed) failed identically, which refuted
+    /// the filing row's own "probably the boxing of an RC handle" hypothesis:
+    /// boxing is not involved at any size.
+    ///
+    /// The JIT failed differently — `fatal runtime error: stack overflow` — and
+    /// the row flagged that as an unproven inference about a shared root. It
+    /// was one: it is gone here too, with no separate change.
+    ///
+    /// Cells 5-7 are the shapes that were ALREADY correct and must stay so,
+    /// since the fix changes what a nested sub-pattern reconstructs to.
+    #[test]
+    fn e2e_nested_shared_enum_pattern_matches_through_its_handle() {
+        const SHARED: &str = "shared enum Kn { A(i64), B }\n";
+        for (label, src, want) in [
+            // 1 — the defect, minimal: a one-word payload, so nothing is boxed.
+            (
+                "option-nested-shared",
+                format!("{SHARED}fn main() {{ let x: Option[Kn] = Option.Some(Kn.A(7)); match x {{ Option.Some(Kn.A(n)) => {{ println(f\"a:{{n}}\"); }}, Option.Some(Kn.B) => {{ println(\"b\"); }}, Option.None => {{ println(\"none\"); }} }} }}\n"),
+                "a:7\n",
+            ),
+            // 2 — the OTHER variant, which must select the second arm rather
+            //     than the first: a tag test that is merely non-crashing would
+            //     pass cell 1 and fail here.
+            (
+                "option-nested-shared-second-variant",
+                format!("{SHARED}fn main() {{ let x: Option[Kn] = Option.Some(Kn.B); match x {{ Option.Some(Kn.A(n)) => {{ println(f\"a:{{n}}\"); }}, Option.Some(Kn.B) => {{ println(\"b\"); }}, Option.None => {{ println(\"none\"); }} }} }}\n"),
+                "b\n",
+            ),
+            // 3 — and `None` must still reach the `None` arm, which is the arm
+            //     the defect wrongly selected for everything.
+            (
+                "option-none-still-none",
+                format!("{SHARED}fn main() {{ let x: Option[Kn] = Option.None; match x {{ Option.Some(Kn.A(n)) => {{ println(f\"a:{{n}}\"); }}, Option.Some(Kn.B) => {{ println(\"b\"); }}, Option.None => {{ println(\"none\"); }} }} }}\n"),
+                "none\n",
+            ),
+            // 4 — the `Result` spelling, listed NOT MEASURED on the row, and a
+            //     heap payload so the binding is exercised too.
+            (
+                "result-nested-shared-heap-payload",
+                "struct R2 { s: String, t: String, u: String }\n\
+                 shared enum Ks { A(R2), B }\n\
+                 fn mkr(i: i64) -> R2 { return R2 { s: f\"ss{i}\", t: f\"tt{i}\", u: f\"uu{i}\" }; }\n\
+                 fn show(x: Result[Ks, i64]) { match x { Result.Ok(Ks.A(r)) => { println(f\"a:{r.s}\"); }, Result.Ok(Ks.B) => {}, Result.Err(e) => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { show(Result.Ok(Ks.A(mkr(i)))); i = i + 1; } }\n"
+                    .to_string(),
+                "a:ss0\na:ss1\na:ss2\n",
+            ),
+            // 5 — CONTROL: the bare spelling with no `Option` wrapper. Always
+            //     worked, because a top-level scrutinee goes through
+            //     `extract_enum_tag`, which is what the nested path now asks.
+            (
+                "bare-shared-control",
+                format!("{SHARED}fn main() {{ let k: Kn = Kn.A(7); match k {{ Kn.A(n) => {{ println(f\"a:{{n}}\"); }}, Kn.B => {{ println(\"b\"); }} }} }}\n"),
+                "a:7\n",
+            ),
+            // 6 — CONTROL: the whole-payload binding, which reaches the shared
+            //     enum through a local and was never affected.
+            (
+                "whole-payload-binding-control",
+                format!("{SHARED}fn main() {{ let x: Option[Kn] = Option.Some(Kn.A(7)); match x {{ Option.Some(k) => {{ match k {{ Kn.A(n) => {{ println(f\"a:{{n}}\"); }}, Kn.B => {{ println(\"b\"); }} }} }}, Option.None => {{ println(\"none\"); }} }} }}\n"),
+                "a:7\n",
+            ),
+            // 7 — CONTROL: the identical nested pattern on a NON-shared enum,
+            //     the cell that isolated `shared` as the variable.
+            (
+                "nonshared-nested-control",
+                "enum Kn { A(i64), B }\n\
+                 fn main() { let x: Option[Kn] = Option.Some(Kn.A(7)); match x { Option.Some(Kn.A(n)) => { println(f\"a:{n}\"); }, Option.Some(Kn.B) => { println(\"b\"); }, Option.None => { println(\"none\"); } } }\n"
+                    .to_string(),
+                "a:7\n",
+            ),
+        ] {
+            let Some(out) = run_program(&src) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by
