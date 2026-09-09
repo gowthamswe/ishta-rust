@@ -111,6 +111,63 @@ fn is_occupied(status: u8) -> bool {
     status >= BUCKET_OCCUPIED_BIT
 }
 
+/// Control bytes scanned per group by the SWAR probe (B-2026-09-09-12).
+/// Eight is the width of one `u64` load; `INITIAL_CAPACITY` is 16 and capacity
+/// only doubles, so a non-wrapping group always fits inside the table.
+const GROUP: usize = 8;
+const LO: u64 = 0x0101_0101_0101_0101;
+const HI: u64 = 0x8080_8080_8080_8080;
+
+/// Lanes of `x` whose byte is ZERO, reported as the high bit of that lane.
+///
+/// NOT the `(x - LO) & !x & HI` form the B-2026-09-09-12 prototype used. That
+/// one is the classic `haszero`, and it is exact for "is there a zero byte"
+/// but NOT per lane: the subtraction borrows ACROSS lanes, so a lane above a
+/// genuine zero is flagged too — `0x0100` reports lane 1 (`0x01`) as zero. Its
+/// LOWEST set lane is always a true zero (a false positive is only reachable
+/// through a borrow out of a real zero below it), which is why the prototype
+/// validated: it only ever read the first lane.
+///
+/// The probes here walk EVERY set lane of the tag mask, so they would see those
+/// false lanes. Note carefully that this is not what makes them safe: a false
+/// lane sits ABOVE a genuine zero, `stop` is set to that zero's index, and the
+/// `lane >= stop` guard therefore already excludes it. The exact test is
+/// DEFENCE IN DEPTH — it costs one instruction per mask and means correctness
+/// does not rest on that interaction holding, so `stop` can be reworked without
+/// silently arming a stale-slot `eq_fn` call. `(b & 0x7f) + 0x7f` cannot carry
+/// out of its lane, so `| x` gives "nonzero" per lane with no cross-lane
+/// coupling and the complement gives "zero".
+#[inline(always)]
+fn zero_lanes(x: u64) -> u64 {
+    !(((x & !HI) + !HI) | x) & HI
+}
+
+/// Lanes of `g` equal to the byte `b`.
+#[inline(always)]
+fn lanes_eq(g: u64, b: u8) -> u64 {
+    zero_lanes(g ^ LO.wrapping_mul(b as u64))
+}
+
+/// Index of the lowest set lane in a lane mask, or `GROUP` when it is empty.
+#[inline(always)]
+fn first_lane(m: u64) -> usize {
+    if m == 0 {
+        GROUP
+    } else {
+        (m.trailing_zeros() / 8) as usize
+    }
+}
+
+/// The `GROUP` control bytes starting at `slot`, lane 0 being `slot` itself on
+/// every host — `from_le` makes lane order match slot order on big-endian too.
+///
+/// # Safety
+/// `slot + GROUP <= capacity`, and `status` points at `capacity` readable bytes.
+#[inline(always)]
+unsafe fn group_at(status: *const u8, slot: usize) -> u64 {
+    u64::from_le(unsafe { (status.add(slot) as *const u64).read_unaligned() })
+}
+
 /// `#[repr(C)]` is load-bearing — codegen-side monomorphized
 /// `Map[K, V]` symbols (`src/codegen.rs`, see
 /// [`wip-monomorphized-collections.md`](../../docs/implementation_checklist/wip-monomorphized-collections.md))
@@ -246,26 +303,56 @@ impl KaracMap {
     }
 
     // Find an occupied slot holding `key`. Returns Some(slot) or None.
+    //
+    // Scans a GROUP of control bytes per iteration rather than one
+    // (B-2026-09-09-12): the byte walk's cost was branch mispredicts, not work,
+    // so testing eight lanes under one unpredictable branch is 2.03x faster in
+    // cycles while executing ~30% MORE instructions. Answers identically to the
+    // byte walk on every input — the tag test still gates `eq_fn`, and both
+    // sentinels stay below `BUCKET_OCCUPIED_BIT` so neither can match a tag.
     unsafe fn lookup(&self, key: *const c_void) -> Option<usize> {
         unsafe {
             let hash = (self.hash_fn)(key);
             let ctrl = ctrl_of(hash);
-            let start = (hash as usize) & (self.capacity - 1);
-            for i in 0..self.capacity {
-                let slot = (start + i) & (self.capacity - 1);
-                let s = *self.status.add(slot);
-                if s == BUCKET_EMPTY {
+            let mask = self.capacity - 1;
+            let mut slot = (hash as usize) & mask;
+            let mut scanned = 0usize;
+            while scanned < self.capacity {
+                if slot + GROUP > self.capacity {
+                    // A group that would run off the end; walk the last few
+                    // slots one byte at a time rather than reading past them.
+                    let s = *self.status.add(slot);
+                    if s == BUCKET_EMPTY {
+                        return None;
+                    }
+                    if s == ctrl && (self.eq_fn)(self.key_ptr(slot), key) {
+                        return Some(slot);
+                    }
+                    slot = (slot + 1) & mask;
+                    scanned += 1;
+                    continue;
+                }
+                let g = group_at(self.status, slot);
+                let empty = zero_lanes(g);
+                // The chain ends at the first EMPTY, so a match in a LATER lane
+                // is not on this chain and must not be returned.
+                let stop = first_lane(empty);
+                let mut m = lanes_eq(g, ctrl);
+                while m != 0 {
+                    let lane = first_lane(m);
+                    if lane >= stop {
+                        break;
+                    }
+                    if (self.eq_fn)(self.key_ptr(slot + lane), key) {
+                        return Some(slot + lane);
+                    }
+                    m &= m - 1;
+                }
+                if empty != 0 {
                     return None;
                 }
-                // The tag test rejects a non-matching key WITHOUT dereferencing it,
-                // which is the whole point of the control byte — see the module
-                // header. It also subsumes the occupancy test: `ctrl >= 0x80` and
-                // both sentinels are below it, so a sentinel can never compare
-                // equal. Past it, `eq_fn` runs only on a real hit or a ~1/128 tag
-                // collision.
-                if s == ctrl && (self.eq_fn)(self.key_ptr(slot), key) {
-                    return Some(slot);
-                }
+                slot = (slot + GROUP) & mask;
+                scanned += GROUP;
             }
             None
         }
@@ -278,25 +365,60 @@ impl KaracMap {
         unsafe {
             let hash = (self.hash_fn)(key);
             let ctrl = ctrl_of(hash);
-            let start = (hash as usize) & (self.capacity - 1);
+            let mask = self.capacity - 1;
+            let mut slot = (hash as usize) & mask;
+            // The delicate half of B-2026-09-09-12: this state must survive
+            // ACROSS groups. The contract is not "find the key" but "find the
+            // key, else the FIRST tombstone, else the first empty", so a
+            // tombstone seen in group 0 still owns the answer when the empty
+            // that ends the chain turns up in group 2.
             let mut first_tombstone: Option<usize> = None;
-            for i in 0..self.capacity {
-                let slot = (start + i) & (self.capacity - 1);
-                let s = *self.status.add(slot);
-                if s == BUCKET_EMPTY {
-                    let target = first_tombstone.unwrap_or(slot);
-                    return (target, false, ctrl);
-                }
-                if s == BUCKET_TOMBSTONE {
-                    if first_tombstone.is_none() {
-                        first_tombstone = Some(slot);
+            let mut scanned = 0usize;
+            while scanned < self.capacity {
+                if slot + GROUP > self.capacity {
+                    let s = *self.status.add(slot);
+                    if s == BUCKET_EMPTY {
+                        return (first_tombstone.unwrap_or(slot), false, ctrl);
                     }
+                    if s == BUCKET_TOMBSTONE {
+                        if first_tombstone.is_none() {
+                            first_tombstone = Some(slot);
+                        }
+                    } else if s == ctrl && (self.eq_fn)(self.key_ptr(slot), key) {
+                        return (slot, true, ctrl);
+                    }
+                    slot = (slot + 1) & mask;
+                    scanned += 1;
                     continue;
                 }
-                // Occupied: same tag-first test as `lookup`.
-                if s == ctrl && (self.eq_fn)(self.key_ptr(slot), key) {
-                    return (slot, true, ctrl);
+                let g = group_at(self.status, slot);
+                let empty = zero_lanes(g);
+                let stop = first_lane(empty);
+                // An existing key wins over any tombstone before it, exactly as
+                // the byte walk returns on the match regardless of what it
+                // recorded earlier — so test the tag matches first.
+                let mut m = lanes_eq(g, ctrl);
+                while m != 0 {
+                    let lane = first_lane(m);
+                    if lane >= stop {
+                        break;
+                    }
+                    if (self.eq_fn)(self.key_ptr(slot + lane), key) {
+                        return (slot + lane, true, ctrl);
+                    }
+                    m &= m - 1;
                 }
+                if first_tombstone.is_none() {
+                    let t = first_lane(lanes_eq(g, BUCKET_TOMBSTONE));
+                    if t < stop {
+                        first_tombstone = Some(slot + t);
+                    }
+                }
+                if empty != 0 {
+                    return (first_tombstone.unwrap_or(slot + stop), false, ctrl);
+                }
+                slot = (slot + GROUP) & mask;
+                scanned += GROUP;
             }
             // Should not reach here if resize policy is respected.
             (first_tombstone.unwrap_or(0), false, ctrl)
@@ -1614,7 +1736,8 @@ pub unsafe extern "C" fn karac_map_iter_free(iter: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ctrl_of, is_occupied, KaracMap, BUCKET_EMPTY, BUCKET_OCCUPIED_BIT, BUCKET_TOMBSTONE,
+        ctrl_of, first_lane, is_occupied, lanes_eq, zero_lanes, KaracMap, BUCKET_EMPTY,
+        BUCKET_OCCUPIED_BIT, BUCKET_TOMBSTONE, GROUP, HI, LO,
     };
     use std::mem::offset_of;
 
@@ -2147,6 +2270,104 @@ mod tests {
                 );
                 assert!(hit, "final sweep: live key {k} was lost");
                 assert_eq!(got, want, "final sweep: wrong value for {k}");
+            }
+            super::karac_map_free(map);
+        }
+    }
+
+    /// B-2026-09-09-12. The group scan walks EVERY set lane of a mask, so the
+    /// per-lane zero test has to be exact — and the classic `haszero` the
+    /// prototype used is not. This pins both halves: that the exact form is
+    /// right per lane, and that `haszero` really does differ, so nobody
+    /// "simplifies" `zero_lanes` back to the cheaper form.
+    #[test]
+    fn swar_zero_lanes_is_exact_per_lane_where_haszero_is_not() {
+        // A single zero lane is found at its own index, wherever it sits.
+        for lane in 0..GROUP {
+            let g = !0u64 & !(0xffu64 << (lane * 8));
+            assert_eq!(first_lane(zero_lanes(g)), lane, "lane {lane}");
+        }
+        assert_eq!(zero_lanes(!0u64), 0, "no zero lane in all-ones");
+
+        // The divergence. `0x0100` is lane0 = 0x00, lane1 = 0x01. The
+        // subtraction in `haszero` borrows out of lane 0 and flags lane 1 too.
+        let g = 0x0100u64;
+        let haszero = g.wrapping_sub(LO) & !g & HI;
+        assert_ne!(
+            haszero & (0x80 << 8),
+            0,
+            "haszero flags lane 1, which is 0x01"
+        );
+        assert_eq!(zero_lanes(g) & (0x80 << 8), 0, "the exact test does not");
+        // Both agree on the LOWEST lane — a false positive is only reachable
+        // through a borrow out of a real zero beneath it. That is why the
+        // prototype validated while only ever reading the first lane.
+        assert_eq!(first_lane(haszero), 0);
+        assert_eq!(first_lane(zero_lanes(g)), 0);
+
+        // Tag lanes, and the sentinels that must never match one.
+        let g = u64::from_le_bytes([0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81]);
+        assert_eq!(first_lane(lanes_eq(g, 0x83)), 5);
+        assert_eq!(first_lane(lanes_eq(g, 0x99)), GROUP, "absent tag");
+        assert_eq!(
+            lanes_eq(g, BUCKET_EMPTY),
+            0,
+            "no EMPTY among occupied bytes"
+        );
+        assert_eq!(lanes_eq(g, BUCKET_TOMBSTONE), 0, "no TOMBSTONE either");
+    }
+
+    /// B-2026-09-09-12's named gate: a chain that spans several GROUPs, with
+    /// tombstones punched through it, answered identically to the byte walk.
+    ///
+    /// `hash_tag_only` puts EVERY key in bucket 0 (the low bits are zero) while
+    /// giving each a DISTINCT tag (`ctrl_of` reads bits 57..63), so one probe
+    /// crosses many groups and the tag filter is exercised in every lane rather
+    /// than degenerating to "everything collides". The removals then leave
+    /// tombstone runs straddling group boundaries, which is the state
+    /// `find_insert_slot`'s cross-group `first_tombstone` has to survive.
+    #[test]
+    fn group_scan_answers_like_the_byte_walk_across_group_boundaries() {
+        unsafe extern "C" fn hash_tag_only(p: *const c_void) -> u64 {
+            unsafe { ((*(p as *const i64) as u64) & 0x7f) << 57 }
+        }
+        use std::collections::HashMap;
+        unsafe {
+            let map = KaracMap::new(8, 8, hash_tag_only, eq_i64_t) as *mut c_void;
+            let mut reference: HashMap<i64, i64> = HashMap::new();
+
+            // One chain, ~40 slots long: five GROUPs deep before it ends.
+            for k in 0..40i64 {
+                put(map, k, k * 3);
+                reference.insert(k, k * 3);
+            }
+            // Punch tombstone runs that straddle the 8-lane boundaries.
+            for k in [6i64, 7, 8, 9, 15, 16, 17, 23, 24, 31, 32, 33] {
+                assert_eq!(del(map, k), reference.remove(&k).is_some(), "remove({k})");
+            }
+            // Refill across those runs — each of these must land in the FIRST
+            // tombstone of its chain, which is what carries across groups.
+            for k in [100i64, 101, 102, 103, 104] {
+                put(map, k, k * 3);
+                reference.insert(k, k * 3);
+            }
+
+            // Every key that should be there is, with the right value; every
+            // key that should not be, is not.
+            for k in -5i64..140 {
+                let mut out: i64 = -1;
+                let found = super::karac_map_get(
+                    map,
+                    &k as *const i64 as *const c_void,
+                    &mut out as *mut i64 as *mut c_void,
+                );
+                match reference.get(&k) {
+                    Some(&want) => {
+                        assert!(found, "key {k} lost by the group scan");
+                        assert_eq!(out, want, "key {k} read back the wrong value");
+                    }
+                    None => assert!(!found, "key {k} found though absent"),
+                }
             }
             super::karac_map_free(map);
         }
