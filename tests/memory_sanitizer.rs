@@ -84272,4 +84272,69 @@ fn main() {
             "b14-bound-spelling-control",
         );
     }
+
+    /// B-2026-09-09-9 — the shapes the nested-indexed-read fix newly makes
+    /// buildable, under ASAN.
+    ///
+    /// Every cell here refused to compile before the fix ("nested indexed read
+    /// on '<x>' — element TypeExpr unknown"), so none of them had ever executed
+    /// on a compiled backend: widening what builds is exactly the change that
+    /// needs a memory gate behind it, since a program that never linked cannot
+    /// have been leaking. All four are valgrind-clean at `KARAC_OPT_LEVEL=0`
+    /// and `2` alike.
+    ///
+    /// The cells were CHOSEN by measuring, not assumed. Two neighbouring shapes
+    /// that the same fix unblocks are deliberately absent because they are NOT
+    /// clean at `-O0` — a user-enum `Array[Vec[String], 2]` payload loses 48 B
+    /// in 1 block, and an `Array[String, 2]` payload indexed once loses 18 B in
+    /// 2. The second needs no part of this fix to build (a single index never
+    /// reaches the nested-read path), which is what places both in the
+    /// pre-existing Array-element-interior class rather than in this one.
+    #[test]
+    fn asan_nested_indexed_read_on_an_array_outer_owns_its_elements() {
+        // 1 — the row's own shape: an `Array[Vec[String], N]` bound out of an
+        //     `Option` arm and read two levels deep.
+        assert_clean_asan_run(
+            "fn plainV(x: Option[Array[Vec[String], 2]]) {\n\
+             \x20   match x { Some(t) => { println(f\"s:{t[0][0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainV(Some(a));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b9-arm-array-vec-string",
+        );
+        // 2 — no arm at all. A plain annotated `let` failed identically, so the
+        //     arm was never the discriminator and this cell is the base case.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   println(f\"s:{a[0][0]}\");\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b9-annotated-let-base",
+        );
+        // 3 — the array crosses a call boundary as an owned param, so the
+        //     callee frame is the one doing the two-level read.
+        assert_clean_asan_run(
+            "fn takes(a: Array[Vec[String], 2]) { println(f\"s:{a[0][0]}\"); }\n\
+             fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   takes(a);\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b9-fn-param-base",
+        );
+        // 4 — both levels arrays. No heap at all, so this one is about the
+        //     synth minted for the inner element not outliving its owner.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let a: Array[Array[i64, 2], 2] = [[10, 11], [20, 21]];\n\
+             \x20   println(f\"s:{a[1][0]}\");\n\
+             }\n",
+            &["s:20"],
+            "b9-array-of-array",
+        );
+    }
 }

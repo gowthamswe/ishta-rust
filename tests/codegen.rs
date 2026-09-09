@@ -152663,6 +152663,155 @@ fn main() {
         }
     }
 
+    /// B-2026-09-09-9 — a nested indexed read whose OUTER is an `Array[T, N]`
+    /// was rejected by codegen on every compiled backend while `--interp` ran
+    /// the program: `error: codegen: nested indexed read on 'a' — element
+    /// TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, a
+    /// message that names Array as tracked while Array was the one hole.
+    ///
+    /// TWO registrations were missing, and only the first is what the row
+    /// suspected:
+    ///
+    ///   * `compile_nested_index_read` read only `var_elem_type_exprs`, and an
+    ///     `Array` records its element in `array_elem_type_exprs` instead. The
+    ///     indexed-RECEIVER path took exactly this fallback in B-2026-08-11-1;
+    ///     the nested-read path, which shares the diagnostic text, never did.
+    ///     That alone accounts for cells 4, 5 and 6 — a plain annotated `let`,
+    ///     an `Array` fn param and an array of arrays — which is why the base
+    ///     is NOT the discriminator: nothing about a `match` arm was required
+    ///     to hit this, and `a[i][j]` over an array was unreachable everywhere.
+    ///
+    ///   * a `match`-arm payload binding registered no element type at all,
+    ///     because `bind_pattern_values` had no `"Array"` arm beside its
+    ///     `Vec` / `Slice` ones. Cells 1–3.
+    ///
+    /// The arm registration then needed `array_inner_type_expr` widened: an
+    /// array has two `TypeExpr` spellings — the parser's `Path(["Array"], ..)`
+    /// for a written annotation, and the structural `TypeKind::Array` node for
+    /// anything the TYPECHECKER inferred — and the resolver knew only the
+    /// written one. A payload binding's type always comes from the typechecker,
+    /// so the arm peeled `None` and registered nothing until both spellings
+    /// answered.
+    ///
+    /// Cells 7 and 8 are the hazards. A single index on an arm-bound array and
+    /// a `Vector[T, N]` payload both already worked, and the new arm keys on
+    /// `"Array"` alone so the vector — whose surface name is recorded by the
+    /// same typechecker site — must stay out of it.
+    ///
+    /// NOT covered here, deliberately: the REBIND spelling (`let b = a;` /
+    /// `Some(t) => { let u = t; u[i][j] }`) still refuses. Carrying the element
+    /// type across a bare rebind makes it compile, and what it then compiles to
+    /// is a double free at `-O0` — `Array[Vec[T], N]` rebinding duplicates the
+    /// element owners, which is live on `main` today for a rebind with no index
+    /// in it at all. Turning a loud refusal into silent corruption is a worse
+    /// trade than the refusal, so that spelling waits on the ownership row.
+    #[test]
+    fn e2e_nested_indexed_read_reaches_an_array_outer() {
+        for (label, src, want) in [
+            // 1 — the row's own shape: an `Array[Vec[String], N]` payload bound
+            //     out of an `Option` arm, read two levels deep.
+            (
+                "arm-array-vec-string",
+                "fn plainV(x: Option[Array[Vec[String], 2]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[0][0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainV(Some(a));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 2 — the same arm with a SCALAR element, so the gap is not about
+            //     the element being heap-bearing.
+            (
+                "arm-array-vec-i64",
+                "fn plainV(x: Option[Array[Vec[i64], 2]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[0][1]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+                 \x20   plainV(Some(a));\n\
+                 }\n",
+                "s:11\n",
+            ),
+            // 3 — a USER enum payload rather than `Option`, which reaches the
+            //     same binding site by a different variant path.
+            (
+                "user-enum-array-payload",
+                "enum E { A(Array[Vec[String], 2]), B }\n\
+                 fn plainE(x: E) {\n\
+                 \x20   match x { E.A(t) => { println(f\"s:{t[1][0]}\") } E.B => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\"], [f\"bbbbbbbb0\", f\"bbbbbbbb1\"]];\n\
+                 \x20   plainE(E.A(a));\n\
+                 }\n",
+                "s:bbbbbbbb0\n",
+            ),
+            // 4 — no arm anywhere. A plain annotated `let` failed identically,
+            //     which is what refutes the row's "the base is the variable".
+            (
+                "annotated-let-base",
+                "fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   println(f\"s:{a[0][0]}\");\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 5 — an `Array` FN PARAM, the third base with the same miss.
+            (
+                "fn-param-base",
+                "fn takes(a: Array[Vec[String], 2]) { println(f\"s:{a[0][0]}\"); }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   takes(a);\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 6 — both levels are arrays, so the synth minted for the inner
+            //     element is itself registered from the array table.
+            (
+                "array-of-array",
+                "fn main() {\n\
+                 \x20   let a: Array[Array[i64, 2], 2] = [[10, 11], [20, 21]];\n\
+                 \x20   println(f\"s:{a[1][0]}\");\n\
+                 }\n",
+                "s:20\n",
+            ),
+            // 7 — HAZARD: a SINGLE index on an arm-bound array already worked
+            //     (it never reaches the nested-read path), so the new
+            //     registration must leave it exactly as it was.
+            (
+                "single-index-arm-control",
+                "fn plainV(x: Option[Array[i64, 3]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[2]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() { plainV(Some([7, 8, 9])); }\n",
+                "s:9\n",
+            ),
+            // 8 — HAZARD: `Vector[T, N]` records its surface name at the same
+            //     typechecker site as `Array` and shares the width path, but it
+            //     is NOT an array and must not enter the array table.
+            (
+                "vector-payload-control",
+                "enum E { V(Vector[i64, 4]), N }\n\
+                 fn plainE(x: E) {\n\
+                 \x20   match x { E.V(v) => { println(f\"s:{v}\") } E.N => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vector[i64, 4] = Vector[i64, 4](1, 2, 3, 4);\n\
+                 \x20   plainE(E.V(v));\n\
+                 }\n",
+                "s:Vector(1, 2, 3, 4)\n",
+            ),
+        ] {
+            let Some(out) = run_program(src) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by

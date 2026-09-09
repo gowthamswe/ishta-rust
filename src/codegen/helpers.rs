@@ -150,6 +150,23 @@ pub(super) fn vec_inner_type_expr(te: &TypeExpr) -> Option<TypeExpr> {
 /// (via `infer_elem_from_source`, which reads the array slot) while leaving its
 /// NAME unbound — the asymmetry that emits a shared `karac_clone_T`.
 pub(super) fn array_inner_type_expr(te: &TypeExpr) -> Option<TypeExpr> {
+    // A fixed array has TWO `TypeExpr` spellings and this resolver knew only
+    // one (B-2026-09-09-9). The PARSER builds `Path(["Array"], [T, N])` from a
+    // written `Array[T, N]` annotation; `type_to_type_expr`, which is how any
+    // type INFERRED by the typechecker reaches codegen, builds the structural
+    // `TypeKind::Array { element, size }` node instead. Both mean `Array[T, N]`
+    // — the doc comment above describes them both — so answering for only the
+    // written one made every element lookup depend on whether the array's type
+    // had been spelled out at that binding, which is not a distinction any
+    // caller here intends.
+    //
+    // Measured on the `match`-arm payload binding, whose type comes from the
+    // typechecker and so is always the structural node: the arm registered no
+    // element type, and `t[i][j]` over an `Array` payload refused to compile
+    // while `--interp` ran it.
+    if let TypeKind::Array { element, .. } = &te.kind {
+        return Some((**element).clone());
+    }
     if let TypeKind::Path(path) = &te.kind {
         if path.segments.last().map(|s| s.as_str()) == Some("Array") {
             if let Some(args) = &path.generic_args {

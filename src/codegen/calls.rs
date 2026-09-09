@@ -1461,6 +1461,27 @@ impl<'ctx> super::Codegen<'ctx> {
             .var_types
             .var_elem_type_exprs
             .get(outer_name.as_str())
+            // B-2026-09-09-9 — the same `array_elem_type_exprs` fallback the
+            // indexed-RECEIVER path took in B-2026-08-11-1, one call site over.
+            // An `Array[T, N]` records its element `TypeExpr` in its OWN table,
+            // so the shared lookup above misses EVERY array outer and this
+            // diagnostic fired on a variable that is exactly the "Array" its
+            // own message named. The two paths share the message and the miss;
+            // only the receiver half had been fixed.
+            //
+            // The base is NOT the discriminator the ledger row proposed: a
+            // plain annotated `let a: Array[Vec[i64], 2]`, an `Array` fn param
+            // and a `match`-arm-bound payload all failed identically, so
+            // `a[i][j]` over an array was unreachable on every compiled backend
+            // while `--interp` ran it. Reading the array table here rather than
+            // widening `var_elem_type_exprs` keeps that table's ~170 readers —
+            // which treat a present entry as "this binding is a Vec/Slice/Map"
+            // — seeing exactly what they saw before.
+            .or_else(|| {
+                self.var_types
+                    .array_elem_type_exprs
+                    .get(outer_name.as_str())
+            })
             .cloned()
             .ok_or_else(|| {
                 format!(

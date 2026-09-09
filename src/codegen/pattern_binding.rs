@@ -524,6 +524,33 @@ impl<'ctx> super::Codegen<'ctx> {
                                     .slice_elem_types
                                     .insert(name.clone(), elem_llvm);
                             }
+                            // B-2026-09-09-9 — an `Array[T, N]` payload binding
+                            // records its element type in the array-only table.
+                            //
+                            // `inner_te` here is the WHOLE `Array[T, N]` (the
+                            // typechecker records the full type for an array,
+                            // not the element, because `pattern_payload_word_count`
+                            // needs the width), so peel `T` off it rather than
+                            // using it directly the way the Vec arm does.
+                            //
+                            // `array_elem_type_exprs`, never `var_elem_type_exprs`:
+                            // the split is deliberate (that table's readers treat a
+                            // present entry as "this binding is a Vec/Slice/Map"),
+                            // and the consumers that need an array's element read
+                            // the array table. Nothing else is registered — an
+                            // Array payload's slot, indexing and cleanup already
+                            // work off its LLVM array type, and this must not
+                            // divert any of that, the same argument the `let` and
+                            // param registrars make for writing only this table.
+                            "Array" => {
+                                if let Some(inner) =
+                                    crate::codegen::helpers::array_inner_type_expr(&inner_te)
+                                {
+                                    self.var_types
+                                        .array_elem_type_exprs
+                                        .insert(name.clone(), inner);
+                                }
+                            }
                             _ => {}
                         }
                     }
