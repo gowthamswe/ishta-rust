@@ -21,18 +21,64 @@
 # the store real, the same argument `asan-o0-leg.sh` makes for the allocator
 # gate. Override with ASAN_LEG_OPT_LEVEL if a level-specific question comes up.
 #
-# WHY A SEPARATE QUARANTINE LIST. This leg sees a strictly larger error class
-# than the -O0 leg, so its failure set is a superset and cannot share that
-# list — merging them would let an access-checking regression hide behind an
-# allocator-class quarantine entry. Same ratchet in both directions: an unlisted
-# failure is red, and a listed fixture that starts PASSING is red too. Every
-# entry names the bug row that owns it; the list only shrinks.
+# WHY A SEPARATE QUARANTINE LIST. The two legs see DIFFERENT error classes, so
+# their failure sets cannot share a list — merging them would let an
+# access-checking regression hide behind an allocator-class quarantine entry.
+# Same ratchet in both directions: an unlisted failure is red, and a listed
+# fixture that starts PASSING is red too. Every entry names the bug row that
+# owns it; the list only shrinks.
+#
+# NOT A SUPERSET, AND NOT A LEAK GATE (B-2026-09-08-12, measured 2026-09-09).
+# This header used to claim the leg sees "a strictly LARGER error class than the
+# -O0 leg, so its failure set is a superset". That is FALSE, in both directions,
+# and the correction matters because the natural next move — "the strict leg is
+# green, so the leak must be gone" — is wrong.
+#
+# Reproduced by reverse-applying 730ae1828 (the B-2026-09-08-7 weak-slot fix) to
+# resurrect its 24-byte `Vec[Vec[weak N]]` leak, then running all three legs:
+#
+#     fixture                       default   -O0    instrumented
+#     nested `Vec[Vec[weak N]]`      FAIL     pass       pass
+#     `Map[K, Vec[weak V]]` stash    FAIL     FAIL       pass
+#
+# MECHANISM, which that row left unchased. It is not codegen perturbation — the
+# leak still happens under instrumentation; only the REPORT is lost. It is
+# LeakSanitizer's conservative STACK root scan: ASAN's stack instrumentation
+# leaves a copy of the pointer in a frame that is still live at exit (`main`),
+# so LSan reaches the block and classifies it reachable rather than lost.
+# Single-variable A/B on the second fixture above:
+#
+#     LSAN_OPTIONS=(default)      pass    — leak hidden
+#     LSAN_OPTIONS=use_stacks=0   FAIL    — leak reported
+#     LSAN_OPTIONS=use_registers=0 pass   — stack specifically, not registers
+#
+# DO NOT "FIX" THIS WITH use_stacks=0. Measured over the full suite: the current
+# default is 1564 passed / 0 failed, and `use_stacks=0` is 1530 / 34 failed.
+# Those 34 are FALSE POSITIVES, not hidden leaks — under valgrind, matched to
+# this harness's auto-par-ON build, every one spot-checked reports `definitely
+# lost: 0 bytes` with 1,216-1,444 bytes only `possibly lost`, i.e. reachable
+# through an interior pointer. The shared ~1,216-byte floor is the auto-par
+# runtime's own state. Dropping stack roots reclassifies that as leaked.
+#
+# SO: THIS LEG IS AN ACCESS GATE, NOT A LEAK GATE. It exists for the invalid
+# read/write class the allocator-only legs are structurally blind to, which is
+# what the paragraphs above describe. A GREEN RUN HERE IS NOT EVIDENCE THAT A
+# LEAK IS GONE — the DEFAULT and -O0 legs own that question.
 #
 # The mechanism has its own positive control INSIDE the suite:
 # `asan_instrumentation_tracks_the_sanitize_address_knob` asserts the emitted
 # object carries an `__asan_report*` reference exactly when the knob is set. It
 # is not skippable, so a knob that silently stopped instrumenting fails this leg
 # rather than turning it green over an uninstrumented run.
+#
+# WHAT CAN AND CANNOT BE QUARANTINED (B-2026-09-08-12). A fixture for an open
+# defect can only live in the tree if it fails ONLY this leg and/or the -O0 leg,
+# because those are the two legs with an expected-failures list. One that fails
+# the DEFAULT `--features llvm` leg cannot be quarantined at all — that leg has
+# no list — so it is simply red CI and has to be removed. That asymmetry is why
+# a known-broken shape sometimes has NO fixture at all, and it is worth knowing
+# before writing one: check the default leg FIRST, or the fixture may have to be
+# deleted after it is written.
 #
 # Usage:
 #   scripts/asan-instrumented-leg.sh                  # full leg
