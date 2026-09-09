@@ -517,6 +517,13 @@ pub(super) fn run_ir_via_jit_subprocess(ir: &str, program_argv: &[String]) -> i3
         .arg(&ir_path)
         .env("KARAC_PROGRAM_ARGS", program_argv.join("\u{1F}"))
         .env("KARAC_JIT_IR_UNLINK", "1")
+        // Our OWN pid, so the runner's watchdog watches the process that
+        // actually spawned it rather than whatever `getppid()` happens to
+        // report by the time it looks (B-2026-09-09-1).
+        .env(
+            crate::test_jit_dispatch::SPAWNER_PID_ENV,
+            std::process::id().to_string(),
+        )
         .spawn();
     let mut child = match child {
         Ok(c) => c,

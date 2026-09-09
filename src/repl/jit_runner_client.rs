@@ -66,6 +66,10 @@ impl ReplRunnerClient {
         })?;
         let mut child = Command::new(&path)
             .arg("--repl-mode")
+            .env(
+                crate::test_jit_dispatch::SPAWNER_PID_ENV,
+                std::process::id().to_string(),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

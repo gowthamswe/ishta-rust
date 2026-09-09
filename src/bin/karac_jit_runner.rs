@@ -217,13 +217,52 @@ fn watch_for_parent_death() {
     if std::env::var_os("KARAC_JIT_RUNNER_NO_PARENT_WATCH").is_some() {
         return;
     }
+    // WHICH pid to watch. `getppid()` alone is a RACE, and B-2026-09-09-1 is
+    // what it looks like when it loses: between the spawner's `spawn()`
+    // returning and this line running, the spawner can already have died and
+    // left us reparented, so `getppid()` reports the REAPER instead of the
+    // process we were meant to watch. The old code then hit its `spawner <= 1`
+    // guard and returned WITHOUT ARMING, on the reasoning that there was
+    // "nothing left to watch" — exactly backwards, because being orphaned
+    // before you look means the parent is already gone and this process should
+    // be leaving. Measured under CPU load, 2 runs in 6 were orphaned
+    // PERMANENTLY (alive at 120 s against the test's 15 s window), each with a
+    // single thread: the watchdog had never been spawned.
+    //
+    // So prefer the pid the spawner DECLARED for itself. If we are no longer
+    // its child by the time we look, it is gone and we exit now rather than
+    // arming a watch that would never fire.
+    let declared = std::env::var(karac::test_jit_dispatch::SPAWNER_PID_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+        .filter(|p| *p > 1);
+    // Remove it before the JIT'd program runs: anything IT spawns would
+    // otherwise inherit a pid that is not its parent's and exit immediately.
+    std::env::remove_var(karac::test_jit_dispatch::SPAWNER_PID_ENV);
+
     // SAFETY: `getppid` is a pure read of process state and cannot fail.
-    let spawner = unsafe { libc::getppid() };
-    if spawner <= 1 {
-        // Already reparented to init (or no meaningful parent): there is
-        // nothing left to watch, and watching would fire immediately.
-        return;
-    }
+    let spawner = match declared {
+        Some(declared) => {
+            if unsafe { libc::getppid() } != declared {
+                // Orphaned before we could arm. Same exit code and same
+                // reasoning as the watchdog below.
+                unsafe { libc::_exit(129) };
+            }
+            declared
+        }
+        None => {
+            // Hand-launched, or spawned by a site that predates the variable:
+            // fall back to the observed parent. `<= 1` stays a plain return
+            // here rather than an exit, because without a declared pid there is
+            // no way to tell "orphaned already" from "init really is my parent",
+            // and exiting on the latter would be a regression.
+            let observed = unsafe { libc::getppid() };
+            if observed <= 1 {
+                return;
+            }
+            observed
+        }
+    };
     let _ = std::thread::Builder::new()
         .name("karac-parent-watch".to_string())
         .stack_size(64 * 1024)

@@ -271,6 +271,24 @@ fn build_skeleton(module_program: &Program) -> Program {
 /// runner looks up). NOT `main` — see `build_test_main_ir`.
 pub const TEST_MAIN_SYMBOL: &str = "__karac_test_entry";
 
+/// Environment variable carrying the SPAWNER's own pid to `karac_jit_runner`,
+/// set by every site that spawns it.
+///
+/// The runner's parent-death watchdog cannot learn this from `getppid()`
+/// alone, because that is a RACE (B-2026-09-09-1): between `spawn()` returning
+/// and the runner reaching its watchdog setup, the spawner can already have
+/// died and left the runner reparented — and `getppid()` then reports the
+/// REAPER rather than the process the runner was meant to watch. The watchdog
+/// read that as "no meaningful parent, nothing to watch" and returned without
+/// arming, which is exactly backwards: being orphaned before you look means the
+/// parent is already gone. Measured under load, 2 runs in 6 were orphaned
+/// PERMANENTLY (still alive at 120 s, against a 15 s test window), each with
+/// only one thread — the watchdog had never been spawned.
+///
+/// The runner REMOVES this from its own environment once read, so a process the
+/// JIT'd program itself spawns cannot inherit a stale pid and exit on it.
+pub const SPAWNER_PID_ENV: &str = "KARAC_JIT_RUNNER_SPAWNER_PID";
+
 /// Persistent JIT test runner (cold-start amortization). Holds one
 /// `karac_jit_runner --test-batch` subprocess that runs every test in the
 /// suite, paying LLVM target init + engine construction ONCE instead of
@@ -373,6 +391,7 @@ impl TestBatchRunner {
         let mut child = Command::new(&runner_path)
             .arg("--test-batch")
             .arg(&self.prefix)
+            .env(SPAWNER_PID_ENV, std::process::id().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
