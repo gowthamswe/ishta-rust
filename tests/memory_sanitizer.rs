@@ -83758,4 +83758,171 @@ fn main() {{
             "b67-struct-payload-control",
         );
     }
+
+    /// B-2026-09-06-72 — a `shared` FIELD's 16-byte refcount block when the
+    /// owning struct travels out of a function inside an AGGREGATE.
+    ///
+    /// `__karac_drop_struct_<T>` skips a direct `shared` / `Option[shared]`
+    /// scalar field by design (B-2026-06-14-28 #3): those are refcount
+    /// machinery, and the contract is that the value's OWN cleanup rc-decs
+    /// them. A struct `let` honours it (`track_struct_var_inst` registers the
+    /// combined drop), which is why `return r;` was always clean. Three
+    /// channels that are likewise a value's only cleanup did not, and each
+    /// resolved the memory drop with the bare value synthesis:
+    ///
+    ///   * a TUPLE element — `emit_tuple_elem_drops`;
+    ///   * a BOXED enum payload — `track_boxed_enum_var` (the `Option` cell);
+    ///   * the memory dispatcher's Drop-bearing-struct guard, which the inline
+    ///     `Result`/`Option` payload drop funnels through (the `Result` cell).
+    ///
+    /// All three now ask `sole_owner_struct_memory_drop`.
+    ///
+    /// The `Drop` BODY was correct on every surface at both opt levels
+    /// throughout — this is memory only, so a body-count assertion would not
+    /// have caught it and does not guard it. The leak is what these assert.
+    ///
+    /// `-O2` hid every cell (the block is dead-store-eliminated once nothing
+    /// reads it), which is the B-2026-09-07-36 rule: an `-O2`-only zero is
+    /// evidence of nothing for a leak-class cell.
+    ///
+    /// SO THIS FIXTURE'S GUARD IS THE `-O0` LEG, not the default one, and that
+    /// is stated rather than assumed: measured against the pre-fix compiler it
+    /// PASSES on the default `-O2` run (LSan sees nothing, because the block
+    /// was never allocated) and FAILS under `scripts/asan-o0-leg.sh` with
+    /// `ERROR: LeakSanitizer` and exit 23. `assert_clean_asan_run` takes no
+    /// opt-level argument, so a reader checking this fixture on the default leg
+    /// alone would conclude it guards nothing — it is the -O0 leg that makes it
+    /// bite, exactly the case that leg exists for.
+    #[test]
+    fn asan_aggregate_returned_struct_releases_its_shared_field() {
+        // `RET` is the return type, `WRAP` the returned expression, `READ` a
+        // use of the payload — a never-read aggregate is dead-code-eliminated
+        // at `-O2` and would assert nothing there.
+        fn prog(ret: &str, wrap: &str, read: &str) -> String {
+            format!(
+                "shared struct Inner {{ v: i64 }}\n\
+                 struct R {{ id: i64, name: String, inner: Inner }}\n\
+                 impl Drop for R {{ fn drop(mut ref self) {{ println(f\"dR{{self.id}}\") }} }}\n\
+                 fn mk(i: i64) -> R {{ return R {{ id: i, name: f\"h{{i}}\", inner: Inner {{ v: i }} }}; }}\n\
+                 fn f(r: R) -> {ret} {{ return {wrap}; }}\n\
+                 fn main() {{ let z = f(mk(20)); {read} }}\n"
+            )
+        }
+
+        // 1-3 — the row's two cells plus the `Result` spelling found with them.
+        //       Each lost 16 B in 1 block at -O0 (12 allocs / 11 frees).
+        for (label, ret, wrap, read) in [
+            (
+                "b72-tuple",
+                "(R, i64)",
+                "(r, 9)",
+                "println(f\"{z.0.inner.v}\");",
+            ),
+            (
+                "b72-option",
+                "Option[R]",
+                "Option.Some(r)",
+                "match z { Option.Some(x) => println(f\"{x.inner.v}\"), Option.None => println(\"n\") }",
+            ),
+            (
+                "b72-result",
+                "Result[R, i64]",
+                "Result.Ok(r)",
+                "match z { Result.Ok(x) => println(f\"{x.inner.v}\"), Result.Err(e) => println(\"e\") }",
+            ),
+        ] {
+            assert_clean_asan_run(&prog(ret, wrap, read), &["20", "dR20"], label);
+        }
+
+        // 4 — the CONTROL that localized it: the same function returning the
+        //     struct BARE was clean before this change and must stay clean. A
+        //     regression here means the combined drop reached a value whose
+        //     `let` cleanup already rc-decs it, i.e. a double release.
+        assert_clean_asan_run(
+            &prog("R", "r", "println(f\"{z.inner.v}\");"),
+            &["20", "dR20"],
+            "b72-bare-return-control",
+        );
+
+        // 5 — UNBOUNDED, which is what makes a 16-byte leak worth fixing: the
+        //     block is lost once per evaluation, not once per program.
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn f(r: R) -> (R, i64) { return (r, 9); }\n\
+             fn main() { let mut i = 0; while i < 3 { let z = f(mk(i)); i = i + 1; } println(\"done\"); }\n",
+            &["dR0", "dR1", "dR2", "done"],
+            "b72-loop-unbounded",
+        );
+
+        // 6 — a DESTRUCTURE of the returned tuple. The element is moved out, so
+        //     `zero_tuple_elem_cap_at` must have disarmed the tuple's own walk
+        //     over the same slot; a mismatch between that dual and the drop is
+        //     a double free rather than a leak, and the tuple's route changed
+        //     here (it now takes the TypeExpr path, not the LLVM-type one).
+        assert_clean_asan_run(
+            &prog("(R, i64)", "(r, 9)", "").replace(
+                "let z = f(mk(20)); ",
+                "let (a, b) = f(mk(20)); println(f\"{a.inner.v}{b}\");",
+            ),
+            &["209", "dR20"],
+            "b72-destructure",
+        );
+
+        // 7 — a single-element move-out of the returned tuple into a by-value
+        //     callee, the other half of that dual.
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn f(r: R) -> (R, i64) { return (r, 9); }\n\
+             fn g(r: R) -> i64 { return r.inner.v; }\n\
+             fn main() { let z = f(mk(20)); let n = g(z.0); println(f\"{n}\"); }\n",
+            &["dR20", "20"],
+            "b72-elem-moveout",
+        );
+
+        // 8 — the aggregate return over a struct with NO shared field, and 9 —
+        //     the shared field spelled `Option[shared]`. The first is the
+        //     control that isolated the shared field as the cause (it was
+        //     clean throughout); the second is the sibling classification the
+        //     combined drop's pass 2 also covers, so a walker that handled one
+        //     and not the other would show up here.
+        assert_clean_asan_run(
+            "struct R2 { id: i64, name: String }\n\
+             impl Drop for R2 { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn mk2(i: i64) -> R2 { return R2 { id: i, name: f\"h{i}\" }; }\n\
+             fn f(r: R2) -> (R2, i64) { return (r, 9); }\n\
+             fn main() { let z = f(mk2(20)); println(f\"{z.0.id}\"); }\n",
+            &["20", "dR20"],
+            "b72-no-shared-field-control",
+        );
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Option[Inner] }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Option.Some(Inner { v: i }) }; }\n\
+             fn f(r: R) -> (R, i64) { return (r, 9); }\n\
+             fn main() { let z = f(mk(20)); println(\"ok\"); }\n",
+            &["dR20", "ok"],
+            "b72-option-shared-field",
+        );
+
+        // 10 — the same shape with NO `impl Drop` at all. It reaches a
+        //      different resolver (the dispatcher's guard is keyed on
+        //      `drop_method_keys`), and was already clean; it is here so a
+        //      later narrowing of that key cannot silently drop it.
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"h{i}\", inner: Inner { v: i } }; }\n\
+             fn f(r: R) -> (R, i64) { return (r, 9); }\n\
+             fn main() { let z = f(mk(20)); println(f\"{z.0.inner.v}\"); }\n",
+            &["20"],
+            "b72-no-user-drop",
+        );
+    }
 }

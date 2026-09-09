@@ -2079,8 +2079,24 @@ impl<'ctx> super::Codegen<'ctx> {
         //
         // Ordered struct-first so every existing struct payload keeps the exact
         // fn it resolved before; the enum arm only fills the `None`.
+        //
+        // B-2026-09-06-72 — and the struct arm owes the COMBINED drop when the
+        // payload owns a `shared` field. `__karac_drop_struct_<S>` skips a
+        // direct `shared` / `Option[shared]` scalar by design, on the contract
+        // (B-2026-06-14-28 #3) that the owner's own `let` cleanup rc-decs it —
+        // and a BOXED payload has no such cleanup, exactly as a `Vec` element
+        // and a tuple element do not. `vec_elem_agg_drop_for_type_expr` has
+        // routed the `Vec`-element spelling of this question to the combined
+        // drop since B-2026-06-14-28; this is the box asking it.
+        //
+        // Measured on `fn f(r: R) -> Option[R] { return Option.Some(r); }`:
+        // 16 B lost in 1 block at -O0 with the `Drop` body correct on every
+        // surface, and the same function returning `R` BARE clean — the bare
+        // return takes `track_struct_var_inst`, which honours the contract.
+        // `struct_owns_shared_field` reads `struct_field_type_exprs`, so it is
+        // `false` for the enum payload name below and that arm is untouched.
         let inner_drop_fn = inner_struct_name.and_then(|n| {
-            self.emit_struct_drop_synthesis(n)
+            self.sole_owner_struct_memory_drop(n)
                 .or_else(|| self.emit_enum_drop_switch(n))
         });
         self.track_boxed_enum_var_with_inner_drop(

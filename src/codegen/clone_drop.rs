@@ -1981,7 +1981,19 @@ impl<'ctx> super::Codegen<'ctx> {
                         .is_some_and(|prog| prog.drop_method_keys.contains_key(single.as_str()))
                 {
                     let single = single.clone();
-                    if let Some(f) = self.emit_struct_drop_synthesis(&single) {
+                    // B-2026-09-06-72 — through `sole_owner_struct_memory_drop`,
+                    // so a payload that owns a `shared` field gets the COMBINED
+                    // drop (value drop + rc-dec of the direct shared scalars
+                    // `__karac_drop_struct_<T>` skips by contract). Every caller
+                    // of this dispatcher is the sole cleanup for the value it
+                    // drops — the note on that helper's B-2026-09-03-31 half
+                    // states it — so there is no second owner to double-release
+                    // against. The reachable spelling is the inline
+                    // `Result`/`Option` payload drop
+                    // (`inline_struct_payload_drop`): `return Result.Ok(r)` lost
+                    // 16 B at -O0 while the tuple and `Option` spellings of the
+                    // same function, which reach their own channels, did too.
+                    if let Some(f) = self.sole_owner_struct_memory_drop(&single) {
                         return f;
                     }
                     // B-2026-08-03-10 — the fallback must NOT reuse `type_name`.

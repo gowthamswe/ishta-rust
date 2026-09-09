@@ -4736,7 +4736,24 @@ impl<'ctx> super::Codegen<'ctx> {
                                         .unwrap();
                                 }
                             } else if self.type_decls.struct_types.contains_key(&name) {
-                                if let Some(nested_drop_fn) = self.emit_struct_drop_synthesis(&name)
+                                // B-2026-09-06-72 — the COMBINED drop when the
+                                // element owns a `shared` field, for the reason
+                                // stated on `emit_vec_elem_struct_with_shared_drop_fn`
+                                // and restated by B-2026-09-03-31 for the user-drop
+                                // wrappers: `__karac_drop_struct_<S>` deliberately
+                                // SKIPS a direct `shared` / `Option[shared]` scalar,
+                                // on the contract that the owner's own cleanup
+                                // rc-decs it — and a tuple ELEMENT has no such
+                                // cleanup, exactly as a `Vec` element does not.
+                                // This walk IS the element's whole memory-side
+                                // cleanup, so it owes the rc-dec.
+                                //
+                                // Pass 1 (the value drop) and pass 2 (the shared
+                                // rc-decs) cover disjoint fields, so the combined
+                                // form cannot double-release what the value drop
+                                // already freed.
+                                if let Some(nested_drop_fn) =
+                                    self.sole_owner_struct_memory_drop(&name)
                                 {
                                     self.builder
                                         .build_call(nested_drop_fn, &[field_ptr.into()], "")
@@ -7478,7 +7495,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.builder
             .build_call(user_drop_fn, &[self_ptr.into()], "")
             .unwrap();
-        if let Some(field_drop_fn) = self.user_drop_wrapper_field_drop_fn_mono(type_name, subst) {
+        if let Some(field_drop_fn) = self.sole_owner_struct_memory_drop_mono(type_name, subst) {
             self.builder
                 .build_call(field_drop_fn, &[self_ptr.into()], "")
                 .unwrap();
@@ -7567,7 +7584,7 @@ impl<'ctx> super::Codegen<'ctx> {
         self.builder
             .build_call(bodies_fn, &[self_ptr.into()], "")
             .unwrap();
-        if let Some(field_drop_fn) = self.user_drop_wrapper_field_drop_fn_mono(type_name, subst) {
+        if let Some(field_drop_fn) = self.sole_owner_struct_memory_drop_mono(type_name, subst) {
             self.builder
                 .build_call(field_drop_fn, &[self_ptr.into()], "")
                 .unwrap();
@@ -8972,9 +8989,44 @@ impl<'ctx> super::Codegen<'ctx> {
                     // A `Vec[shared]` element has had this answer for a long
                     // time; this is the tuple asking the same question.
                     || self.shared_heap_type_for_type_expr(te).is_some()
+                    // B-2026-09-06-72 — a plain STRUCT element that
+                    // transitively owns a `shared` field. Exactly the
+                    // disjunct above one level down, and the same relation
+                    // `contains_vec_of_heap_elems` bears to the `Vec` one:
+                    // the element is not itself shared, so
+                    // `shared_heap_type_for_type_expr` answers `None`, and
+                    // it owns no `Vec` of heap, so `(R, i64)` over
+                    // `struct R { name: String, inner: Inner }` (`Inner`
+                    // shared) answered `false` here and took the LLVM-type
+                    // path. That path walks `{ptr,len,cap}` fields, so it
+                    // freed `name` and could not see `inner` at all: the
+                    // 16-byte refcount block leaked, once per tuple, with
+                    // the `Drop` body correct on every surface.
+                    || self.struct_elem_owns_shared_field(te)
             }
             _ => false,
         }
+    }
+
+    /// B-2026-09-06-72 — is `te` a plain (non-`shared`) user struct that
+    /// transitively owns a `shared` field?
+    ///
+    /// The tuple-element question behind the last disjunct of
+    /// [`Self::tuple_elem_needs_deep_drop`]. Kept separate from
+    /// `struct_owns_shared_field` because that predicate takes a NAME: this
+    /// resolves the `TypeExpr` and excludes a `shared` type itself, whose
+    /// slot holds a handle rather than a value to walk and which the
+    /// `shared_heap_type_for_type_expr` disjunct already admits.
+    pub(super) fn struct_elem_owns_shared_field(&self, te: &TypeExpr) -> bool {
+        let TypeKind::Path(p) = &te.kind else {
+            return false;
+        };
+        let Some(name) = p.segments.last() else {
+            return false;
+        };
+        !self.type_decls.shared_types.contains_key(name.as_str())
+            && self.type_decls.struct_types.contains_key(name.as_str())
+            && self.struct_owns_shared_field(name, &mut Vec::new())
     }
 
     /// True when a tuple ELEMENT of type `Option[P]` / `Result[O, E]` owns heap
@@ -10460,8 +10512,13 @@ impl<'ctx> super::Codegen<'ctx> {
         Some(walker)
     }
 
-    /// B-2026-09-03-31 — the MEMORY half of a user-`Drop` wrapper, which is the
-    /// COMBINED drop whenever the type owns a `shared` field.
+    /// The MEMORY-side drop for a struct whose slot has NO other owner — the
+    /// COMBINED drop whenever the type owns a `shared` field, else the plain
+    /// value drop.
+    ///
+    /// B-2026-09-03-31 introduced this for the user-`Drop` wrappers;
+    /// B-2026-09-06-72 made it the shared answer for every sole-owner channel
+    /// (see the second half of this doc).
     ///
     /// `__karac_drop_struct_<T>` deliberately skips a direct `shared` /
     /// `Option[shared]` scalar field: those are RC machinery, not buffer-owned,
@@ -10485,7 +10542,22 @@ impl<'ctx> super::Codegen<'ctx> {
     /// struct never reaches a wrapper — `vec_elem_agg_drop_for_type_expr` routes
     /// it to the combined drop directly, for this same reason — and every other
     /// caller of `karac_drop_<T>` is the sole cleanup for the value it drops.
-    fn user_drop_wrapper_field_drop_fn(&mut self, type_name: &str) -> Option<FunctionValue<'ctx>> {
+    ///
+    /// B-2026-09-06-72 — the wrappers were not the only channel holding a
+    /// struct nothing else releases. Three more resolved the memory drop with
+    /// a bare `emit_struct_drop_synthesis`, each of them the value's ONLY
+    /// cleanup: a TUPLE element (`emit_tuple_elem_drops`), a BOXED enum
+    /// payload (`track_boxed_enum_var`), and the memory-side dispatcher's
+    /// Drop-bearing-struct guard (`emit_drop_fn_for_type_expr`, which the
+    /// inline `Result`/`Option` payload drop funnels through). All three now
+    /// ask here, so the contract is stated once rather than re-derived per
+    /// channel. Measured leaks, 16 B each at -O0, on `return (r, 9)`,
+    /// `return Option.Some(r)` and `return Result.Ok(r)` over
+    /// `struct R { name: String, inner: Inner }` with `Inner` shared.
+    pub(super) fn sole_owner_struct_memory_drop(
+        &mut self,
+        type_name: &str,
+    ) -> Option<FunctionValue<'ctx>> {
         if self.struct_owns_shared_field(type_name, &mut Vec::new()) {
             if let Some(f) = self.emit_vec_elem_struct_with_shared_drop_fn(type_name) {
                 return Some(f);
@@ -10503,13 +10575,13 @@ impl<'ctx> super::Codegen<'ctx> {
     /// reaches the mono arm. That arm mirrors `emit_user_drop_wrapper_mono`'s
     /// own choice between the shared-field walker and the plain synthesizer,
     /// with the name-keyed fall-through preserved.
-    fn user_drop_wrapper_field_drop_fn_mono(
+    fn sole_owner_struct_memory_drop_mono(
         &mut self,
         type_name: &str,
         subst: &std::collections::HashMap<String, TypeExpr>,
     ) -> Option<FunctionValue<'ctx>> {
         if subst.is_empty() {
-            return self.user_drop_wrapper_field_drop_fn(type_name);
+            return self.sole_owner_struct_memory_drop(type_name);
         }
         if self.struct_owns_shared_field_subst(type_name, &mut Vec::new(), Some(subst)) {
             if let Some(f) =
@@ -10734,7 +10806,7 @@ impl<'ctx> super::Codegen<'ctx> {
         // synthesizer for heap-owning fields. Returns `None` for structs
         // with no heap-bearing fields (primitive-only) — skip the call
         // in that case since there's nothing to free.
-        if let Some(field_drop_fn) = self.user_drop_wrapper_field_drop_fn(type_name) {
+        if let Some(field_drop_fn) = self.sole_owner_struct_memory_drop(type_name) {
             self.builder
                 .build_call(field_drop_fn, &[self_ptr.into()], "")
                 .unwrap();
