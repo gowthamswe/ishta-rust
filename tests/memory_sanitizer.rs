@@ -47930,6 +47930,40 @@ fn main() {
     }
 
     #[test]
+    fn asan_self_referential_by_value_param_touching_nothing_frees_its_box() {
+        // B-2026-09-09-3 — B-2026-09-06-66's by-value remainder, closed for the
+        // callee class that can be proved safe.
+        //
+        // That row's gate refused on the whole-type question "is this ever a
+        // bare by-value param", inherited from the shared-owning arm. It is now
+        // the two hazards that question stood in for: does any callee STORE
+        // such a param (asked with the same predicates
+        // `declined_copy_arg_stays_with_caller` uses per call site, so the two
+        // cannot drift), and does any callee MOVE the promoted field out
+        // (B-2026-08-07-20, unchanged). Here the callee provably does neither.
+        //
+        // 67 bytes: the boxed `Node` payload plus its `tag`. The `Drop` bodies
+        // were already correct before this fix and the values already agreed,
+        // so no A/B gate could see this — only a leak checker.
+        assert_clean_asan_run(
+            r#"
+struct Node { id: i64, next: Option[Node], tag: String }
+impl Drop for Node { fn drop(mut ref self) { println(f"  dN{self.id}") } }
+
+fn mkn(i: i64) -> Node { return Node { id: i, next: Option.None, tag: f"t{i}" }; }
+fn nothing(n: Node) -> i64 { return 1; }
+
+fn main() {
+    let c: Node = Node { id: 9, next: Option.Some(mkn(10)), tag: "n" };
+    println(nothing(c));
+}
+"#,
+            &["1", "  dN9", "  dN10"],
+            "self_referential_by_value_param_touching_nothing",
+        );
+    }
+
+    #[test]
     fn asan_owned_string_param_let_move_grow() {
         // String sibling with a realloc after the move — without the
         // deep copy the caller frees a stale (realloc-moved) pointer.

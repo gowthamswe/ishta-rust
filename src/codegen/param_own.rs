@@ -2067,8 +2067,101 @@ impl<'ctx> super::Codegen<'ctx> {
         {
             return false;
         }
-        self.struct_is_self_referential(struct_name)
-            && !self.struct_used_as_bare_by_value_param(struct_name)
+        if !self.struct_is_self_referential(struct_name) {
+            return false;
+        }
+        // B-2026-09-09-3 — the scope condition, NARROWED from the whole-type
+        // question "is this ever a bare by-value param" to the two hazards that
+        // question was standing in for.
+        //
+        // B-2026-09-06-66 inherited it wholesale from the shared-owning arm
+        // when this predicate was written, and recorded the resulting 67-byte
+        // by-value remainder as real and unclosed, blocked on B-2026-09-08-13.
+        // That row has since landed: `declined_copy_arg_stays_with_caller` makes
+        // the caller's cleanup retraction conditional, so the caller now KEEPS
+        // its drop for exactly this class. The blanket refusal outlived its
+        // justification.
+        //
+        //   * `..._stores_it` — no callee anywhere stores such a param into an
+        //     outliving place, so no callee took ownership and the caller's
+        //     drop stands. Asked with the same two predicates
+        //     `declined_copy_arg_stays_with_caller` uses per CALL SITE, so the
+        //     two sites cannot drift apart on the same question.
+        //   * `..._takes_field` — B-2026-08-07-20's hazard, unchanged: a callee
+        //     that moves the promoted field out zeroes only its own shallow
+        //     copy, a write this frame never sees, so arming the field's free
+        //     against it double-frees. Asked over EVERY field, because this
+        //     predicate answers for the whole type at once.
+        //
+        // TYPE-LEVEL is kept deliberately: the drop fn is synthesized once per
+        // struct TYPE and runs at every death of it, so its gate needs one
+        // answer true at every site at once — `struct_used_as_bare_by_value_param`'s
+        // own stated reason for being type-keyed. What changed is WHICH question
+        // is asked at that granularity, not the granularity.
+        if self.struct_by_value_param_body_stores_it(struct_name) {
+            return false;
+        }
+        let fields = self
+            .type_decls
+            .struct_field_names
+            .get(struct_name)
+            .cloned()
+            .unwrap_or_default();
+        !fields
+            .iter()
+            .any(|f| self.struct_by_value_param_body_takes_field(struct_name, f))
+    }
+
+    /// B-2026-09-09-3 — does ANY by-value callee STORE a `struct_name`
+    /// parameter into a place that outlives the call?
+    ///
+    /// The type-level form of the first half of
+    /// [`Self::declined_copy_arg_stays_with_caller`], and it asks through the
+    /// same two predicates on purpose: that one decides per CALL SITE whether
+    /// the caller keeps its cleanup, this one decides for the whole TYPE
+    /// whether the struct drop may arm its promoted-field free, and the two
+    /// must not be able to disagree about whether an owner exists.
+    ///
+    /// Both the unconditional and the CONDITIONAL store count. A callee that
+    /// stores the param on only some paths still owns it on those paths, and a
+    /// type-level answer has to hold on all of them.
+    ///
+    /// No snapshot means no way to tell, so it answers "yes" and nothing
+    /// changes.
+    pub(super) fn struct_by_value_param_body_stores_it(&self, struct_name: &str) -> bool {
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return true;
+        };
+        let is_bare = |ty: &TypeExpr| -> bool {
+            matches!(&ty.kind, TypeKind::Path(p)
+                if p.segments.last().map(String::as_str) == Some(struct_name))
+        };
+        let fn_stores = |f: &crate::ast::Function| -> bool {
+            f.params.iter().enumerate().any(|(idx, p)| {
+                is_bare(&p.ty)
+                    && (crate::ast::fn_moves_param_into_outliving_place(f, idx)
+                        || crate::ast::fn_conditionally_moves_param_into_outliving_place(f, idx))
+            })
+        };
+        for item in &program.items {
+            match item {
+                Item::Function(f) => {
+                    if fn_stores(f) {
+                        return true;
+                    }
+                }
+                Item::ImplBlock(b) => {
+                    for it in &b.items {
+                        let ImplItem::Method(m) = it else { continue };
+                        if fn_stores(m) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Does ANY function, method, or `self` receiver in the program take
