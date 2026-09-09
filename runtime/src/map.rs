@@ -313,6 +313,22 @@ impl KaracMap {
     unsafe fn lookup(&self, key: *const c_void) -> Option<usize> {
         unsafe {
             let hash = (self.hash_fn)(key);
+            self.lookup_hashed(hash, |slot| (self.eq_fn)(self.key_ptr(slot), key))
+        }
+    }
+
+    /// The one probe walk, with the hash already computed and the key compare
+    /// supplied by the caller. `lookup` reaches it through the map's erased
+    /// `hash_fn`/`eq_fn`; `karac_map_get_i64_prehashed` reaches it with the hash supplied and the key
+    /// compare inlined.
+    ///
+    /// Factored so there is exactly ONE group scan in this file rather than a
+    /// typed copy beside the erased one — the module header's warning about a
+    /// diverging probe being "a silent wrong answer, not a crash" applies with
+    /// full force to a second copy of this walk.
+    #[inline]
+    unsafe fn lookup_hashed(&self, hash: u64, eq: impl Fn(usize) -> bool) -> Option<usize> {
+        unsafe {
             let ctrl = ctrl_of(hash);
             let mask = self.capacity - 1;
             let mut slot = (hash as usize) & mask;
@@ -325,7 +341,7 @@ impl KaracMap {
                     if s == BUCKET_EMPTY {
                         return None;
                     }
-                    if s == ctrl && (self.eq_fn)(self.key_ptr(slot), key) {
+                    if s == ctrl && eq(slot) {
                         return Some(slot);
                     }
                     slot = (slot + 1) & mask;
@@ -343,7 +359,7 @@ impl KaracMap {
                     if lane >= stop {
                         break;
                     }
-                    if (self.eq_fn)(self.key_ptr(slot + lane), key) {
+                    if eq(slot + lane) {
                         return Some(slot + lane);
                     }
                     m &= m - 1;
@@ -1212,6 +1228,69 @@ pub unsafe extern "C" fn karac_map_insert_borrowed_str_old(
         );
         *m.status.add(slot) = ctrl;
         exists
+    }
+}
+
+/// Returns `true` and copies the value into `out_val` if the key exists.
+/// Returns `false` and leaves `out_val` untouched otherwise.
+/// # Safety
+/// Shared contract above; `out_val` writable for `val_size` bytes. The copy
+/// written on `true` is a bit-copy — for a heap-owning value it ALIASES the
+/// stored buffer; the caller must not free through it.
+/// `karac_map_get_i64_prehashed(map, key, hash, out) -> bool` — the group-scan
+/// PROBE for an i64-keyed map, with the hash already computed by the caller.
+///
+/// B-2026-09-09-12. Codegen emits the probe inline and calls out for the hash;
+/// this moves the PROBE here, where the group scan lives, and leaves the hash
+/// exactly where it is.
+///
+/// # Why the hash is a PARAMETER rather than computed here
+/// An earlier draft took only `(map, key)` and hashed with
+/// `karac_hash::hash_u64`. That is precisely the bug B-2026-08-22-27 fixed: the
+/// hasher is a CONSTRUCTION-time decision stored in the map's control block
+/// (`Map[K, V, FxBuildHasher]` hashes through `karac_hash_u64_fx`), the
+/// monomorphized body is shared across hashers, and baking the default in makes
+/// a non-default map file keys under one hash and probe under another. That
+/// failure does not look like a hash bug: every resize rehashes through the
+/// stored fn and REPAIRS the table, so only the keys inserted since the last
+/// resize are lost — a contiguous tail starting at 3/4 of the stalled capacity,
+/// counted by `len` and invisible to `contains_key`. Taking the hash as a
+/// parameter keeps the caller's stored `hash_fn` authoritative and makes this
+/// function hasher-agnostic.
+///
+/// # Safety
+/// `map` is a live `karac_map_new` pointer whose key stride is 8 and whose
+/// value stride is 8; `hash` is that map's own hash of `key`; `out_val` is null
+/// or writable for 8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn karac_map_get_i64_prehashed(
+    map: *const c_void,
+    key: i64,
+    hash: u64,
+    out_val: *mut i64,
+) -> bool {
+    unsafe {
+        if map.is_null() {
+            return false;
+        }
+        let m = &*(map as *const KaracMap);
+        debug_assert_eq!(
+            m.key_size, 8,
+            "karac_map_get_i64_prehashed on a non-i64 key stride"
+        );
+        debug_assert_eq!(
+            m.val_size, 8,
+            "karac_map_get_i64_prehashed on a non-8-byte value"
+        );
+        match m.lookup_hashed(hash, |slot| *(m.key_ptr(slot) as *const i64) == key) {
+            Some(slot) => {
+                if !out_val.is_null() {
+                    *out_val = *(m.val_ptr(slot) as *const i64);
+                }
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -2368,6 +2447,92 @@ mod tests {
                     }
                     None => assert!(!found, "key {k} found though absent"),
                 }
+            }
+            super::karac_map_free(map);
+        }
+    }
+
+    /// B-2026-09-09-12. `karac_map_get_i64_prehashed` is a SECOND way into the table,
+    /// the module header's warning applies to it: a probe that disagrees is a
+    /// silent wrong answer, not a crash. So it is checked against the erased
+    /// `karac_map_get` on every key of a churned table — present, absent, and
+    /// across the tombstone runs and the resize.
+    ///
+    /// It reaches the SAME walk (`lookup_hashed`) with the hash and the key
+    /// compare inlined, so what this actually pins is that inlining them agrees
+    /// with going through `hash_fn`/`eq_fn` — i.e. that codegen's emitted i64
+    /// hash really is `karac_hash_u64`.
+    #[test]
+    fn typed_i64_lookup_agrees_with_the_erased_one_on_every_key() {
+        unsafe extern "C" fn hash_via_runtime(p: *const c_void) -> u64 {
+            unsafe { karac_hash::hash_u64(*(p as *const i64) as u64) }
+        }
+        use std::collections::HashMap;
+        unsafe {
+            let map = KaracMap::new(8, 8, hash_via_runtime, eq_i64_t) as *mut c_void;
+            let mut reference: HashMap<i64, i64> = HashMap::new();
+            let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+            for step in 0..40_000u32 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let key = ((state >> 33) % 700) as i64;
+                if (state >> 17).is_multiple_of(3) {
+                    let _ = del(map, key);
+                    reference.remove(&key);
+                } else {
+                    let val = key * 11 + step as i64;
+                    put(map, key, val);
+                    reference.insert(key, val);
+                }
+            }
+            for key in -20i64..760 {
+                let mut erased: i64 = -1;
+                let found_erased = super::karac_map_get(
+                    map,
+                    &key as *const i64 as *const c_void,
+                    &mut erased as *mut i64 as *mut c_void,
+                );
+                let mut typed: i64 = -1;
+                let h = karac_hash::hash_u64(key as u64);
+                let found_typed =
+                    super::karac_map_get_i64_prehashed(map, key, h, &mut typed as *mut i64);
+                assert_eq!(found_erased, found_typed, "presence disagreed for {key}");
+                if found_erased {
+                    assert_eq!(erased, typed, "value disagreed for {key}");
+                }
+                assert_eq!(
+                    found_typed,
+                    reference.contains_key(&key),
+                    "typed lookup disagreed with the reference for {key}"
+                );
+            }
+            // A null map answers "absent".
+            assert!(!super::karac_map_get_i64_prehashed(
+                std::ptr::null(),
+                1,
+                karac_hash::hash_u64(1),
+                std::ptr::null_mut()
+            ));
+            // A null `out` still answers, it just writes nowhere — so it must
+            // agree with the erased path's presence rather than being waved through.
+            for key in [0i64, 1, 699] {
+                let mut sink: i64 = -1;
+                let want = super::karac_map_get(
+                    map,
+                    &key as *const i64 as *const c_void,
+                    &mut sink as *mut i64 as *mut c_void,
+                );
+                assert_eq!(
+                    super::karac_map_get_i64_prehashed(
+                        map,
+                        key,
+                        karac_hash::hash_u64(key as u64),
+                        std::ptr::null_mut()
+                    ),
+                    want,
+                    "null out changed the answer for {key}"
+                );
             }
             super::karac_map_free(map);
         }

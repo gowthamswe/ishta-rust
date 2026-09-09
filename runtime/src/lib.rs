@@ -420,6 +420,8 @@ pub fn __preserve_no_mangle_symbols() -> usize {
         map::karac_map_try_insert,
         map::karac_map_insert_borrowed_str_old,
         map::karac_map_get,
+        // B-2026-09-09-12 — the typed whole-lookup entry.
+        map::karac_map_get_i64_prehashed,
         map::karac_map_remove,
         map::karac_map_remove_old,
         // B-2026-08-27-2 — the key-body variants. Keep-list entries are
