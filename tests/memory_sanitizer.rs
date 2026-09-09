@@ -12950,6 +12950,29 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         );
     }
 
+    /// One `ALLOCAUDIT` row for the corpus sweep — see [`assert_clean_asan_run`].
+    ///
+    /// `guard` names the threshold the fixture is held to (`min:60`, `max:12`,
+    /// or `-` when it has none), because a sweep that reports only a COUNT
+    /// cannot compute a fixture's MARGIN, and the margin is the number that
+    /// says whether the guard is sound. B-2026-09-09-4:
+    /// `rc_fb_twin_shape_both_boxed` sits 5 allocations above its own
+    /// `min_allocs` on x86_64 Linux and its raw count moves by 7 between runs
+    /// of ONE binary, so it fails under full-suite load and passes alone — and
+    /// the four-column row made that indistinguishable from a healthy fixture.
+    /// Emitting the threshold is what turns the sweep into a margin table.
+    fn alloc_audit_row(stderr: &str, label: &str, guard: &str, auto_par: bool) {
+        if !std::env::var("KARAC_ASAN_ALLOC_AUDIT").is_ok_and(|v| v != "0") {
+            return;
+        }
+        let raw = asan_malloc_calls(stderr).map_or(-1, |n| n as i64);
+        let floor = asan_alloc_floor(auto_par) as i64;
+        eprintln!(
+            "ALLOCAUDIT\t{}\t{raw}\t{floor}\t{guard}\t{label}",
+            (raw - floor).max(-1)
+        );
+    }
+
     fn assert_clean_asan_run(src: &str, expected_stdout: &[&str], label: &str) {
         if !asan_available() {
             eprintln!("[{label}] ASAN unavailable on this host — skipping");
@@ -12961,7 +12984,8 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         //   KARAC_ASAN_ALLOC_AUDIT=1 cargo test --features llvm \
         //     --test memory_sanitizer -- --nocapture
         //
-        // prints one `ALLOCAUDIT\t<program>\t<raw>\t<floor>\t<label>` line per
+        // prints one `ALLOCAUDIT\t<program>\t<raw>\t<floor>\t<guard>\t<label>` line
+        // per
         // fixture, where `<program>` is `<raw> - <floor>` — the allocations the
         // program itself performed. A fixture at 0 there did no heap work of its
         // own and asserts nothing.
@@ -12977,12 +13001,7 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         let audit = std::env::var("KARAC_ASAN_ALLOC_AUDIT").is_ok_and(|v| v != "0");
         let ran = if audit {
             run_under_asan_counting(src, label).map(|(out, err, st)| {
-                let raw = asan_malloc_calls(&err).map_or(-1, |n| n as i64);
-                let floor = asan_alloc_floor(true) as i64;
-                eprintln!(
-                    "ALLOCAUDIT\t{}\t{raw}\t{floor}\t{label}",
-                    (raw - floor).max(-1)
-                );
+                alloc_audit_row(&err, label, "-", true);
                 (out, st)
             })
         } else {
@@ -13106,6 +13125,7 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         );
         let got: Vec<&str> = stdout.trim().lines().collect();
         assert_eq!(got, expected_stdout, "[{label}] stdout mismatch");
+        alloc_audit_row(&stderr, label, &format!("max:{max_allocs}"), false);
         if let Some(raw) = asan_malloc_calls(&stderr) {
             // Floor-relative, so the ceiling means the same thing on every host
             // — see [`asan_alloc_floor`]. Raw counts differ by 189 between
@@ -13148,6 +13168,7 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         );
         let got: Vec<&str> = stdout.trim().lines().collect();
         assert_eq!(got, expected_stdout, "[{label}] stdout mismatch");
+        alloc_audit_row(&stderr, label, &format!("min:{min_allocs}"), true);
         if let Some(raw) = asan_malloc_calls(&stderr) {
             let floor = asan_alloc_floor(true);
             let allocs = raw.saturating_sub(floor);
@@ -13188,14 +13209,7 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         );
         // Join the `KARAC_ASAN_ALLOC_AUDIT` sweep too, so a corpus scan sees
         // every fixture rather than only the unfloored ones.
-        if std::env::var("KARAC_ASAN_ALLOC_AUDIT").is_ok_and(|v| v != "0") {
-            let raw = asan_malloc_calls(&stderr).map_or(-1, |n| n as i64);
-            let floor = asan_alloc_floor(true) as i64;
-            eprintln!(
-                "ALLOCAUDIT\t{}\t{raw}\t{floor}\t{label}",
-                (raw - floor).max(-1)
-            );
-        }
+        alloc_audit_row(&stderr, label, &format!("min:{min_allocs}"), true);
         match asan_malloc_calls(&stderr) {
             Some(raw) => {
                 // Floor-relative — see [`asan_alloc_floor`]. Raw, this guard was
@@ -67052,25 +67066,27 @@ fn main() { println(go()); }
             ),
             &["drop P 38", "1", "drop Q 38", "2"],
             "rc_fb_twin_shape_both_boxed",
-            // 60 — and this is the ONE cell in the file whose count is
-            // HOST-DEPENDENT, so it gets a margin where its siblings get their
-            // exact audited number. Measured: 183 on macOS 26.6 / M5, 75 on
-            // arm64 Linux. Every other fixture in this suite agrees to the
-            // allocation between the two hosts (B-2026-09-07-26 checked 55 of
-            // them); this one does not.
+            // Measured: 183 on macOS 26.6 / M5, 75 on arm64 Linux, 64-72 on
+            // x86_64 Linux. The old note here called that HOST-dependence and
+            // guessed at a per-`println` cost on macOS. It is not the host: the
+            // count moves ON ONE HOST with CPU CONTENTION (B-2026-09-09-4).
+            // Measured on this box, affinity held constant, only load varying:
             //
-            // The suspect is the harness, not the compiler. This is the only
-            // fixture here whose `main` calls `println` TWICE, and macOS's ASAN
-            // runtime is already the one with a 199-allocation start-up floor
-            // against Linux's 10 — so a per-output-call cost on that side would
-            // land exactly here and nowhere else. Not chased down: it is
-            // platform overhead either way, it is 20x above the vacuity
-            // threshold that matters, and the sibling `single_box` cell pins the
-            // same mechanism at a stable 10.
+            //     quiet    72        8 CPU hogs   62        taskset -c 0   54
             //
-            // 60 sits under the LOWER of the two measurements. Anything at or
-            // near zero still fails, which is what the floor is for.
-            60,
+            // and it returns to 72 when the load goes away. `par` work
+            // DISTRIBUTION is the variable — a saturated box spreads less work
+            // across workers and so allocates fewer per-worker blocks — which
+            // is why re-running the test alone always "fixes" it and why a
+            // full-suite run is where it fails. A 60 floor is inside that
+            // range, so the cell failed the suite on a green tree.
+            //
+            // Floored at lowest-observed minus twice the observed swing
+            // (64 - 2*7), rounded down. A folded-away payload still trips it:
+            // the sibling `single_box` cell pins the same mechanism at a
+            // contention-INSENSITIVE 10 (bit-identical across three sweeps), so
+            // a collapse here lands far below 40.
+            40,
         );
     }
 
@@ -78064,10 +78080,23 @@ fn main() {
                 "true", "true", "true", "true", "true", "true", "true", "true", "done",
             ],
             "fresh-temp-field-read-consumed-by-an-aggregate",
-            // Measured 120 on the fixed compiler; floored under it so a future
-            // optimizer that folds these payloads away trips the vacuity check
-            // rather than passing over allocations that never happened.
-            90,
+            // Measured 120 on the fixed compiler's host; 87-102 on x86_64
+            // Linux. This count MOVES WITH CPU CONTENTION (B-2026-09-09-4): the
+            // program's `par` work DISTRIBUTION decides how many per-worker
+            // blocks get allocated, and a saturated box distributes less work,
+            // so it allocates less. A three-run corpus sweep put this cell at
+            // 102/102/87 against a floor of 90 — ALREADY BREACHED at 87, the
+            // one hard failure among 223 floored fixtures, and the cell
+            // B-2026-09-09-5 reported as an unexplained intermittent.
+            //
+            // Floored at lowest-observed minus twice the observed swing
+            // (87 - 2*15), rounded down. That is still ~50x above the collapse
+            // this guard exists to catch — a folded-away payload lands near
+            // zero, and the `two_fields_one_taken` control would go with it —
+            // while sitting outside the scheduling noise. Do NOT re-tighten
+            // this to a freshly measured number: setting it just under one
+            // host's quiet reading is exactly what put it under its own floor.
+            50,
         );
     }
     /// B-2026-08-31-30 — the `if let` / `let … else` / NESTED spellings of a
