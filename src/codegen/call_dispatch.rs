@@ -3064,6 +3064,53 @@ impl<'ctx> super::Codegen<'ctx> {
                 .is_some_and(|l| !l.is_shared)
     }
 
+    /// B-2026-09-09-13 — does the callee REBIND parameter `arg_index` whole
+    /// into a local (`fn f(value: Option[Val]) { let mut vv = value; .. }`)?
+    ///
+    /// That rebind is an ownership transfer the caller cannot see from the
+    /// signature: the local now holds the payload's box, and the callee frees
+    /// it when the local is reassigned or leaves scope. A caller that ALSO
+    /// registers the box frees it twice.
+    ///
+    /// Asks `param_rebound_into_mut_local`, NOT the `param_whole_aliases`
+    /// closure beside it: that one admits only IMMUTABLE rebinds, because an
+    /// alias that can be reassigned is not a stable alias — and a mutable
+    /// rebind is precisely the shape at issue here, since the reassignment is
+    /// what frees the displaced box.
+    pub(super) fn callee_rebinds_param_whole(&self, callee_name: &str, arg_index: usize) -> bool {
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return false;
+        };
+        let bare = callee_name.rsplit('.').next().unwrap_or(callee_name);
+        let check = |f: &Function, ast_i: usize| -> bool {
+            let Some(p) = f.params.get(ast_i) else {
+                return false;
+            };
+            let PatternKind::Binding(pname) = &p.pattern.kind else {
+                return false;
+            };
+            crate::ast::param_rebound_into_mut_local(f, pname)
+        };
+        program.items.iter().any(|item| match item {
+            Item::Function(f) if f.name == callee_name => check(f, arg_index),
+            Item::ImplBlock(b) => b.items.iter().any(|ii| match ii {
+                ImplItem::Method(f) if f.name == bare => {
+                    let ast_i = if f.self_param.is_some() {
+                        match arg_index.checked_sub(1) {
+                            Some(v) => v,
+                            None => return false,
+                        }
+                    } else {
+                        arg_index
+                    };
+                    check(f, ast_i)
+                }
+                _ => false,
+            }),
+            _ => false,
+        })
+    }
+
     pub(super) fn owned_boxed_option_param_struct(&self, name: &str, i: usize) -> Option<String> {
         let flagged = |table: &HashMap<String, Vec<bool>>| {
             table
@@ -3097,6 +3144,20 @@ impl<'ctx> super::Codegen<'ctx> {
             .segments
             .last()
             .filter(|s| self.boxed_param_payload_owns_its_box(s.as_str()))?;
+        // B-2026-09-09-13 — a callee that rebinds the param whole already owns
+        // the box, and registering the caller too frees it twice. ENUM payloads
+        // only: a struct payload's whole-payload binding is DISARMED by
+        // `register_boxed_payload_alias`, so its callee-side local does not free
+        // the box and the caller is still the only owner. Widening this to
+        // structs would re-open the leak B-2026-09-06-56 closed.
+        if !self
+            .type_decls
+            .struct_types
+            .contains_key(struct_name.as_str())
+            && self.callee_rebinds_param_whole(name, i)
+        {
+            return None;
+        }
         self.option_payload_is_boxed(payload_te)
             .then(|| struct_name.clone())
     }

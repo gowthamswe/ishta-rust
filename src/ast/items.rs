@@ -1882,6 +1882,12 @@ type CallRebind = (String, String, Vec<(usize, String)>);
 /// times each name is bound anywhere the walk reaches.
 struct RebindWalk {
     rebinds: Vec<(String, String)>,
+    /// B-2026-09-09-13 — `let MUT x = y`, which [`rebinds`] deliberately does
+    /// NOT record: an alias that can be reassigned is not a stable alias, so
+    /// every ALIASING predicate here is right to ignore it. It is exactly the
+    /// shape an OWNERSHIP question needs, though — a mutable rebind is the one
+    /// that gets overwritten, and the overwrite frees what it displaced.
+    mut_rebinds: Vec<(String, String)>,
     /// B-2026-09-06-19 — `let x = S { f: y, .. }` / `let x = (y, ..)`: `x` WRAPS
     /// `y` at `path`. A wrap is not a rebind (the types differ), but it is the
     /// other way a by-value param travels through a local on its way out:
@@ -1948,6 +1954,11 @@ impl RebindWalk {
                         (*is_mut, &pattern.kind, &value.kind)
                     {
                         self.rebinds.push((x.clone(), y.clone()));
+                    }
+                    if let (true, PatternKind::Binding(x), ExprKind::Identifier(y)) =
+                        (*is_mut, &pattern.kind, &value.kind)
+                    {
+                        self.mut_rebinds.push((x.clone(), y.clone()));
                     }
                     if let (false, PatternKind::Binding(x)) = (*is_mut, &pattern.kind) {
                         let mut path: ParamPath = Vec::new();
@@ -2084,6 +2095,7 @@ impl RebindWalk {
 fn rebind_walk(f: &Function) -> RebindWalk {
     let mut w = RebindWalk {
         rebinds: Vec::new(),
+        mut_rebinds: Vec::new(),
         wraps: Vec::new(),
         proj_rebinds: Vec::new(),
         call_rebinds: Vec::new(),
@@ -2096,6 +2108,27 @@ fn rebind_walk(f: &Function) -> RebindWalk {
     }
     w.block(&f.body);
     w
+}
+
+/// B-2026-09-09-13 — is `param_name` rebound whole into a MUTABLE local
+/// (`fn f(value: Option[Val]) { let mut vv = value; .. }`), directly or through
+/// a chain of immutable aliases?
+///
+/// This is an OWNERSHIP question, not an aliasing one, which is why it does not
+/// go through [`param_whole_aliases`]: that closure deliberately admits only
+/// immutable rebinds, because a name that can be reassigned is no longer a
+/// reliable alias of the param. For ownership the mutable case is the whole
+/// point — the local holds the param's heap, and reassigning it frees what it
+/// displaced, so a CALLER that also owns that heap frees it twice.
+///
+/// Over-approximates on purpose. A false positive stands the caller down and
+/// costs at most a leak; a false negative is a double free.
+pub fn param_rebound_into_mut_local(f: &Function, param_name: &str) -> bool {
+    let w = rebind_walk(f);
+    let aliases = close_rebind_aliases(&w, param_name);
+    w.mut_rebinds
+        .iter()
+        .any(|(_, y)| aliases.iter().any(|a| a == y))
 }
 
 /// The transitive whole-rebind closure of `seed` over `w.rebinds`, admitting
