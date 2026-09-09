@@ -3224,7 +3224,7 @@ impl<'ctx> super::Codegen<'ctx> {
                     // expression (its array leg reaches a non-`Identifier`
                     // root), matching the method leg's placement.
                     if !is_ref {
-                        self.move_declined_copy_struct_arg(&a.value);
+                        self.move_declined_copy_struct_arg_for(&a.value, Some(&qualified), i);
                     }
                     // B-2026-08-30-23 — the BINDING-argument body retraction,
                     // which this arm never performed. `compile_call` and

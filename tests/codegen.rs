@@ -152116,6 +152116,110 @@ fn main() {
         );
     }
 
+    /// B-2026-09-08-13 — a LET-BOUND LOCAL of a SELF-REFERENTIAL struct passed
+    /// BY VALUE into a callee that never hands it on lost its `Drop` body and
+    /// leaked its heap.
+    ///
+    /// `move_declined_copy_struct_arg`'s self-referential arm (B-2026-07-28-3)
+    /// retracts the caller's cleanup on a MAY-analysis — the callee "receives
+    /// an ALIAS it may STORE into an owning container" — and the retraction was
+    /// unconditional, so it fired for a callee that stores nothing either.
+    /// Nothing then owns the value: the memory authority
+    /// (`struct_param_memory_stays_with_caller`) leaves the buffer with the
+    /// caller, and the callee's prologue agrees by listing the param in
+    /// `caller_retained_aggregate_memory`. The gate now asks the CALLEE
+    /// (`declined_copy_arg_stays_with_caller`) and stands down only when it
+    /// provably returns, stores and forwards nothing.
+    ///
+    /// Cells, and what each one isolates:
+    ///
+    ///   * `c1` is the row's own shape — the defect. Pre-fix: `v10` on the JIT
+    ///     and at both opt levels against `--interp`'s `v10 dN10`, valgrind
+    ///     `3 bytes in 1 blocks` definitely lost (the `tag` buffer).
+    ///   * `c2` is the TEMPORARY spelling, correct throughout: the retraction
+    ///     only matches an `Identifier` argument, so the fresh-temp registrar
+    ///     kept its own cleanup. It also pins the ORDER difference between the
+    ///     two spellings, which is what makes them distinguishable at all.
+    ///   * `c3`/`c4` are the never-passed and by-`ref` controls, correct
+    ///     throughout — they show the defect needs the by-value pass.
+    ///   * `c5` is the METHOD spelling and `c6` the ASSOC-FN spelling, both
+    ///     defective pre-fix for the same reason and both wired here.
+    ///   * `c7` (always returns), `c8` (stores into a `mut ref`) and `c9`
+    ///     (conditionally stores, taking the MISS path) are the hazards this
+    ///     narrowing must NOT admit: restoring the caller's drop for any of
+    ///     them would be a second owner of one value. They were correct before
+    ///     this change and must stay so.
+    #[test]
+    fn e2e_declined_copy_arg_keeps_its_owner_when_the_callee_drops_it() {
+        let Some(out) = run_program(
+            "struct Node { id: i64, next: Option[Node], tag: String }\n\
+             impl Drop for Node {\n\
+             \x20   fn drop(mut ref self) { println(f\"dN{self.id}\") }\n\
+             }\n\
+             fn mkn(i: i64) -> Node { return Node { id: i, next: Option.None, tag: f\"t{i}\" }; }\n\
+             fn read(n: Node) -> i64 { return n.id; }\n\
+             fn peek(n: ref Node) -> i64 { return n.id; }\n\
+             fn pass(n: Node) -> Node { return n; }\n\
+             fn stash(n: Node, v: mut ref Vec[Node]) { v.push(n); }\n\
+             fn cs(n: Node, k: bool, v: mut ref Vec[Node]) { if k { v.push(n); } }\n\
+             struct H { z: i64 }\n\
+             impl H {\n\
+             \x20   fn eat(ref self, n: Node) -> i64 { return n.id + self.z; }\n\
+             \x20   fn eatA(n: Node) -> i64 { return n.id; }\n\
+             }\n\
+             fn main() {\n\
+             \x20   println(\"c1\");\n\
+             \x20   let c = mkn(10);\n\
+             \x20   println(f\"v{read(c)}\");\n\
+             \x20   println(\"c2\");\n\
+             \x20   println(f\"v{read(mkn(20))}\");\n\
+             \x20   println(\"c3\");\n\
+             \x20   let e = mkn(30);\n\
+             \x20   println(f\"v{e.id}\");\n\
+             \x20   println(\"c4\");\n\
+             \x20   let g = mkn(40);\n\
+             \x20   println(f\"v{peek(g)}\");\n\
+             \x20   println(\"c5\");\n\
+             \x20   let h = H { z: 1 };\n\
+             \x20   let i2 = mkn(50);\n\
+             \x20   println(f\"v{h.eat(i2)}\");\n\
+             \x20   println(\"c6\");\n\
+             \x20   let j = mkn(60);\n\
+             \x20   println(f\"v{H.eatA(j)}\");\n\
+             \x20   println(\"c7\");\n\
+             \x20   let k = mkn(70);\n\
+             \x20   let l = pass(k);\n\
+             \x20   println(f\"v{l.id}\");\n\
+             \x20   println(\"c8\");\n\
+             \x20   let mut v1: Vec[Node] = Vec.new();\n\
+             \x20   let m = mkn(80);\n\
+             \x20   stash(m, mut v1);\n\
+             \x20   println(f\"n{v1.len()}\");\n\
+             \x20   println(\"c9\");\n\
+             \x20   let mut v2: Vec[Node] = Vec.new();\n\
+             \x20   let p = mkn(90);\n\
+             \x20   cs(p, false, mut v2);\n\
+             \x20   println(f\"n{v2.len()}\");\n\
+             \x20   println(\"end\");\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            "c1\nv10\ndN10\n\
+             c2\ndN20\nv20\n\
+             c3\nv30\ndN30\n\
+             c4\nv40\ndN40\n\
+             c5\nv51\ndN50\n\
+             c6\nv60\ndN60\n\
+             c7\nv70\ndN70\n\
+             c8\nn1\ndN80\n\
+             c9\ndN90\nn0\n\
+             end\n"
+        );
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by

@@ -2548,6 +2548,94 @@ impl<'ctx> super::Codegen<'ctx> {
             && !crate::ast::fn_moves_param_into_outliving_place(f, arg_index)
     }
 
+    /// B-2026-09-08-13 — does a COPY-DECLINED by-value struct argument stay
+    /// the CALLER's, because the callee provably never hands it on?
+    ///
+    /// The narrowing gate on [`Self::move_declined_copy_struct_arg`]'s
+    /// self-referential arm. That retraction was written for B-2026-07-28-3
+    /// with a MAY-analysis in its comment — the callee "receives an ALIAS it
+    /// may STORE into an owning container, so the caller must give up its
+    /// drop" — and the retraction is unconditional, so the caller gives it up
+    /// for a callee that stores nothing either. Nobody then owns the value:
+    /// the memory authority
+    /// ([`Self::struct_param_memory_stays_with_caller`]) says the buffer never
+    /// left the caller, and the callee's prologue agrees by putting the param
+    /// in `caller_retained_aggregate_memory`, so the retraction takes away the
+    /// only owner there was.
+    ///
+    /// Measured on `struct Node { id: i64, next: Option[Node], tag: String }`
+    /// with an `impl Drop`, over `fn read(n: Node) -> i64 { return n.id; }`:
+    /// `let c = mkn(10); println(f"v{read(c)}")` printed `v10 dN10` under
+    /// `--interp` and a bare `v10` on the JIT and at both opt levels, with
+    /// valgrind reporting `3 bytes in 1 blocks` definitely lost — the `tag`
+    /// buffer. The TEMPORARY spelling `read(mkn(10))` is clean on every
+    /// surface, because this retraction only matches an `Identifier` argument
+    /// and the fresh-temp registrar keeps its own cleanup.
+    ///
+    /// Asked of the callee rather than of the type, because the type cannot
+    /// answer it: `Node` is the same `Node` whether `read` drops it on the
+    /// floor or stashes it in a `Vec`. The union is
+    /// [`Self::callee_takes_over_arg_drop_body`] — the same one the drop-body
+    /// hand-off gate uses, so the two cannot drift about which frame owns the
+    /// value — plus the CONDITIONAL store route, which that union leaves out
+    /// because its own consumer wants all-paths certainty. Here the direction
+    /// is reversed: this gate RESTORES an owner, so any route by which the
+    /// callee might become one has to refuse it.
+    ///
+    /// Conservative in the direction that matters, like every predicate around
+    /// it. A callee this DECLINES keeps today's behaviour byte-for-byte; one
+    /// it wrongly ADMITS leaves two owners of one buffer. So an unresolvable
+    /// callee, a generic one, a coroutine, a generic struct and a param whose
+    /// memory DID move to the callee are all refused outright.
+    pub(super) fn declined_copy_arg_stays_with_caller(
+        &self,
+        callee_name: &str,
+        arg_index: usize,
+    ) -> bool {
+        let Some(program) = self.program_snapshot.as_deref() else {
+            return false;
+        };
+        if self.is_coroutine_compiled(callee_name) {
+            return false;
+        }
+        let Some(f) = crate::codegen::declarations::find_function_ast(program, callee_name) else {
+            return false;
+        };
+        if f.generic_params.is_some() {
+            return false;
+        }
+        // Receiver-EXCLUDING, the convention `find_function_ast` returns and
+        // the one `conditional_handback_memory_moves_to_callee` documents.
+        let Some(param) = f.params.get(arg_index) else {
+            return false;
+        };
+        let crate::ast::TypeKind::Path(path) = &param.ty.kind else {
+            return false;
+        };
+        let Some(struct_name) = path.segments.first() else {
+            return false;
+        };
+        if self
+            .type_decls
+            .struct_generic_params
+            .get(struct_name.as_str())
+            .is_some_and(|g| !g.is_empty())
+        {
+            return false;
+        }
+        if !self.struct_param_memory_stays_with_caller(struct_name) {
+            return false;
+        }
+        // The mixed-path shape has its own arrangement (B-2026-09-06-69): the
+        // callee owns the memory per path there, so the caller's stand-down is
+        // correct and must not be undone.
+        if self.conditional_handback_memory_moves_to_callee(callee_name, arg_index) {
+            return false;
+        }
+        !self.callee_takes_over_arg_drop_body(callee_name, arg_index)
+            && !crate::ast::fn_conditionally_moves_param_into_outliving_place(f, arg_index)
+    }
+
     fn aggregate_param_copy_supported_struct_mono(&self, struct_name: &str) -> bool {
         if self.type_decls.shared_types.contains_key(struct_name) {
             return false;

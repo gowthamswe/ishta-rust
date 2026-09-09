@@ -83153,4 +83153,68 @@ fn main() {{
             "b41-direct-control",
         );
     }
+    /// B-2026-09-08-13 — a LET-BOUND LOCAL of a SELF-REFERENTIAL struct passed
+    /// BY VALUE into a callee that never hands it on lost its `Drop` body and
+    /// leaked its heap, because `move_declined_copy_struct_arg` retracted the
+    /// caller's cleanup on a MAY-analysis it never checked against the actual
+    /// callee.
+    ///
+    /// WHAT THIS FIXTURE PINS. On Linux CI this harness runs LeakSanitizer, so
+    /// cell 1 pins the LEAK half directly — the 3-byte `tag` buffer the parent
+    /// stranded (measured by hand at `-O0` and `-O2`: 11 allocs / 10 frees,
+    /// `3 bytes in 1 blocks` definitely lost, against 11 / 11 clean after). On
+    /// macOS `-fsanitize=address` runs no LSan and the leak is invisible here,
+    /// which is why the E2E twin in `tests/codegen.rs` asserts the missing
+    /// `dN10` line as well — that half is architecture-independent.
+    ///
+    /// Cells 2-4 are the hazard controls for the NARROWING, and they are the
+    /// half this harness catches everywhere: a gate that restored the caller's
+    /// drop for a callee that DOES take the value over would abort as a double
+    /// free at any opt level, on any platform. They were clean before this
+    /// change and must stay clean.
+    #[test]
+    fn asan_declined_copy_arg_keeps_exactly_one_owner() {
+        const PRE: &str = "struct Node { id: i64, next: Option[Node], tag: String }\n\
+             impl Drop for Node { fn drop(mut ref self) { println(f\"dN{self.id}\") } }\n\
+             fn mkn(i: i64) -> Node { return Node { id: i, next: Option.None, tag: f\"t{i}\" }; }\n";
+        // 1 — the row's cell: the callee reads and drops, so the CALLER owns it.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{PRE}fn read(n: Node) -> i64 {{ return n.id; }}\n\
+                 fn main() {{ let c = mkn(10); println(f\"v{{read(c)}}\"); println(\"end\") }}\n"
+            ),
+            &["v10", "dN10", "end"],
+            "b13-letbound",
+        );
+        // 2 — HAZARD: the callee always returns it. The caller must still stand
+        // down, or the result binding and the argument binding both own it.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{PRE}fn pass(n: Node) -> Node {{ return n; }}\n\
+                 fn main() {{ let c = mkn(10); let d = pass(c); println(f\"v{{d.id}}\"); println(\"end\") }}\n"
+            ),
+            &["v10", "dN10", "end"],
+            "b13-returns-hazard",
+        );
+        // 3 — HAZARD: the callee stores it into a container the caller holds.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{PRE}fn stash(n: Node, v: mut ref Vec[Node]) {{ v.push(n); }}\n\
+                 fn main() {{ let mut v: Vec[Node] = Vec.new(); let c = mkn(10); stash(c, mut v); println(f\"n{{v.len()}}\"); println(\"end\") }}\n"
+            ),
+            &["n1", "dN10", "end"],
+            "b13-stores-hazard",
+        );
+        // 4 — HAZARD: the callee stores it on SOME paths. The miss path is the
+        // one taken here, and it is the path with no second owner to balance a
+        // restored caller drop against.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{PRE}fn cs(n: Node, k: bool, v: mut ref Vec[Node]) {{ if k {{ v.push(n); }} }}\n\
+                 fn main() {{ let mut v: Vec[Node] = Vec.new(); let c = mkn(10); cs(c, false, mut v); println(f\"n{{v.len()}}\"); println(\"end\") }}\n"
+            ),
+            &["dN10", "n0", "end"],
+            "b13-cond-store-hazard",
+        );
+    }
 }

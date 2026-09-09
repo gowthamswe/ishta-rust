@@ -986,7 +986,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 if !is_ref {
                     // B-2026-07-28-4: by-value struct arg whose param declined
                     // the entry copy — move it, don't leave both sides owning it.
-                    self.move_declined_copy_struct_arg(&arg.value);
+                    self.move_declined_copy_struct_arg_for(&arg.value, Some(&name), i);
                     // B-2026-08-29-63: …and the same retraction for a param the
                     // prepass proved transfer-safe, whose callee now takes these
                     // buffers instead of copying them.
@@ -1206,7 +1206,7 @@ impl<'ctx> super::Codegen<'ctx> {
                 if !is_ref {
                     // B-2026-07-28-4: by-value struct arg whose param declined
                     // the entry copy — move it, don't leave both sides owning it.
-                    self.move_declined_copy_struct_arg(&arg.value);
+                    self.move_declined_copy_struct_arg_for(&arg.value, Some(&name), i);
                     // B-2026-08-29-63: …and the same retraction for a param the
                     // prepass proved transfer-safe, whose callee now takes these
                     // buffers instead of copying them.
@@ -1495,7 +1495,7 @@ impl<'ctx> super::Codegen<'ctx> {
             if !is_ref {
                 // B-2026-07-28-4: by-value struct arg whose param declined the
                 // entry copy — move it, don't leave both sides owning it.
-                self.move_declined_copy_struct_arg(&a.value);
+                self.move_declined_copy_struct_arg_for(&a.value, Some(&name), i);
                 // B-2026-08-29-63: …and the same retraction for a param the
                 // prepass proved transfer-safe, whose callee now takes these
                 // buffers instead of copying them.
@@ -10123,6 +10123,29 @@ impl<'ctx> super::Codegen<'ctx> {
     }
 
     pub(super) fn move_declined_copy_struct_arg(&mut self, arg: &Expr) {
+        self.move_declined_copy_struct_arg_for(arg, None, 0);
+    }
+
+    /// [`Self::move_declined_copy_struct_arg`] with the CALLEE it is standing
+    /// the caller down for.
+    ///
+    /// B-2026-09-08-13 — the retraction's self-referential arm is a
+    /// MAY-analysis ("the callee then receives an ALIAS it may STORE"), and
+    /// asking it of the type alone stands the caller down for a callee that
+    /// stores nothing, leaving the value with no owner at all. Sites that know
+    /// which function they are calling pass it here and get the narrowed gate
+    /// ([`Self::declined_copy_arg_stays_with_caller`]); `None` keeps the
+    /// unnarrowed behaviour, which is what the coroutine and monomorph legs
+    /// want anyway — the predicate refuses both outright.
+    ///
+    /// `arg_index` is receiver-EXCLUDING, the convention every AST-resolved
+    /// predicate around this uses.
+    pub(super) fn move_declined_copy_struct_arg_for(
+        &mut self,
+        arg: &Expr,
+        callee: Option<&str>,
+        arg_index: usize,
+    ) {
         // B-2026-08-22-18 follow-up — an owned `Array[T, N]` binding/param passed
         // BY VALUE into a callee transfers ownership (the callee frees it,
         // `make_array_param_callee_owned`), so retract the caller's own array
@@ -10179,6 +10202,15 @@ impl<'ctx> super::Codegen<'ctx> {
         // "is already covered by `track_struct_var` at its binding site", which
         // was true only until this retraction removed it.
         if self.struct_owns_shared_field(&type_name, &mut Vec::new()) {
+            return;
+        }
+        // B-2026-09-08-13 — …and neither may a callee that never hands the
+        // value on. What survives the two clauses above is exactly
+        // B-2026-07-28-3's self-referential class, whose retraction rests on a
+        // MAY-analysis; where the callee is known and provably stores nothing,
+        // returns nothing and forwards nothing, the caller is the only owner
+        // and retracting here loses the `Drop` body and leaks the buffers.
+        if callee.is_some_and(|c| self.declined_copy_arg_stays_with_caller(c, arg_index)) {
             return;
         }
         let var = var.clone();
