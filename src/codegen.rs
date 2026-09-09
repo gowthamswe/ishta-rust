@@ -5769,6 +5769,21 @@ impl<'ctx> Codegen<'ctx> {
         let karac_map_get_fn =
             module.add_function("karac_map_get", map_get_ty, Some(Linkage::External));
 
+        // karac_map_get_i64_prehashed(map: ptr, key: i64, hash: i64, out: ptr) -> i1
+        // B-2026-09-09-12 — the runtime's SWAR group scan, reachable from the
+        // mono probe under `KARAC_MAP_PROBE=runtimegroup`. The hash is passed
+        // IN: the hasher is a construction-time decision and this body is
+        // shared across hashers (B-2026-08-22-27), so the caller's stored
+        // `hash_fn` stays authoritative.
+        let map_get_i64_prehashed_ty = context
+            .bool_type()
+            .fn_type(&[ptr_md, i64_ty, i64_ty, ptr_md], false);
+        module.add_function(
+            "karac_map_get_i64_prehashed",
+            map_get_i64_prehashed_ty,
+            Some(Linkage::External),
+        );
+
         // karac_map_remove_old(map: ptr, key: ptr, out_old_val: ptr, drop_key: i32) -> i1
         // The value is moved out via out_old_val (caller owns it), so only the
         // bucket's STORED key is freed; `drop_key` (nonzero = heap key) gates
@@ -6550,6 +6565,9 @@ impl<'ctx> Codegen<'ctx> {
                 map_lookup_probe: match std::env::var("KARAC_MAP_PROBE").as_deref() {
                     Ok("unbounded") => mono::MapLookupProbe::Unbounded,
                     Ok("slotwalk") => mono::MapLookupProbe::SlotWalk,
+                    // B-2026-09-09-12 — hand the whole probe to the runtime's
+                    // SWAR group scan instead of walking bytes here.
+                    Ok("runtimegroup") => mono::MapLookupProbe::RuntimeGroup,
                     _ => mono::MapLookupProbe::Bounded,
                 },
                 temp_recv_mapset_types: HashMap::new(),

@@ -79,6 +79,17 @@ pub(crate) enum MapLookupProbe {
     /// actually clearing the x86 register spill this bug is about, since
     /// freeing ONE register (measured) did not.
     SlotWalk,
+    /// B-2026-09-09-12. Do not walk here at all: call
+    /// `karac_map_get_i64_prehashed`, whose group scan tests eight control
+    /// bytes per load. The hash stays where it is — computed through the map's
+    /// STORED `hash_fn` and passed in — because the hasher is a
+    /// construction-time decision and this body is shared across hashers
+    /// (B-2026-08-22-27).
+    ///
+    /// Only the i64-key/i64-value `Map` get is routed; every other mono probe
+    /// keeps its byte walk, so this form is a measurement lever rather than a
+    /// wholesale replacement until it has a number on the corpus.
+    RuntimeGroup,
 }
 
 /// The loop-carried cursor of a mono LOOKUP probe, returned by
@@ -5808,7 +5819,10 @@ impl<'ctx> super::Codegen<'ctx> {
         let cur = phi.as_basic_value().into_int_value();
 
         match form {
-            MapLookupProbe::Bounded => {
+            // `RuntimeGroup` rides with `Bounded` here: only the one routed
+            // site short-circuits before reaching this cursor, and every other
+            // probe must keep a correct walk.
+            MapLookupProbe::Bounded | MapLookupProbe::RuntimeGroup => {
                 let bound_done = self
                     .builder
                     .build_int_compare(IntPredicate::UGE, cur, cap, "bound.done")
@@ -6505,6 +6519,81 @@ impl<'ctx> super::Codegen<'ctx> {
     /// ptr out_val)`. Returns true and writes the value through
     /// `out_val` on match; returns false otherwise, leaving
     /// `out_val` untouched.
+    /// B-2026-09-09-12. Emit the i64 `Map.get` as ONE call to the runtime's
+    /// group scan, with the hash computed here through the map's STORED
+    /// `hash_fn` and passed in.
+    ///
+    /// The hash deliberately stays on this side. Baking `karac_hash_u64` into
+    /// the callee would let the permutation inline into the walk, which is the
+    /// shape a sibling row prototyped — and it is the B-2026-08-22-27 bug: this
+    /// monomorphized body is shared across hashers, so a
+    /// `Map[K, V, FxBuildHasher]` would file keys under one hash and probe
+    /// under another, losing only the keys inserted since the last resize
+    /// (every resize rehashes through the stored fn and repairs the rest).
+    fn emit_mono_map_get_via_runtime_group(
+        &mut self,
+        f: FunctionValue<'ctx>,
+        map_arg: inkwell::values::PointerValue<'ctx>,
+        key_arg: IntValue<'ctx>,
+        out_val_arg: inkwell::values::PointerValue<'ctx>,
+    ) {
+        let i8_t = self.context.i8_type();
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let entry_bb = self.context.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry_bb);
+
+        // The map's own hash of this key — same load-and-call the byte-walk
+        // body does, kept here so the stored `hash_fn` stays authoritative.
+        let hash_fn_ty = i64_t.fn_type(&[ptr_ty.into()], false);
+        let hash_fn_pp = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    map_arg,
+                    &[i64_t.const_int(Self::KARAC_MAP_HASH_FN_OFFSET, false)],
+                    "hash.fn.pp",
+                )
+                .unwrap()
+        };
+        let hash_fn_ptr = self
+            .builder
+            .build_load(ptr_ty, hash_fn_pp, "hash.fn")
+            .unwrap()
+            .into_pointer_value();
+        let key_slot = self.builder.build_alloca(i64_t, "hash.key.slot").unwrap();
+        self.builder.build_store(key_slot, key_arg).unwrap();
+        let hash = self
+            .builder
+            .build_indirect_call(hash_fn_ty, hash_fn_ptr, &[key_slot.into()], "hash")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+
+        let probe_fn = self
+            .module
+            .get_function("karac_map_get_i64_prehashed")
+            .expect("karac_map_get_i64_prehashed declared in module setup");
+        let found = self
+            .builder
+            .build_call(
+                probe_fn,
+                &[
+                    map_arg.into(),
+                    key_arg.into(),
+                    hash.into(),
+                    out_val_arg.into(),
+                ],
+                "group.found",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        self.builder.build_return(Some(&found)).unwrap();
+    }
+
     pub(super) fn emit_mono_map_get_body(
         &mut self,
         f: FunctionValue<'ctx>,
@@ -6523,6 +6612,18 @@ impl<'ctx> super::Codegen<'ctx> {
         let map_arg = f.get_nth_param(0).unwrap().into_pointer_value();
         let key_arg = f.get_nth_param(1).unwrap().into_int_value();
         let out_val_arg = f.get_nth_param(2).unwrap().into_pointer_value();
+
+        // B-2026-09-09-12 — hand the probe to the runtime's SWAR group scan
+        // instead of walking control bytes here. Only an i64 key with an
+        // 8-byte value, the stride `karac_map_get_i64_prehashed` documents;
+        // every other shape keeps the byte walk below.
+        if self.mapset.map_lookup_probe == MapLookupProbe::RuntimeGroup
+            && key_size == 8
+            && val_size == 8
+        {
+            self.emit_mono_map_get_via_runtime_group(f, map_arg, key_arg, out_val_arg);
+            return;
+        }
 
         let entry_bb = self.context.append_basic_block(f, "entry");
         let probe_cond_bb = self.context.append_basic_block(f, "probe.cond");
