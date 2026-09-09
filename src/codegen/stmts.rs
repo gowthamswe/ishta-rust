@@ -10620,7 +10620,42 @@ impl<'ctx> super::Codegen<'ctx> {
                                         self.drop_rc.caller_retained_aggregate_memory.contains(s)
                                     }),
                                 };
-                                if source_is_caller_retained {
+                                // B-2026-09-06-59 — ...BUT ONLY IF THE REBIND
+                                // REALLY IS A VIEW. `uam_defensive_copy` (the
+                                // `let` site, ~4.5k lines up in this same
+                                // function) hands the destination an
+                                // INDEPENDENT deep copy whenever the ownership
+                                // pass flagged the source as read-after-move,
+                                // so that the later read stays valid — and its
+                                // own comment justifies that copy's safety with
+                                // "a `let` destination always registers its own
+                                // cleanup, so here the copy provably has an
+                                // owner." Declining below made that sentence
+                                // false: `fn f(r: R) -> String { let m = r;
+                                // return f"{r.name}"; }` allocated one buffer
+                                // more than its non-reading sibling (15 allocs
+                                // vs 14) and freed one fewer, losing the copied
+                                // `name` — 3 bytes in 1 block at -O0, and clean
+                                // at -O2 only because LLVM deletes the dead
+                                // copy before it can be lost.
+                                //
+                                // Keyed on `uam_copied_sites` — "a copy really
+                                // happened" — which is the authority the other
+                                // consumers of this copy already use for the
+                                // mirror-image decision (`param_own.rs`'s
+                                // field-move disarm, `control_flow_match.rs`'s
+                                // tuple-elem zeroing). Keying on
+                                // `uam_consume_sites` instead would decline
+                                // wherever the pass merely FLAGGED a read,
+                                // including the shapes `uam_defensive_copy`
+                                // turns away uncopied, and that is a second
+                                // owner for one buffer — the double free
+                                // B-2026-09-06-52 removed.
+                                let rebind_took_a_defensive_copy = self
+                                    .span_tables
+                                    .uam_copied_sites
+                                    .contains(&(value.span.offset, value.span.length));
+                                if source_is_caller_retained && !rebind_took_a_defensive_copy {
                                     // The step: `m` is a view onto the caller's
                                     // memory too, so `let n = m;` one line later
                                     // must decline for the same reason `let m =
@@ -10835,7 +10870,24 @@ impl<'ctx> super::Codegen<'ctx> {
                                         .contains(src.as_str()),
                                     _ => false,
                                 };
-                                if self_src_caller_retained {
+                                // B-2026-09-06-59 — the receiver leg's half of
+                                // the same guard. A bare `self` never takes a
+                                // defensive copy (`uam_defensive_copy` bails
+                                // before its struct arm for anything that is
+                                // not an `Identifier`, and `self` parses as
+                                // `SelfValue`), so this is inert for `let m =
+                                // self;` itself. It is NOT inert one step
+                                // along: `let m = self; let n = m;` reaches
+                                // here with a bare identifier, and if `m` is
+                                // read afterwards the copy really is taken —
+                                // measured leaking the same 3 bytes in 1 block
+                                // at -O0 while the param leg beside it was
+                                // already clean.
+                                let self_rebind_took_a_defensive_copy = self
+                                    .span_tables
+                                    .uam_copied_sites
+                                    .contains(&(value.span.offset, value.span.length));
+                                if self_src_caller_retained && !self_rebind_took_a_defensive_copy {
                                     // The induction step the param leg makes
                                     // too: `let n = m;` after this must decline
                                     // for the same reason.

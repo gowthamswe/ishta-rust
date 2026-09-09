@@ -6205,7 +6205,22 @@ impl<'ctx> super::Codegen<'ctx> {
                 let fn_val = self.current_fn.unwrap();
                 let slot = self.create_entry_alloca(fn_val, "uam.struct.src", val.get_type());
                 self.builder.build_store(slot, val).unwrap();
+                // B-2026-09-06-59 — CLONE-ON-EXTRACT, not entry-copy. This
+                // clone gets its own cleanup at the `let` destination, so a
+                // bare `shared` field must be rc-INC'd or the clone co-owns
+                // the box without a count and the second struct-drop rc-DEC
+                // reads and writes the freed 16-byte refcount block (measured:
+                // `Invalid read of size 8` + `Invalid write of size 8` on the
+                // `read` cell once its destination started registering).
+                // `deep_copy_one_aggregate_field`'s own words for this flag:
+                // "rc-INC it so the clone independently co-owns the box,
+                // symmetric with the leaf's combined struct-drop rc-DEC" —
+                // which is exactly this site, and was not exactly this site
+                // only while the destination registered nothing.
+                let saved_rc_inc = self.drop_rc.deep_copy_rc_inc_bare_shared;
+                self.drop_rc.deep_copy_rc_inc_bare_shared = true;
                 self.deep_copy_struct_heap_fields_in_place(slot, &struct_name);
+                self.drop_rc.deep_copy_rc_inc_bare_shared = saved_rc_inc;
                 let cloned = self
                     .builder
                     .build_load(val.get_type(), slot, "uam.struct.clone")

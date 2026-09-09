@@ -8215,9 +8215,20 @@ fn main() { let mut i = 0; while i < 3 { round(); i = i + 1; } println("done"); 
     /// free under the JIT and at `-O0`; ASAN sees the `shared` handle's refcount
     /// block read and written after its free even where the abort does not land.
     ///
-    /// The E2E twin's `rd` cell is deliberately absent here: reading the source
-    /// after the move leaves its `String` unowned at `-O0` (3 B in 1 block),
-    /// which is B-2026-09-06-59's subject and not this row's.
+    /// THE `rd*` CELLS ARE B-2026-09-06-59's, added when that row closed. They
+    /// read the source AFTER the rebind, which makes the ownership pass take a
+    /// `UseAfterMove` defensive copy — an INDEPENDENT buffer that this row's
+    /// fix had taught the destination not to own, so each lost its `String`.
+    ///
+    /// THEY ARE `-O0`-ONLY, and that is the whole reason they are here rather
+    /// than in the E2E twin. At `-O2` LLVM deletes the dead copy before it can
+    /// be lost, so this fixture is CLEAN ON THE UNFIXED COMPILER at the default
+    /// opt level: measured on stock `main`, `-O0` loses 15 B in 5 blocks (one
+    /// per cell, 98 allocs / 93 frees) while `-O2` reports 0 errors. A
+    /// non-vacuity check run at the default level would therefore "pass" on a
+    /// tree without the fix and prove nothing. `scripts/asan-o0-leg.sh` is what
+    /// makes these cells a ratchet; `cargo test --features llvm` alone does
+    /// not.
     fn asan_declined_copy_param_rebind_keeps_the_callers_ownership() {
         assert_clean_asan_run_min_allocs(
             r#"
@@ -8258,6 +8269,11 @@ fn deep(s: S) -> i64 { let m = s; return m.mid.d.v; }
 fn nodrop(n: N) -> i64 { let m = n; return m.inner.v; }
 fn selfref(nd: Node) -> i64 { let m = nd; return m.id; }
 fn ctl(p: P) -> i64 { let m = p; return m.id; }
+fn rd(r: R) -> String { let m = r; return f"{r.name}"; }
+fn rdi(r: R) -> i64 { let m = r; return r.inner.v; }
+fn rdb(r: R) -> i64 { let m = r; return m.id + r.id; }
+fn rdc(r: R) -> String { let m = r; let n = m; return f"{m.name}"; }
+impl R { fn takerd(self) -> String { let m = self; let n = m; return f"{m.name}"; } }
 
 fn main() {
     println(f"top={top(mk(21))}");
@@ -8271,13 +8287,19 @@ fn main() {
     println(f"nod={nodrop(mkn(30))}");
     println(f"self={selfref(mknode(31))}");
     println(f"ctl={ctl(mkp(32))}");
+    println(f"rd={rd(mk(33))}");
+    println(f"rdi={rdi(mk(34))}");
+    println(f"rdb={rdb(mk(35))}");
+    println(f"rdc={rdc(mk(36))}");
+    println(f"rds={mk(37).takerd()}");
     println("end");
 }
 "#,
             &[
                 "dR21", "top=21", "dR22", "brT=22", "dR23", "brF=0", "dR24", "two=24", "dR25",
                 "call=25", "dR26", "dR1", "pair=27", "dR28", "loop=28", "dS29", "deep=29",
-                "nod=30", "dNd31", "self=31", "dP32", "ctl=32", "end",
+                "nod=30", "dNd31", "self=31", "dP32", "ctl=32", "dR33", "rd=h33", "dR34", "rdi=34",
+                "dR35", "rdb=70", "dR36", "rdc=h36", "dR37", "rds=h37", "end",
             ],
             "b0906-52-declined-copy-param-rebind",
             50,
