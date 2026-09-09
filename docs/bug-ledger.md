@@ -102,7 +102,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | false-positive | 106 |
 | perf | 102 |
 | soundness | 95 |
-| other | 84 |
+| other | 85 |
 | crash | 78 |
 | use-after-free | 36 |
 
@@ -113,7 +113,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen | 1618 |
 | interp | 407 |
 | typecheck | 295 |
-| other | 76 |
+| other | 77 |
 | ownership | 74 |
 | cli | 72 |
 | autopar | 56 |
@@ -159,7 +159,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-72 | 2026-09-06 | codegen | low | A `shared` FIELD LEAKS ITS 16-BYTE REFCOUNT BLOCK WHEN ITS STRUCT IS RETURNED INSIDE A TUPLE OR AN `Option` -- `fn f(r: R) -> (R, i64) { return (r, 9); }` and `fn f(r: R) -> Option[R] { return Option.Some(r); }` each lose 16 B in 1 block at -O0 (12 allocs / 11 frees), with no rebind involved; the same function returning the struct BARE (`return r;`) is clean, and so is the same aggregate return over a struct with no `shared` field. Clean at -O2 and under `--interp` | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
 | B-2026-09-07-21 | 2026-09-07 | codegen | low | TWO DISCARDED-LITERAL FIELD SHAPES STILL HAVE NO OWNER AFTER B-2026-09-01-5 -- a projecting arm followed by another statement strands 38 B in the SEQUENTIAL lane only (clean under auto-par, which is the default and what the fixtures run), and a `.clone()` field in a discarded statement literal strands 39 B on every surface | — |
-| B-2026-09-07-26 | 2026-09-07 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on the Linux container that closed B-2026-09-06-68 `not-reproduced`; same revisions, same fixture, both reproduced repeatedly | tests/memory_sanitizer.rs#asan_by_value_struct_param_is_owned_by_transfer_not_entry_copy |
 | B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
 | B-2026-09-07-44 | 2026-09-07 | codegen | low | A FRESH-TEMP ENUM SCRUTINEE WHOSE CONSUMING ARM BINDS A COPY-DECLINED STRUCT PAYLOAD LEAKS THE PAYLOAD'S INTERIOR -- `match W.T(mkx(1)) { W.T(x) => .. }` loses 2 B while the `let`-bound scrutinee and the `W.T(_)` arm of the same program are clean | none |
 | B-2026-09-07-53 | 2026-09-07 | codegen | high | AT EQUAL HASHING kara's Map IS NOW SLOWER THAN RUST'S, INVERTING A PUBLISHED HEADLINE: on 3 of 4 re-measured map katas kara went from 3-4x AHEAD of both rustc builds to 1.2-2.4x BEHIND (kata:146 0.31x -> 2.35x vs rust_ovf), and also lost its lead over Go -- so the 2026-06-15 equal-safety claim "parity with memory-safe Rust, BEATS IT ON COLLECTIONS" rested on comparing kara's compile-time-constant-seeded FxHash against Rust's per-process SipHash-1-3, and cannot be quoted until the collection set is re-run | BENCHMARKS.md + the 16 collection/pointer kata READMEs still publish the pre-59c8d30cd collection-superiority claim | corrects the unmeasured speculation in B-2026-09-07-42's COST DECOMPOSED section |
@@ -169,7 +168,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
 | B-2026-09-08-13 | 2026-09-08 | codegen | medium | A LET-BOUND LOCAL OF A SELF-REFERENTIAL STRUCT PASSED BY VALUE LOSES ITS `Drop` BODY ON EVERY COMPILED BACKEND -- `let c = mkn(10); read(c)` prints the body under `--interp` and nothing under the JIT, `-O0`, `-O2` and `KARAC_AUTO_PAR=0`; passing the SAME value as a temporary agrees, which is the only variable, and is why six existing fixtures for this type all miss it | none |
 | B-2026-09-09-1 | 2026-09-09 | cli | low | `signalling_karac_run_does_not_orphan_the_jit_runner` FAILS UNDER LOAD IN THE REQUIRED GATE SET -- 1 failure in 5 runs of the full `--test cli` binary on one tree, at the 15-SECOND watchdog assert (the runner outlived the signal), while the same test passes in ISOLATION in 2.8s and the four other full-binary runs were 738/738; either the window is too short for a loaded debug container or B-2026-09-05-24's orphan is intermittent rather than fixed, and the two readings need different remedies | — |
-| B-2026-09-09-2 | 2026-09-09 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }` called with `k = true` dies with SIGSEGV (rc=139) on the JIT and at both opt levels, valgrind `Invalid read of size 8 / Address 0x8 is not stack'd, malloc'd or (recently) free'd` -- a NULL box handle GEP'd at field 1 -- while `--interp` prints `s100 n1 dR100 end` correctly; the `k = false` half of the same callee is B-2026-09-07-50 and is a lost body, not a crash | — |
 
 ### Relocated
 
@@ -2375,6 +2373,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-23 | codegen | high | A `let`-BOUND STRUCT LITERAL PROJECTING A LOOP-OUTER LOCAL FREES THE ALIASED BUFFER ONCE PER ITERATION -- `while i < 2 { let p = P { a: t.a, b: 1 };… | afe5abf |
 | B-2026-09-07-24 | interp | medium | A `u64` ABOVE `i64::MAX` IN A WIDTH-SPEC'D f-STRING HOLE RENDERS NEGATIVE UNDER `--interp` AND UNSIGNED ON BOTH COMPILED BACKENDS -- `f"{ubig:22}"` f… | f5f86c16e |
 | B-2026-09-07-25 | codegen | medium | B-2026-09-05-23 LEFT THE SPEC'D f-STRING INTEGER PATH ON libc `snprintf` -- `f"{n}"` was fast and `f"{n:5}"` was ~23x slower inside a parallel loop (… | c5982d963 |
+| B-2026-09-07-26 | codegen | medium | THE BY-VALUE STRUCT-PARAM TRANSFER CEILING IS HOST-CONDITIONAL, NOT UNREPRODUCIBLE -- 320 malloc calls on macOS 26.6 / Apple M5 arm64 against 131 on… | 6e23fe215 |
 | B-2026-09-07-27 | codegen | high | AN RC-FALLBACK BOX HAS NO TYPE IDENTITY, so it runs a SAME-SHAPED TWIN'S `Drop` body -- B-2026-09-07-17 named the boxed value by reverse lookup over… | f37af501e |
 | B-2026-09-07-28 | codegen | medium | AN RC-BOXED TUPLE LOSES ITS ELEMENT'S `Drop` BODY -- `let t = (S { . | 0e881224f |
 | B-2026-09-07-29 | codegen | high | A WHOLE CONSUME INSIDE A LOOP THAT ACTUALLY RUNS DOUBLE-FREES AN RC-PROMOTED LOCAL, with no projection anywhere in the program -- `while i < 3i64 { t… | ebc87c6 |
@@ -2418,6 +2417,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-10 | interp | medium | `--interp` NEVER DESTROYS THE FIELD AN RC-PROMOTED BASE RETAINS, so it hands out N live copies and runs N bodies where N+1 values exist -- `while i <… | 650dee7f3 |
 | B-2026-09-08-14 | codegen | low | A CONDITIONAL MOVE-OUT FOLLOWED BY AN UNCONDITIONAL REASSIGN LOSES THE DISPLACED VALUE'S `Drop` BODY -- `if f { let taken = g.one; } g.one = mks(7);`… | 1606c18 |
 | B-2026-09-08-15 | codegen | high | BOTH -O0 ASAN RATCHETS ARE RED ON `main` -- `rc_boxed_tuple_index_destinations_stay_clean` leaks 76 B in 2 objects on its `b49_tuple_assign_three_tri… | 3130242 |
+| B-2026-09-08-16 | other | high | THE ASAN VACUOUS-FIXTURE GUARD WAS ITSELF VACUOUS ON EVERY HOST -- `min_allocs` compared ASAN's RAW process-wide count against thresholds smaller tha… | 6e23fe215 |
+| B-2026-09-09-2 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push… | 33c5c25 |
 
 </details>
 
