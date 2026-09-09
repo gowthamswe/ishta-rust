@@ -95,7 +95,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | miscompile | 402 |
 | run-vs-build | 378 |
 | leak | 307 |
-| double-free | 215 |
+| double-free | 216 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
 | diagnostics | 125 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1625 |
+| codegen | 1626 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 81 |
@@ -159,7 +159,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
 | B-2026-09-08-11 | 2026-09-08 | codegen | low | `display_mangle_te` RENDERS EVERY UNNAMEABLE TYPE AS `unknown`, SO THEY SHARE ONE MANGLED SYMBOL AND ONE DROP/CLONE CACHE ENTRY -- `Vec[weak A]` and `Vec[weak B]` both emit `karac_drop_Vec_unknown` / `karac_clone_unknown` and the second requested gets the first's function; benign for `weak` ONLY because every weak-slot operation is slot-type-agnostic, and the fallback is not weak-only | none |
 | B-2026-09-09-5 | 2026-09-09 | other | low | THREE LOAD-SENSITIVE TESTS IN THE REQUIRED GATE SET ARE STILL UNEXPLAINED after B-2026-09-09-1's named one turned out NOT to be flaky -- that one was a deterministic watchdog race that never armed (fixed 32223a5a6, 2-in-6 permanent orphans under load -> 0 in 8), so its resolution transfers no conclusion to the rest. Leading hypothesis for the ASAN pair is the vacuous-fixture floor: n=102 against a per-process HOST FLOOR of 90 measured on a box running dozens of concurrent ASAN processes, a 12-allocation margin that a drifting floor would trip with nothing wrong in the compiler -- with the counter-argument that a shared OnceLock floor should fail many fixtures at once, and only one failed | — |
-| B-2026-09-09-6 | 2026-09-09 | runtime | low | A PER-THREAD SMALL-BLOCK FREE LIST is 5.8-6.8x on B-2026-09-05-22's probes and 2.76x SLOWER on kata:288 at a 99.2% hit rate -- REFUTED IN THIS FORM, and the blocker is isolated: the TLS ACCESS costs 2.09x on that kata with recycling switched off entirely, so Rust's `thread_local!` + `try_with` per alloc and per free costs more than the malloc it replaces except where libmalloc is contending. The idea needs a pool reached WITHOUT a per-call TLS lookup; the probes oversold it 6x because they are contention-dominated and the katas are not | docs/investigations/autopar-alloc-scaling.md, "The M5 answer" section |
 | B-2026-09-09-7 | 2026-09-09 | other | medium | A FULL DISK FAILS THE GATE SET AS AN LLVM CRASH, A LINKER BUS ERROR, OR A LOST OUTPUT STREAM -- never as a named test -- and it hit ELEVEN times across seven unrelated slices in one session. The session allowance is ~38 GiB (df's '252G size' is the host volume and is meaningless), ONE leg of `cargo test --no-run` costs 19.6 GiB in test binaries (134 executables x ~250 MiB at the default debug=2), so the SECOND feature leg cannot start. The obvious suspect is wrong: both clippy legs together cost 1.19 GiB. `CARGO_PROFILE_TEST_DEBUG=line-tables-only` cuts a test binary 252 -> 97 MiB and makes both legs fit | — |
 | B-2026-09-09-8 | 2026-09-09 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-49 STILL LEAKS ITS INLINE-BUILT `Array` INTERIOR -- `plainR(Result.Ok([f"a{i}", f"b{i}"]))` over `Result[Array[String, 2], i64]` loses 54 B in 6 blocks after the Option half was fixed, because the param-site arm that owns the payload reads it through `option_generic_arg_type_expr` and no `Result` sibling exists | none |
 | B-2026-09-09-9 | 2026-09-09 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` over `Option[Array[Vec[String], 2]]` fails with `codegen: nested indexed read on 't' -- element TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, the eighth base shape in a family whose other seven are fixed | none |
@@ -199,6 +198,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-08-29-62 | 2026-08-29 | codegen | low | Spelling a binary-search midpoint `lo + ((hi - lo) >> 1)` instead of `lo + (hi - lo) / 2` costs 1.67x on current main: LLVM's X86CmovConversion rewrites the branchless loop back into a branch, and only `/ 2`'s signed sign-correction lengthens the dependency chain enough to stop it -- so the "slower" spelling wins by accident. NOT statically decidable: forcing the branchless form is 1.86x FASTER on this kata and 2.02x SLOWER on kata #275, and flipping only the input data from random to a ramp reverses the sign within this one program |
 | B-2026-09-03-29 | 2026-09-03 | typecheck | medium | `E_INDEX_MOVE_NON_COPY`'s FOUR-SITE SET IS DELIBERATE, NOT THE SITE-BASED ACCIDENT `partial_move_of_drop_struct` WAS -- the rule rejects exactly where `ref v[i]` is a spellable remedy (`let`, assignment RHS, call and method argument) and permits-and-deep-copies where an owned value is required and no borrow can be constructed; widening it to the other eleven positions fails 58 tests across four binaries, breaks `PriorityQueue.peek` and `fn first[T](s: Slice[T]) -> T { s[0] }` with no migration available, and this row's premise that it is "mechanically add the second rule at the same lines" is refuted |
 | B-2026-09-05-22 | 2026-09-05 | runtime | medium | NOT A KARA DEFECT -- macOS libmalloc collapses at exactly TWO concurrent allocators each holding ONE small block live in the same size class, in any language: the shape-matched C control runs 59.94ms -> 463.15ms -> 27.52ms across 1/2/3 threads at the 3 bytes kara was measured to request, and mt_malloc_k at K=1 (the density its own sweep never ran) gives 113.83 -> 948.96 -> 49.15. Every earlier control did TWO pairs per step. Not the size class (1 B to 1 KiB all collapse), not thread count, not timing phase; arm64 and x86 Linux/glibc scale cleanly. kara's exposure is a parallel region whose iter_total is 2 |
+| B-2026-09-09-6 | 2026-09-09 | runtime | low | A PER-THREAD SMALL-BLOCK FREE LIST is 5.8-6.8x on B-2026-09-05-22's probes and 2.76x SLOWER on kata:288 at a 99.2% hit rate -- REFUTED IN THIS FORM, and the blocker is isolated: the TLS ACCESS costs 2.09x on that kata with recycling switched off entirely, so Rust's `thread_local!` + `try_with` per alloc and per free costs more than the malloc it replaces except where libmalloc is contending. The idea needs a pool reached WITHOUT a per-call TLS lookup; the probes oversold it 6x because they are contention-dominated and the katas are not |
 
 </details>
 
@@ -2432,6 +2432,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-11 | codegen | medium | A `shared enum` WITH A BOXED STRUCT PAYLOAD PRINTS NOTHING ON EVERY COMPILED BACKEND AND STACK-OVERFLOWS THE JIT, while `--interp` prints the right t… | 768a9be |
 | B-2026-09-09-13 | codegen | medium | 99f54104e REGRESSED AN IN-TREE FIXTURE INTO A DOUBLE FREE, and both ASAN ratchet legs are red on origin/main because of it -- `fn f(value: Option[Val… | src/codegen/call_dispatch.rs: `owned_boxed_option_param_str… |
 | B-2026-09-09-15 | other | medium | THE INSTRUMENTED ASAN LEG CANNOT LINK ON macOS -- every fixture dies at `___asan_version_mismatch_check_v8` from `_asan.module_ctor`, karac's bundled… | scripts/asan-instrumented-leg.sh appends `-asan-guard-again… |
+| B-2026-09-09-16 | codegen | medium | THE STRUCT-PAYLOAD SPELLING OF B-2026-09-09-13 DOUBLE-FREES TOO, and it PREDATES the commit that row blames -- `fn f(value: Option[R2]) { let mut vv… | 4fb2adee0 |
 
 </details>
 
