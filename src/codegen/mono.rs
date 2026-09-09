@@ -1854,6 +1854,10 @@ impl<'ctx> super::Codegen<'ctx> {
         // B-2026-09-02-46's escape gate, computed at most once per call and
         // only when a boxed-payload `Option`/`Result` temp argument turns up.
         let mut nonescaping_generic_params: Option<std::collections::HashSet<String>> = None;
+        // B-2026-09-06-48 — memoised beside its sibling above; see the use site.
+        let mut payload_consuming_generic_params: Option<
+            std::collections::HashMap<String, std::collections::HashSet<String>>,
+        > = None;
         for (i, a) in args.iter().enumerate() {
             let val = arg_vals[i];
             // B-2026-07-14-12: a fresh-heap `String` TEMP arg to a generic fn
@@ -2004,7 +2008,32 @@ impl<'ctx> super::Codegen<'ctx> {
             if param_nonescaping && self.optres_arg_is_unowned_temp(&a.value) {
                 if let Some(p) = generic_fn.params.get(i) {
                     let inst = self.callee_param_te_for_call(&p.ty, call_span);
-                    self.track_boxed_optres_arg_temp(val, &inst);
+                    // B-2026-09-06-48 — arm the payload's own drop only when
+                    // the callee does not take it. Memoised beside the escape
+                    // set above, and asked of the same `generic_fn`, so both
+                    // answers are properties of the CALLEE rather than of this
+                    // call — two call sites of one monomorph cannot disagree
+                    // and nothing needs caching per instantiation.
+                    let taken = match &p.pattern.kind {
+                        crate::ast::PatternKind::Binding(n) => payload_consuming_generic_params
+                            .get_or_insert_with(|| {
+                                crate::result_escape::optres_payload_consuming_param_variants(
+                                    &generic_fn,
+                                )
+                            })
+                            .get(n.as_str())
+                            .cloned()
+                            .unwrap_or_default(),
+                        // A non-`Binding` param pattern cannot be named in the
+                        // walk, so nothing can be proved about its arms —
+                        // decline every variant, which leaves today's leak
+                        // rather than arming a second owner.
+                        _ => ["Some", "Ok", "Err"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    };
+                    self.track_boxed_optres_arg_temp(val, &inst, &taken);
                 }
             }
         }

@@ -3554,12 +3554,20 @@ impl<'ctx> super::Codegen<'ctx> {
     /// exists, so this cannot become a second owner of one the caller already
     /// registered.
     ///
-    /// BOX-ONLY, exactly as all three `compile_function` siblings are: the
-    /// payload interior belongs to whichever arm binds it out.
+    /// BOX PLUS INTERIOR since B-2026-09-06-48, where all three
+    /// `compile_function` siblings are box-only. Not an inconsistency: those
+    /// register on the CALLEE, where an arm that binds the payload out retracts
+    /// the interior back off the action in the same frame
+    /// (`retract_boxed_tuple_inner_drop_for_arm`). This action lives in the
+    /// CALLER's frame and the monomorph body compiles with
+    /// `scope_cleanup_actions` swapped, so no retraction can reach it — the
+    /// interior is therefore armed only after asking the callee's AST whether
+    /// any arm takes it. See the arm below.
     pub(super) fn track_boxed_optres_arg_temp(
         &mut self,
         val: BasicValueEnum<'ctx>,
         inst_te: &TypeExpr,
+        payload_taken_by_callee: &std::collections::HashSet<String>,
     ) {
         let variants = self.boxed_enum_payload_variants(inst_te);
         if variants.is_empty() {
@@ -3589,14 +3597,67 @@ impl<'ctx> super::Codegen<'ctx> {
             let deeper = Self::option_generic_arg_type_expr(inst_te)
                 .map(|inner| self.nested_box_deeper_tag_chain(&inner))
                 .unwrap_or_default();
+            // B-2026-09-06-48 — a boxed TUPLE payload's own heap elements,
+            // owned here rather than by nobody. Verbatim B-2026-09-04-12's
+            // derivation for the NON-GENERIC twin (`compile_function`'s leg A),
+            // which is what makes the two paths free the same set; the reason
+            // it had to be repeated on this side at all is that the two have
+            // DIFFERENT owners for one box — there the callee, here the caller.
+            //
+            // `payload_taken_by_callee` is the retraction, moved to the only
+            // place it can happen. Codegen's `retract_boxed_tuple_inner_drop_for_arm`
+            // downgrades the non-generic action back to box-only when a
+            // consuming arm takes the interior, and it CANNOT reach this
+            // action: the monomorph body compiles with `scope_cleanup_actions`
+            // swapped, so `clear_boxed_enum_inner_drop` never sees the caller's
+            // frame. The caller therefore asks the callee's AST the same
+            // question up front — `optres_payload_consuming_param_variants` —
+            // and simply does not arm what it would have had to retract.
+            //
+            // PER VARIANT: a `Result`'s `Err` arm consuming its `i64` says
+            // nothing about the `Ok` tuple, and collapsing the two lost that
+            // tuple's interior again.
+            let inner_drop = if !payload_taken_by_callee.contains(variant) {
+                Self::optres_variant_payload_type_expr(inst_te, variant)
+                    .filter(|p| {
+                        matches!(p.kind, TypeKind::Tuple(_))
+                            && self.option_payload_struct_or_enum_drop_ok(p)
+                    })
+                    .map(|p| self.emit_drop_fn_for_type_expr(&p))
+            } else {
+                None
+            };
             self.track_boxed_enum_var_with_chain(
                 "__boxed_optres_arg_tmp",
                 slot,
                 enum_lit,
                 variant,
-                None,
+                inner_drop,
                 deeper,
             );
+        }
+    }
+
+    /// B-2026-09-06-48 — the payload `TypeExpr` a seeded-pair VARIANT carries,
+    /// resolved from the instantiated envelope type.
+    ///
+    /// `Self::option_generic_arg_type_expr`'s generalisation: that one is
+    /// `Option`-only because its caller (leg A) is gated to `Option` before it
+    /// runs, while this site iterates the variants `boxed_enum_payload_variants`
+    /// reports and so must answer for `Ok` and `Err` too. `Some`/`Ok` take the
+    /// first generic argument, `Err` the second.
+    fn optres_variant_payload_type_expr(te: &TypeExpr, variant: &str) -> Option<TypeExpr> {
+        let TypeKind::Path(p) = &te.kind else {
+            return None;
+        };
+        let idx = match variant {
+            "Some" | "Ok" => 0usize,
+            "Err" => 1usize,
+            _ => return None,
+        };
+        match p.generic_args.as_ref()?.get(idx)? {
+            crate::ast::GenericArg::Type(t) => Some(t.clone()),
+            _ => None,
         }
     }
 

@@ -80332,13 +80332,16 @@ fn main() {
     let c1 = takesOpt(Some(a));
 
     // Cell 2 — a TUPLE payload, proving the array is only the shape that
-    // made this reachable and not the cause. Four scalar words, past the
-    // 3-word area, so it boxes with no heap of its own INSIDE the box —
-    // deliberately, because a two-`String` tuple additionally loses its
-    // interior in a monomorph (6 B here, measured) and that is a separate
-    // live defect this fixture must not silently depend on. See
-    // B-2026-09-04-14.
-    let p = (n, n + 1, n + 2, n + 3);
+    // made this reachable and not the cause. Two `String`s: 6 words, past the
+    // 3-word area, so it boxes AND carries heap of its own inside the box.
+    //
+    // B-2026-09-06-48 — this cell was four SCALAR words until that row closed,
+    // because a two-`String` tuple additionally lost its interior in a
+    // monomorph and this fixture must not silently depend on a live defect.
+    // Widening it back is what that row's note asked for, and it is now the
+    // cell that would catch a regression of it here as well as in the row's
+    // own fixture.
+    let p = (f"ab{n}", f"cd{n}");
     let c2 = takesOpt(Some(p));
 
     // Cell 3 — `Result` rather than `Option`, boxing against the 5-word area.
@@ -80369,7 +80372,7 @@ fn main() {
             src,
             &[
                 "o:[uv1, wx1]",
-                "o:(1, 2, 3, 4)",
+                "o:(ab1, cd1)",
                 "r:[yz1, za1]",
                 "m7:[mn1, op1]",
                 "o:[pq1, rs1]",
@@ -80378,6 +80381,120 @@ fn main() {
             ],
             "b0902-46-generic-boxed-optres-temp-arg",
             20,
+        );
+    }
+
+    /// B-2026-09-06-48 — a GENERIC callee's boxed `Option`/`Result` payload
+    /// frees its own heap interior, not just the box around it.
+    ///
+    /// The generic half of B-2026-09-04-12. That row gave the NON-GENERIC
+    /// by-value param's `BoxedEnumDrop` the tuple's own drop; the generic path
+    /// never reached it, because the two spellings have DIFFERENT owners for
+    /// one box — there the callee (`compile_function`'s leg A), here the caller
+    /// (`track_boxed_optres_arg_temp`, B-2026-09-02-46), whose registration was
+    /// box-only. 54 B in 6 blocks over three calls, one lost element per heap
+    /// element of the payload.
+    ///
+    /// THE CONSUMING-ARM CELL IS THE DOUBLE-FREE CONTROL, and it is the reason
+    /// the fix is a caller-side AST question rather than the obvious port. An
+    /// arm that TAKES the payload (`let u = t`) already owns and frees it, so
+    /// arming the caller's interior drop as well is a second owner. Codegen's
+    /// own retraction (`retract_boxed_tuple_inner_drop_for_arm`) cannot reach
+    /// the caller's action here — the monomorph body compiles with
+    /// `scope_cleanup_actions` SWAPPED, so `clear_boxed_enum_inner_drop` never
+    /// sees that frame — which is why the caller asks
+    /// `optres_payload_consuming_param_names` up front and declines to arm what
+    /// it could not retract. Get that backwards and this cell aborts rather
+    /// than leaks, so it fails LOUDLY in the dangerous direction.
+    ///
+    /// THE BINDING CELL IS THE OTHER CONTROL. A named `Option` argument's
+    /// let-site drop already owns box AND interior on this path and is never
+    /// disarmed, so it was clean before this fix and must stay exactly one
+    /// owner after it.
+    #[test]
+    fn asan_generic_callee_boxed_optres_payload_frees_its_interior() {
+        let src = r#"
+fn readsIt[T: Display](x: Option[T]) -> i64 {
+    match x {
+        Some(t) => { println(f"o:{t}"); return 1; }
+        None => { return 0; }
+    }
+}
+
+fn takesIt[T: Display](x: Option[T]) -> i64 {
+    match x {
+        Some(t) => { let u = t; println("took"); return 1; }
+        None => { return 0; }
+    }
+}
+
+fn wildArm[T: Display](x: Option[T]) -> i64 {
+    match x {
+        Some(_) => { println("some"); return 1; }
+        None => { return 0; }
+    }
+}
+
+fn readsRes[T: Display](x: Result[T, i64]) -> i64 {
+    match x {
+        Ok(t) => { println(f"r:{t}"); return 1; }
+        Err(e) => { return e; }
+    }
+}
+
+fn main() {
+    let n = env.args().len();
+
+    // Cell 1 — the row's own shape: a two-`String` tuple through a fresh-temp
+    // `Option` argument, read-only in the arm. This is the 54 B.
+    let p = (f"aaaa{n}", f"bbbb{n}");
+    let c1 = readsIt(Some(p));
+
+    // Cell 2 — a THREE-element payload, so a fix that frees only the first
+    // element is caught (the row measured 81 B in 9 for this one).
+    let q = (f"cccc{n}", f"dddd{n}", f"eeee{n}");
+    let c2 = readsIt(Some(q));
+
+    // Cell 3 — a MIXED payload: the scalar words must not be walked as heap.
+    let r = (f"ffff{n}", n, n + 1, n + 2);
+    let c3 = readsIt(Some(r));
+
+    // Cell 4 — the CONSUMING-arm control. Aborts on a double free if the
+    // caller arms an interior drop the callee already owns.
+    let s = (f"gggg{n}", f"hhhh{n}");
+    let c4 = takesIt(Some(s));
+
+    // Cell 5 — a wildcard arm binds nothing, so nothing in the callee can own
+    // the interior and the caller must.
+    let t = (f"iiii{n}", f"jjjj{n}");
+    let c5 = wildArm(Some(t));
+
+    // Cell 6 — `Result` rather than `Option`, boxing against the 5-word area.
+    let u = (f"kkkk{n}", f"llll{n}", f"mmmm{n}", f"nnnn{n}");
+    let c6 = readsRes(Ok(u));
+
+    // Cell 7 — the BINDING control: sole owner is the let site, before and
+    // after.
+    let v = (f"oooo{n}", f"pppp{n}");
+    let bound: Option[(String, String)] = Some(v);
+    let c7 = readsIt(bound);
+
+    println(f"acc{c1 + c2 + c3 + c4 + c5 + c6 + c7}");
+}
+"#;
+        assert_clean_asan_run(
+            src,
+            &[
+                "o:(aaaa1, bbbb1)",
+                "o:(cccc1, dddd1, eeee1)",
+                "o:(ffff1, 1, 2, 3)",
+                "took",
+                "some",
+                "r:(kkkk1, llll1, mmmm1, nnnn1)",
+                "o:(oooo1, pppp1)",
+                "acc7",
+            ],
+            "b0906-48-generic-boxed-optres-payload-interior",
         );
     }
 

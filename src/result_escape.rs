@@ -42,6 +42,12 @@ struct Acc<'a> {
     /// `(binding name, value-span (offset,length))` for every `Binding`-pattern
     /// `let` / `let…else` encountered — filtered against `counts` after the walk.
     lets: Vec<(&'a str, (usize, usize))>,
+    /// B-2026-09-06-48 — param names whose boxed `Option`/`Result` payload is
+    /// TAKEN by some `Some`/`Ok`/`Err` arm matching on them directly, keyed by
+    /// the VARIANT whose payload it is. Read by
+    /// [`optres_payload_consuming_param_variants`]; see that function for why the
+    /// question has to be answered from the CALLER's side on the generic path.
+    payload_consumers: HashMap<&'a str, HashSet<&'a str>>,
     /// True while walking inside a closure body. A reference to an OUTER binding
     /// there is a CAPTURE — an escape into an env that can outlive the binding's
     /// scope — so `match`-scrutinee safety is suppressed (even `match d` inside a
@@ -164,6 +170,147 @@ pub fn unused_param_names(func: &Function) -> HashSet<String> {
         .collect()
 }
 
+/// B-2026-09-06-48 — for each PARAM of `func`, the seeded-pair VARIANTS whose
+/// boxed payload is TAKEN by an arm matching on that param directly.
+///
+/// The caller-side twin of codegen's `boxed_tuple_payload_arm_takes_ownership`,
+/// and it exists as a separate AST-level predicate because on the GENERIC path
+/// the codegen one cannot be reached in time. `compile_generic_call` owns a
+/// fresh-temp `Option`/`Result` argument's box (`track_boxed_optres_arg_temp`,
+/// B-2026-09-02-46) from the CALLER's frame, while the arm that would retract
+/// an inner drop runs inside the monomorph body — and that body is compiled
+/// with `scope_cleanup_actions` SWAPPED, so `clear_boxed_enum_inner_drop`
+/// cannot see the caller's action at all. There is no retraction path, which
+/// is why the caller has to decide BEFORE it arms anything.
+///
+/// Asking it of the callee's AST makes the answer a property of the callee
+/// rather than of the call, so two call sites of one monomorph cannot disagree
+/// and nothing has to be cached per instantiation.
+///
+/// PER VARIANT, not per param, and that is load-bearing rather than tidy: a
+/// `Result`'s two variants have different payloads and only one of them is the
+/// boxed tuple. `Err(e) => { return e; }` takes the `i64` and says nothing
+/// about the `Ok` tuple, so collapsing the two lost the `Ok` interior again —
+/// 20 B in 4 blocks, measured, on a fixture whose `Err` arm merely returned
+/// its binding.
+///
+/// Conservative in the safe direction, like every other predicate here: an
+/// unrecognised arm shape counts as NOT taking the payload, which leaves
+/// today's leak rather than arming a second owner of it.
+pub fn optres_payload_consuming_param_variants(
+    func: &Function,
+) -> HashMap<String, HashSet<String>> {
+    let mut acc = Acc::default();
+    walk_block(&func.body, &mut acc);
+    func.params
+        .iter()
+        .filter_map(|p| {
+            let crate::ast::PatternKind::Binding(name) = &p.pattern.kind else {
+                return None;
+            };
+            acc.payload_consumers.get(name.as_str()).map(|vs| {
+                (
+                    name.clone(),
+                    vs.iter()
+                        .map(|v| (*v).to_string())
+                        .collect::<HashSet<String>>(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The VARIANT a `Some`/`Ok`/`Err` arm TAKES the payload of, rather than only
+/// reading it. Mirrors codegen's `boxed_tuple_payload_arm_takes_ownership`
+/// (a per-element destructure always takes; a whole-payload binding takes
+/// unless every use in guard and body only borrows), minus that function's
+/// `pattern_binding_types == "Tuple"` test — the caller applies the tuple
+/// restriction itself, from the instantiated type, which is where it is known
+/// exactly on this path.
+fn variant_arm_takes_payload<'a>(
+    pattern: &'a crate::ast::Pattern,
+    guard: Option<&Expr>,
+    body: &Expr,
+) -> Option<&'a str> {
+    let (variant, binds) = variant_payload_binds(pattern)?;
+    match binds {
+        // A per-element destructure (`Some((a, b))`) gives every leaf its own
+        // owner unconditionally.
+        None => Some(variant),
+        Some(names) => (!names.iter().all(|v| {
+            crate::consume_class::binding_only_borrowed(v, body)
+                && guard.is_none_or(|g| crate::consume_class::binding_only_borrowed(v, g))
+        }))
+        .then_some(variant),
+    }
+}
+
+/// Block-scoped sibling of [`variant_arm_takes_payload`], for `if let` /
+/// `while let` bodies. `None` for the block means the bindings escape the
+/// construct entirely (`let`-else), so they always take.
+fn variant_arm_takes_payload_block<'a>(
+    pattern: &'a crate::ast::Pattern,
+    block: Option<&Block>,
+) -> Option<&'a str> {
+    let (variant, binds) = variant_payload_binds(pattern)?;
+    match (binds, block) {
+        (None, _) => Some(variant),
+        (Some(_), None) => Some(variant),
+        (Some(names), Some(b)) => (!names
+            .iter()
+            .all(|v| crate::consume_class::binding_only_borrowed_block(v, b)))
+        .then_some(variant),
+    }
+}
+
+/// The variant name and payload bindings of a `Some`/`Ok`/`Err` pattern: the
+/// bindings are `None` when the pattern DESTRUCTURES the payload into elements
+/// (which always takes it), `Some(names)` for whole-payload bindings, and the
+/// whole result is `None` for a pattern this predicate does not recognise (a
+/// wildcard `Some(_)` included, which binds nothing and therefore takes
+/// nothing).
+fn variant_payload_binds(pattern: &crate::ast::Pattern) -> Option<(&str, Option<Vec<&str>>)> {
+    let crate::ast::PatternKind::TupleVariant { path, patterns } = &pattern.kind else {
+        return None;
+    };
+    let variant = match path.last().map(|s| s.as_str()) {
+        Some(v @ ("Some" | "Ok" | "Err")) => v,
+        _ => return None,
+    };
+    if patterns
+        .iter()
+        .any(|p| matches!(&p.kind, crate::ast::PatternKind::Tuple(_)))
+    {
+        return Some((variant, None));
+    }
+    // Anything that is neither a plain `Binding` nor a `Wildcard` binds the
+    // payload by a spelling this predicate cannot follow — `Some(t @ ..)`,
+    // an or-pattern, a struct/slice sub-pattern. Report it as TAKEN rather
+    // than as unrecognised: the two answers differ in which direction the
+    // uncertainty falls, and "taken" costs the leak this row is fixing while
+    // "not taken" would arm a second owner of a payload the arm may consume.
+    if patterns.iter().any(|p| {
+        !matches!(
+            &p.kind,
+            crate::ast::PatternKind::Binding(_) | crate::ast::PatternKind::Wildcard
+        )
+    }) {
+        return Some((variant, None));
+    }
+    let names: Vec<&str> = patterns
+        .iter()
+        .filter_map(|p| match &p.kind {
+            crate::ast::PatternKind::Binding(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    // All wildcards: binds nothing, so takes nothing.
+    if names.is_empty() {
+        return None;
+    }
+    Some((variant, Some(names)))
+}
+
 fn record_use<'a>(acc: &mut Acc<'a>, name: &'a str, scrutinee: bool) {
     let e = acc.counts.entry(name).or_insert((0, 0, 0));
     e.0 += 1;
@@ -233,6 +380,18 @@ fn walk_stmt<'a>(s: &'a Stmt, acc: &mut Acc<'a>) {
                 // Refutable `let Pat = <scrutinee> else { … }` — match-sugar
                 // over `value`, so `value` is a consume-in-place scrutinee.
                 walk_scrutinee(acc, value);
+                // B-2026-09-06-48 — a `let`-else binding ESCAPES into the
+                // enclosing scope, so it always takes the payload. Same rule
+                // `retract_boxed_tuple_inner_drop_for_block` states by passing
+                // `None` for its block.
+                if let ExprKind::Identifier(n) = &value.kind {
+                    if let Some(v) = variant_arm_takes_payload_block(pattern, None) {
+                        acc.payload_consumers
+                            .entry(n.as_str())
+                            .or_default()
+                            .insert(v);
+                    }
+                }
             }
             walk_block(else_block, acc);
         }
@@ -275,6 +434,18 @@ fn walk_expr<'a>(e: &'a Expr, acc: &mut Acc<'a>) {
         ExprKind::Identifier(n) => record_use(acc, n.as_str(), false),
         ExprKind::Match { scrutinee, arms } => {
             walk_scrutinee(acc, scrutinee);
+            if let ExprKind::Identifier(n) = &scrutinee.kind {
+                for a in arms {
+                    if let Some(v) =
+                        variant_arm_takes_payload(&a.pattern, a.guard.as_ref(), &a.body)
+                    {
+                        acc.payload_consumers
+                            .entry(n.as_str())
+                            .or_default()
+                            .insert(v);
+                    }
+                }
+            }
             for arm in arms {
                 walk_match_arm(arm, acc);
             }
@@ -366,13 +537,21 @@ fn walk_expr<'a>(e: &'a Expr, acc: &mut Acc<'a>) {
             }
         }
         ExprKind::IfLet {
+            pattern,
             value,
             then_block,
             else_branch,
-            ..
         } => {
             // `if let Pat = <scrutinee>` is match-sugar — consume-in-place.
             walk_scrutinee(acc, value);
+            if let ExprKind::Identifier(n) = &value.kind {
+                if let Some(v) = variant_arm_takes_payload_block(pattern, Some(then_block)) {
+                    acc.payload_consumers
+                        .entry(n.as_str())
+                        .or_default()
+                        .insert(v);
+                }
+            }
             walk_block(then_block, acc);
             if let Some(e) = else_branch {
                 walk_expr(e, acc);
@@ -384,9 +563,22 @@ fn walk_expr<'a>(e: &'a Expr, acc: &mut Acc<'a>) {
             walk_expr(condition, acc);
             walk_block(body, acc);
         }
-        ExprKind::WhileLet { value, body, .. } => {
+        ExprKind::WhileLet {
+            pattern,
+            value,
+            body,
+            ..
+        } => {
             // `while let Pat = <scrutinee>` is match-sugar — consume-in-place.
             walk_scrutinee(acc, value);
+            if let ExprKind::Identifier(n) = &value.kind {
+                if let Some(v) = variant_arm_takes_payload_block(pattern, Some(body)) {
+                    acc.payload_consumers
+                        .entry(n.as_str())
+                        .or_default()
+                        .insert(v);
+                }
+            }
             walk_block(body, acc);
         }
         ExprKind::For { iterable, body, .. } => {
