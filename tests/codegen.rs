@@ -97568,6 +97568,54 @@ fn main() {
         );
     }
 
+    /// B-2026-09-08-11 — two DISTINCT `Vec[weak T]` types must not share one
+    /// drop symbol. `display_mangle_te` had no `Weak` arm, so both fell to the
+    /// `unknown` fallback, both emitted `karac_drop_Vec_unknown`, and because
+    /// the drop and clone families MEMOISE on that mangled string the second
+    /// type requested was handed the FIRST type's function.
+    ///
+    /// It was invisible rather than harmless: every weak-slot operation is
+    /// slot-type-agnostic (one nullable pointer, no read of the referent's
+    /// layout), so the function collided with happened to be the one you
+    /// wanted. This pins the NAMES rather than the behaviour, because the
+    /// behaviour is exactly what cannot go wrong yet — a behavioural assertion
+    /// here would pass just as well with the bug present.
+    #[test]
+    fn test_ir_distinct_weak_referents_get_distinct_drop_symbols() {
+        let ir = ir_for(
+            r#"
+shared struct Wa { a: i64 }
+shared struct Wb { b: i64 }
+fn main() {
+    let x: Wa = Wa { a: 1 };
+    let y: Wb = Wb { b: 2 };
+    let mut ia: Vec[weak Wa] = Vec.new();
+    ia.push(x);
+    let mut ib: Vec[weak Wb] = Vec.new();
+    ib.push(y);
+    let mut oa: Vec[Vec[weak Wa]] = Vec.new();
+    oa.push(ia);
+    let mut ob: Vec[Vec[weak Wb]] = Vec.new();
+    ob.push(ib);
+    println(f"{oa.len()}{ob.len()}")
+}
+"#,
+        );
+        assert!(
+            !ir.contains("Vec_unknown"),
+            "a weak referent still mangles to `unknown`:\n{ir}"
+        );
+        let syms: Vec<&str> = ir
+            .lines()
+            .filter(|l| l.contains("define") && (l.contains("drop") || l.contains("clone")))
+            .collect();
+        assert!(
+            ir.contains("weak_Wa") && ir.contains("weak_Wb"),
+            "the two weak referents did not both get named symbols. drop/clone defines:\n{}",
+            syms.join("\n")
+        );
+    }
+
     #[test]
     fn test_ir_map_i64_i64_get_uses_mono_symbol_with_inline_probe() {
         // Slice 1b.3 — Map[i64, i64].get routes through the mono

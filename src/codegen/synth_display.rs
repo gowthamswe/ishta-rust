@@ -1886,6 +1886,49 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
                 head
             }
+            // B-2026-09-08-11 — the arms below exist so these kinds do not all
+            // collapse onto the `unknown` fallback. That fallback is not just a
+            // display wart: the drop and clone families MEMOISE on this string,
+            // so two types that mangle alike share one emitted function and the
+            // second requested silently gets the first's.
+            //
+            // `Weak` is the case that row was filed for. Note what the arm
+            // costs: weak-slot operations are slot-type-agnostic (one nullable
+            // pointer, `karac_weak_drop` / `karac_weak_downgrade`, neither
+            // reading the referent's layout), so ONE shared function really did
+            // serve every weak slot and the collision was invisible because the
+            // function collided with was the one you wanted. Naming the referent
+            // emits a separate identical function per referent type instead.
+            // That is deliberate: the old safety was accidental, and it lapses
+            // the moment any weak-slot operation needs the referent's type.
+            TypeKind::Weak(inner) => format!("weak_{}", Self::display_mangle_te(inner)),
+            // `Unit` is a live collision with every other fallback user today:
+            // the empty-`Tuple` arm above already yields "unit", but the
+            // dedicated variant fell through to "unknown".
+            TypeKind::Unit => "unit".to_string(),
+            // `MutSlice` is the one kind CONFIRMED to reach the fallback in
+            // practice — `test_e2e_slice_ordering` keys its comparator on a
+            // canonical `Slice[T]` rebuilt from the element precisely to dodge
+            // this, the collision B-2026-08-27-25 records. That workaround stays
+            // (it is load-bearing for the comparator's identity, not just its
+            // name); this arm stops the kind colliding with everything else.
+            TypeKind::MutSlice(inner) => format!("mutslice_{}", Self::display_mangle_te(inner)),
+            TypeKind::Ref(inner) => format!("ref_{}", Self::display_mangle_te(inner)),
+            TypeKind::MutRef(inner) => format!("mutref_{}", Self::display_mangle_te(inner)),
+            TypeKind::Frozen(inner) => format!("frozen_{}", Self::display_mangle_te(inner)),
+            TypeKind::Pointer { is_mut, inner } => {
+                let head = if *is_mut { "mutptr" } else { "ptr" };
+                format!("{head}_{}", Self::display_mangle_te(inner))
+            }
+            // DELIBERATELY still `unknown`, and not an oversight:
+            //   * `FnType`, `ImplTrait`, `Dyn` carry richer structure (effect
+            //     rows, trait paths, once-ness) whose mangling is a naming
+            //     decision rather than a one-liner, and none is known to reach
+            //     a drop/clone request today. Give them arms when one does,
+            //     with the structure spelled out rather than flattened.
+            //   * `Error` is the parse/resolve failure placeholder. Compilation
+            //     does not reach codegen with one, and a collision between two
+            //     error types has nothing to be wrong about.
             _ => "unknown".to_string(),
         }
     }
