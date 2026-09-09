@@ -166,9 +166,13 @@ impl<'ctx> super::Codegen<'ctx> {
     /// seed load, which std hoists out of its loop and a `hash_fn` reached
     /// through a function pointer cannot. B-2026-09-07-42.
     fn emit_hash_int_call(&mut self, value: IntValue<'ctx>, nbytes: u64) -> Option<IntValue<'ctx>> {
-        if !matches!(self.hash_hasher, crate::hasher_kind::HasherKind::SipHash13) {
-            return None;
-        }
+        // A user `impl Hasher` has no integer-shaped entry point -- its
+        // permutation is user code -- so it alone keeps the byte path.
+        let (wide_sym, narrow_sym) = match self.hash_hasher {
+            crate::hasher_kind::HasherKind::SipHash13 => ("karac_hash_u64", "karac_hash_int"),
+            crate::hasher_kind::HasherKind::Fx => ("karac_hash_u64_fx", "karac_hash_int_fx"),
+            crate::hasher_kind::HasherKind::User(_) => return None,
+        };
         let i64_t = self.context.i64_type();
         // ZERO-extend: the digest is defined over the key's low `nbytes`
         // bytes, so a negative `i8` must present 0xff, not a sign-extended
@@ -184,13 +188,10 @@ impl<'ctx> super::Codegen<'ctx> {
         // straight-line code in the callee; every narrower key carries its
         // width as an argument.
         let (f, args) = if nbytes >= 8 {
-            (
-                self.module.get_function("karac_hash_u64")?,
-                vec![widened.into()],
-            )
+            (self.module.get_function(wide_sym)?, vec![widened.into()])
         } else {
             (
-                self.module.get_function("karac_hash_int")?,
+                self.module.get_function(narrow_sym)?,
                 vec![widened.into(), i64_t.const_int(nbytes, false).into()],
             )
         };
@@ -653,8 +654,8 @@ impl<'ctx> super::Codegen<'ctx> {
                 // width known right here.
                 let hash = match self.emit_hash_int_call(raw, nbyte_count) {
                     Some(h) => h,
-                    // `FxBuildHasher` / a user `impl Hasher`: no integer-shaped
-                    // entry point, so the key's bytes it is.
+                    // A user `impl Hasher`: no integer-shaped entry point, so
+                    // the key's bytes it is.
                     None => {
                         let nbytes = i64_t.const_int(nbyte_count, false);
                         self.emit_hash_bytes_call(key_ptr, nbytes)

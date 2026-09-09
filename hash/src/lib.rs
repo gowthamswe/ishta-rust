@@ -228,6 +228,45 @@ pub fn hash_int(v: u64, nbytes: u32) -> u64 {
     hash_int_with_key(v, nbytes, k0, k1)
 }
 
+/// [`fx_hash_bytes`] of the low `nbytes` (1..=8) bytes of `v`, little-endian —
+/// the FIXED-WIDTH entry point compiled integer keys take on the
+/// `FxBuildHasher` opt-out.
+///
+/// The Fx arm needed this MORE than the seeded one, not less, which is the
+/// opposite of what the opt-out's purpose suggests. Measured per 8-byte key:
+/// the mixing itself is 12 instructions fully inlined, but reached through
+/// `karac_hash_bytes_fx(ptr, len)` it costs 50 — the boundary is THREE TIMES
+/// the work, because the callee cannot specialise `as_chunks::<8>()` against a
+/// length it cannot see and the caller must spill the key to get an address.
+/// So `Map[K, V, FxBuildHasher]`, the opt-out users reach for to go faster, was
+/// paying a bigger proportional overhead than the default. B-2026-09-07-53.
+///
+/// NOTE THE TAIL RULE DIFFERS FROM `hash_int`'s. `fx_hash_bytes` folds each
+/// trailing byte as its OWN word (`fx_add(h, byte)`), where `sip` packs the
+/// tail into one word with a length byte. This mirrors that byte-at-a-time
+/// tail exactly; `fx_int_matches_fx_bytes` is what proves it, and it is the
+/// detail that would silently re-bucket every narrow-keyed Fx map if someone
+/// "simplified" it into a single masked word.
+#[inline]
+pub fn fx_hash_int(v: u64, nbytes: u32) -> u64 {
+    let mut h: u64 = 0;
+    if nbytes >= 8 {
+        h = fx_add(h, v);
+    } else {
+        for i in 0..nbytes {
+            h = fx_add(h, (v >> (8 * i)) & 0xff);
+        }
+    }
+    fx_finalize(h)
+}
+
+/// [`fx_hash_int`] at the dominant width, pinned so the callee folds to
+/// straight-line code across the FFI boundary.
+#[inline]
+pub fn fx_hash_u64(v: u64) -> u64 {
+    fx_finalize(fx_add(0, v))
+}
+
 /// [`hash_int`] at the ONE width that dominates every corpus map: a full
 /// 8-byte integer key.
 ///
@@ -657,6 +696,44 @@ mod tests {
                         want,
                         hash_int_with_key(v, 8, k0, k1),
                         "the 8-byte specialization diverged at v={v:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Fx arm's fixed-width entry must match its byte form at every width
+    /// too. Its tail rule is byte-at-a-time where sip's is one packed word, so
+    /// this is not the same assertion as `sip_int_matches_sip_bytes` wearing
+    /// different names -- it is the one that catches the tail being "unified"
+    /// with sip's.
+    #[test]
+    fn fx_int_matches_fx_bytes() {
+        let values: [u64; 10] = [
+            0,
+            1,
+            0xff,
+            0x100,
+            0xdead_beef,
+            u64::MAX,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            42,
+            1_000_003,
+        ];
+        for nbytes in 1u32..=8 {
+            for &v in &values {
+                let bytes = v.to_le_bytes();
+                assert_eq!(
+                    fx_hash_bytes(&bytes[..nbytes as usize]),
+                    fx_hash_int(v, nbytes),
+                    "fx_hash_int diverged at nbytes={nbytes} v={v:#x}"
+                );
+                if nbytes == 8 {
+                    assert_eq!(
+                        fx_hash_bytes(&bytes),
+                        fx_hash_u64(v),
+                        "the fx 8-byte specialization diverged at v={v:#x}"
                     );
                 }
             }

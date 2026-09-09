@@ -41696,10 +41696,18 @@ fn main() { let a = mkbag([\"x\",\"y\",\"z\"]).inner(); println(a[0]); let b = m
             ("i64", "-9223372036854775807, -1, 0, 1, 9223372036854775807"),
             ("u8", "0, 1, 127, 128, 255"),
         ];
-        for (ty, keys) in cases {
-            let src = format!(
-                "fn main() {{\n\
-                     let mut m: Map[{ty}, i64] = Map.new();\n\
+        // BOTH hashers: the seeded default and the `FxBuildHasher` opt-out
+        // reach different runtime symbols through the same width logic, so a
+        // zext/mask mistake could live in one arm and not the other.
+        for (map_ty, arm) in [
+            ("Map[{ty}, i64]", "default"),
+            ("Map[{ty}, i64, FxBuildHasher]", "fx"),
+        ] {
+            for (ty, keys) in cases {
+                let map_ty = map_ty.replace("{ty}", ty);
+                let src = format!(
+                    "fn main() {{\n\
+                     let mut m: {map_ty} = Map.new();\n\
                      let ks: Vec[{ty}] = vec![{keys}];\n\
                      let mut i = 0;\n\
                      while i < ks.len() {{\n\
@@ -41717,15 +41725,17 @@ fn main() { let a = mkbag([\"x\",\"y\",\"z\"]).inner(); println(a[0]); let b = m
                      }}\n\
                      println(f\"{{hits}} {{m.len()}}\");\n\
                  }}\n"
-            );
-            let Some(out) = run_program(&src) else { return };
-            assert_eq!(
-                out.trim(),
-                "5 5",
-                "every {ty} key must be found with its own value and the map must \
-                 hold exactly the 5 distinct keys inserted; a wrong extend or mask \
-                 in the register hash path collapses or loses them"
-            );
+                );
+                let Some(out) = run_program(&src) else { return };
+                assert_eq!(
+                    out.trim(),
+                    "5 5",
+                    "every {ty} key must be found with its own value on the {arm} \
+                 hasher, and the map must hold exactly the 5 distinct keys \
+                 inserted; a wrong extend or mask in the register hash path \
+                 collapses or loses them"
+                );
+            }
         }
     }
 

@@ -85,6 +85,32 @@ pub unsafe extern "C" fn karac_hash_bytes_fx(ptr: *const u8, len: usize) -> u64 
     karac_hash::fx_hash_bytes(bytes)
 }
 
+/// `karac_hash_int_fx(v, nbytes) -> u64` / `karac_hash_u64_fx(v) -> u64` — the
+/// `FxBuildHasher` siblings of [`karac_hash_int`] / [`karac_hash_u64`], same
+/// digest as [`karac_hash_bytes_fx`] over the key's little-endian bytes.
+///
+/// The opt-out needed these more than the default did: the Fx mixing is 12
+/// instructions inlined but 50 through the byte-slice boundary, so four fifths
+/// of what a user chose `FxBuildHasher` to avoid was the boundary, not the
+/// hash. B-2026-09-07-53.
+///
+/// # Safety
+/// Nothing is dereferenced; `unsafe` only for ABI consistency with its
+/// siblings.
+#[no_mangle]
+pub unsafe extern "C" fn karac_hash_int_fx(v: u64, nbytes: u64) -> u64 {
+    karac_hash::fx_hash_int(v, nbytes.min(8) as u32)
+}
+
+/// See [`karac_hash_int_fx`].
+///
+/// # Safety
+/// Nothing is dereferenced; `unsafe` only for ABI consistency.
+#[no_mangle]
+pub unsafe extern "C" fn karac_hash_u64_fx(v: u64) -> u64 {
+    karac_hash::fx_hash_u64(v)
+}
+
 /// `karac_stable_siphash24(ptr, len, k0, k1) -> u64` — SipHash-2-4 of `len`
 /// bytes at `ptr` under the CALLER's 128-bit key. The compiled backend for
 /// `StableHash.siphash24` (design.md § `Hash` and `Hasher`, stability policy).
