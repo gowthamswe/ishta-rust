@@ -73,17 +73,28 @@ That also resizes the per-call seed read, measured separately at 13 instructions
 and **0.46 cycles**: it is roughly a third of the instruction gap and almost
 none of the cycle gap. Hoisting the seed alone does not reach this.
 
-**Two candidate shapes, neither measured yet**, both of which keep ONE
-permutation in ONE crate (the invariant `CLAUDE.md` and `hash/src/lib.rs` rest
-on, and which open-coding the permutation in codegen would break):
+**Candidate 2 was built and measured. It buys nothing** — see
+[`maptest.c`](maptest.c). `karac_map_get_i64`, with the permutation inlined into
+the walk and the key in a register, lands at 132.5 instr / 59.5 cycles against
+the existing mono probe's 133.1 / 61.0.
 
-1. **Link the runtime as bitcode** (cross-language LTO) so `karac_hash_u64` can
-   inline into the emitted probe.
-2. **Move the whole lookup behind one typed entry point** — `karac_map_get_i64`
-   — so the hash inlines into the probe *inside the runtime*, and the emitted
-   code makes one call instead of a call plus an indirect hash. Today's shape
-   is the worst of both: codegen emits the probe inline and calls out for the
-   hash.
+That is the useful result, because of what it forces:
+
+| | instr | cycles | IPC |
+|---|---:|---:|---:|
+| kāra, keyed (no seed read) | 115.5 | 58.3 | 1.98 |
+| Rust, behind `#[inline(never)]` | 114.9 | 35.6 | 3.23 |
+
+**At instruction parity kāra is still 1.64× the cycles.** The gap is stalls, not
+work, so no instruction-shaving fix reaches it — not the seed hoist (17
+instructions, 1.2 cycles), not the typed entry point, not open-coding the
+permutation.
+
+The suspect for the stall is layout: `KaracMap` holds `status` and `kv` as **two
+separate allocations**, so a lookup touches two independent cache lines in two
+arrays, where hashbrown keeps control bytes and buckets in one allocation with
+the controls adjacent to the data. Not measured — a hypothesis with a mechanism,
+and the first thing to test.
 
 ## Where the kata's gap actually is
 
