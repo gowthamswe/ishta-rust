@@ -93,8 +93,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 402 |
-| run-vs-build | 376 |
-| leak | 304 |
+| run-vs-build | 377 |
+| leak | 305 |
 | double-free | 214 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1619 |
+| codegen | 1621 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 80 |
@@ -166,6 +166,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-5 | 2026-09-09 | other | low | THREE LOAD-SENSITIVE TESTS IN THE REQUIRED GATE SET ARE STILL UNEXPLAINED after B-2026-09-09-1's named one turned out NOT to be flaky -- that one was a deterministic watchdog race that never armed (fixed 32223a5a6, 2-in-6 permanent orphans under load -> 0 in 8), so its resolution transfers no conclusion to the rest. Leading hypothesis for the ASAN pair is the vacuous-fixture floor: n=102 against a per-process HOST FLOOR of 90 measured on a box running dozens of concurrent ASAN processes, a 12-allocation margin that a drifting floor would trip with nothing wrong in the compiler -- with the counter-argument that a shared OnceLock floor should fail many fixtures at once, and only one failed | — |
 | B-2026-09-09-6 | 2026-09-09 | runtime | low | A PER-THREAD SMALL-BLOCK FREE LIST would take kara off macOS libmalloc's shared per-size-class state, which B-2026-09-05-22 measured as a hard ceiling: two concurrent allocators holding one small block live each are 8.3x SLOWER than one thread on this host (113.83ms -> 948.96ms, 49.15ms at three), and kara's compiled parallel probes allocate in exactly that shape -- worth up to 6x for a parallel region whose iter_total is 2, nothing on Linux, and narrow enough that it is filed low rather than inheriting -22's severity | docs/investigations/autopar-alloc-scaling.md, "The M5 answer" section |
 | B-2026-09-09-7 | 2026-09-09 | other | medium | A FULL DISK FAILS THE GATE SET AS AN LLVM CRASH, A LINKER BUS ERROR, OR A LOST OUTPUT STREAM -- never as a named test -- and it hit ELEVEN times across seven unrelated slices in one session. The session allowance is ~38 GiB (df's '252G size' is the host volume and is meaningless), ONE leg of `cargo test --no-run` costs 19.6 GiB in test binaries (134 executables x ~250 MiB at the default debug=2), so the SECOND feature leg cannot start. The obvious suspect is wrong: both clippy legs together cost 1.19 GiB. `CARGO_PROFILE_TEST_DEBUG=line-tables-only` cuts a test binary 252 -> 97 MiB and makes both legs fit | — |
+| B-2026-09-09-8 | 2026-09-09 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-49 STILL LEAKS ITS INLINE-BUILT `Array` INTERIOR -- `plainR(Result.Ok([f"a{i}", f"b{i}"]))` over `Result[Array[String, 2], i64]` loses 54 B in 6 blocks after the Option half was fixed, because the param-site arm that owns the payload reads it through `option_generic_arg_type_expr` and no `Result` sibling exists | none |
+| B-2026-09-09-9 | 2026-09-09 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` over `Option[Array[Vec[String], 2]]` fails with `codegen: nested indexed read on 't' -- element TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, the eighth base shape in a family whose other seven are fixed | none |
 
 ### Relocated
 
