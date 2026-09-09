@@ -1,6 +1,8 @@
 # Auto-par scaling on the M5: it is allocation, not partitioning
 
-Measured 2026-09-06, Apple M5 Pro (6P+12E), `karac 0.1.0-dev.8222+g2923cb4f2`
+Measured 2026-09-06 (the four results) and 2026-09-09 (everything from "The
+Linux control" on, which reverses result 3's verdict), Apple M5 Pro (6P+12E),
+`karac 0.1.0-dev.8222+g2923cb4f2`
 (runtime source byte-identical to `main` at the time of writing — 0 commits
 touched `runtime/src/lib.rs` between that revision and `4dba34463`).
 
@@ -68,6 +70,14 @@ without core-placement games, at normal QoS, in 22 lines.
 
 ### 3. It is Kāra-specific, but libmalloc bounds everyone
 
+> **SUPERSEDED by "The M5 answer" below (2026-09-09).** The "Kāra-specific"
+> half of this section is WRONG, and wrong because of the control below rather
+> than the
+> measurement: `mt_malloc.c` does two malloc/free pairs per step where the
+> compiled Kāra probes do one. At one pair the same C program collapses at two
+> threads exactly as Kāra does. The libmalloc-ceiling half stands. Read
+> that section before quoting anything here.
+
 `mt_malloc.c` — N pthreads, same allocate/copy/free pattern, no shared state,
 total allocation count held constant:
 
@@ -81,6 +91,9 @@ total allocation count held constant:
 **Two threads in C is 1.60× faster, not 6× slower** — so the N=2 collapse
 belongs to Kāra, not to macOS malloc, and `B-2026-09-05-22` stands as a real
 bug with a corrected mechanism.
+
+*(That inference is the one section 6 retracts: this table's two-pairs-per-step
+body is not the body Kāra runs.)*
 
 But note the right-hand column: past 4 threads C's wall time goes **flat** while
 user CPU grows **linearly** (114 → 871 ms). macOS libmalloc does not scale this
@@ -234,16 +247,106 @@ decisive next step**: if 3-byte single-allocation steps are fast there at two
 threads, size class and density are both fully refuted and the free path is
 what remains.
 
+## The M5 answer: the C control collapses too, so it is not Kāra's
+
+Measured 2026-09-09 on the M5, `karac` built from `2a23fc7b6` with a matched
+archive pair, `libsystem_malloc.dylib` 812.160.5. This runs the decisive step
+the section above asks for, and the answer is the opposite of both its branches:
+**3-byte single-allocation steps are NOT fast at two threads on macOS**, so what
+is refuted is not the size class but the premise that this belongs to Kāra.
+
+`mt_malloc_shape.c`, the control written for exactly this, on the M5:
+
+| size | 1 thread | **2 threads** | 3 threads | 4 threads |
+|---|---|---|---|---|
+| 3 B (the measured size) | 59.94 ms | **463.15 ms** | 27.52 ms | 28.43 ms |
+| 32 B | 69.73 ms | **467.14 ms** | 32.20 ms | 27.12 ms |
+| 512 B | 102.83 ms | **398.41 ms** | 43.40 ms | 37.07 ms |
+
+**7.7× slower at two threads than at one, 16.8× slower than at three — in a C
+program with no Kāra in it**, at the shape and size `mcount.c` measured. The
+same cell reached independently through `mt_malloc_k.c` at K=1, the density
+value its recorded sweep (K = 2, 4, 8) never ran: 113.83 ms → **948.96** →
+49.15 → 51.70 (4 threads) → 43.93 (6). `sample` there gives `_xzm_free` 1031,
+`__ulock_wait` 676, `_xzm_xzone_malloc_tiny` 146, `mach_absolute_time` 65 —
+the signature this investigation recorded for Kāra.
+
+[`autopar-alloc-scaling/mt_pair1.c`](autopar-alloc-scaling/mt_pair1.c) bounds
+it, holding total allocation volume constant:
+
+| configuration (1 pair/step) | 1 thread | **2 threads** | 3 threads |
+|---|---|---|---|
+| size varies 1..8 | 119.20 ms | **948.91** | 50.63 ms |
+| size fixed 8 | 119.97 ms | **960.77** | 54.27 ms |
+| size fixed 64 | 123.29 ms | **779.35** | 57.67 ms |
+| size fixed 1024 | 195.52 ms | **869.53** | 82.79 ms |
+| compute between the alloc and the free | 157.15 ms | **989.94** | 68.19 ms |
+
+- **Not the size class.** 1 byte through 1 KiB all collapse — so the one-size-
+  class limitation of `decouple2` noted above, real as it is, was never load-
+  bearing for this row's conclusion.
+- **Not thread phase alignment.** Work inserted between the `malloc` and the
+  `free` changes the timing without changing the allocation stream; it does not
+  help.
+- **Not the thread count.** Two allocating threads: 853 ms alone, 977 ms with
+  one extra idle thread, 881 ms with sixteen — `decouple2`'s pool-size
+  independence, reproduced in C.
+- **It is per-size-class state.** Give the two threads a size class each and the
+  collapse largely lifts: 853 ms → 167 ms.
+
+The Linux control travels to this shape as well: `mt_pair1` under **arm64**
+Linux/glibc on this same machine (colima, `gcc:14`) scales cleanly at one pair
+per step — 49 → 24 → 17 → 13 ms across 1-4 threads, matching the x86 result
+above from the other side of the architecture.
+
+And the Kāra side, re-measured here rather than quoted, on this tree:
+
+| probe | N=1 | **N=2** | N=3 | N=18 |
+|---|---|---|---|---|
+| `decouple2` (iter_total = 2, always 2 active) | 8.79 ms | **52.70** | 53.19 ms | 52.54 ms |
+| `alloc3` (iter_total = 720) | 10.62 ms | **52.49** | 5.52 ms | — |
+
+### One correction to the shape measurement
+
+The `otool -tvV` disassembly of `___karac_reduce_worker_0` agrees exactly with
+`mcount.c` on the shape — one `karac_alloc_or_panic` / `memcpy` /
+`karac_free_buf` triple per inner step — but it also shows *why*, and the
+mechanism is not the one inferred from the identical histograms:
+
+```
+    add  x9, x23, #0x1      ; t.len() folded to n + 1
+    adds x21, x8, x9        ; ...and that is all `t` was ever used for
+```
+
+The concat is **dead-code eliminated**: no buffer is allocated for it at all,
+rather than its bytes being absorbed into the substring's usable size. So the
+correct statement is narrower than "adding concats to a Kāra loop adds no
+allocator traffic" — a concat whose result is *live* allocates
+(`src/codegen/expr_ops.rs`, `BinOp::Add`, `malloc(l_len + r_len)`). In these
+probes it never is.
+
+### What it means
+
+Two concurrent allocators, each holding exactly one small block live at a time
+in the same size class, are pathological in macOS libmalloc **in any language**.
+Kāra's exposure is real but narrow: the default worker count is
+`available_parallelism()`, so a program runs exactly two *active* workers only
+when a parallel region's `iter_total` is 2, or under an explicit
+`KARAC_PAR_WORKERS=2`.
+
+Nothing in the partitioner or the pool addresses it. The one Kāra-side move the
+measurements support is a per-thread small-block free list in the runtime, which
+would keep these allocations off libmalloc's shared per-size-class state
+entirely — filed as `B-2026-09-09-6`, sized against what a two-iteration
+parallel region is worth rather than against this row's 6×.
+
 ## What this leaves open
 
-- **`B-2026-09-05-22`** — why exactly two active workers, and not three,
-  drives `_xzm_free` to dominate. Still not answered, but narrowed twice since
-  this was written. The `iter_total = 2` decoupling attempt (`alloc4.kara`, not
-  kept) was inconclusive because the runtime cost gate skipped the dispatch
-  entirely; `decouple2.kara` / `decouple3.kara` score the body high enough to
-  clear it and confirm the trigger is the ACTIVE worker count, not the pool.
-  And the Linux control above shows the collapse is macOS-only, so what is left
-  to explain is an interaction with libmalloc rather than a portable defect.
+- **`B-2026-09-05-22`** — CLOSED `wontfix`. Two Linux controls narrowed it to
+  an interaction with macOS libmalloc; running the shape-matched C control on
+  the M5 finished the job by reproducing the collapse with no Kāra involved.
+  What remains is not this row but a possible mitigation — a per-thread
+  small-block cache in the runtime (`B-2026-09-09-6`).
 - **`B-2026-08-28-76`** — its stated hypothesis is refuted, but the katas do
   collapse. On this evidence the cause is (2) and (4) above plus the libmalloc
   ceiling in (3), not the partition. The homogeneous Linux control this listed
@@ -262,6 +365,10 @@ cd docs/investigations/autopar-alloc-scaling
 karac build uniform.kara -o u_par
 sh sweep.sh ./u_par "" 10          # add "taskpolicy -b" as $2 for all-E
 clang -O3 mt_malloc.c -o mt_malloc -lpthread && sh csweep.sh
+clang -O3 mt_pair1.c -o mt_pair1 -lpthread
+./mt_pair1 2 1                     # the collapsing cell: 2 threads, 1 pair/step
+./mt_pair1 3 1                     # recovers
+./mt_pair1 2 2                     # 2 pairs/step: no collapse
 sh prof.sh 2 a3l s_n2.txt          # top-of-stack profile at a worker count
 ```
 
