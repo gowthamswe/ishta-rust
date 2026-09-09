@@ -1029,7 +1029,31 @@ impl<'ctx> super::Codegen<'ctx> {
                                     // conservative answer byte-for-byte.
                                     || self
                                         .pattern_state
-                                        .pattern_binding_scrutinee_is_transfer_owned_enum);
+                                        .pattern_binding_scrutinee_is_transfer_owned_enum
+                                    // B-2026-09-07-44 — the THIRD callee-owned
+                                    // source, and the same argument one
+                                    // scrutinee class over. A fresh owning temp
+                                    // (`match W.T(mkx(1)) { .. }`) has no name,
+                                    // so by construction it has no later reader
+                                    // and no second owner for a use-after-free
+                                    // to race — the property the copy-supported
+                                    // proxy is standing in for. The consuming
+                                    // arm then zeroes the temp's payload words
+                                    // and frees the envelope, leaving the
+                                    // CONTENTS to a binding this gate refused to
+                                    // register: 2 B per evaluation on
+                                    // `match W.T(mkx(1)) { W.T(x) => .. }`,
+                                    // against a clean `W.T(_)` arm and a clean
+                                    // `let w = W.T(mkx(1)); match w` on the same
+                                    // program.
+                                    //
+                                    // Visible only at `KARAC_OPT_LEVEL=0`: at
+                                    // -O2 nothing reads the binding, so LLVM
+                                    // elides the allocation and all three
+                                    // spellings compile to one identical binary.
+                                    || self
+                                        .pattern_state
+                                        .pattern_binding_scrutinee_is_fresh_owning_temp);
                             // B-2026-07-10-3: an `Option`/`Result` scrutinee whose
                             // INLINE struct payload (held as a value in the slot, not
                             // heap-boxed) is bound WHOLE as `e`. The dedicated inline

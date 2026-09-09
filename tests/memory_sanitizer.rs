@@ -377,6 +377,49 @@ mod memory_sanitizer_tests {
     /// LSan is clean on Linux. The transcript is asserted alongside so a
     /// regression that drops the registration again fails here on output even
     /// where a leak alone might not trip the checker.
+    /// B-2026-09-07-44 — A FRESH-TEMP ENUM SCRUTINEE WHOSE CONSUMING ARM BINDS
+    /// A COPY-DECLINED STRUCT PAYLOAD LEAKED THE PAYLOAD'S INTERIOR.
+    ///
+    /// `bind_pattern_values`'s user-struct arm registers an owner only when the
+    /// payload is copy-supported — a PROXY for "the source is callee-owned".
+    /// B-2026-09-07-38 admitted the transfer-owned param as a second such
+    /// source; a fresh owning temp is the third, and for the same reason: it
+    /// has no name, so by construction no later reader and no second owner for
+    /// a use-after-free to race. The consuming arm zeroes the temp's payload
+    /// words and frees the envelope, leaving the CONTENTS to a binding the gate
+    /// had refused to register.
+    ///
+    /// ALL THREE SPELLINGS ARE HERE because the defect needed all three of a
+    /// fresh-temp scrutinee, an arm binding the WHOLE payload, and a payload the
+    /// entry copy declines — the `let`-bound scrutinee and the `W.T(_)` arm were
+    /// already clean, and a fix that broke either would be trading this leak for
+    /// a double free.
+    ///
+    /// THE SUITE'S DEFAULT OPT LEVEL CANNOT SEE THIS. Nothing reads the binding,
+    /// so at -O2 LLVM elides the allocation outright and all three spellings
+    /// compile to one BYTE-IDENTICAL binary that valgrind calls clean. Measured
+    /// at `KARAC_OPT_LEVEL=0`: 10 allocs / 9 frees before the fix, 10 / 10
+    /// after — a restored free, not a removed allocation. This case therefore
+    /// earns its keep on the `-O0` leg (`scripts/asan-o0-leg.sh`); on the
+    /// default leg it is a transcript assertion only.
+    #[test]
+    fn asan_fresh_temp_enum_scrutinee_binding_copy_declined_payload_owns_it() {
+        assert_clean_asan_run(
+            "struct X1 { a: Option[i64], s: String }\n\
+             enum W { T(X1), U(i64) }\n\
+             fn mkx(i: i64) -> X1 { return X1 { a: Option.Some(i), s: f\"s{i}\" }; }\n\
+             fn main() {\n\
+             \x20   match W.T(mkx(1)) { W.T(x) => println(f\"t{x.a.unwrap_or(0)}\"), W.U(n) => println(\"u\") }\n\
+             \x20   let w = W.T(mkx(2));\n\
+             \x20   match w { W.T(x) => println(f\"l{x.a.unwrap_or(0)}\"), W.U(n) => println(\"u\") }\n\
+             \x20   match W.T(mkx(3)) { W.T(_) => println(\"w\"), W.U(n) => println(\"u\") }\n\
+             \x20   println(\"end\")\n\
+             }\n",
+            &["t1", "l2", "w", "end"],
+            "b44-fresh-temp-enum-payload-binding",
+        );
+    }
+
     #[test]
     fn asan_discarded_branch_struct_variant_literal_owns_its_payload() {
         assert_clean_asan_run(
