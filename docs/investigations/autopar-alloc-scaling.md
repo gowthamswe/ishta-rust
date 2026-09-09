@@ -138,16 +138,117 @@ call. Codegen knows the spec at compile time, so the fix that works passes the
 decoded fields as constants and renders straight into the caller's buffer —
 no parse, no allocation, no lock. Fixed in `B-2026-09-07-24`.
 
+## The Linux control: the collapse is macOS-only
+
+Measured 2026-09-09, x86_64 Linux container (4 cores), **glibc 2.39**, `karac`
+at `3f2342ca9` with the runtime archives rebuilt at that revision. Same probe
+sources, same `KARAC_PAR_WORKERS` sweep, `bench.py` (min of 10 after 2 warmups)
+in place of hyperfine.
+
+This is the "homogeneous many-core Linux control" the section below lists as
+missing. It answers a question the M5 cannot: whether the two-active-worker
+collapse belongs to Kāra's allocation shape as such, or to that shape meeting
+**macOS libmalloc** in particular. glibc's ptmalloc2 is a different allocator
+with a different threading model (per-thread arenas rather than magazines), so
+running the identical Kāra binaries against it isolates exactly that variable.
+
+**It does not reproduce. Two active workers are a SPEEDUP on glibc.**
+
+| probe | active workers | N=1 | pool=2 | pool=3 | pool=4 | pool=8 | pool=18 |
+|---|---|---|---|---|---|---|---|
+| `decouple2` | exactly 2 | 8.40 ms | 5.35 | 5.10 | 5.19 | 5.73 | 5.97 |
+| `decouple3` | exactly 3 | 8.15 ms | — | 4.04 | 4.12 | 4.74 | 4.75 |
+| `alloc3` | pool | 8.61 ms | 5.43 | 4.37 | 4.50 | 3.71 | — |
+| `uniform` | pool | 86.47 ms | 44.47 | 30.36 | 23.15 | 24.20 | — |
+
+`decouple2` runs **0.61-0.71x of N=1 at every pool size** — against
+**5.83-5.90x SLOWER** at pool 2, 3 and 18 on the M5. The `decouple2` /
+`decouple3` ratio, which is the sharpest form of the anomaly, is **1.26x** here
+(5.10 vs 4.04 at pool=3) against **8.0x** there (54.61 vs 6.81); and 1.26x is
+just the expected cost of splitting the same work two ways instead of three, on
+a box with cores to spare.
+
+The C controls replicate on glibc too, so the negative control travels rather
+than being a macOS artifact: `mt_malloc` is 0.51x at two threads (127.7 → 65.1
+ms) and `mt_malloc_main` 0.53x (121.8 → 64.1).
+
+**Consequence for the row.** The trigger is not Kāra's allocation shape on its
+own — glibc is untroubled by the identical shape at the identical worker
+counts. It is that shape *meeting macOS libmalloc*, which is also consistent
+with the M5 signature (`mach_absolute_time` top-of-stack out of
+`libsystem_malloc`, absent at three workers). The two surviving candidates —
+size class and free path — are therefore **allocator-interaction** questions to
+settle on macOS, not portable defects.
+
+## Kāra's actual allocation shape, measured
+
+The counting probe `B-2026-09-05-22` records as ABANDONED is tractable on
+Linux, and [`autopar-alloc-scaling/mcount.c`](autopar-alloc-scaling/mcount.c)
+is it. The macOS DYLD interposer hit self-interposition recursion and a
+pre-constructor null pointer, and cost ~2500x once both were fixed — enough to
+change the contention behaviour under study. `LD_PRELOAD` avoids all three:
+`dlsym(RTLD_NEXT, ...)` for the real symbols, a static bootstrap arena for
+dlsym's own `calloc`, and **thread-local** counters summed only at exit, so the
+hot path is one TLS increment with no atomic and no lock. Verified against a
+known-answer program before use.
+
+`decouple2` at `pool=2`, 432000 inner steps:
+
+```
+malloc=432021  calloc=6  realloc=3  free=432016  bytes=1303647
+432000 requests in one bit-length bucket; mean 3.0 B
+```
+
+**One malloc per inner step, every one of them exactly 3 bytes** — not the two
+per step of 1-10 bytes that `mt_malloc.c`, `mt_malloc_main.c` and
+`mt_malloc_k.c` all assumed from reading the probe source. Kāra allocates
+*half* as often as the control it is being compared against, which refutes
+allocation density from the opposite direction to `mt_malloc_k.c`'s sweep.
+
+Which call allocates was measured rather than inferred — three variants of one
+100000-step loop with a loop-carried (non-foldable) length `n = 1..4`:
+
+| body | mallocs | size histogram |
+|---|---|---|
+| `substring` only | 100033 | 25000 @ 1 B · 50000 @ 2-3 B · 25000 @ 4 B |
+| `substring` + one concat | 100033 | identical |
+| `substring` + two concats | 100033 | identical |
+
+Byte-identical across all three: the **substring's buffer is the only libc
+allocation**, and the concats grow it without ever reaching the allocator (the
+request is `n` bytes and malloc's usable size covers the appended bytes). Two
+consequences worth carrying: adding concats to a Kāra loop adds no allocator
+traffic at all, and `alloc3`/`decouple2`'s "two short-lived Strings per step"
+comment describes the source, not the behaviour.
+
+One probe limitation this exposed: `decouple2`'s `acc` reaches a fixed point at
+`acc % 8 == 2`, so the intended 1..8 length spread collapses to a constant. The
+probe exercises exactly **one** size class, not eight — which matters before
+reading anything into size-class effects.
+
+[`autopar-alloc-scaling/mt_malloc_shape.c`](autopar-alloc-scaling/mt_malloc_shape.c)
+is the control that matches the measured shape: one malloc + free per step at a
+settable size, defaulting to the measured 3 bytes. On glibc it scales cleanly
+(N=1 74.7 ms → N=2 38.1 → N=3 26.7 → N=4 20.3). **Running it on the M5 is the
+decisive next step**: if 3-byte single-allocation steps are fast there at two
+threads, size class and density are both fully refuted and the free path is
+what remains.
+
 ## What this leaves open
 
 - **`B-2026-09-05-22`** — why exactly two active workers, and not three,
-  drives `_xzm_free` to dominate. Not answered here. The `iter_total = 2`
-  decoupling attempt (`alloc4.kara`, not kept) was inconclusive: the runtime
-  cost gate skipped the dispatch entirely, so it never ran two workers.
+  drives `_xzm_free` to dominate. Still not answered, but narrowed twice since
+  this was written. The `iter_total = 2` decoupling attempt (`alloc4.kara`, not
+  kept) was inconclusive because the runtime cost gate skipped the dispatch
+  entirely; `decouple2.kara` / `decouple3.kara` score the body high enough to
+  clear it and confirm the trigger is the ACTIVE worker count, not the pool.
+  And the Linux control above shows the collapse is macOS-only, so what is left
+  to explain is an interaction with libmalloc rather than a portable defect.
 - **`B-2026-08-28-76`** — its stated hypothesis is refuted, but the katas do
   collapse. On this evidence the cause is (2) and (4) above plus the libmalloc
-  ceiling in (3), not the partition. A homogeneous many-core Linux control is
-  still the missing measurement, and it is container-only.
+  ceiling in (3), not the partition. The homogeneous Linux control this listed
+  as missing has now been run (see above) — on 4 container cores, which settles
+  the allocator question but not the many-core scaling one.
 - The `order_free` path already has heterogeneity-aware dynamic chunking
   (`karac_par_reduce_pooled`, `KARAC_PAR_CHUNK_FACTOR`, default 8). Neither
   kata is order-free, so neither uses it. Whether extending it to ordinary
@@ -162,4 +263,17 @@ karac build uniform.kara -o u_par
 sh sweep.sh ./u_par "" 10          # add "taskpolicy -b" as $2 for all-E
 clang -O3 mt_malloc.c -o mt_malloc -lpthread && sh csweep.sh
 sh prof.sh 2 a3l s_n2.txt          # top-of-stack profile at a worker count
+```
+
+On Linux (no hyperfine, no `taskpolicy`, no `sample`):
+
+```sh
+karac build decouple2.kara -o d2
+KARAC_PAR_WORKERS=3 RUNS=10 python3 bench.py ./d2
+
+gcc -shared -fPIC -O2 -o mcount.so mcount.c -ldl
+KARAC_PAR_WORKERS=2 LD_PRELOAD=./mcount.so ./d2      # malloc/free counts + sizes
+
+clang -O3 mt_malloc_shape.c -o mt_malloc_shape -lpthread
+./mt_malloc_shape 2 3                                 # 2 threads, 3-byte steps
 ```
