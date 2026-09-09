@@ -102,7 +102,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | false-positive | 106 |
 | perf | 104 |
 | soundness | 95 |
-| other | 88 |
+| other | 89 |
 | crash | 78 |
 | use-after-free | 36 |
 
@@ -113,7 +113,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen | 1625 |
 | interp | 407 |
 | typecheck | 295 |
-| other | 80 |
+| other | 81 |
 | ownership | 74 |
 | cli | 72 |
 | autopar | 56 |
@@ -166,8 +166,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-9 | 2026-09-09 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` over `Option[Array[Vec[String], 2]]` fails with `codegen: nested indexed read on 't' -- element TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, the eighth base shape in a family whose other seven are fixed | none |
 | B-2026-09-09-10 | 2026-09-09 | codegen | low | A BOXED USER ENUM PAYLOAD'S INTERIOR IS STILL UNOWNED WHEN THE ARM BINDS THROUGH A NESTED PATTERN -- `match x { Some(K.A(r)) => .. }` over `fn show(x: Option[K])` leaks 81 B in 9 blocks after B-2026-09-06-67 closed the envelope half, and the fix cannot simply register it because the WHOLE-PAYLOAD spelling `Some(k)` double-frees if it does | — |
 | B-2026-09-09-12 | 2026-09-09 | runtime | medium | kara's MAP PROBE WALKS ONE CONTROL BYTE PER STEP WITH A DATA-DEPENDENT BRANCH, and an 8-byte SWAR group scan is 2.03x FASTER IN CYCLES WHILE EXECUTING 30% MORE INSTRUCTIONS (36.0 -> 17.7 cyc/lookup, IPC 1.15 -> 3.05) -- the cost is mispredicts, not work, which is why no instruction-count fix on B-2026-09-07-53 reached it. Prototyped and validated against the reference walk on every key; not shipped, because the win needs the same scan in find_insert_slot and in the CODEGEN MONO probes, not just the runtime's lookup | docs/investigations/hash-cost/README.md |
-| B-2026-09-09-13 | 2026-09-09 | codegen | medium | 99f54104e REGRESSED AN IN-TREE FIXTURE INTO A DOUBLE FREE, and both ASAN ratchet legs are red on origin/main because of it -- `fn f(value: Option[Val]) -> i64 { let mut vv = value; .. }` over a boxed user-enum payload aborts with `AddressSanitizer: double-free` at -O0 while the default -O2 gate set, both clippy legs and `cargo test --features llvm` are all green. Bisected: 99f54104e~1 passes, 99f54104e fails | — |
 | B-2026-09-09-14 | 2026-09-09 | codegen | low | SIX MORE POSITIONS STILL LOSE THE `shared` FIELD'S REFCOUNT BLOCK after B-2026-09-06-72 -- the aggregate as a struct FIELD, as a by-value PARAM, as a `Vec` ELEMENT, DISCARDED at statement level, `Option[R]` as a field, and `Option[(R, i64)]`, each 16 B in 1 block at -O0 (19 B in 2 for the discarded one). `Vec[R]` DIRECT is clean, so the walker exists and what is missing is per-channel wiring. Plus a body divergence in the last cell: `--interp` runs the `Drop` body zero times where the compiled backend runs it early | — |
+| B-2026-09-09-15 | 2026-09-09 | other | medium | THE INSTRUMENTED ASAN LEG CANNOT LINK ON macOS -- every fixture dies at `___asan_version_mismatch_check_v8` from `_asan.module_ctor`, karac's bundled LLVM asan pass against Xcode's clang_rt, so 1555 of 1567 fail in 41s where the passing -O0 leg takes 396s. A near-total failure that finishes an order of magnitude FASTER than the green leg is a link failure, not a memory-error storm -- but the leg's own diagnostic says "these are real, fix the codegen defect or quarantine them", so it reads as a catastrophic regression | scripts/asan-instrumented-leg.sh |
 
 ### Relocated
 
@@ -2431,6 +2431,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-3 | codegen | low | B-2026-09-06-66's BY-VALUE REMAINDER IS STILL OPEN AFTER B-2026-09-08-13 CLOSED ITS PRECONDITION -- a self-referential struct's `Option` payload box… | 4ef36450e |
 | B-2026-09-09-4 | other | low | THE `rc_fb_twin_shape_both_boxed` VACUITY GUARD FAILS INTERMITTENTLY ON A GREEN TREE -- `min_allocs = 60` against an x86_64-Linux count of 65-72 that… | fb05f38 |
 | B-2026-09-09-11 | codegen | medium | A `shared enum` WITH A BOXED STRUCT PAYLOAD PRINTS NOTHING ON EVERY COMPILED BACKEND AND STACK-OVERFLOWS THE JIT, while `--interp` prints the right t… | 768a9be |
+| B-2026-09-09-13 | codegen | medium | 99f54104e REGRESSED AN IN-TREE FIXTURE INTO A DOUBLE FREE, and both ASAN ratchet legs are red on origin/main because of it -- `fn f(value: Option[Val… | src/codegen/call_dispatch.rs: `owned_boxed_option_param_str… |
 
 </details>
 
