@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 402 |
 | run-vs-build | 376 |
-| leak | 303 |
+| leak | 304 |
 | double-free | 214 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1618 |
+| codegen | 1619 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 77 |
@@ -2419,6 +2419,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-15 | codegen | high | BOTH -O0 ASAN RATCHETS ARE RED ON `main` -- `rc_boxed_tuple_index_destinations_stay_clean` leaks 76 B in 2 objects on its `b49_tuple_assign_three_tri… | 3130242 |
 | B-2026-09-08-16 | other | high | THE ASAN VACUOUS-FIXTURE GUARD WAS ITSELF VACUOUS ON EVERY HOST -- `min_allocs` compared ASAN's RAW process-wide count against thresholds smaller tha… | 6e23fe215 |
 | B-2026-09-09-2 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push… | 33c5c25 |
+| B-2026-09-09-3 | codegen | low | B-2026-09-06-66's BY-VALUE REMAINDER IS STILL OPEN AFTER B-2026-09-08-13 CLOSED ITS PRECONDITION -- a self-referential struct's `Option` payload box… | 4ef36450e |
 
 </details>
 
