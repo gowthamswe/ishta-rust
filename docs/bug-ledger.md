@@ -102,7 +102,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | false-positive | 106 |
 | perf | 102 |
 | soundness | 95 |
-| other | 85 |
+| other | 86 |
 | crash | 78 |
 | use-after-free | 36 |
 
@@ -113,7 +113,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen | 1619 |
 | interp | 407 |
 | typecheck | 295 |
-| other | 77 |
+| other | 78 |
 | ownership | 74 |
 | cli | 72 |
 | autopar | 56 |
@@ -150,7 +150,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-36 | 2026-09-06 | codegen | low | A MATCH OVER A LOCAL STRUCT SCRUTINEE WITH AN UNCONSUMED ENUM LEAF LOSES THE LEAF'S `Drop` BODY ON THE COMPILED BACKENDS -- `let c = H1 { e: E.A(mk(34)) }; match c { H1 { e } => .. }` with `e` never touched prints `dE dR34` under `--interp` and NOTHING on run/build/AUTO_PAR=0 (memory balanced -- a lost BODY, not a leak). The by-value PARAM spelling is correct (the caller runs the body); only a LOCAL scrutinee has no such owner | — |
 | B-2026-09-06-39 | 2026-09-06 | interp+codegen | low | A READ-ONLY ARM OVER AN OWNED ENUM RECEIVER RUNS THE PAYLOAD'S `Drop` BODY BEFORE THE SHELL'S ON EVERY SURFACE -- `a.m_read()` prints `dR1 dE`, the reverse of the local-scrutinee order B-2026-08-28-67 established (`dE dR`, shell then fields per design.md § Part 8), so the same read-only arm orders its two bodies differently depending on whether the scrutinee is `self` or a local | — |
 | B-2026-09-06-40 | 2026-09-06 | interp+codegen | low | A REORDERED STRUCT `let` PATTERN DROPS ITS LEAVES IN REVERSE PATTERN ORDER ON THE INTERPRETER AND REVERSE DECLARATION ORDER ON EVERY COMPILED BACKEND -- `let s = S3 { a: mk(7), b: mk(8) }; let S3 { b, a } = s; return b.id * 100 + a.id;` prints `dR7 dR8 dR6 v=807` under `--interp` and `dR8 dR7 dR6 v=807` under jit / aot / `KARAC_AUTO_PAR=0`; every body runs once, the sequence alone diverges | — |
-| B-2026-09-06-48 | 2026-09-06 | codegen | low | THE GENERIC HALF OF B-2026-09-04-12 STILL LOSES A BOXED TUPLE PAYLOAD'S INTERIOR -- `generic[T](x: Option[T])` leaks the same 54 B in 6 blocks the non-generic `plainT(x: Option[(String, String)])` did before its fix, and by a DIFFERENT owner, so the parent row's "identical on both paths, therefore not monomorph-specific" premise is refuted rather than confirmed | — |
 | B-2026-09-06-49 | 2026-09-06 | codegen | low | AN INLINE-BUILT `Array` PAYLOAD LOSES ITS INTERIOR EXACTLY AS THE TUPLE DID -- 54 B in 6 blocks for `f(Some([f"a{i}", f"b{i}"]))`, while the same array through a NAMED LOCAL is clean, because the array's interior is owned by a caller-side drop that a missing move-suppressor leaves armed | — |
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-63 | 2026-09-06 | interp+codegen | low | A CALLEE THAT WRAPS A `Drop`-BEARING ARGUMENT IN ANOTHER `Drop`-BEARING TYPE LOSES THE WRAPPER'S OWN BODY -- `fn wrap_bodied(r: R) -> H { return H { r: r, n: 3 }; }` called as `let h = wrap_bodied(r)` prints the `R`'s body once and the `H`'s never, on --interp / jit / aot / `KARAC_OPT_LEVEL=0` alike, with valgrind clean; the view mark that keeps the `R` correct is what suppresses the `H` | — |
@@ -167,6 +166,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-11 | 2026-09-08 | codegen | low | `display_mangle_te` RENDERS EVERY UNNAMEABLE TYPE AS `unknown`, SO THEY SHARE ONE MANGLED SYMBOL AND ONE DROP/CLONE CACHE ENTRY -- `Vec[weak A]` and `Vec[weak B]` both emit `karac_drop_Vec_unknown` / `karac_clone_unknown` and the second requested gets the first's function; benign for `weak` ONLY because every weak-slot operation is slot-type-agnostic, and the fallback is not weak-only | none |
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
 | B-2026-09-09-1 | 2026-09-09 | cli | low | `signalling_karac_run_does_not_orphan_the_jit_runner` FAILS UNDER LOAD IN THE REQUIRED GATE SET -- 1 failure in 5 runs of the full `--test cli` binary on one tree, at the 15-SECOND watchdog assert (the runner outlived the signal), while the same test passes in ISOLATION in 2.8s and the four other full-binary runs were 738/738; either the window is too short for a loaded debug container or B-2026-09-05-24's orphan is intermittent rather than fixed, and the two readings need different remedies | — |
+| B-2026-09-09-4 | 2026-09-09 | other | low | THE `rc_fb_twin_shape_both_boxed` VACUITY GUARD FAILS INTERMITTENTLY ON A GREEN TREE -- `min_allocs = 60` against an x86_64-Linux count of 65-72 that MOVES BY 7 BETWEEN RUNS of one binary, so the full suite reports 1561/1 and a re-run of the same binary reports 1562/0; the threshold was justified from macOS (183) and arm64 Linux (75), neither of which bounds this host | — |
 
 ### Relocated
 
@@ -2332,6 +2332,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-45 | interp+codegen | low | A REBIND OF `self` NESTED IN A BRANCH OF AN OWNED-`self` METHOD RUNS THE RECEIVER'S OWN `Drop` BODY TWICE ON EVERY SURFACE -- `fn m_cond(self, c: boo… | 6138e02 |
 | B-2026-09-06-46 | codegen | medium | A PARTIAL `let` DESTRUCTURE OF A LOCAL WHOSE OTHER FIELD WAS MOVED OUT EARLIER LOSES THE BOUND LEAF'S `Drop` BODY ON EVERY COMPILED BACKEND -- `let s… | 736a4fc |
 | B-2026-09-06-47 | interp | medium | THE `let`-DESTRUCTURE DISCARD RE-RUNS THE `Drop` BODY OF A FIELD ALREADY MOVED OUT OF THE SOURCE -- `let s = S3 { a: mk(8), b: mk(9) }; let x: R = s.… | 20e9ebc |
+| B-2026-09-06-48 | codegen | low | THE GENERIC HALF OF B-2026-09-04-12 STILL LOSES A BOXED TUPLE PAYLOAD'S INTERIOR -- `generic[T](x: Option[T])` leaks the same 54 B in 6 blocks the no… | 1ed0321 |
 | B-2026-09-06-50 | codegen | high | A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE PARAM ABORTS ON BOTH COMPILED BACKENDS -- `free(): double free detected in tcache 2`, exit 134,… | 7020445 |
 | B-2026-09-06-51 | codegen | medium | THE -O0 ASAN RATCHET HAS BEEN RED ON `main` SINCE edb7236 -- six fixtures that commit ADDED fail `scripts/asan-o0-leg.sh` unquarantined, so the gate… | f2ec7d6ac |
 | B-2026-09-06-52 | codegen | high | A TOP-LEVEL WHOLE REBIND OF A BY-VALUE PARAM WHOSE STRUCT HAS A DIRECT `shared` FIELD DOUBLE-FREES ON EVERY COMPILED SURFACE -- `fn topreb(r: R) -> i… | 0083494 |
