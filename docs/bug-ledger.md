@@ -102,7 +102,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | false-positive | 106 |
 | perf | 102 |
 | soundness | 95 |
-| other | 83 |
+| other | 84 |
 | crash | 77 |
 | use-after-free | 36 |
 
@@ -115,7 +115,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | typecheck | 295 |
 | other | 76 |
 | ownership | 74 |
-| cli | 71 |
+| cli | 72 |
 | autopar | 56 |
 | parser | 46 |
 | runtime | 40 |
@@ -124,7 +124,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | lexer | 8 |
 ## Current state
 
-_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-08). Do not edit this block by hand; edit the ledger and regenerate._
+_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-09). Do not edit this block by hand; edit the ledger and regenerate._
 
 ### Open
 
@@ -172,6 +172,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-11 | 2026-09-08 | codegen | low | `display_mangle_te` RENDERS EVERY UNNAMEABLE TYPE AS `unknown`, SO THEY SHARE ONE MANGLED SYMBOL AND ONE DROP/CLONE CACHE ENTRY -- `Vec[weak A]` and `Vec[weak B]` both emit `karac_drop_Vec_unknown` / `karac_clone_unknown` and the second requested gets the first's function; benign for `weak` ONLY because every weak-slot operation is slot-type-agnostic, and the fallback is not weak-only | none |
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
 | B-2026-09-08-13 | 2026-09-08 | codegen | medium | A LET-BOUND LOCAL OF A SELF-REFERENTIAL STRUCT PASSED BY VALUE LOSES ITS `Drop` BODY ON EVERY COMPILED BACKEND -- `let c = mkn(10); read(c)` prints the body under `--interp` and nothing under the JIT, `-O0`, `-O2` and `KARAC_AUTO_PAR=0`; passing the SAME value as a temporary agrees, which is the only variable, and is why six existing fixtures for this type all miss it | none |
+| B-2026-09-09-1 | 2026-09-09 | cli | low | `signalling_karac_run_does_not_orphan_the_jit_runner` FAILS UNDER LOAD IN THE REQUIRED GATE SET -- 1 failure in 5 runs of the full `--test cli` binary on one tree, at the 15-SECOND watchdog assert (the runner outlived the signal), while the same test passes in ISOLATION in 2.8s and the four other full-binary runs were 738/738; either the window is too short for a loaded debug container or B-2026-09-05-24's orphan is intermittent rather than fixed, and the two readings need different remedies | — |
 
 ### Relocated
 
