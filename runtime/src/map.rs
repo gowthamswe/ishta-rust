@@ -2284,7 +2284,7 @@ mod tests {
     fn swar_zero_lanes_is_exact_per_lane_where_haszero_is_not() {
         // A single zero lane is found at its own index, wherever it sits.
         for lane in 0..GROUP {
-            let g = !0u64 & !(0xffu64 << (lane * 8));
+            let g = !(0xffu64 << (lane * 8));
             assert_eq!(first_lane(zero_lanes(g)), lane, "lane {lane}");
         }
         assert_eq!(zero_lanes(!0u64), 0, "no zero lane in all-ones");
