@@ -92,10 +92,10 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 402 |
+| miscompile | 403 |
 | run-vs-build | 378 |
-| leak | 307 |
-| double-free | 216 |
+| leak | 308 |
+| double-free | 217 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
 | diagnostics | 125 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1626 |
+| codegen | 1629 |
 | interp | 407 |
 | typecheck | 295 |
 | other | 81 |
@@ -160,9 +160,11 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-7 | 2026-09-09 | other | medium | A FULL DISK FAILS THE GATE SET AS AN LLVM CRASH, A LINKER BUS ERROR, OR A LOST OUTPUT STREAM -- never as a named test -- and it hit ELEVEN times across seven unrelated slices in one session. The session allowance is ~38 GiB (df's '252G size' is the host volume and is meaningless), ONE leg of `cargo test --no-run` costs 19.6 GiB in test binaries (134 executables x ~250 MiB at the default debug=2), so the SECOND feature leg cannot start. The obvious suspect is wrong: both clippy legs together cost 1.19 GiB. `CARGO_PROFILE_TEST_DEBUG=line-tables-only` cuts a test binary 252 -> 97 MiB and makes both legs fit | — |
 | B-2026-09-09-8 | 2026-09-09 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-49 STILL LEAKS ITS INLINE-BUILT `Array` INTERIOR -- `plainR(Result.Ok([f"a{i}", f"b{i}"]))` over `Result[Array[String, 2], i64]` loses 54 B in 6 blocks after the Option half was fixed, because the param-site arm that owns the payload reads it through `option_generic_arg_type_expr` and no `Result` sibling exists | none |
 | B-2026-09-09-9 | 2026-09-09 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` over `Option[Array[Vec[String], 2]]` fails with `codegen: nested indexed read on 't' -- element TypeExpr unknown (outer is not a tracked Vec/Slice/Array variable)`, the eighth base shape in a family whose other seven are fixed | none |
-| B-2026-09-09-10 | 2026-09-09 | codegen | low | A BOXED USER ENUM PAYLOAD'S INTERIOR IS STILL UNOWNED WHEN THE ARM BINDS THROUGH A NESTED PATTERN -- `match x { Some(K.A(r)) => .. }` over `fn show(x: Option[K])` leaks 81 B in 9 blocks after B-2026-09-06-67 closed the envelope half, and the fix cannot simply register it because the WHOLE-PAYLOAD spelling `Some(k)` double-frees if it does | — |
 | B-2026-09-09-12 | 2026-09-09 | runtime | medium | kara's MAP PROBE WALKS ONE CONTROL BYTE PER STEP WITH A DATA-DEPENDENT BRANCH, and an 8-byte SWAR group scan is 2.03x FASTER IN CYCLES WHILE EXECUTING 30% MORE INSTRUCTIONS (36.0 -> 17.7 cyc/lookup, IPC 1.15 -> 3.05) -- the cost is mispredicts, not work, which is why no instruction-count fix on B-2026-09-07-53 reached it. Prototyped and validated against the reference walk on every key; not shipped, because the win needs the same scan in find_insert_slot and in the CODEGEN MONO probes, not just the runtime's lookup | docs/investigations/hash-cost/README.md |
 | B-2026-09-09-14 | 2026-09-09 | codegen | low | SIX MORE POSITIONS STILL LOSE THE `shared` FIELD'S REFCOUNT BLOCK after B-2026-09-06-72 -- the aggregate as a struct FIELD, as a by-value PARAM, as a `Vec` ELEMENT, DISCARDED at statement level, `Option[R]` as a field, and `Option[(R, i64)]`, each 16 B in 1 block at -O0 (19 B in 2 for the discarded one). `Vec[R]` DIRECT is clean, so the walker exists and what is missing is per-channel wiring. Plus a body divergence in the last cell: `--interp` runs the `Drop` body zero times where the compiled backend runs it early | — |
+| B-2026-09-09-17 | 2026-09-09 | codegen | medium | THE REBIND STAND-DOWN OF B-2026-09-09-13/-16 IS MUTABLE-ONLY, so the IMMUTABLE spelling still double-frees on `main` -- `fn f(x: Option[K]) { let y = x; match y { .. } }` is 1 invalid free for an enum payload and TEN for a struct one, measured at 4fb2adee with both of those rows fixed, because `param_rebound_into_mut_local` asks `w.mut_rebinds` and the reasoning it rests on ("an alias that can be reassigned is not a stable alias") is refuted by the scope-exit drop, which frees the box whether or not the local is ever reassigned | — |
+| B-2026-09-09-18 | 2026-09-09 | codegen | medium | A `Drop`-BEARING PAYLOAD BOXED BEHIND A BY-VALUE `Option`/`Result` PARAM NEVER RUNS ITS `Drop` BODY, ON EVERY SURFACE -- `fn show(x: Option[K])` over `enum K { A(R2), B }` with `impl Drop for R2` prints the arm's line three times and NOT ONE `d:` line, identically under `karac run`, a sequential build and an auto-par build, so neither the A/B rule nor any sanitizer can see it; the axis is the BOXED-PAYLOAD PARAM and not the enum, since `Option[R2]` loses it too while a plain local, a plain `R2` param and a local `K.A(..)` all fire correctly | — |
+| B-2026-09-09-19 | 2026-09-09 | codegen | low | A BOXED ENUM PAYLOAD'S INTERIOR IS UNOWNED ONE LEVEL DEEPER, INSIDE A STRUCT FIELD -- `fn show(h: Holder)` over `struct Holder { k: Option[K], n: i64 }` leaks the same 81 B in 9 blocks that B-2026-09-09-10 just closed for a bare `Option[K]` param, unchanged by that fix because a field-held payload registers through `struct_payload_boxed_field_variants` / `track_nested_boxed_enum_var_at_field` rather than the arg-site arm | — |
 
 ### Relocated
 
@@ -2429,6 +2431,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-2 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push… | 33c5c25 |
 | B-2026-09-09-3 | codegen | low | B-2026-09-06-66's BY-VALUE REMAINDER IS STILL OPEN AFTER B-2026-09-08-13 CLOSED ITS PRECONDITION -- a self-referential struct's `Option` payload box… | 4ef36450e |
 | B-2026-09-09-4 | other | low | THE `rc_fb_twin_shape_both_boxed` VACUITY GUARD FAILS INTERMITTENTLY ON A GREEN TREE -- `min_allocs = 60` against an x86_64-Linux count of 65-72 that… | fb05f38 |
+| B-2026-09-09-10 | codegen | low | A BOXED USER ENUM PAYLOAD'S INTERIOR IS STILL UNOWNED WHEN THE ARM BINDS THROUGH A NESTED PATTERN -- `match x { Some(K.A(r)) => . | 1347735 |
 | B-2026-09-09-11 | codegen | medium | A `shared enum` WITH A BOXED STRUCT PAYLOAD PRINTS NOTHING ON EVERY COMPILED BACKEND AND STACK-OVERFLOWS THE JIT, while `--interp` prints the right t… | 768a9be |
 | B-2026-09-09-13 | codegen | medium | 99f54104e REGRESSED AN IN-TREE FIXTURE INTO A DOUBLE FREE, and both ASAN ratchet legs are red on origin/main because of it -- `fn f(value: Option[Val… | src/codegen/call_dispatch.rs: `owned_boxed_option_param_str… |
 | B-2026-09-09-15 | other | medium | THE INSTRUMENTED ASAN LEG CANNOT LINK ON macOS -- every fixture dies at `___asan_version_mismatch_check_v8` from `_asan.module_ctor`, karac's bundled… | scripts/asan-instrumented-leg.sh appends `-asan-guard-again… |
