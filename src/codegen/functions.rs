@@ -2599,10 +2599,32 @@ impl<'ctx> super::Codegen<'ctx> {
                 // exactly the erasure that causes the boxing — so resolve it
                 // through the active monomorph subst first, or the predicate
                 // measures the erased one-word `T` and never reports a box.
+                // B-2026-09-02-22 — the STRICT non-escaping set is the wrong
+                // question for a BOXED payload's owner, and using it is why a
+                // callee whose whole body is `println(f"{x}")` owned nothing.
+                // That set is `total == scrut`: every non-scrutinee use counts
+                // as an escape, so a read-only interpolation hole classifies
+                // the param as escaping. An interpolation hole READS and cannot
+                // MOVE, so it cannot hand the box to anyone else — which is the
+                // only thing this registration needs to be sure of.
+                // `by_value_nonescaping_param_names` asks exactly that
+                // (`total == scrut + ro`) and is a strict SUPERSET, so this
+                // only ever adds params the old gate refused; a param that is
+                // returned or forwarded is in NEITHER set and stays
+                // unregistered, keeping the terminal consumer the only owner
+                // (measured: `fn id(x) -> Option[Option[String]] { return x }`
+                // is clean before and after).
+                //
+                // The strict set is still right for the `Result[shared]` RC
+                // consumer above, which is why that arm keeps it and this one
+                // does not share the predicate.
                 if !self.borrow_vars.ref_params.contains_key(&param_name)
-                    && self
+                    && (self
                         .result_shared_nonescaping_param_names
                         .contains(&param_name)
+                        || self
+                            .optres_by_value_nonescaping_param_names
+                            .contains(&param_name))
                 {
                     let mono_ty = self.subst_monomorph_type_params(&param.ty);
                     for (enum_name, variant) in self.user_enum_boxed_payload_variants(&mono_ty) {
@@ -2768,18 +2790,88 @@ impl<'ctx> super::Codegen<'ctx> {
                         // an all-scalar `(i64, i64)` from getting a drop it does
                         // not need, and what declines a tuple whose recursive
                         // drop is not fully supported.
+                        // B-2026-09-02-22 — the same derivation, one payload
+                        // shape wider. `Option[Option[String]]` boxes because
+                        // its 4-word inner exceeds the 3-word area, reaches
+                        // this arm with `inner_struct = None` (an `Option` is
+                        // not a user struct), and got the box-only free — so
+                        // the box was reclaimed and the `String` INSIDE it was
+                        // not: 45 B in 3 blocks over three calls, on top of the
+                        // 96 B of boxes that the gate widening above recovers.
+                        // `option_payload_struct_or_enum_drop_ok` already
+                        // admits a seeded-enum payload (`Option` is in
+                        // `enum_layouts`); the `TypeKind::Tuple` test was the
+                        // only thing holding it out.
+                        //
+                        // THE DROP GOES TO THE BOTTOM OF THE CHAIN, not to
+                        // the immediate payload. The comment above says the
+                        // exclusion holds "by TYPE", and that is STALE:
+                        // B-2026-08-29-2 made `inner_drop_fn` and the chain
+                        // COMPOSE, defining the drop as the one for the value
+                        // at the chain's leaf — the only level holding a real
+                        // payload — and `track_boxed_enum_var_with_chain` hands
+                        // it there. Dropping the IMMEDIATE payload of a chained
+                        // type would free an ENVELOPE as though it were a
+                        // value; `nested_box_leaf_contents` walks to the level
+                        // that actually owns heap, and returns its argument
+                        // unchanged when there is no chain, so the tuple and
+                        // single-level cases are byte-identical to before.
                         let tuple_inner_drop = Self::option_generic_arg_type_expr(&mono_ty)
                             .filter(|p| {
                                 matches!(p.kind, TypeKind::Tuple(_))
                                     && self.option_payload_struct_or_enum_drop_ok(p)
                             })
                             .map(|p| self.emit_drop_fn_for_type_expr(&p));
+                        // B-2026-09-02-22 — the LEAF drop, for a payload that is
+                        // not a tuple. `Option[Option[String]]` boxes (4 words
+                        // past the 3-word area), reaches here with
+                        // `inner_struct = None`, and got the box-only free — so
+                        // the box was reclaimed and the `String` inside it was
+                        // not, 45 B in 3 blocks over three calls.
+                        //
+                        // THIS IS THE LET SITE'S REGISTRATION, SPELLED THE SAME
+                        // WAY ON PURPOSE (`stmts.rs`, B-2026-08-29-2): resolve
+                        // the drop for `nested_box_leaf_contents` through
+                        // `vec_elem_agg_drop_for_type_expr`, then record
+                        // `boxed_leaf_owning_depth` so the EXISTING
+                        // `retract_boxed_leaf_drop_for_consuming_pattern` can
+                        // stand the drop down when an arm binds the leaf out.
+                        // Registering without that depth is what makes this a
+                        // double free instead of a fix: measured, an arm
+                        // `Option.Some(Option.Some(s))` owns and frees `s`
+                        // itself, and the retraction bails on its first lines
+                        // for a name the map does not know.
+                        //
+                        // The depth is `None` for a STRUCT or ENUM leaf and the
+                        // registration follows it there rather than second-
+                        // guessing: an arm binding `Some(Some(w))` takes the
+                        // struct HEADER, not its fields' heap, so nothing is
+                        // retracted and the box's drop stays the fields' only
+                        // owner (`leaf-bound-wide`).
+                        let leaf_drop = if tuple_inner_drop.is_some() {
+                            None
+                        } else {
+                            Self::option_generic_arg_type_expr(&mono_ty).and_then(|p| {
+                                let leaf = self.nested_box_leaf_contents(&p).clone();
+                                self.vec_elem_agg_drop_for_type_expr(&leaf)
+                            })
+                        };
+                        if leaf_drop.is_some() {
+                            if let Some(d) = Self::option_generic_arg_type_expr(&mono_ty)
+                                .and_then(|p| self.boxed_leaf_owning_depth(&p, deeper.len()))
+                            {
+                                self.payload_vars
+                                    .boxed_leaf_owning_depth
+                                    .insert(param_name.clone(), d);
+                            }
+                        }
+                        let payload_inner_drop = tuple_inner_drop.or(leaf_drop);
                         self.track_boxed_enum_var_with_chain(
                             &param_name,
                             alloca,
                             enum_lit,
                             variant,
-                            tuple_inner_drop,
+                            payload_inner_drop,
                             deeper,
                         );
                     }

@@ -18500,6 +18500,107 @@ fn main() {
         );
     }
 
+    /// B-2026-09-02-22 — AN `Option` PAYLOAD WIDER THAN THE 3-WORD AREA LOST
+    /// ITS BOX, ITS INTERIOR, OR BOTH, DEPENDING ONLY ON THE CALLEE'S BODY.
+    ///
+    /// `fn show(x: Option[Option[String]])` boxes its payload (4 words, past
+    /// the 3-word `Option` area) and measured 141 B in 3 blocks over three
+    /// calls at `-O0` — 96 direct (the three boxes) plus 45 indirect (the
+    /// `String` inside each). Two independent defects, and the body decided
+    /// which fired:
+    ///
+    ///   - a body that reads the param in an INTERPOLATION HOLE
+    ///     (`println(f"{x}")`) reached the callee's owned-param registration
+    ///     under the STRICT non-escaping set, which counts every non-scrutinee
+    ///     use as an escape — so nothing was registered and the BOX leaked too.
+    ///     The registration now asks `by_value_nonescaping_param_names`, which
+    ///     is the same question one position looser: a read cannot move the box.
+    ///   - once registered, the arm freed the BOX ONLY, because it derived its
+    ///     interior drop from a TUPLE payload and an `Option` is not one. The
+    ///     45 B interior survived the box's own reclamation.
+    ///
+    /// The interior drop goes to `nested_box_leaf_contents` — the bottom of the
+    /// envelope chain — not to the immediate payload, so `triple` frees the
+    /// `String` under two envelopes rather than freeing an envelope as though
+    /// it were a value (B-2026-08-29-2 made the chain and the drop compose).
+    ///
+    /// Every cell is a direction the fix could break, and three are the
+    /// double-free directions:
+    ///   - `interp` is the reported shape (gate widening);
+    ///   - `matched` binds the whole inner out, so the interior drop must be
+    ///     RETRACTED to box-only or the arm's binding and the box free twice;
+    ///   - `unused` never mentions the param, so the box is the only owner;
+    ///   - `other` is the OTHER nesting order (`Option[Result[..]]`), which the
+    ///     row measured at the identical 45 B for the same reason;
+    ///   - `triple` exercises the chain leaf (was 96 direct + 141 indirect);
+    ///   - `admitted` is the CONTROL on the far side of the same word-count
+    ///     gate: a `Result`'s area is 5 words and `Option[String]` is 4, so it
+    ///     IS entry-copied and was already clean — B-2026-09-03-6's double free
+    ///     lives here and must not come back;
+    ///   - `ident` RETURNS the param, so it is in neither escape set and must
+    ///     stay unregistered, leaving the caller's binding the only owner.
+    #[test]
+    fn asan_wide_option_payload_param_frees_box_and_interior() {
+        assert_clean_asan_run(
+            r#"
+fn interp(x: Option[Option[String]]) { println(f"i:{x}"); }
+
+fn matched(x: Option[Option[String]]) {
+    match x { Some(inner) => { println(f"m:{inner}"); } None => { println("mn"); } }
+}
+
+fn unused(x: Option[Option[String]]) { println("u"); }
+
+fn other(x: Option[Result[String, String]]) { println(f"o:{x}"); }
+
+fn triple(x: Option[Option[Option[String]]]) { println(f"t:{x}"); }
+
+fn admitted(x: Result[Option[String], String]) { println(f"a:{x}"); }
+
+fn ident(x: Option[Option[String]]) -> Option[Option[String]] { return x; }
+
+fn main() {
+    let mut n = 0;
+    while n < 3 {
+        interp(Some(Some(f"in-{n}-padpadpad")));
+        matched(Some(Some(f"ma-{n}-padpadpad")));
+        unused(Some(Some(f"un-{n}-padpadpad")));
+        other(Some(Ok(f"ot-{n}-padpadpad")));
+        triple(Some(Some(Some(f"tr-{n}-padpadpad"))));
+        admitted(Ok(Some(f"ad-{n}-padpadpad")));
+        let r = ident(Some(Some(f"id-{n}-padpadpad")));
+        println(f"r:{r}");
+        n = n + 1;
+    }
+}
+"#,
+            &[
+                "i:Some(Some(in-0-padpadpad))",
+                "m:Some(ma-0-padpadpad)",
+                "u",
+                "o:Some(Ok(ot-0-padpadpad))",
+                "t:Some(Some(Some(tr-0-padpadpad)))",
+                "a:Ok(Some(ad-0-padpadpad))",
+                "r:Some(Some(id-0-padpadpad))",
+                "i:Some(Some(in-1-padpadpad))",
+                "m:Some(ma-1-padpadpad)",
+                "u",
+                "o:Some(Ok(ot-1-padpadpad))",
+                "t:Some(Some(Some(tr-1-padpadpad)))",
+                "a:Ok(Some(ad-1-padpadpad))",
+                "r:Some(Some(id-1-padpadpad))",
+                "i:Some(Some(in-2-padpadpad))",
+                "m:Some(ma-2-padpadpad)",
+                "u",
+                "o:Some(Ok(ot-2-padpadpad))",
+                "t:Some(Some(Some(tr-2-padpadpad)))",
+                "a:Ok(Some(ad-2-padpadpad))",
+                "r:Some(Some(id-2-padpadpad))",
+            ],
+            "asan_wide_option_payload_param_frees_box_and_interior",
+        );
+    }
+
     /// B-2026-09-06-50 — A BOXED STRUCT PAYLOAD DESTRUCTURED OUT OF A BY-VALUE
     /// PARAM ABORTED WITH A DOUBLE FREE ON EVERY COMPILED BACKEND.
     ///
