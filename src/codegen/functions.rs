@@ -2918,15 +2918,84 @@ impl<'ctx> super::Codegen<'ctx> {
                     && self.is_rc_fallback_binding(&param_name)
                 {
                     let val_ty = param_val.get_type();
-                    let heap_type = self
-                        .context
-                        .struct_type(&[self.context.i64_type().into(), val_ty], false);
+                    // B-2026-09-07-50 — the box is NAMED after the boxed value's
+                    // type and carries a VALUE-DROP, exactly as the `let` site's
+                    // copy of this boxing does. Both halves were missing here,
+                    // and one omission explains both of the row's symptoms.
+                    //
+                    // A param is RC-promoted when it is consumed and then read
+                    // again -- `if k { self.xs.push(r); } println(f"s{r.inner.v}")`
+                    // draws `perf[rc-fallback]: RC fallback inserted for 'r'
+                    // (direct re-use after consume)`, and it is the ONLY one of
+                    // the four statement orders that does (read BEFORE the store,
+                    // a trailing statement that does not read the param, and no
+                    // trailing statement at all are each silent and each correct).
+                    // This loop then boxed it and `continue`d past every
+                    // registration below, so on the non-storing path the value's
+                    // user `Drop` body ran nowhere -- `s100 end` on the JIT and
+                    // both AOT lanes against `--interp`'s `s100 dR100 end` -- and
+                    // its heap was never freed: 20 B in 2 blocks at -O0, 12 allocs
+                    // / 10 frees, which is the `String` plus the `shared` field's
+                    // refcount block, i.e. the WHOLE of the value's heap.
+                    //
+                    // `register_rc_fallback_box_drop` is what owns both: it is
+                    // body AND memory in one action (B-2026-09-07-17 moved them
+                    // here from the let site precisely because an RC-promoted
+                    // binding's slot holds the HANDLE, so a wrapper registered
+                    // against the slot reads a pointer as a `T`). The anonymous
+                    // `context.struct_type` the old code built could not have
+                    // carried it either: `rc_fallback_box_drop_fns` is keyed on
+                    // the box type, and B-2026-09-07-18 records what a SHARED box
+                    // type does -- two same-shaped values get one drop fn.
+                    // The gate is computed FIRST because it also decides the
+                    // box TYPE. `rc_fallback_box_type` returns a type NAMED
+                    // after the boxed value (`karac.rcfb.R`), and
+                    // `rc_fallback_box_drop_fns` is keyed on the box type — so
+                    // a named param box would find a value-drop that some `let`
+                    // site registered for the same type, in exactly the cases
+                    // the gate below declines. Passing `None` there yields the
+                    // anonymous `{i64, T}` this loop has always built, so a
+                    // declined param keeps today's type and today's behaviour
+                    // rather than merely being argued safe. Found by re-reading
+                    // this diff, not by a test.
+                    let cond_stored = !self.is_coroutine_compiled(&func.name)
+                        && (crate::ast::fn_conditionally_moves_param_into_outliving_place(func, i)
+                            || self.program_snapshot.as_deref().is_some_and(|p| {
+                                crate::ast::fn_conditionally_hands_param_to_flip_callee(p, func, i)
+                            }));
+                    let boxed_type_name = cond_stored
+                        .then(|| self.rc_fallback_boxed_type_name(&param_name, val_ty))
+                        .flatten();
+                    let heap_type = self.rc_fallback_box_type(boxed_type_name.as_deref(), val_ty);
                     let heap_ptr = self.emit_rc_alloc(heap_type);
                     let val_field = self
                         .builder
                         .build_struct_gep(heap_type, heap_ptr, 1, "rc_fb_param_val")
                         .unwrap();
                     self.builder.build_store(val_field, param_val).unwrap();
+                    // GATED ON THE REGISTRATION THIS `continue` SKIPS, not on
+                    // the promotion. Registering the value-drop unconditionally
+                    // is the obvious reading of "the let site does it" and it is
+                    // WRONG: for a promoted param whose body some other frame
+                    // already owns, the box drop is a SECOND owner. Measured --
+                    // `test_e2e_conditional_param_view_assign_keeps_target_body_per_path`
+                    // went to `dE dE` where one `dE` is due, and four more
+                    // ownership tests failed with it. The `continue` was
+                    // shielding those shapes as much as it was breaking this
+                    // one.
+                    //
+                    // So ask the same question the skipped block asks: does this
+                    // parameter reach a store on SOME path and not every path,
+                    // which is the case where the caller has stood down and no
+                    // frame is left holding the body. Everything else keeps
+                    // today's path exactly.
+                    if cond_stored {
+                        self.register_rc_fallback_box_drop(
+                            heap_type,
+                            boxed_type_name.as_deref(),
+                            None,
+                        );
+                    }
                     // Overwrite alloca to hold heap ptr instead of T.
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
                     let ptr_alloca = self.create_entry_alloca(fn_val, &param_name, ptr_ty.into());

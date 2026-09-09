@@ -8436,6 +8436,63 @@ fn main() {
     }
 
     #[test]
+    /// B-2026-09-07-50 — the OWNERSHIP half of
+    /// `e2e_rc_promoted_param_keeps_its_drop_body_and_heap`.
+    ///
+    /// One omission produced both of that row's symptoms. The `let` site's copy
+    /// of the RC-fallback boxing names its box after the boxed type and calls
+    /// `register_rc_fallback_box_drop`; the param loop's copy built an
+    /// ANONYMOUS `{i64, T}` and registered no value-drop at all, then
+    /// `continue`d. So the boxed param's user `Drop` body ran nowhere and its
+    /// heap was never freed — 20 B in 2 blocks at -O0, 12 allocs / 10 frees,
+    /// the `String` plus the `shared` field's refcount block.
+    ///
+    /// The anonymous type could not have carried the drop fn either:
+    /// `rc_fallback_box_drop_fns` is keyed on the box type, and B-2026-09-07-18
+    /// records what a shared box type does — two same-shaped values get one
+    /// drop fn.
+    ///
+    /// `pf` is the cell that separates the two halves: `P` has no `Drop` of its
+    /// own but does own a `String`, so it never had a body to lose and leaked
+    /// anyway. A body-only check would have called it clean.
+    fn asan_rc_promoted_param_owns_its_body_and_heap() {
+        assert_clean_asan_run_min_allocs(
+            r#"
+shared struct Inner { v: i64 }
+struct R { id: i64, name: String, inner: Inner }
+impl Drop for R { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mk(i: i64) -> R { return R { id: i, name: f"h{i}", inner: Inner { v: i } }; }
+struct P { id: i64, name: String }
+fn mkp(i: i64) -> P { return P { id: i, name: f"p{i}" }; }
+struct Box2 { mut xs: Vec[R] }
+
+impl Box2 {
+    fn after(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } println(f"s{r.inner.v}"); }
+    fn before(mut ref self, r: R, k: bool) { println(f"s{r.inner.v}"); if k { self.xs.push(r); } }
+    fn bare(mut ref self, r: R, k: bool) { if k { self.xs.push(r); } }
+}
+fn ff(v: mut ref Vec[R], r: R, k: bool) { if k { v.push(r); } println(f"s{r.inner.v}"); }
+fn pf(v: mut ref Vec[P], p: P, k: bool) { if k { v.push(p); } println(f"s{p.id}"); }
+
+fn main() {
+    let mut b = Box2 { xs: Vec.new() };
+    b.after(mk(1), false);
+    b.before(mk(2), false);
+    b.bare(mk(4), false);
+    let mut v: Vec[R] = Vec.new();
+    ff(mut v, mk(5), false);
+    let mut w: Vec[P] = Vec.new();
+    pf(mut w, mkp(6), false);
+    println("end");
+}
+"#,
+            &["s1", "dR1", "s2", "dR2", "dR4", "s5", "dR5", "s6", "end"],
+            "b0907-50-rc-promoted-param-ownership",
+            18,
+        );
+    }
+
+    #[test]
     /// B-2026-09-07-51 — the OWNERSHIP half of
     /// `e2e_generic_conditional_store_runs_one_body_on_the_missed_path`.
     ///
