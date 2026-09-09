@@ -5687,6 +5687,30 @@ impl<'ctx> super::Codegen<'ctx> {
     /// overhead on the arm that already wins. A spill-free tag would widen
     /// x86's margin, and might flip arm64's sign if part of what the tag costs
     /// there is the same spill rather than the compare.
+    ///
+    /// SUPERSEDED 2026-09-09 (B-2026-09-07-53), on x86_64 only. That loose
+    /// thread is CLOSED: there is no spill left to remove. Re-measured on the
+    /// same kata:170 bench with `KARAC_HASH_SEED` PINNED across three seeds,
+    /// tag-on and tag-off execute an IDENTICAL number of writes (221,805,716 on
+    /// every run) -- not the 2.00 per probe recorded above -- and tag-on now
+    /// executes 1.4-2.3% FEWER instructions with 21-23% fewer reads, where the
+    /// figures above have it executing 15.1% more. The conclusion (the tag
+    /// pays on x86) is unchanged and strengthened; only the reasoning is stale,
+    /// and it is stale by DATE: everything above was measured 2026-08-07,
+    /// fifteen days before the SipHash-1-3 migration (59c8d30cd) took the
+    /// integer hash from ~2 instructions to ~97, and before 9ce695e9e removed
+    /// the key's stack round-trip. Do not re-derive the x86 policy from the
+    /// numbers above; re-measure.
+    ///
+    /// The arm64 half is UNTESTED against those same two changes and its sign
+    /// may have moved for the same reason. Until someone runs this A/B on an
+    /// M-series box, `!target_is_aarch64` rests on a 2026-08-07 measurement of
+    /// a materially different compiler.
+    ///
+    /// ALWAYS PIN `KARAC_HASH_SEED` FOR THIS A/B. Probe-chain length depends on
+    /// the per-process random seed: two cachegrind runs of the SAME binary
+    /// differed by 7% here, which is larger than the effect being measured. An
+    /// unpinned A/B on a map workload measures the seed.
     pub(super) fn map_tag_compare(&self, key: MapProbeKey) -> bool {
         if let Some(forced) = self.mapset.map_tag_override {
             return forced;
