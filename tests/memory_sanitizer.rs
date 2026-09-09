@@ -84180,4 +84180,96 @@ fn main() {
             "b13-no-rebind-pod-control",
         );
     }
+
+    /// B-2026-09-09-14 — a DISCARDED tuple temp (`f(mk(20));`) owns its whole
+    /// interior and nothing was freeing it.
+    ///
+    /// `track_discarded_temp_cleanup` is a chain of arms keyed to a return
+    /// SHAPE — inline `Option`, `Result`, the boxed and shared variants of
+    /// each — ending at `materialize_owned_temp`, whose chokepoint knows
+    /// Vec/String/Map/RC scalars and has no aggregate walk. A tuple matched
+    /// none of them and fell through, so the result's heap had no owner at all.
+    /// That is strictly more than the aggregate-RETURN family this row came
+    /// from (B-2026-09-06-72), which loses only the refcount block: here the
+    /// `String` goes too.
+    ///
+    /// NO `Drop` BODY IS REGISTERED, and the expected stdout below is what pins
+    /// that. `--interp` runs no body for this shape either — both backends
+    /// print only the trailing statement — so registering one on the compiled
+    /// side alone would turn a leak into a run-vs-build divergence. A body that
+    /// runs on NEITHER backend is a real defect and a different class; it is
+    /// filed separately rather than folded into a leak fix. If a later change
+    /// makes the body fire, these cells fail on stdout, which is the correct
+    /// outcome: the interpreter has to move in the same commit.
+    #[test]
+    fn asan_discarded_tuple_temp_frees_its_interior() {
+        // 1 — the row's cell: a `shared` field AND a String, 19 B in 2 blocks
+        //     at -O0 before the fix.
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"hhhhhhhh{i}{seed()}\", inner: Inner { v: i } }; }\n\
+             fn f(r: R) -> (R, i64) { return (r, 9); }\n\
+             fn main() { f(mk(20)); println(\"ok\"); }\n",
+            &["ok"],
+            "b14-discarded-tuple-shared-field",
+        );
+
+        // 2 — a DIRECT `String` element, which the first cut of this fix still
+        //     leaked: it reused `tuple_elem_needs_deep_drop`, and that
+        //     predicate CHOOSES between two walks at a `let`, where the one it
+        //     declines still frees the element. In discard position there is no
+        //     second walk, so the gate is the union of both let-site tests.
+        assert_clean_asan_run(
+            "fn seed() -> i64 { env.args().len() }\n\
+             fn mkstr(i: i64) -> String { return f\"ssssssss{i}{seed()}\"; }\n\
+             fn f(i: i64) -> (String, i64) { return (mkstr(i), 9); }\n\
+             fn main() { f(3); println(\"ok\"); }\n",
+            &["ok"],
+            "b14-discarded-tuple-direct-string",
+        );
+
+        // 3 — UNBOUNDED: once per evaluation, not once per program.
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"hhhhhhhh{i}{seed()}\", inner: Inner { v: i } }; }\n\
+             fn f(r: R) -> (R, i64) { return (r, 9); }\n\
+             fn main() { let mut i = 0; while i < 8 { f(mk(i)); i = i + 1; } println(\"done\"); }\n",
+            &["done"],
+            "b14-discarded-tuple-loop",
+        );
+
+        // 4 — the ALL-POD control. The arm must decline outright here, leaving
+        //     this program's codegen byte-for-byte what it was; a fix that
+        //     registered a walk for every discarded tuple would be freeing a
+        //     slot with nothing in it.
+        assert_clean_asan_run(
+            "fn seed() -> i64 { env.args().len() }\n\
+             fn f(a: i64) -> (i64, i64) { return (a, 9); }\n\
+             fn main() { f(seed()); println(\"ok\"); }\n",
+            &["ok"],
+            "b14-discarded-tuple-pod-control",
+        );
+
+        // 5 — the BOUND spelling of cell 1, which was already clean
+        //     (B-2026-09-06-72) and must stay so: it proves the axis is the
+        //     DISCARD position rather than the tuple return itself. A double
+        //     free here would mean the new arm fires where a binding already
+        //     owns the value.
+        assert_clean_asan_run(
+            "shared struct Inner { v: i64 }\n\
+             struct R { id: i64, name: String, inner: Inner }\n\
+             impl Drop for R { fn drop(mut ref self) { println(f\"dR{self.id}\") } }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn mk(i: i64) -> R { return R { id: i, name: f\"hhhhhhhh{i}{seed()}\", inner: Inner { v: i } }; }\n\
+             fn f(r: R) -> (R, i64) { return (r, 9); }\n\
+             fn main() { let z = f(mk(20)); println(f\"{z.0.inner.v}\"); }\n",
+            &["20", "dR20"],
+            "b14-bound-spelling-control",
+        );
+    }
 }

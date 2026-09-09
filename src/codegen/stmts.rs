@@ -21907,12 +21907,46 @@ impl<'ctx> super::Codegen<'ctx> {
         if not_borrow {
             self.try_track_discarded_user_drop_temp(tail, val);
         }
+        // B-2026-09-09-14 — a discarded TUPLE temp (`f(mk(20));` where
+        // `f -> (R, i64)`). Every arm above is keyed to a specific return
+        // SHAPE — inline `Option`, `Result`, their boxed and shared
+        // variants — and a tuple matched none of them, so the value fell
+        // through to `materialize_owned_temp`, whose chokepoint handles
+        // Vec/String/Map/RC scalars and has no aggregate walk. The result's
+        // whole interior was then unowned: measured 19 B in 2 blocks at -O0
+        // on `struct R { name: String, inner: Inner }` with `Inner` shared —
+        // the `String` AND the 16-byte refcount block, i.e. more than the
+        // aggregate-return family this row came from, which loses only the
+        // refcount block.
+        //
+        // Reuses the two pieces the let-site already has: `tuple_binding_elem_tes`
+        // recovers a free-function `Call`'s element types out of
+        // `fn_return_type_exprs`, and `synthesize_tuple_drop_fn_te` builds the
+        // same TypeExpr-driven walk a `let`-bound tuple registers. Nothing else
+        // owns a discarded fresh call result, so this walk is its sole cleanup
+        // and cannot double-release.
+        //
+        // BODIES ARE DELIBERATELY NOT REGISTERED. `--interp` runs no `Drop`
+        // body for this shape either — both backends print only the trailing
+        // statement — so the two agree today and adding one here alone would
+        // CREATE a run-vs-build divergence out of a leak fix. That the body
+        // runs nowhere is a real defect and a separate class from this one;
+        // it is filed rather than folded in.
+        let handled_tuple = not_borrow
+            && !handled_option
+            && !handled_result
+            && !handled_option_map
+            && !handled_shared_option
+            && !handled_boxed_result
+            && !handled_boxed_option
+            && self.try_track_discarded_tuple_temp(tail, val);
         if !handled_option
             && !handled_result
             && !handled_option_map
             && !handled_shared_option
             && !handled_boxed_result
             && !handled_boxed_option
+            && !handled_tuple
         {
             // B-2026-08-25-17 — last resort, and only once every handler above
             // has declined: an inline-`Option` temp discarded inside a GENERIC
@@ -21923,6 +21957,62 @@ impl<'ctx> super::Codegen<'ctx> {
                 self.materialize_owned_temp(val, (tail.span.offset, tail.span.length));
             }
         }
+    }
+
+    /// B-2026-09-09-14 — register the memory walk for a discarded TUPLE temp.
+    /// See the call site for why the arm exists and why it registers no bodies.
+    ///
+    /// Declines unless the element types are recoverable AND at least one of
+    /// them owns heap the walk can free, so a `(i64, i64)` discard registers
+    /// nothing and keeps its current codegen byte-for-byte.
+    fn try_track_discarded_tuple_temp(&mut self, tail: &Expr, val: BasicValueEnum<'ctx>) -> bool {
+        let BasicValueEnum::StructValue(sv) = val else {
+            return false;
+        };
+        let Some(elem_tes) = self.tuple_binding_elem_tes(None, tail) else {
+            return false;
+        };
+        // The UNION of the two let-site gates, not `tuple_elem_needs_deep_drop`
+        // alone. At a `let` that predicate CHOOSES between the TypeExpr walk
+        // and the LLVM-type walk, so an element it declines is still freed by
+        // the other path; in the discard position there IS no other path, and
+        // gating on it alone left a direct `String` element (`f(3);` over
+        // `f -> (String, i64)`) losing its buffer — 2 B at -O0, clean at -O2
+        // where the dead allocation is elided. `emit_tuple_elem_drops` has
+        // handled a direct String/Vec element since it was written; only this
+        // gate kept it from being asked.
+        if !elem_tes
+            .iter()
+            .any(|e| self.tuple_elem_needs_deep_drop(e) || self.type_expr_has_drop_heap(e))
+        {
+            return false;
+        }
+        let agg_ty = sv.get_type();
+        if agg_ty == self.vec_struct_type() {
+            return false;
+        }
+        let Some(cur_fn) = self
+            .builder
+            .get_insert_block()
+            .and_then(|bb| bb.get_parent())
+        else {
+            return false;
+        };
+        let Some(drop_fn) = self.synthesize_tuple_drop_fn_te(agg_ty, &elem_tes) else {
+            return false;
+        };
+        let slot = self.create_entry_alloca(cur_fn, "__disc_tuple_tmp", agg_ty.into());
+        if self.builder.build_store(slot, val).is_err() {
+            return false;
+        }
+        if let Some(frame) = self.drop_rc.scope_cleanup_actions.last_mut() {
+            frame.push(super::state::CleanupAction::StructDrop {
+                struct_alloca: slot,
+                drop_fn,
+            });
+            return true;
+        }
+        false
     }
 
     /// B-2026-07-30-11 (discarded-temp leg) — payload user-Drop BODIES for a
