@@ -2137,7 +2137,9 @@ impl<'ctx> super::Codegen<'ctx> {
                 && self.expr_yields_fresh_owned_temp(&a.value)
                 && self.owned_boxed_option_param_struct(&name, i).is_some()
             {
-                let inner_struct = self.owned_boxed_option_param_struct(&name, i);
+                let inner_struct = self
+                    .owned_boxed_option_param_struct(&name, i)
+                    .filter(|n| self.type_decls.struct_types.contains_key(n.as_str()));
                 let cur_fn = self
                     .builder
                     .get_insert_block()
@@ -2190,12 +2192,17 @@ impl<'ctx> super::Codegen<'ctx> {
                     self.create_entry_alloca(cur_fn, &format!("resbox_arg_tmp{i}"), val.get_type());
                 self.builder.build_store(slot, val).unwrap();
                 for (variant, struct_name) in &result_boxed {
+                    let inner = self
+                        .type_decls
+                        .struct_types
+                        .contains_key(struct_name.as_str())
+                        .then_some(struct_name.as_str());
                     self.track_boxed_enum_var(
                         &format!("__resbox_arg_tmp{i}_{variant}"),
                         slot,
                         "Result",
                         variant,
-                        Some(struct_name.as_str()),
+                        inner,
                     );
                 }
             }
@@ -2992,6 +2999,71 @@ impl<'ctx> super::Codegen<'ctx> {
     /// binding keeps its let-site drop (see the arg-site skip that consults
     /// `boxed_struct_payload_vars`), and a FRESH TEMP has neither, which is what
     /// this arm exists for.
+    /// B-2026-09-06-67 — is `payload` a boxed by-value param payload whose BOX
+    /// the CALLER must own?
+    ///
+    /// The shared filter of [`Self::owned_boxed_option_param_struct`] and
+    /// [`Self::owned_boxed_result_param_structs`], which each spelled
+    /// `struct_types.contains_key(..)` inline. That test dropped a user ENUM
+    /// payload even though `boxed_enum_payload_variants` admits one
+    /// (B-2026-08-28-64 widened it for the LET-site path), so the analysis was
+    /// already available at the arg site and only this filter discarded it:
+    /// `fn show(x: Option[K])` over `enum K { A(R2), B }` left the box owned by
+    /// nobody, and the `Result` spelling measured identically because both arms
+    /// carried the same test.
+    ///
+    /// THE ENVELOPE ONLY, FOR AN ENUM PAYLOAD — the call sites pass
+    /// `inner_struct_name = None` for one, which is the choice the `Option`
+    /// arm's own comment already prescribes ("if the callee's arm binds the
+    /// payload out, that binding owns `T`'s interior and dropping `T` here
+    /// would double-free it"). For an enum payload that condition is REAL and
+    /// depends on the arm's SHAPE, which is why the interior is left alone:
+    ///
+    ///   `Some(K.A(r))`  a nested TupleVariant: nobody owns the interior.
+    ///                   Registering it here is clean (23 allocs / 23 frees).
+    ///   `Some(k)`       a whole-payload Binding: the local `k` is matched
+    ///                   again and owns the interior. Registering it here is a
+    ///                   DOUBLE FREE — measured, 9 invalid frees in 3 contexts,
+    ///                   32 frees against 23 allocs.
+    ///
+    /// A struct payload has no such split (its whole-payload binding is
+    /// disarmed by `register_boxed_payload_alias` /
+    /// `suppress_aliased_boxed_payload_cleanup`), which is why it keeps passing
+    /// its interior and its behaviour is byte-for-byte unchanged here.
+    ///
+    /// MEASURED, `karac build -O0`, `KARAC_AUTO_PAR=0`, valgrind, parent ->
+    /// this change; no cell gains an error and none regresses:
+    ///
+    ///   nested arm, `Option` and `Result`   240 B + 81 B indirect -> 81 B
+    ///   both `Result` sides boxed enums     480 B + 162 B         -> 162 B
+    ///   `Drop`-bearing payload enum         240 B + 81 B          -> 81 B
+    ///   arm binds nothing (`Some(_)`)       240 B + 81 B          -> 81 B
+    ///   POD payload enum (no interior)      168 B                 -> clean
+    ///   whole-payload binding (`Some(k)`)   240 B                 -> clean
+    ///   struct payload / flows-into-return / `shared` enum   clean -> clean
+    ///
+    /// So the ENVELOPE half is closed on every spelling. The remaining 81 B is
+    /// the payload's INTERIOR under a nested-pattern arm, which needs the
+    /// callee-side disarm this row's "WHERE TO START" names; it is filed
+    /// separately rather than bought at the price of the double free above.
+    ///
+    /// Refuses `Option` / `Result` themselves (their payloads have their own
+    /// machinery) and any `shared` enum (RC-owned, never box-owned), so the
+    /// admitted set widens by exactly one class.
+    pub(super) fn boxed_param_payload_owns_its_box(&self, payload: &str) -> bool {
+        if self.type_decls.struct_types.contains_key(payload) {
+            return true;
+        }
+        payload != "Option"
+            && payload != "Result"
+            && !self.type_decls.shared_types.contains_key(payload)
+            && self
+                .type_decls
+                .enum_layouts
+                .get(payload)
+                .is_some_and(|l| !l.is_shared)
+    }
+
     pub(super) fn owned_boxed_option_param_struct(&self, name: &str, i: usize) -> Option<String> {
         let flagged = |table: &HashMap<String, Vec<bool>>| {
             table
@@ -3024,7 +3096,7 @@ impl<'ctx> super::Codegen<'ctx> {
         let struct_name = pp
             .segments
             .last()
-            .filter(|s| self.type_decls.struct_types.contains_key(s.as_str()))?;
+            .filter(|s| self.boxed_param_payload_owns_its_box(s.as_str()))?;
         self.option_payload_is_boxed(payload_te)
             .then(|| struct_name.clone())
     }
@@ -3079,9 +3151,7 @@ impl<'ctx> super::Codegen<'ctx> {
             .filter(|(enum_lit, _, _)| *enum_lit == "Result")
             .filter_map(|(_, variant, inner)| {
                 let inner = inner?;
-                self.type_decls
-                    .struct_types
-                    .contains_key(inner.as_str())
+                self.boxed_param_payload_owns_its_box(inner.as_str())
                     .then_some((variant, inner))
             })
             .collect()

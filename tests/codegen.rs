@@ -152313,6 +152313,73 @@ fn main() {
         }
     }
 
+    /// B-2026-09-06-67 — the OUTPUT twin of
+    /// `memory_sanitizer.rs::asan_boxed_enum_payload_param_owns_its_box`.
+    ///
+    /// The row is a leak, so the leak checker pins it; this pins that giving
+    /// the caller ownership of a boxed ENUM payload's box is otherwise
+    /// invisible. It also carries the `String`-bearing spellings the ASAN twin
+    /// cannot assert clean — their payload INTERIOR is still unowned under a
+    /// nested-pattern arm, filed separately — so the row's own cells are at
+    /// least pinned for output, and a fix for that residual has a place to
+    /// prove it changed nothing here.
+    #[test]
+    fn e2e_boxed_enum_payload_param_output_is_unchanged() {
+        const PRE: &str = "struct R2 { s: String, t: String, u: String }\n\
+             enum K { A(R2), B }\n\
+             fn mkr(i: i64) -> R2 { return R2 { s: f\"s{i}\", t: f\"t{i}\", u: f\"u{i}\" }; }\n";
+        for (label, body, want) in [
+            (
+                "option-nested-arm",
+                "fn show(x: Option[K]) { match x { Option.Some(K.A(r)) => { println(f\"a:{r.s}\"); }, Option.Some(K.B) => {}, Option.None => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { show(Option.Some(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
+                "a:s0\na:s1\na:s2\nend\n",
+            ),
+            (
+                "result-nested-arm",
+                "fn show(x: Result[K, i64]) { match x { Result.Ok(K.A(r)) => { println(f\"a:{r.s}\"); }, Result.Ok(K.B) => {}, Result.Err(e) => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { show(Result.Ok(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
+                "a:s0\na:s1\na:s2\nend\n",
+            ),
+            (
+                "result-err-side",
+                "fn show(x: Result[i64, K]) { match x { Result.Ok(n) => { println(f\"n{n}\"); }, Result.Err(K.A(r)) => { println(f\"e:{r.s}\"); }, Result.Err(K.B) => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { show(Result.Err(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
+                "e:s0\ne:s1\ne:s2\nend\n",
+            ),
+            (
+                "whole-payload-binding",
+                "fn show(x: Option[K]) { match x { Option.Some(k) => { match k { K.A(r) => { println(f\"a:{r.s}\"); }, K.B => {} } }, Option.None => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { show(Option.Some(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
+                "a:s0\na:s1\na:s2\nend\n",
+            ),
+            (
+                "binds-nothing",
+                "fn show(x: Option[K]) { match x { Option.Some(_) => { println(\"s\"); }, Option.None => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { show(Option.Some(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
+                "s\ns\ns\nend\n",
+            ),
+            (
+                "drop-bearing-payload-enum",
+                "impl Drop for K { fn drop(mut ref self) { println(\"dK\") } }\n\
+                 fn show(x: Option[K]) { match x { Option.Some(K.A(r)) => { println(f\"a:{r.s}\"); }, Option.Some(K.B) => {}, Option.None => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { show(Option.Some(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
+                "a:s0\na:s1\na:s2\nend\n",
+            ),
+            (
+                "flows-into-return-control",
+                "fn pass(x: Option[K]) -> Option[K] { return x; }\n\
+                 fn main() { let mut i = 0; while i < 3 { let y = pass(Option.Some(K.A(mkr(i)))); match y { Option.Some(K.A(r)) => { println(f\"a:{r.s}\"); }, Option.Some(K.B) => {}, Option.None => {} } i = i + 1; } println(\"end\") }\n",
+                "a:s0\na:s1\na:s2\nend\n",
+            ),
+        ] {
+            let Some(out) = run_program(&format!("{PRE}{body}")) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by

@@ -83548,4 +83548,113 @@ fn main() {{
             "b62-vecstring-direct-field",
         );
     }
+    /// B-2026-09-06-67 — a boxed user *ENUM* payload of a by-value param had no
+    /// owner for its BOX, on both seeded enums.
+    ///
+    /// `owned_boxed_option_param_struct` and `owned_boxed_result_param_structs`
+    /// both filtered the payload name through `struct_types`, so a boxed user
+    /// enum payload was dropped even though `boxed_enum_payload_variants`
+    /// admits one. Both spellings leaked identically, which is what said the
+    /// axis is the payload being an ENUM rather than anything about `Result`'s
+    /// per-variant boxing.
+    ///
+    /// THE ENVELOPE ONLY — the registration passes no interior drop for an enum
+    /// payload, and cell 5 is why. That is not caution; it is the measured
+    /// difference between two arm shapes:
+    ///
+    ///   `Some(K.A(r))`  nested TupleVariant — nobody owns the interior, and
+    ///                   registering it here is clean (23 allocs / 23 frees).
+    ///   `Some(k)`       whole-payload Binding — the local owns the interior,
+    ///                   and registering it here DOUBLE-FREES: 9 invalid frees
+    ///                   in 3 contexts, 32 frees against 23 allocs.
+    ///
+    /// WHICH CELLS PIN WHAT, stated because the obvious choice of cell does not
+    /// work here. The row's own spelling has a `String`-bearing payload whose
+    /// INTERIOR is still unowned under a nested arm (81 B, filed separately),
+    /// so it cannot assert clean and is covered for OUTPUT in the
+    /// `tests/codegen.rs` twin instead. Cells 1-2 use a POD payload: no
+    /// interior to confound the measurement, so the envelope fix alone takes
+    /// them from 168 B leaked to clean, on both seeded enums. They are the
+    /// leak-pinning cells for this row.
+    ///
+    /// Cell 5 is the hazard that would fail loudly if the interior were ever
+    /// folded in without the callee-side disarm first.
+    #[test]
+    fn asan_boxed_enum_payload_param_owns_its_box() {
+        const POD: &str = "struct P4 { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64 }\n\
+             enum Kp { A(P4), B }\n\
+             fn mkp(i: i64) -> P4 { return P4 { a: i, b: 0, c: 0, d: 0, e: 0, f: 0 }; }\n";
+        // 1-2 — THE LEAK, on both seeded enums. 168 B in 3 blocks each, parent.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{POD}fn show(x: Option[Kp]) {{ match x {{ Option.Some(Kp.A(p)) => {{ println(f\"a:{{p.a}}\"); }}, Option.Some(Kp.B) => {{}}, Option.None => {{}} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 3 {{ show(Option.Some(Kp.A(mkp(i)))); i = i + 1; }} println(\"end\") }}\n"
+            ),
+            &["a:0", "a:1", "a:2", "end"],
+            "b67-option-pod-payload",
+        );
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{POD}fn show(x: Result[Kp, i64]) {{ match x {{ Result.Ok(Kp.A(p)) => {{ println(f\"a:{{p.a}}\"); }}, Result.Ok(Kp.B) => {{}}, Result.Err(e) => {{}} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 3 {{ show(Result.Ok(Kp.A(mkp(i)))); i = i + 1; }} println(\"end\") }}\n"
+            ),
+            &["a:0", "a:1", "a:2", "end"],
+            "b67-result-pod-payload",
+        );
+        // 3 — the `Err` side, which the row listed as NOT MEASURED.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{POD}fn show(x: Result[i64, Kp]) {{ match x {{ Result.Ok(n) => {{ println(f\"n{{n}}\"); }}, Result.Err(Kp.A(p)) => {{ println(f\"e:{{p.a}}\"); }}, Result.Err(Kp.B) => {{}} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 3 {{ show(Result.Err(Kp.A(mkp(i)))); i = i + 1; }} println(\"end\") }}\n"
+            ),
+            &["e:0", "e:1", "e:2", "end"],
+            "b67-result-err-side",
+        );
+        // 4 — BOTH sides boxed enums: two registrations against one slot, made
+        //     mutually exclusive by `BoxedEnumDrop`'s tag guard. 336 B parent.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{POD}enum Jp {{ C(P4), D }}\n\
+                 fn show(x: Result[Kp, Jp]) {{ match x {{ Result.Ok(Kp.A(p)) => {{ println(f\"a:{{p.a}}\"); }}, Result.Ok(Kp.B) => {{}}, Result.Err(Jp.C(p)) => {{ println(f\"c:{{p.a}}\"); }}, Result.Err(Jp.D) => {{}} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 3 {{ show(Result.Ok(Kp.A(mkp(i)))); show(Result.Err(Jp.C(mkp(i)))); i = i + 1; }} println(\"end\") }}\n"
+            ),
+            &["a:0", "c:0", "a:1", "c:1", "a:2", "c:2", "end"],
+            "b67-both-sides",
+        );
+        // 5 — THE HAZARD, and the reason the interior is not registered. The arm
+        //     binds the WHOLE payload, so the local owns the interior. This uses
+        //     a String-bearing payload deliberately: with a POD one there would
+        //     be no interior to double-free and the cell would prove nothing.
+        //     240 B parent -> clean; folding the interior in makes it 9 invalid
+        //     frees.
+        assert_clean_asan_run_no_auto_par(
+            "struct R2 { s: String, t: String, u: String }\n\
+             enum K { A(R2), B }\n\
+             fn mkr(i: i64) -> R2 { return R2 { s: f\"ssssssss{i}\", t: f\"tttttttt{i}\", u: f\"uuuuuuuu{i}\" }; }\n\
+             fn show(x: Option[K]) { match x { Option.Some(k) => { match k { K.A(r) => { println(f\"a:{r.s}\"); }, K.B => {} } }, Option.None => {} } }\n\
+             fn main() { let mut i = 0; while i < 3 { show(Option.Some(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
+            &["a:ssssssss0", "a:ssssssss1", "a:ssssssss2", "end"],
+            "b67-whole-payload-binding-hazard",
+        );
+        // 6-7 — CONTROLS that must not move: a payload flowing into the return
+        //       (the caller must NOT register at all), and a plain struct
+        //       payload (the pre-existing class, whose interior IS still
+        //       registered). Both clean before and after.
+        assert_clean_asan_run_no_auto_par(
+            &format!(
+                "{POD}fn pass(x: Option[Kp]) -> Option[Kp] {{ return x; }}\n\
+                 fn main() {{ let mut i = 0; while i < 3 {{ let y = pass(Option.Some(Kp.A(mkp(i)))); match y {{ Option.Some(Kp.A(p)) => {{ println(f\"a:{{p.a}}\"); }}, Option.Some(Kp.B) => {{}}, Option.None => {{}} }} i = i + 1; }} println(\"end\") }}\n"
+            ),
+            &["a:0", "a:1", "a:2", "end"],
+            "b67-flows-into-return-control",
+        );
+        assert_clean_asan_run_no_auto_par(
+            "struct R2 { s: String, t: String, u: String }\n\
+             fn mkr(i: i64) -> R2 { return R2 { s: f\"ssssssss{i}\", t: f\"tttttttt{i}\", u: f\"uuuuuuuu{i}\" }; }\n\
+             fn show(x: Option[R2]) { match x { Option.Some(r) => { println(f\"a:{r.s}\"); }, Option.None => {} } }\n\
+             fn main() { let mut i = 0; while i < 3 { show(Option.Some(mkr(i))); i = i + 1; } println(\"end\") }\n",
+            &["a:ssssssss0", "a:ssssssss1", "a:ssssssss2", "end"],
+            "b67-struct-payload-control",
+        );
+    }
 }
