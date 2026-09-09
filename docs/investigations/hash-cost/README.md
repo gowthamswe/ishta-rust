@@ -90,11 +90,50 @@ work, so no instruction-shaving fix reaches it — not the seed hoist (17
 instructions, 1.2 cycles), not the typed entry point, not open-coding the
 permutation.
 
-The suspect for the stall is layout: `KaracMap` holds `status` and `kv` as **two
-separate allocations**, so a lookup touches two independent cache lines in two
-arrays, where hashbrown keeps control bytes and buckets in one allocation with
-the controls adjacent to the data. Not measured — a hypothesis with a mechanism,
-and the first thing to test.
+### The stall is the probe's branching, and a group scan removes it
+
+That layout guess was wrong. Splitting the lookup under the **real** hash
+distribution — a caller-supplied hash, so the walk runs against SipHash's own
+spread rather than a truncated stand-in — puts the cost squarely in the walk:
+
+| | instr/iter | cyc/iter | IPC |
+|---|---:|---:|---:|
+| loop floor | 5.7 | 4.4 | 1.30 |
+| hash only | 95.7 | 17.2 | **5.58** |
+| probe only, byte-at-a-time | 41.5 | **36.0** | **1.15** |
+| probe only, 8-byte SWAR group scan | 54.1 | **17.7** | 3.05 |
+
+**The group scan is 2.03× faster in cycles while executing 30% MORE
+instructions.** That is the signature of branch mispredicts, not cache misses:
+the byte walk takes a data-dependent branch at every one of its 2.24 average
+steps, while the group scan tests eight control bytes per load and finds the
+match with a bitmask. Both agree on every key in the range.
+
+Note also the hash at **IPC 5.58**: measured where consecutive iterations can
+overlap, kāra's permutation costs ~12.8 cycles, not the ~26 the truncation
+differential suggested. That earlier figure was the hash's cost *inside a
+serialised lookup*, which is a different quantity.
+
+The SWAR core, for reconstruction (`ctrl_of(hash)` is the 7-bit tag with the
+occupancy bit; `LO = 0x0101..`, `HI = 0x8080..`):
+
+```rust
+let want = LO.wrapping_mul(ctrl as u64);
+let g = (status.add(slot) as *const u64).read_unaligned();
+let eq = g ^ want;
+let eq_z = eq.wrapping_sub(LO) & !eq & HI;   // lanes equal to the tag
+let em_z = g.wrapping_sub(LO) & !g & HI;     // lanes that are EMPTY
+// walk eq_z's set lanes; if em_z != 0 the chain ends here
+```
+
+Groups that would wrap the table fall back to the byte walk — with a
+power-of-two capacity that is the last few slots only.
+
+**Projected**: the typed lookup at 59.5 cycles becomes ~41, which is 1.27×
+Rust's 32.3 rather than 1.84×. Filed for implementation as `B-2026-09-09-12`;
+it needs the same scan in `KaracMap::lookup`, in `find_insert_slot` (whose
+tombstone bookkeeping is the delicate part), and in the codegen-emitted mono
+probes, which is where the katas would actually feel it.
 
 ## Where the kata's gap actually is
 
