@@ -117,6 +117,69 @@ mod memory_sanitizer_tests {
             .and_then(|n| n.parse::<u64>().ok())
     }
 
+    /// The ASAN allocation FLOOR for this host and lane — what a program that
+    /// does nothing already costs, before any fixture's own heap work.
+    ///
+    /// B-2026-09-07-26. Every allocation predicate in this file used to compare
+    /// ASAN's RAW process-wide malloc count against a threshold calibrated on
+    /// one host, and the floor is not portable: measured with this harness,
+    /// **macOS 26.6 / Apple M5 reports 199 where arm64 Linux reports 10**, a
+    /// constant +189 the fixture never asked for. Apple's ASAN runtime does
+    /// more of its own start-up allocation, and none of it is the program under
+    /// test.
+    ///
+    /// That broke the predicates in BOTH directions, and the quiet direction
+    /// was the worse one:
+    ///
+    ///   * [`assert_clean_asan_run_max_allocs`] — the by-value struct-param
+    ///     transfer ceiling of 180 is BELOW the macOS floor alone, so the test
+    ///     could not pass on this host however well the transfer worked. It
+    ///     didn't: measured here, the transfer halves the fixture's
+    ///     per-iteration allocations on macOS exactly as it does on Linux
+    ///     (3/iteration with it, 6 without, on both). The 320-vs-131
+    ///     disagreement that opened B-2026-09-06-68 was the floor, start to
+    ///     finish.
+    ///   * [`assert_clean_asan_run_min_allocs`] — the vacuous-fixture guard,
+    ///     and this is the direction that mattered. Its thresholds run from 1
+    ///     to 3000 and 169 of the 191 numeric ones sit at or below 199, so a
+    ///     fixture whose payload LLVM had deleted outright still cleared its
+    ///     floor on start-up allocations alone. That is precisely the failure
+    ///     mode B-2026-08-04-17 built this guard to catch, disarmed without a
+    ///     symptom on the primary development host.
+    ///
+    /// Subtracting a measured floor makes every threshold mean the same thing
+    /// everywhere: allocations THE PROGRAM PERFORMED. Cached per lane per test
+    /// process, because it costs a full compile + ASAN run.
+    ///
+    /// The two lanes are kept separate on principle rather than on evidence —
+    /// the auto-par lane could start a worker pool. Measured on macOS it does
+    /// NOT: both lanes floor at 199, because a program that only prints never
+    /// dispatches anything and the pool is built lazily. They are still
+    /// measured independently so that a future eager pool is absorbed instead
+    /// of silently inflating every auto-par fixture's count.
+    ///
+    /// The floor program prints, because every fixture does; what is being
+    /// removed is the fixed cost of "an ASAN process that got as far as
+    /// `println`", not of an empty `main`. A host where the count is
+    /// unavailable yields 0, which leaves the old raw-count behaviour intact
+    /// rather than inventing a subtraction.
+    fn asan_alloc_floor(auto_par: bool) -> u64 {
+        static SEQ: OnceLock<u64> = OnceLock::new();
+        static PAR: OnceLock<u64> = OnceLock::new();
+        let cell = if auto_par { &PAR } else { &SEQ };
+        *cell.get_or_init(|| {
+            run_under_asan_opts(
+                "fn main() { println(\"floor\") }\n",
+                "asan-alloc-floor",
+                true,
+                true,
+                auto_par,
+            )
+            .and_then(|(_, stderr, _)| asan_malloc_calls(&stderr))
+            .unwrap_or(0)
+        })
+    }
+
     /// Variant of [`run_under_asan`] that disables LeakSanitizer for the run.
     /// Used by [`assert_asan_panics_with`]: an `emit_panic` exit aborts the
     /// program partway through an operation (e.g. the `extend_from_slice`
@@ -8431,7 +8494,9 @@ fn main() {
                 "a1", "dEs", "b1", "dEs", "c1", "dEs", "d1", "dEs", "e1", "dEs", "f1", "dEs", "end",
             ],
             "b0907-13-stored-enum-arg",
-            20,
+            // 19, measured on both hosts; the 20 was an estimate one above the
+            // real count (B-2026-09-07-26).
+            19,
         );
     }
 
@@ -12896,18 +12961,28 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         //   KARAC_ASAN_ALLOC_AUDIT=1 cargo test --features llvm \
         //     --test memory_sanitizer -- --nocapture
         //
-        // prints one `ALLOCAUDIT\t<n>\t<label>` line per fixture. A program that
-        // allocates NOTHING reports 3 — the ASAN runtime's own startup
-        // allocations — and `asan_baseline_no_allocations` calibrates that,
-        // so any fixture at 3 did no heap work of its own. Off by default: it
-        // costs an extra ASAN option and a very noisy stderr. Fixtures that
-        // should never be allowed to drift back to zero take a hard floor via
-        // [`assert_clean_asan_run_min_allocs`] instead.
+        // prints one `ALLOCAUDIT\t<program>\t<raw>\t<floor>\t<label>` line per
+        // fixture, where `<program>` is `<raw> - <floor>` — the allocations the
+        // program itself performed. A fixture at 0 there did no heap work of its
+        // own and asserts nothing.
+        //
+        // The floor is MEASURED per host rather than assumed (B-2026-09-07-26).
+        // This comment used to say a program that allocates nothing "reports 3",
+        // which is a Linux number: macOS reports 199. Reading a raw column
+        // against a remembered constant is how that row's disagreement survived
+        // two sessions. Off by default: it costs an extra ASAN option and a very
+        // noisy stderr. Fixtures that should never be allowed to drift back to
+        // zero take a hard floor via [`assert_clean_asan_run_min_allocs`]
+        // instead.
         let audit = std::env::var("KARAC_ASAN_ALLOC_AUDIT").is_ok_and(|v| v != "0");
         let ran = if audit {
             run_under_asan_counting(src, label).map(|(out, err, st)| {
-                let n = asan_malloc_calls(&err).map_or(-1, |n| n as i64);
-                eprintln!("ALLOCAUDIT\t{n}\t{label}");
+                let raw = asan_malloc_calls(&err).map_or(-1, |n| n as i64);
+                let floor = asan_alloc_floor(true) as i64;
+                eprintln!(
+                    "ALLOCAUDIT\t{}\t{raw}\t{floor}\t{label}",
+                    (raw - floor).max(-1)
+                );
                 (out, st)
             })
         } else {
@@ -13031,11 +13106,18 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         );
         let got: Vec<&str> = stdout.trim().lines().collect();
         assert_eq!(got, expected_stdout, "[{label}] stdout mismatch");
-        if let Some(allocs) = asan_malloc_calls(&stderr) {
+        if let Some(raw) = asan_malloc_calls(&stderr) {
+            // Floor-relative, so the ceiling means the same thing on every host
+            // — see [`asan_alloc_floor`]. Raw counts differ by 189 between
+            // macOS and Linux for reasons that have nothing to do with the
+            // program (B-2026-09-07-26).
+            let floor = asan_alloc_floor(false);
+            let allocs = raw.saturating_sub(floor);
             assert!(
                 allocs <= max_allocs,
-                "[{label}] {allocs} malloc calls, over the {max_allocs} ceiling — the by-value \
-                 struct param is still being ENTRY-COPIED at each call. Check that \
+                "[{label}] {allocs} malloc calls by the program ({raw} raw, minus a {floor} \
+                 host floor), over the {max_allocs} ceiling — the by-value struct param is \
+                 still being ENTRY-COPIED at each call. Check that \
                  `param_transfer::compute_transferable_struct_params` still admits the callee \
                  and that `struct_param_transfer_eligible` still admits the type."
             );
@@ -13066,11 +13148,14 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         );
         let got: Vec<&str> = stdout.trim().lines().collect();
         assert_eq!(got, expected_stdout, "[{label}] stdout mismatch");
-        if let Some(allocs) = asan_malloc_calls(&stderr) {
+        if let Some(raw) = asan_malloc_calls(&stderr) {
+            let floor = asan_alloc_floor(true);
+            let allocs = raw.saturating_sub(floor);
             assert!(
                 allocs >= min_allocs,
-                "[{label}] only {allocs} malloc calls — under the {min_allocs} floor, so the \
-                 program was optimized away and the fixture asserts nothing"
+                "[{label}] only {allocs} malloc calls by the program ({raw} raw, minus a \
+                 {floor} host floor) — under the {min_allocs} floor, so the program was \
+                 optimized away and the fixture asserts nothing"
             );
         }
     }
@@ -13104,19 +13189,31 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         // Join the `KARAC_ASAN_ALLOC_AUDIT` sweep too, so a corpus scan sees
         // every fixture rather than only the unfloored ones.
         if std::env::var("KARAC_ASAN_ALLOC_AUDIT").is_ok_and(|v| v != "0") {
-            let n = asan_malloc_calls(&stderr).map_or(-1, |n| n as i64);
-            eprintln!("ALLOCAUDIT\t{n}\t{label}");
+            let raw = asan_malloc_calls(&stderr).map_or(-1, |n| n as i64);
+            let floor = asan_alloc_floor(true) as i64;
+            eprintln!(
+                "ALLOCAUDIT\t{}\t{raw}\t{floor}\t{label}",
+                (raw - floor).max(-1)
+            );
         }
         match asan_malloc_calls(&stderr) {
-            Some(n) => assert!(
-                n >= min_allocs,
-                "[{label}] VACUOUS FIXTURE: the program performed {n} allocations, \
-                 below the floor of {min_allocs}. A clean ASAN run over allocations \
-                 that never happened proves nothing. The optimizer has most likely \
-                 folded the payload away or deleted it as dead — check that the seed \
-                 is runtime-opaque and that the buffer's BYTES are read, not just \
-                 its length."
-            ),
+            Some(raw) => {
+                // Floor-relative — see [`asan_alloc_floor`]. Raw, this guard was
+                // vacuous on macOS for every threshold at or below 199
+                // (B-2026-09-07-26): start-up allocations alone cleared it, so a
+                // fixture whose payload had been deleted still passed.
+                let floor = asan_alloc_floor(true);
+                let n = raw.saturating_sub(floor);
+                assert!(
+                    n >= min_allocs,
+                    "[{label}] VACUOUS FIXTURE: the program performed {n} allocations \
+                     ({raw} raw, minus a {floor} host floor), below the floor of \
+                     {min_allocs}. A clean ASAN run over allocations that never happened \
+                     proves nothing. The optimizer has most likely folded the payload away \
+                     or deleted it as dead — check that the seed is runtime-opaque and that \
+                     the buffer's BYTES are read, not just its length."
+                );
+            }
             None => eprintln!(
                 "[{label}] ASAN printed no allocation stats — min_allocs={min_allocs} unchecked"
             ),
@@ -46927,7 +47024,12 @@ fn main() {
              }\n",
             &["2"],
             "tensor-field-in-vec",
-            10,
+            // 3 = the Vec's buffer plus one block per tensor-bearing element,
+            // measured identically on macOS and arm64 Linux. The 10 here was an
+            // estimate that had never been checkable — see B-2026-09-07-26 and
+            // [`asan_alloc_floor`]. Below 3, a tensor block has gone missing,
+            // which is the elision this floor exists to catch.
+            3,
         );
         // The -O2-visible MOVE row: a struct moved into a `Vec`, so the tensor
         // stays live in memory the optimizer cannot promote away. This is the
@@ -46944,10 +47046,31 @@ fn main() {
              }\n",
             &["1"],
             "tensor-field-moved-into-vec",
-            10,
+            // 2, measured on both hosts — the moved-from struct contributes no
+            // second block, which is the whole point of the `zero_struct_move_caps`
+            // half of the fix, so this row allocates one fewer than its sibling
+            // above. The 10 was an estimate; see B-2026-09-07-26. Below 2 a
+            // tensor block has been elided and the row asserts nothing.
+            2,
         );
-        // The flat spellings. -O2 elides these (see the note above), so they
-        // carry a low floor and do their real work under the -O0 leg.
+        // The flat spellings. -O2 elides these (see the note above), so they do
+        // their real work under the -O0 leg and NOT here.
+        //
+        // They carried a `min_allocs` floor of 4 until B-2026-09-07-26, and that
+        // floor was never capable of failing: it compared against ASAN's raw
+        // process-wide count, whose per-host start-up floor (10 on arm64 Linux,
+        // 199 on macOS) clears 4 on its own. Measured floor-relative, ALL FIVE
+        // ROWS ALLOCATE EXACTLY ZERO at -O2 — which is precisely what the note
+        // above predicts, so the fixtures are behaving as designed and it is the
+        // floor that was decorative.
+        //
+        // The plain predicate is therefore the honest one. A floor of 0 would
+        // pass unconditionally, and a floor that cannot fail is worse than no
+        // floor: it reads, to anyone scanning this file, as a guard. What these
+        // rows still assert here is real but narrow — ASAN-clean, and the right
+        // value out — and their allocation-level claim lives in
+        // `scripts/asan-o0-leg.sh`. The two `Vec`-held rows above keep their
+        // floors, because they are the ones with something left to count.
         let rows: [(&str, &str, &str); 5] = [
             (
                 "fn main() { let h = H { t: Tensor.from([[10, 20, 30], [40, 50, 60]]), n: 5 }; println(7); }",
@@ -46986,7 +47109,7 @@ fn main() {
         ];
         for (body, expected, label) in rows {
             let src = format!("struct H {{ t: Tensor[i64, [2, 3]], n: i64 }}\n{body}\n");
-            assert_clean_asan_run_min_allocs(&src, &[expected], label, 4);
+            assert_clean_asan_run(&src, &[expected], label);
         }
     }
 
@@ -66474,7 +66597,12 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["1"],
             "rc_fb_no_drop_anywhere_control",
-            10,
+            // 8, measured. The `Drop`-bearing cells above genuinely reach 10;
+            // this control has no `Drop` body and so no body-side allocation,
+            // which is exactly why it is the control. The shared 10 was an
+            // estimate applied across cells with different real counts, and the
+            // raw-count predicate could not tell them apart (B-2026-09-07-26).
+            8,
         );
     }
 
@@ -66513,7 +66641,9 @@ fn main() { println(go()); }
             ),
             &["drop E", "1"],
             "rc_fb_enum_own_drop_loop_never_entered",
-            9,
+            // 8, measured on both hosts; the 9 was an estimate. See
+            // B-2026-09-07-26 and [`asan_alloc_floor`].
+            8,
         );
         assert_clean_asan_run_min_allocs(
             &format!(
@@ -66523,7 +66653,9 @@ fn main() { println(go()); }
             ),
             &["drop E", "1"],
             "rc_fb_enum_own_drop_loop_entered",
-            9,
+            // 8, measured on both hosts; the 9 was an estimate. See
+            // B-2026-09-07-26 and [`asan_alloc_floor`].
+            8,
         );
         // A `Drop`-bearing STRUCT PAYLOAD under an enum that declares no `Drop`
         // of its own: the payload-bodies walker is the piece that carries it,
@@ -66544,7 +66676,16 @@ fn main() { println(go()); }
             ),
             &["drop R 38", "1"],
             "rc_fb_enum_payload_drop_body",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            10,
         );
         // BOTH — the enum's own body first, then the payload's, which is the
         // interpreter's order and the one the straight-line call sequence in
@@ -66564,7 +66705,16 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["drop E", "drop R 38", "1"],
             "rc_fb_enum_own_and_payload_drop",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            10,
         );
         // The second axis on its own: NO user `Drop` anywhere in the program,
         // so nothing here is about a body. The RC-boxed enum still leaked its
@@ -66581,7 +66731,16 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["1"],
             "rc_fb_enum_no_drop_payload_memory",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // CONTROL — the same enum NOT promoted (no consume, so no loop-of-
         // consume rule). This was already correct and must stay byte-identical.
@@ -66589,7 +66748,16 @@ fn main() { println(go()); }
             &format!("{OWN}fn go() -> i64 {{ let t = mke(); return 1; }}\n"),
             &["drop E", "1"],
             "rc_fb_enum_unpromoted_control",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
     }
 
@@ -66633,7 +66801,9 @@ fn main() { println(go()); }
             ),
             &["drop S", "1"],
             "rc_fb_tuple_elem_drop_loop_never_entered",
-            9,
+            // 8, measured on both hosts; the 9 was an estimate. See
+            // B-2026-09-07-26 and [`asan_alloc_floor`].
+            8,
         );
         assert_clean_asan_run_min_allocs(
             &format!(
@@ -66643,7 +66813,9 @@ fn main() { println(go()); }
             ),
             &["drop S", "1"],
             "rc_fb_tuple_elem_drop_loop_entered",
-            9,
+            // 8, measured on both hosts; the 9 was an estimate. See
+            // B-2026-09-07-26 and [`asan_alloc_floor`].
+            8,
         );
         // The NESTED spelling the row flagged as untested: the element is a
         // struct that CARRIES a `Drop`-bearing field rather than declaring
@@ -66662,7 +66834,16 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["drop R 38", "1"],
             "rc_fb_tuple_nested_field_drop_body",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            10,
         );
         // An ENUM element with a `Drop` of its own — body through the tuple
         // walk, and the payload memory the aggregate walk could not reach.
@@ -66679,7 +66860,16 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["drop E", "1"],
             "rc_fb_tuple_enum_elem_own_drop",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // MEMORY ONLY, no user `Drop` anywhere in either program: the enum
         // element and the `Option` element each leaked their payload to the
@@ -66696,7 +66886,16 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["1"],
             "rc_fb_tuple_enum_elem_no_drop_memory",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         assert_clean_asan_run_min_allocs(
             "fn seed() -> i64 { env.args().len() }\n\
@@ -66709,7 +66908,16 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["1"],
             "rc_fb_tuple_option_elem_no_drop_memory",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // CONTROLS — the shapes both walks already covered, which must stay
         // byte-identical, and the same tuple NOT promoted.
@@ -66724,13 +66932,31 @@ fn main() { println(go()); }
              fn main() { println(go()); }\n",
             &["1"],
             "rc_fb_tuple_string_elem_control",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         assert_clean_asan_run_min_allocs(
             &format!("{OWN}fn go() -> i64 {{ let t = mkt(); return 1; }}\n"),
             &["drop S", "1"],
             "rc_fb_tuple_unpromoted_control",
-            9,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
     }
 
@@ -66772,7 +66998,7 @@ fn main() { println(go()); }
             ),
             &["drop P 38", "1"],
             "rc_fb_twin_shape_single_box",
-            9,
+            10,
         );
         // BOTH twins promoted in one module. The box heap type is
         // `{i64, <value>}`, and it is interned structurally too, so the two
@@ -66792,7 +67018,25 @@ fn main() { println(go()); }
             ),
             &["drop P 38", "1", "drop Q 38", "2"],
             "rc_fb_twin_shape_both_boxed",
-            9,
+            // 60 — and this is the ONE cell in the file whose count is
+            // HOST-DEPENDENT, so it gets a margin where its siblings get their
+            // exact audited number. Measured: 183 on macOS 26.6 / M5, 75 on
+            // arm64 Linux. Every other fixture in this suite agrees to the
+            // allocation between the two hosts (B-2026-09-07-26 checked 55 of
+            // them); this one does not.
+            //
+            // The suspect is the harness, not the compiler. This is the only
+            // fixture here whose `main` calls `println` TWICE, and macOS's ASAN
+            // runtime is already the one with a 199-allocation start-up floor
+            // against Linux's 10 — so a per-output-call cost on that side would
+            // land exactly here and nowhere else. Not chased down: it is
+            // platform overhead either way, it is 20x above the vacuity
+            // threshold that matters, and the sibling `single_box` cell pins the
+            // same mechanism at a stable 10.
+            //
+            // 60 sits under the LOWER of the two measurements. Anything at or
+            // near zero still fails, which is what the floor is for.
+            60,
         );
     }
 
@@ -67559,7 +67803,9 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_literal_loop_entered",
-            10,
+            // 8, measured on both hosts; the 10 was an estimate. See
+            // B-2026-09-07-26 and [`asan_alloc_floor`].
+            8,
         );
         // 2 — NO LITERAL. The defect is the projection, not the literal.
         assert_clean_asan_run_min_allocs(
@@ -67570,7 +67816,9 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_bare_no_literal",
-            10,
+            // 8, measured on both hosts; the 10 was an estimate. See
+            // B-2026-09-07-26 and [`asan_alloc_floor`].
+            8,
         );
         // 3 — ONE trip. The smallest cell that is dirty on the parent, and the
         // one that shows the damage is per-iteration rather than per-loop.
@@ -67582,7 +67830,16 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_one_trip",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // 4 — the `for` spelling, a different loop lowering onto the same
         // promotion.
@@ -67594,7 +67851,16 @@ fn main() { println(go()); }
             ),
             &["3"],
             "rc_boxed_proj_for_loop",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // 5 — FIVE trips: the 17-allocs-against-22-frees B-2026-09-07-19 was
         // filed with, which is how those numbers were traced to a running loop
@@ -67607,7 +67873,16 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_five_trips",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // 6 — READS the projected field on every iteration. This is the cell
         // that rules out disarming the box's own field: the length has to be 38
@@ -67621,7 +67896,16 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_field_read_each_trip",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // 7 — the projected binding is MUTATED. The copy must be independent:
         // `push_str` reallocs, and with the destination's registration declined
@@ -67634,7 +67918,16 @@ fn main() { println(go()); }
             ),
             &["40"],
             "rc_boxed_proj_mutated_destination",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            15,
         );
         // 8 — CONTROL: the loop is never entered (B-2026-09-07-19's own cell).
         // Clean on the parent and must stay clean.
@@ -67646,7 +67939,16 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_never_entered_control",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // 9 — CONTROL: no loop, so no promotion. The disarm works and the
         // destination legitimately OWNS; the copy must not fire here.
@@ -67657,7 +67959,16 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_no_promotion_control",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
         // 10 — CONTROL: the projection as a CALL ARGUMENT was already clean
         // before this fix and must stay so.
@@ -67670,7 +67981,16 @@ fn main() { println(go()); }
             ),
             &["1"],
             "rc_boxed_proj_call_argument_control",
-            10,
+            // AUDITED, per cell (B-2026-09-07-26). Every floor in this family is
+            // now the count `KARAC_ASAN_ALLOC_AUDIT=1` reports for that exact
+            // cell, not a family-wide estimate: most sit at 8, the `Drop`-body
+            // cells at 10, `rc_boxed_proj_mutated_destination` at 15 and
+            // `rc_fb_twin_shape_both_boxed` at 183. Until the predicate became
+            // floor-relative none of them could be checked — the comparison was
+            // against ASAN's raw process-wide count, whose host start-up floor
+            // (10 arm64 Linux, 199 macOS) exceeds most of these numbers on its
+            // own. See [`asan_alloc_floor`].
+            8,
         );
     }
 
@@ -68702,7 +69022,12 @@ fn main() {
 "#,
             &["dR2 heap-two", "dR1 heap-one", "v=7"],
             "static_method_args_run_bodies_and_free",
-            8,
+            // 5 = the two `name` payloads, the two `Drop` bodies' f-strings, and
+            // `f"v={v}"` — every allocation this program makes, measured, and the
+            // same on both hosts. The 8 was an estimate; see B-2026-09-07-26.
+            // The point of the floor is unchanged: at 0 the two payloads have
+            // been optimized away again and the fixture proves nothing.
+            5,
         );
     }
 
@@ -72759,6 +73084,25 @@ fn main() {
     // fixture from silently optimising its allocation away and asserting
     // nothing.
     //
+    // THE FLOORS DID NOT DO THAT, for two and a half years' worth of these
+    // rows, and B-2026-09-07-26 is where it surfaced. `min_allocs` compared
+    // against ASAN's RAW process-wide count, which includes a per-host
+    // start-up floor larger than any threshold here — 10 on arm64 Linux, 199
+    // on macOS. Every fixture in this family cleared its floor on the ASAN
+    // runtime's own allocations, and MEASURED once the count was made
+    // floor-relative, nine of them performed ZERO OR ONE allocation of their
+    // own: `let mut i = 0` with a constant trip count folds the whole loop
+    // away at -O2, payloads included, so a suite built to catch a double free
+    // was running over a program that never allocated. Identical counts on
+    // both hosts, so this was never a platform difference.
+    //
+    // Hence `env.args().len() - 1` — the file's established opaque-seed idiom
+    // (B-2026-08-04-17), worth exactly 0 under this harness and a bare
+    // invocation alike, so every expected transcript is unchanged while the
+    // loop can no longer be folded. `loop-break-map-handle` and
+    // `loop-break-map-rvalue` keep their literal seeds: a Map handle survives
+    // -O2 regardless, and both were already above their floors.
+    //
     // These do NOT guard the COMPILE path: `assert_clean_asan_run` skips when
     // setup fails, so if aggregates ever regressed to being refused outright,
     // every fixture here would print "setup failed — skipping" and pass
@@ -72775,7 +73119,7 @@ fn main() {
     fn asan_loop_break_fstring_value_single_owner() {
         assert_clean_asan_run_min_allocs(
             "fn pick() -> String {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop { i = i + 1; if i == 2 { break f\"got{i}\" } }\n\
              }\n\
              fn main() { println(pick()); }\n",
@@ -72794,7 +73138,7 @@ fn main() {
     fn asan_loop_break_binding_value_frees_unbroken_iterations() {
         assert_clean_asan_run_min_allocs(
             "fn pick() -> String {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop {\n\
              \x20       i = i + 1;\n\
              \x20       let s = f\"row{i}\";\n\
@@ -72816,7 +73160,7 @@ fn main() {
     fn asan_labeled_loop_break_vec_value_single_owner() {
         assert_clean_asan_run_min_allocs(
             "fn pick() -> Vec[i64] {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   outer: loop {\n\
              \x20       i = i + 1;\n\
              \x20       let mut j = 0;\n\
@@ -72878,7 +73222,7 @@ fn main() {
         assert_clean_asan_run_min_allocs(
             "shared struct Node { v: i64 }\n\
              fn pick() -> Node {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop {\n\
              \x20       i = i + 1;\n\
              \x20       let n = Node { v: i * 11 };\n\
@@ -72899,7 +73243,7 @@ fn main() {
         assert_clean_asan_run_min_allocs(
             "shared enum Tree { Leaf(i64), Node(i64, i64) }\n\
              fn pick() -> Tree {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop {\n\
              \x20       i = i + 1;\n\
              \x20       let t = Tree.Node(i, i * 2);\n\
@@ -72928,7 +73272,7 @@ fn main() {
         assert_clean_asan_run_min_allocs(
             "shared struct Node { v: i64 }\n\
              fn pick() -> Node {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop {\n\
              \x20       i = i + 1;\n\
              \x20       let scratch = Node { v: i };\n\
@@ -72950,7 +73294,7 @@ fn main() {
         assert_clean_asan_run_min_allocs(
             "shared enum Tree { Leaf(i64), Node(i64, i64) }\n\
              fn pick() -> Tree {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop {\n\
              \x20       i = i + 1;\n\
              \x20       let scratch = Tree.Leaf(i);\n\
@@ -73055,7 +73399,20 @@ fn main() {
                  fn pick() -> E {{ let t = mk(); return match t {{ Num(a) => E.Num(a), Bin(l, r) => l }}; }}\n\
                  fn main() {{ {body} }}\n"
             );
-            assert_clean_asan_run_min_allocs(&src, &[expected], label, 8);
+            // 3 — `mk()`'s three boxes. Every row here measures exactly that,
+            // audited, on macOS and arm64 Linux alike: the recursive
+            // `E.Bin(E.Num(1), E.Num(2))` is the whole of this program's heap
+            // and no spelling of the consume adds to it. What the floor is for
+            // is unchanged — at 0 the boxes have been folded away and the
+            // refcount claim has nothing to stand on.
+            //
+            // It read 8 until B-2026-09-07-26, when the predicate became
+            // floor-relative. Nothing could have caught that: the old comparison
+            // was against ASAN's raw process-wide count, which carries a host
+            // start-up floor of 10 (arm64 Linux) or 199 (macOS) — larger, by
+            // itself, than the threshold it was being checked against. See
+            // [`asan_alloc_floor`].
+            assert_clean_asan_run_min_allocs(&src, &[expected], label, 3);
         }
     }
 
@@ -73143,7 +73500,11 @@ fn main() {
                  fn mk(n: i64) -> E {{ if n <= 0 {{ return E.Num(n); }} return E.Bin(mk(n - 1), E.Num(n)); }}\n\
                  fn main() {{ {body} }}\n"
             );
-            assert_clean_asan_run_min_allocs(&src, &[expected], label, 8);
+            // 7, measured — the recursive spine's boxes. Was 8, an estimate
+            // one above what every row actually allocates; nothing could catch
+            // that while the predicate compared raw counts against a host floor
+            // of 10 (B-2026-09-07-26).
+            assert_clean_asan_run_min_allocs(&src, &[expected], label, 7);
         }
     }
 
@@ -73181,7 +73542,8 @@ fn main() {
                  fn mk(n: i64) -> E {{ if n <= 0 {{ return E.Num(n); }} return E.Tag(lbl(), mk(n - 1)); }}\n\
                  fn main() {{ {body} }}\n"
             );
-            assert_clean_asan_run_min_allocs(&src, &[expected], label, 8);
+            // 7, measured — see the sibling table above.
+            assert_clean_asan_run_min_allocs(&src, &[expected], label, 7);
         }
     }
 
@@ -73227,7 +73589,7 @@ fn main() {
         assert_clean_asan_run_min_allocs(
             "shared struct Node { v: i64 }\n\
              fn pick() -> Node {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop {\n\
              \x20       i = i + 1;\n\
              \x20       let scratch = Node { v: i };\n\
@@ -73248,7 +73610,7 @@ fn main() {
         assert_clean_asan_run_min_allocs(
             "shared enum Tree { Leaf(i64), Node(i64, i64) }\n\
              fn pick() -> Tree {\n\
-             \x20   let mut i = 0;\n\
+             \x20   let mut i: i64 = env.args().len() - 1;\n\
              \x20   loop {\n\
              \x20       i = i + 1;\n\
              \x20       let scratch = Tree.Leaf(i);\n\
@@ -77767,9 +78129,20 @@ fn main() {
 "#,
             &["true", "true", "true", "true", "true", "true", "done"],
             "every-struct-destructure-spelling-frees-once",
-            // Measured 36 on the fixed compiler; the floor sits under that with
-            // margin. Its job is unchanged — fail if a future optimizer folds
-            // these payloads away, which would drop the count to near zero.
+            // Measured 26 ALLOCATIONS BY THE PROGRAM; the floor sits under that
+            // with margin. Its job is unchanged — fail if a future optimizer
+            // folds these payloads away, which would drop the count to near
+            // zero.
+            //
+            // That number read 36 until B-2026-09-07-26, and 36 was never a
+            // count of this program's allocations: it was ASAN's raw
+            // process-wide total, which on the arm64 Linux host it was taken on
+            // carries a 10-allocation start-up floor (199 on macOS — the two
+            // hosts disagree by 189 for reasons that have nothing to do with
+            // any fixture). The predicate is floor-relative now, so 36 - 10 =
+            // 26 is the real figure, and the floor moves with it. The margin,
+            // and the reasoning below about what the margin is for, are the
+            // author's and are unchanged.
             //
             // It read 80 until B-2026-09-03-40, calibrated against a measured
             // 99. That 99 was NOT 99 payload allocations: roughly 63 of them
@@ -77784,9 +78157,9 @@ fn main() {
             // principle once the band stopped blocking inlining.
             //
             // Lowering a floor deserves suspicion, so state the check plainly:
-            // 36 with payloads present, near zero if they are folded. The
+            // 26 with payloads present, near zero if they are folded. The
             // separation the floor relies on is intact.
-            28,
+            20,
         );
     }
     /// B-2026-08-31-23 under ASAN/LSan — a consuming arm over a BOXED
