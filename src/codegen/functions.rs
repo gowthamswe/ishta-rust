@@ -2995,6 +2995,20 @@ impl<'ctx> super::Codegen<'ctx> {
                             boxed_type_name.as_deref(),
                             None,
                         );
+                        // B-2026-09-09-2 — and give that registration its
+                        // DISARM. `register_rc_fallback_box_drop` makes the box
+                        // the value's owner on every path, but `cond_stored` is
+                        // by definition the shape where some path hands the
+                        // value to a container instead. `arm_conditional_store_flag`
+                        // is LOOKUP-ONLY, so without a flag here the store had
+                        // nothing to clear: `if k { xs.push(r); }` ran the user
+                        // `Drop` body twice for one object.
+                        //
+                        // Created HERE rather than at the store, because this
+                        // `continue`d-past loop is the only place that knows the
+                        // param was boxed at all — and an entry-block `true` is
+                        // correct however late the store turns up.
+                        let _ = self.cond_move_drop_flag_for(&param_name);
                     }
                     // Overwrite alloca to hold heap ptr instead of T.
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());

@@ -11679,6 +11679,18 @@ impl<'ctx> super::Codegen<'ctx> {
     /// The Vec/String and tuple/aggregate arms need nothing: they gate on
     /// `slot.ty` holding the value INLINE, which an RC handle (a bare `ptr`)
     /// fails, so they decline on their own.
+    /// B-2026-09-09-2 — is `var_name` an RC-fallback box whose VALUE-drop is
+    /// guarded by a per-path bit?
+    ///
+    /// True only for the `cond_stored` promotion that
+    /// [`Codegen::register_rc_fallback_box_drop`] arms and
+    /// `cond_move_drop_flag_for` flags in the same breath, so it answers
+    /// `false` for every binding whose move-out suppression is unchanged.
+    pub(super) fn rc_fallback_box_value_drop_is_flagged(&self, var_name: &str) -> bool {
+        self.drop_rc.rc_fallback_heap_types.contains_key(var_name)
+            && self.drop_rc.cond_move_drop_flags.contains_key(var_name)
+    }
+
     pub(super) fn move_suppression_value_ptr(
         &self,
         var_name: &str,
@@ -12385,7 +12397,18 @@ impl<'ctx> super::Codegen<'ctx> {
                     .get(var_name)
                     .map(|i| self.generic_struct_subst_from_inst(&type_name, i));
                 let vptr = self.move_suppression_value_ptr(var_name, slot.ptr);
-                self.zero_struct_move_caps_mono(vptr, &type_name, subst.as_ref());
+                // B-2026-09-09-2 — an RC-FALLBACK BOX whose value-drop carries a
+                // per-path bit is disarmed by that bit, not by wrecking the
+                // value. The promotion exists precisely because the binding is
+                // READ AFTER this consume, so zeroing here destroys what the
+                // read needs: a `shared` field went to `null` and the read
+                // SIGSEGV'd on `0x8` (a null GEP'd to field 1), a `String`
+                // field's zeroed `len` made the read print empty, and both were
+                // silent at compile time. The box keeps a readable value; the
+                // flag stops it being freed twice.
+                if !self.rc_fallback_box_value_drop_is_flagged(var_name) {
+                    self.zero_struct_move_caps_mono(vptr, &type_name, subst.as_ref());
+                }
                 // B-2026-09-05-33 — a bare-tuple ELEMENT binding moved by
                 // value (`v.push(r)`, `out = r`, a by-value call argument) is a
                 // bit-copy of the scrutinee's element: the zeroing above lands

@@ -83042,6 +83042,93 @@ fn main() {
     /// that would catch it. The leak half needs an `-O0` leg; `tests/cli.rs`
     /// can set `KARAC_OPT_LEVEL=0` on a spawned `karac` but has no leak
     /// checker, so neither harness can assert it today.
+    /// B-2026-09-09-2 — a CONDITIONALLY-STORED RC-promoted param stays
+    /// READABLE after the store, and its value is dropped exactly once.
+    ///
+    /// A param the callee stores on one path and READS on another is a consume
+    /// followed by a re-use, so the ownership pass RC-promotes it and
+    /// `compile_function` boxes it. The storing path then handed the value to
+    /// the container and invalidated the source the way an ordinary move does —
+    /// but the promotion exists PRECISELY BECAUSE there is a read still to
+    /// come, so the invalidation destroyed what that read needs.
+    ///
+    /// Three reads, three different failures off the one cause, which is why
+    /// all three are asserted here (measured at `KARAC_OPT_LEVEL` 0 and 2, on
+    /// the JIT, and under auto-par — identical on every leg):
+    ///
+    /// | read after `xs.push(r)` | interpreter | compiled, pre-fix |
+    /// |---|---|---|
+    /// | `r.id`, a scalar | `s100 n1 dR100 end` | `s100 dR100 n1 dR100 end` |
+    /// | `r.name`, a `String` | `sh100 …` | `s …` — silently EMPTY |
+    /// | `r.inner.v`, a `shared` | `s100 …` | SIGSEGV, rc=139 |
+    ///
+    /// The crash is the loudest member, not the whole bug: `store ptr null` on
+    /// the `shared` handle made the read a null GEP to field 1, faulting on
+    /// `0x8`, while the zeroed `String` `len` corrupted a read that stayed
+    /// silent, and the unguarded box body double-dropped one object.
+    ///
+    /// The fix disarms the box's value-drop with the per-path bit
+    /// `arm_conditional_store_flag` already stores for this exact shape, rather
+    /// than by wrecking the value — so the source stays readable and the
+    /// container is the sole owner. `k = false` is the CONTROL and pins
+    /// B-2026-09-07-50's fix: nothing is handed over there, the box is still
+    /// the owner, and its body must still run (`s100 dR100 n0 end`).
+    #[test]
+    fn asan_cond_stored_rc_promoted_param_stays_readable_and_drops_once() {
+        if !asan_available() {
+            eprintln!("[asan_cond_stored_rc_param] ASAN unavailable — skipping");
+            return;
+        }
+        for (read, want_s, label) in [
+            ("{r.id}", "s100", "scalar"),
+            ("{r.name}", "sh100", "string"),
+            ("{r.inner.v}", "s100", "shared"),
+        ] {
+            for (k, want) in [
+                ("true", format!("{want_s}\nn1\ndR100\nend\n")),
+                ("false", format!("{want_s}\ndR100\nn0\nend\n")),
+            ] {
+                let src = format!(
+                    r#"
+shared struct Inner {{ v: i64 }}
+struct R {{ id: i64, name: String, inner: Inner }}
+impl Drop for R {{ fn drop(mut ref self) {{ println(f"dR{{self.id}}") }} }}
+fn mk(i: i64) -> R {{ return R {{ id: i, name: f"h{{i}}", inner: Inner {{ v: i }} }}; }}
+struct Box2 {{ mut xs: Vec[R] }}
+impl Box2 {{
+  fn m(mut ref self, r: R, k: bool) {{ if k {{ self.xs.push(r); }} println(f"s{read}"); }}
+}}
+fn main() {{
+  let mut b = Box2 {{ xs: Vec.new() }};
+  b.m(mk(100), {k});
+  println(f"n{{b.xs.len()}}");
+  println("end");
+}}
+"#
+                );
+                let Some((stdout, status)) =
+                    run_under_asan(&src, &format!("asan_cond_stored_rc_param_{label}_{k}"))
+                else {
+                    eprintln!("[asan_cond_stored_rc_param] setup failed — skipping");
+                    return;
+                };
+                assert!(
+                    status.success(),
+                    "[asan_cond_stored_rc_param/{label}/k={k}] ASAN reported an error \
+                     (exit {:?}). A SIGSEGV means the store nulled a `shared` field the \
+                     read still needs; a double free means the box's value-drop fired on \
+                     the path that handed the value away.\nstdout:\n{stdout}",
+                    status.code()
+                );
+                assert_eq!(
+                    stdout, want,
+                    "[asan_cond_stored_rc_param/{label}/k={k}] output diverges from the \
+                     interpreter"
+                );
+            }
+        }
+    }
+
     #[test]
     fn asan_transfer_owned_enum_param_rebind_owns_its_payload() {
         const PRE: &str = "struct X1 { a: Option[i64], s: String }\n\

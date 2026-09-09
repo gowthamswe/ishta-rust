@@ -673,6 +673,23 @@ impl<'ctx> super::Codegen<'ctx> {
     /// noise versus a malloc/free pair). A reverse map could be
     /// added if profiles show it.
     pub(super) fn emit_rc_dec(&self, heap_type: StructType<'ctx>, ptr: PointerValue<'ctx>) {
+        self.emit_rc_dec_guarded(heap_type, ptr, None)
+    }
+
+    /// [`Self::emit_rc_dec`] with an optional per-path guard on the box's
+    /// VALUE-drop (B-2026-09-09-2).
+    ///
+    /// `Some(flag)` means "this box's value was handed to another owner on
+    /// some path": the box shell is freed either way, but the value-drop —
+    /// the user `Drop` body AND the value's heap — runs only where the flag
+    /// is still `true`. `None` reproduces the unguarded behaviour exactly, so
+    /// every caller but the RC-fallback drain is byte-identical.
+    pub(super) fn emit_rc_dec_guarded(
+        &self,
+        heap_type: StructType<'ctx>,
+        ptr: PointerValue<'ctx>,
+        value_drop_flag: Option<PointerValue<'ctx>>,
+    ) {
         let rc_ptr = self
             .builder
             .build_struct_gep(heap_type, ptr, 0, "rc_ptr")
@@ -737,9 +754,39 @@ impl<'ctx> super::Codegen<'ctx> {
                 .iter()
                 .find(|(ty, _)| *ty == heap_type)
             {
-                self.builder
-                    .build_call(value_drop_fn, &[ptr.into()], "")
-                    .unwrap();
+                // B-2026-09-09-2 — PER PATH when a conditional store handed the
+                // boxed value to a container. The box shell is this frame's
+                // either way and is freed below; the value's body and heap
+                // belong to whoever took it. Unguarded, `if k { xs.push(r); }`
+                // ran the body twice for one object and freed the buffers the
+                // container now owns.
+                match value_drop_flag {
+                    Some(flag) => {
+                        let live = self
+                            .builder
+                            .build_load(self.context.bool_type(), flag, "rcfb.live")
+                            .unwrap()
+                            .into_int_value();
+                        let vd_bb = self.context.append_basic_block(current_fn, "rcfb.vdrop");
+                        let vd_done = self
+                            .context
+                            .append_basic_block(current_fn, "rcfb.vdrop.done");
+                        self.builder
+                            .build_conditional_branch(live, vd_bb, vd_done)
+                            .unwrap();
+                        self.builder.position_at_end(vd_bb);
+                        self.builder
+                            .build_call(value_drop_fn, &[ptr.into()], "")
+                            .unwrap();
+                        self.builder.build_unconditional_branch(vd_done).unwrap();
+                        self.builder.position_at_end(vd_done);
+                    }
+                    None => {
+                        self.builder
+                            .build_call(value_drop_fn, &[ptr.into()], "")
+                            .unwrap();
+                    }
+                }
             }
             // Weak-aware box free (inert for non-weak types): a weak-headered
             // box keeps its control header alive for outstanding weak refs.
@@ -1639,7 +1686,19 @@ impl<'ctx> super::Codegen<'ctx> {
         if self.heap_type_uses_atomic_rc(heap_type) || self.is_arc_binding(name) {
             self.emit_arc_dec(heap_type, ptr);
         } else {
-            self.emit_rc_dec(heap_type, ptr);
+            // B-2026-09-09-2 — an RC-fallback box whose value a conditional
+            // store may have handed away carries a per-path bit; every other
+            // binding passes `None` and keeps today's IR exactly. Gated on the
+            // name's box type MATCHING this dec's, so a `cond_move_drop_flags`
+            // entry a binding holds for an unrelated reason can never reach the
+            // guard.
+            let flag = self
+                .drop_rc
+                .rc_fallback_heap_types
+                .get(name)
+                .filter(|t| **t == heap_type)
+                .and_then(|_| self.drop_rc.cond_move_drop_flags.get(name).copied());
+            self.emit_rc_dec_guarded(heap_type, ptr, flag);
         }
     }
 
