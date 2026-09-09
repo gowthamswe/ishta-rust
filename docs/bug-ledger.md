@@ -102,7 +102,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | false-positive | 106 |
 | perf | 103 |
 | soundness | 95 |
-| other | 87 |
+| other | 88 |
 | crash | 78 |
 | use-after-free | 36 |
 
@@ -113,7 +113,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | codegen | 1619 |
 | interp | 407 |
 | typecheck | 295 |
-| other | 79 |
+| other | 80 |
 | ownership | 74 |
 | cli | 72 |
 | autopar | 56 |
@@ -165,6 +165,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-12 | 2026-09-08 | other | low | THE INSTRUMENTED ASAN LEG REPORTS CLEAN ON A LEAK THE DEFAULT LEG CATCHES, CONTRADICTING ITS OWN DOCUMENTED SUPERSET INVARIANT -- measured on two B-2026-09-08-7 fixtures where the strict-looking legs are green and the plain `--features llvm` leg is red; also records that a fixture failing the DEFAULT leg cannot be quarantined at all, so a known-broken shape sometimes has no fixture | none |
 | B-2026-09-09-5 | 2026-09-09 | other | low | THREE LOAD-SENSITIVE TESTS IN THE REQUIRED GATE SET ARE STILL UNEXPLAINED after B-2026-09-09-1's named one turned out NOT to be flaky -- that one was a deterministic watchdog race that never armed (fixed 32223a5a6, 2-in-6 permanent orphans under load -> 0 in 8), so its resolution transfers no conclusion to the rest. Leading hypothesis for the ASAN pair is the vacuous-fixture floor: n=102 against a per-process HOST FLOOR of 90 measured on a box running dozens of concurrent ASAN processes, a 12-allocation margin that a drifting floor would trip with nothing wrong in the compiler -- with the counter-argument that a shared OnceLock floor should fail many fixtures at once, and only one failed | — |
 | B-2026-09-09-6 | 2026-09-09 | runtime | low | A PER-THREAD SMALL-BLOCK FREE LIST would take kara off macOS libmalloc's shared per-size-class state, which B-2026-09-05-22 measured as a hard ceiling: two concurrent allocators holding one small block live each are 8.3x SLOWER than one thread on this host (113.83ms -> 948.96ms, 49.15ms at three), and kara's compiled parallel probes allocate in exactly that shape -- worth up to 6x for a parallel region whose iter_total is 2, nothing on Linux, and narrow enough that it is filed low rather than inheriting -22's severity | docs/investigations/autopar-alloc-scaling.md, "The M5 answer" section |
+| B-2026-09-09-7 | 2026-09-09 | other | medium | A FULL DISK FAILS THE GATE SET AS AN LLVM CRASH, A LINKER BUS ERROR, OR A LOST OUTPUT STREAM -- never as a named test -- and it hit ELEVEN times across seven unrelated slices in one session. The session allowance is ~38 GiB (df's '252G size' is the host volume and is meaningless), ONE leg of `cargo test --no-run` costs 19.6 GiB in test binaries (134 executables x ~250 MiB at the default debug=2), so the SECOND feature leg cannot start. The obvious suspect is wrong: both clippy legs together cost 1.19 GiB. `CARGO_PROFILE_TEST_DEBUG=line-tables-only` cuts a test binary 252 -> 97 MiB and makes both legs fit | — |
 
 ### Relocated
 

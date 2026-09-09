@@ -137,6 +137,43 @@ on the ids the task list reports. Stragglers do not touch the tree, but they kee
 the session looking busy indefinitely and they burn CPU on the same box the gate
 timings are measured on.
 
+## A red gate with no named test is probably a FULL DISK, not a failure
+
+The writable disk in a cloud session is a **per-session allowance of ~38 GiB**,
+and `df -h /` actively misleads about it: the `252G` size column is the host
+volume, so the number to read is `used + avail`. When that allowance runs out
+mid-gate, the failure NEVER says "disk" in a form that survives a
+`grep -E 'FAILED|test result'`. The four shapes, all measured in one session
+(B-2026-09-09-7):
+
+    rustc-LLVM ERROR: IO failure on output stream: No space left on device
+    collect2: fatal error: ld terminated with signal 7 [Bus error]
+    error: failed to write file .../dep-graph.part.bin: No space left on device (os error 28)
+    (nothing at all -- the harness tmpdir fills, the child's output is lost, exit code only)
+
+The `signal 7` form is the linker's mmap'd write failing on a full filesystem
+and it prints LLVM's `PLEASE submit a bug report` banner, which sends you to the
+wrong project. The fourth reads as a hang or a flake.
+
+**Why it lands on the SECOND gate leg.** One leg of `cargo test --no-run` --
+pure linking, no tests run -- costs **19.6 GiB**: 134 test executables at ~250 MiB
+each under cargo's default `debug = 2`, plus a 420 MiB `libkarac` rlib. That
+leaves ~700 MiB, so the second feature leg cannot start. **Clippy is not the
+culprit** even though it looks like one: both clippy legs together cost 1.19 GiB,
+because clippy emits metadata rather than linked binaries. A session that
+blames clippy here will "fix" it by serialising the wrong commands.
+
+Either of these makes the gate set fit:
+
+```bash
+CARGO_PROFILE_TEST_DEBUG=line-tables-only cargo test --features llvm   # 252 -> 97 MiB per binary
+cargo clean -p karac    # ~20-24 GiB back in seconds; run between feature legs
+```
+
+`line-tables-only` keeps file/line in panic backtraces and drops only the type
+and variable DWARF. **Check `df` before concluding anything from a red gate** --
+a gate that failed with no named test may not have run one.
+
 ## Branch management
 
 **Two environments, two workflows — pick by where the session runs.** The worktree rules in the rest of this section govern the **local multi-worktree checkout** (the primary machine, where sibling worktrees run parallel slices and the primary's clean `git status` is load-bearing). They do **not** apply to an **ephemeral cloud container** (Claude Code on the web / a fresh clone discarded when the session ends): there are no sibling worktrees, no parallel slices, and nothing to isolate from, so `EnterWorktree` + a feature branch buys nothing but ceremony. In a cloud container, **work directly on `main`** — commit straight to `main`, no feature branch, no PR unless explicitly asked (owner-authorized 2026-07-07, overriding the mandatory-worktree default below for this environment only).
