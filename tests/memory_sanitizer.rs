@@ -85429,4 +85429,157 @@ fn main() {
             "b4-let-bound-rebind-control",
         );
     }
+
+    /// B-2026-09-09-8 — a boxed `Result` payload's box had NO OWNER at all,
+    /// because the param-site arm that registers one ran for `Option` only.
+    ///
+    /// The row is filed as an INTERIOR leak ("54 B in 6 blocks", the payload's
+    /// `String`s) on the reading that the box was already owned. Re-measured at
+    /// `-O0` under valgrind on the tree this fixes, three calls of
+    /// `plainR(Result.Ok(..))` over `Result[Array[String, 2], i64]`:
+    ///
+    ///     definitely lost  144 B in 3 blocks   the BOXES     <- unrecorded
+    ///     indirectly lost   54 B in 6 blocks   the Strings
+    ///
+    /// The interior is INDIRECT — it hangs off a box nobody freed — and the
+    /// `Option` twin, which does reach the registration, loses the 54 B alone
+    /// with no boxes. So the row's number was read off the wrong enum.
+    ///
+    /// The gate it names (`option_generic_arg_type_expr` has no `Result`
+    /// sibling) is real but is NOT what holds this up: it sits BELOW
+    /// `if enum_lit != "Option" { continue; }`, so no `Result` reaches it. Both
+    /// had to move, and the extractor had to become per-VARIANT — a `Result`
+    /// boxes `Ok` and `Err` independently, so "the payload" is not a property
+    /// of the type (cell 5 is the shape that proves it).
+    ///
+    /// EVERY CELL HERE IS A TUPLE PAYLOAD, deliberately. The row's own
+    /// `Array[String, 2]` spelling still loses its 54 B interior after this
+    /// fix, because an `Array` payload is admitted by neither the tuple filter
+    /// nor the leaf drop — that is B-2026-09-06-49, which is OPEN and reverted
+    /// (its param-site walk needs a caller-side suppressor that breaks generic
+    /// callees). Asserting the array cell clean here would put the `-O0` ASAN
+    /// leg red on someone else's open row. The boxes it loses ARE fixed.
+    #[test]
+    fn asan_boxed_result_param_payload_box_is_owned() {
+        const PRE: &str = "fn seed() -> i64 { env.args().len() }\n";
+
+        // 1 — the row's shape with a tuple payload: a fresh temp handed
+        //     straight to a by-value param, so no binding exists anywhere.
+        //     198 B lost per program before the fix (144 boxes + 54 interior).
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn plainR(x: Result[(String, String), i64]) {{\n\
+                 \x20  match x {{ Ok(t) => {{ println(f\"s:{{t.0}}\") }} Err(e) => {{ println(f\"e{{e}}\") }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{\n\
+                 \x20  plainR(Result.Ok((f\"aaaaaaaa{{i}}{{seed()}}\", f\"bbbbbbbb{{i}}\"))); i = i + 1; }} }}\n"
+            ),
+            &["s:aaaaaaaa01", "s:aaaaaaaa11"],
+            "b8-result-tuple-fresh-temp",
+        );
+
+        // 2 — NAMED binding of the whole `Result`. The caller's let site
+        //     registers a box drop and then disarms it at the call-arg move
+        //     (`suppress_inline_option_result_binding_move`), which is why the
+        //     callee has to take over: with neither owning it, the box leaked
+        //     here exactly as in cell 1. This is the cell that would double-free
+        //     if that disarm did NOT reach `Result`.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn takeT(x: Result[(String, String), i64]) {{\n\
+                 \x20  match x {{ Ok(t) => {{ println(f\"s:{{t.0}}\") }} Err(e) => {{ println(f\"e{{e}}\") }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{\n\
+                 \x20  let r: Result[(String, String), i64] = Result.Ok((f\"aaaaaaaa{{i}}{{seed()}}\", f\"bbbbbbbb{{i}}\"));\n\
+                 \x20  takeT(r); i = i + 1; }} }}\n"
+            ),
+            &["s:aaaaaaaa01", "s:aaaaaaaa11"],
+            "b8-result-tuple-named-binding",
+        );
+
+        // 3 — a DESTRUCTURING arm. The leaves take the interior and the
+        //     registration is retracted to box-only
+        //     (`retract_boxed_tuple_inner_drop_for_arm`, which already admitted
+        //     `Ok`/`Err` patterns — the retraction was never the `Option`-only
+        //     half). Without that retraction this cell double-frees rather than
+        //     leaking, so it fails LOUDER than the others if the widening ever
+        //     outruns it.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn takeD(x: Result[(String, String), i64]) {{\n\
+                 \x20  match x {{ Ok((a, b)) => {{ println(f\"s:{{a}}{{b}}\") }} Err(e) => {{ println(f\"e{{e}}\") }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{\n\
+                 \x20  takeD(Result.Ok((f\"aaaaaaaa{{i}}{{seed()}}\", f\"bbbbbbbb{{i}}\"))); i = i + 1; }} }}\n"
+            ),
+            &["s:aaaaaaaa01bbbbbbbb0", "s:aaaaaaaa11bbbbbbbb1"],
+            "b8-result-tuple-destructured",
+        );
+
+        // 4 — CONTROL, an ESCAPING param: `outerT` hands its param straight
+        //     back, so it must register NOTHING and leave the terminal consumer
+        //     the only owner. A registration that ignored
+        //     `optres_by_value_nonescaping_param_names` frees a box it already
+        //     handed on — a double free, not a leak.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn innerT(x: Result[(String, String), i64]) {{\n\
+                 \x20  match x {{ Ok((a, b)) => {{ println(f\"s:{{a}}{{b}}\") }} Err(e) => {{ println(f\"e{{e}}\") }} }} }}\n\
+                 fn outerT(x: Result[(String, String), i64]) -> Result[(String, String), i64] {{ return x; }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{\n\
+                 \x20  innerT(outerT(Result.Ok((f\"aaaaaaaa{{i}}{{seed()}}\", f\"bbbbbbbb{{i}}\")))); i = i + 1; }} }}\n"
+            ),
+            &["s:aaaaaaaa01bbbbbbbb0", "s:aaaaaaaa11bbbbbbbb1"],
+            "b8-result-tuple-escaping-param-control",
+        );
+
+        // 5 — BOTH VARIANTS BOX, and the two payloads have different types.
+        //     This is why the extractor is per-variant: `Ok` reads generic arg
+        //     0 and `Err` arg 1, and the loop registers a separate tag-guarded
+        //     box drop for each. Exactly one fires at runtime. Reading the
+        //     `Ok` type for the `Err` arm would free a 3-tuple as a 2-tuple.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn plainB(x: Result[(String, String), (String, String, String)]) {{\n\
+                 \x20  match x {{ Ok(t) => {{ println(f\"o:{{t.0}}\") }} Err(e) => {{ println(f\"e:{{e.0}}\") }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 3 {{\n\
+                 \x20  if i == 1 {{ plainB(Result.Err((f\"pppppppp{{i}}{{seed()}}\", f\"qqqqqqqq{{i}}\", f\"rrrrrrrr{{i}}\"))); }}\n\
+                 \x20  else {{ plainB(Result.Ok((f\"aaaaaaaa{{i}}{{seed()}}\", f\"bbbbbbbb{{i}}\"))); }}\n\
+                 \x20  i = i + 1; }} }}\n"
+            ),
+            &["o:aaaaaaaa01", "e:pppppppp11", "o:aaaaaaaa21"],
+            "b8-result-both-variants-box",
+        );
+
+        // 6 — CONTROL, the `Err` path over a payload that does NOT box. The
+        //     registration is tag-guarded, so a program that never constructs
+        //     the boxing variant must free nothing extra.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn plainR4(x: Result[(String, String), i64]) {{\n\
+                 \x20  match x {{ Ok(t) => {{ println(f\"s:{{t.0}}\") }} Err(e) => {{ println(f\"e{{e}}\") }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{ plainR4(Result.Err(i + seed())); i = i + 1; }} }}\n"
+            ),
+            &["e1", "e2"],
+            "b8-result-err-path-control",
+        );
+
+        // 7 — CONTROL, the `Option` twin, unchanged by this commit and clean
+        //     before it. It is here so a later change that breaks the shared
+        //     extractor shows up on both enums rather than only the new one.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn plainO(x: Option[(String, String)]) {{\n\
+                 \x20  match x {{ Some(t) => {{ println(f\"s:{{t.0}}\") }} None => {{ println(\"n\") }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{\n\
+                 \x20  plainO(Some((f\"aaaaaaaa{{i}}{{seed()}}\", f\"bbbbbbbb{{i}}\"))); i = i + 1; }} }}\n"
+            ),
+            &["s:aaaaaaaa01", "s:aaaaaaaa11"],
+            "b8-option-tuple-twin-control",
+        );
+    }
 }

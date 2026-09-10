@@ -14715,6 +14715,44 @@ impl<'ctx> super::Codegen<'ctx> {
         self.emit_option_drop_fn(&inner_te)
     }
 
+    /// The payload `TypeExpr` of ONE BOXING VARIANT of a seeded enum, or
+    /// `None` when `te` is neither `Option` nor `Result`.
+    ///
+    /// `option_generic_arg_type_expr`'s per-variant peer (B-2026-09-09-8). That
+    /// one answers "the `Some` payload" and returns `None` for every `Result`,
+    /// which is exactly the hole this fills: a `Result` boxes PER VARIANT, so
+    /// "the payload" is not a property of the type alone — `Ok` reads generic
+    /// arg 0 and `Err` reads arg 1, and a `Result[Wide1, Wide2]` genuinely has
+    /// two boxing variants with two different payload types.
+    ///
+    /// Callers hold a `(enum_lit, variant)` pair from
+    /// `boxed_enum_payload_variants` and must use THIS, not the `Option` one,
+    /// or every `Result` silently resolves no payload and whatever the payload
+    /// owns goes unowned.
+    pub(super) fn seeded_enum_variant_payload_type_expr(
+        te: &TypeExpr,
+        variant: &str,
+    ) -> Option<TypeExpr> {
+        let TypeKind::Path(p) = &te.kind else {
+            return None;
+        };
+        let idx = match (p.segments.last().map(|s| s.as_str()), variant) {
+            (Some("Option"), "Some") => 0,
+            (Some("Result"), "Ok") => 0,
+            (Some("Result"), "Err") => 1,
+            _ => return None,
+        };
+        p.generic_args
+            .as_ref()?
+            .iter()
+            .filter_map(|a| match a {
+                crate::ast::GenericArg::Type(t) => Some(t),
+                _ => None,
+            })
+            .nth(idx)
+            .cloned()
+    }
+
     /// Extract the `T` `TypeExpr` from an `Option[T]` `TypeExpr`, or `None` if
     /// `te` is not a single-arg `Option[...]`.
     pub(super) fn option_generic_arg_type_expr(te: &TypeExpr) -> Option<TypeExpr> {

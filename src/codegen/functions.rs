@@ -2646,13 +2646,18 @@ impl<'ctx> super::Codegen<'ctx> {
                     // box drop while the callee registered nothing. 32 B per
                     // call, nobody's.
                     //
-                    // `Option` ONLY, for the reason
-                    // `owned_boxed_option_param_struct` gives: `Result` boxes PER
-                    // VARIANT against a 5-word area, so the caller-side disarm
-                    // this registration needs on the passthrough shape would
-                    // have to know which tag is live before it can zero the
-                    // right word. `Result` keeps its existing ownership
-                    // untouched.
+                    // BOTH seeded enums, since B-2026-09-09-8. This read
+                    // `Option` ONLY, on `owned_boxed_option_param_struct`'s
+                    // argument that a `Result` boxes PER VARIANT so the
+                    // caller-side disarm "would have to know which tag is live
+                    // before it can zero the right word". The disarm zeroes the
+                    // WHOLE SLOT and identifies no tag, so that never bound;
+                    // what the exclusion actually bought was an unowned box on
+                    // every `Result` boxed payload — 144 B in 3 blocks over
+                    // three calls, with the payload's own heap indirectly lost
+                    // behind it. See the gate below for the measurement and for
+                    // why the per-variant boxing is handled by resolving the
+                    // payload type per VARIANT rather than per type.
                     //
                     // ONLY when the boxed payload is NOT a user struct, and
                     // that gate is the whole content of this arm. Registering
@@ -2722,13 +2727,62 @@ impl<'ctx> super::Codegen<'ctx> {
                                 .insert(param_name.clone());
                             continue;
                         }
-                        // `Option` ONLY from here down — the OWNERSHIP half,
-                        // whose reason is the per-variant `Result` box quoted
-                        // above. Unchanged by B-2026-09-06-56, which moved the
-                        // reach test in front of it rather than widening it.
-                        if enum_lit != "Option" {
-                            continue;
-                        }
+                        // B-2026-09-09-8 — the OWNERSHIP half now runs for
+                        // `Result` too, and lifting this gate is the whole of
+                        // that row's fix rather than the extractor it names.
+                        //
+                        // The gate read `Option` ONLY, on the argument that a
+                        // `Result` boxes PER VARIANT against a 5-word area, so
+                        // the caller-side disarm this registration relies on
+                        // "would have to know which tag is live before it can
+                        // zero the right word". That is a claim about
+                        // `suppress_inline_option_result_binding_move`, and it
+                        // does not hold: the disarm identifies NO tag. It stores
+                        // a zero over the slot, so the tag word and payload-area
+                        // word 0 — the box pointer, wherever the live variant
+                        // put it — go to zero together, and the `BoxedEnumDrop`
+                        // guard then skips whichever variant was live.
+                        // `boxed_enum_payload_vars` is enum-agnostic and the
+                        // caller's binding is already a member, so the caller
+                        // half needed no change here.
+                        //
+                        // PRECISELY, because "whole-slot" was not true when this
+                        // was written: that store picked its width from a name
+                        // that could only say `Option` or `Result`, so a
+                        // `Result` binding got a FOUR-word zero over a six-word
+                        // slot. It disarmed correctly anyway — tag and box word
+                        // are both inside the first four — which is why the
+                        // named-binding cell measured clean. 91bd67b01 has since
+                        // sized the store to `slot.ty`, so it now covers the
+                        // slot for real; this registration was correct under
+                        // both widths, and depends only on the tag and word 0.
+                        //
+                        // WHAT THE EXCLUSION COST, measured at `-O0` under
+                        // valgrind over three calls of
+                        // `plainR(Result.Ok([f"a{i}", f"b{i}"]))` against
+                        // `Result[Array[String, 2], i64]`:
+                        //
+                        //     definitely lost  144 B in 3 blocks   the BOXES
+                        //     indirectly lost   54 B in 6 blocks   the Strings
+                        //
+                        // The row this closes records only the second line, on
+                        // the reading that the box was already owned and the
+                        // interior was not. It is the other way round: for a
+                        // `Result` NOTHING was registered, so the box was
+                        // unowned and the interior hung off it — the caller's
+                        // let-site drop having been disarmed at the move, per
+                        // the note above. The `Option` twin loses 54 B and no
+                        // boxes, which is what that reading was taken from.
+                        //
+                        // The interior is not separable from this: it rides on
+                        // the box's own `BoxedEnumDrop` as `payload_inner_drop`
+                        // (ONE OWNER, per the tuple note below), so there is
+                        // nothing to hang an interior walk on until the box has
+                        // an owner at all.
+                        //
+                        // STRUCT payloads never arrive here — `inner_struct`
+                        // returns above — so this widening cannot reach the
+                        // shapes B-2026-09-06-56 left to the move-out mirror.
                         // B-2026-08-07-11 leg (a) — the box may hold a further
                         // chain of ENVELOPES (`Option[Option[Option[i64]]]`:
                         // the param's own payload boxes, and so does the
@@ -2750,8 +2804,17 @@ impl<'ctx> super::Codegen<'ctx> {
                         // (below) is not an `Option`, so its chain is length
                         // zero, and a payload that DOES carry a chain is an
                         // `Option` and never a tuple.
-                        let deeper = Self::option_generic_arg_type_expr(&mono_ty)
-                            .map(|p| self.nested_box_deeper_tag_chain(&p))
+                        // B-2026-09-09-8 — per VARIANT, not per type. A
+                        // `Result` reaches this loop once for `Ok` and again
+                        // for `Err` when both payloads box, and the two have
+                        // different types; `option_generic_arg_type_expr`
+                        // answers `None` for either. Resolved once here because
+                        // all four derivations below want the same answer.
+                        let payload_te =
+                            Self::seeded_enum_variant_payload_type_expr(&mono_ty, variant);
+                        let deeper = payload_te
+                            .as_ref()
+                            .map(|p| self.nested_box_deeper_tag_chain(p))
                             .unwrap_or_default();
                         // B-2026-09-04-12 — a boxed TUPLE payload
                         // (`Option[(String, String)]`) reaches this arm with
@@ -2816,7 +2879,8 @@ impl<'ctx> super::Codegen<'ctx> {
                         // that actually owns heap, and returns its argument
                         // unchanged when there is no chain, so the tuple and
                         // single-level cases are byte-identical to before.
-                        let tuple_inner_drop = Self::option_generic_arg_type_expr(&mono_ty)
+                        let tuple_inner_drop = payload_te
+                            .clone()
                             .filter(|p| {
                                 matches!(p.kind, TypeKind::Tuple(_))
                                     && self.option_payload_struct_or_enum_drop_ok(p)
@@ -2851,14 +2915,15 @@ impl<'ctx> super::Codegen<'ctx> {
                         let leaf_drop = if tuple_inner_drop.is_some() {
                             None
                         } else {
-                            Self::option_generic_arg_type_expr(&mono_ty).and_then(|p| {
-                                let leaf = self.nested_box_leaf_contents(&p).clone();
+                            payload_te.as_ref().and_then(|p| {
+                                let leaf = self.nested_box_leaf_contents(p).clone();
                                 self.vec_elem_agg_drop_for_type_expr(&leaf)
                             })
                         };
                         if leaf_drop.is_some() {
-                            if let Some(d) = Self::option_generic_arg_type_expr(&mono_ty)
-                                .and_then(|p| self.boxed_leaf_owning_depth(&p, deeper.len()))
+                            if let Some(d) = payload_te
+                                .as_ref()
+                                .and_then(|p| self.boxed_leaf_owning_depth(p, deeper.len()))
                             {
                                 self.payload_vars
                                     .boxed_leaf_owning_depth
