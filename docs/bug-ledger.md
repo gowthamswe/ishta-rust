@@ -103,14 +103,14 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | perf | 104 |
 | soundness | 95 |
 | other | 90 |
-| crash | 78 |
+| crash | 79 |
 | use-after-free | 36 |
 
 ### By surface
 
 | surface | total |
 |---|---|
-| codegen | 1639 |
+| codegen | 1640 |
 | interp | 411 |
 | typecheck | 295 |
 | other | 81 |
@@ -2446,6 +2446,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-23 | codegen | medium | REBINDING AN `Array[Vec[T], N]` DUPLICATES ITS ELEMENT OWNERS -- `let b: Array[Vec[i64], 2] = a;` with no index anywhere in the program aborts `free(… | 1e4e74a |
 | B-2026-09-10-1 | codegen | medium | AN `Option[Vec[<heap-bearing struct>]]` PASSED AS AN ARGUMENT STILL DOUBLE FREES AFTER B-2026-09-09-22 -- `plainV(Some([S { s: f".." }, ..]))` aborts… | fb5bdc4 |
 | B-2026-09-10-3 | codegen | low | THE `Result` SPELLING OF B-2026-09-09-19 LOSES THE ENVELOPE AS WELL AS THE INTERIOR, AND LOSES IT ON A WHOLE-PAYLOAD BIND TOO -- `struct HolderR { k:… | 818c3b4 |
+| B-2026-09-10-5 | codegen | high | A NAMED-LOCAL GENERIC ENUM PASSED BY VALUE SMASHES THE CALLER'S STACK -- `let a = G.X(W2 { a: 1, b: 2 }); hg(a);` over `enum G[T] { X(T), Y }` SIGSEG… | 91bd67b01 |
 
 </details>
 
