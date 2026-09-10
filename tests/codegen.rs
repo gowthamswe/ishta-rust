@@ -153179,6 +153179,149 @@ fn main() {
         }
     }
 
+    /// B-2026-09-09-23 — rebinding an `Array[T, N]` whose element owns heap
+    /// gave the destination a SECOND memory drop over elements the source
+    /// still owns: `let a: Array[String, 2] = [..]; let b: Array[String, 2] =
+    /// a;` with nothing else in the program aborted `free(): double free
+    /// detected in tcache 2` under the JIT and at `KARAC_OPT_LEVEL=0`, while
+    /// `--interp` was correct.
+    ///
+    /// THE ANNOTATION IS THE WHOLE DISCRIMINATOR, and that is what names the
+    /// bug. B-2026-08-28-57's rule is already written down beside this code —
+    /// "Bodies follow the move; memory does not" — and it cites this exact
+    /// double free as the thing it is avoiding. But it was enforced only by
+    /// accident of resolution: a BARE rebind (`let b = a;`) has no annotation
+    /// and no `array_elem_type_exprs` entry for the destination, so the
+    /// element type came back `None` and the memory registration was skipped.
+    /// An ANNOTATED rebind resolves the element type from the annotation and
+    /// walked straight past the rule into `make_array_param_callee_owned`.
+    ///
+    /// So the guard now keys on the RHS SHAPE rather than on where the element
+    /// type was resolved: a rebind of a live array memory owner
+    /// (`owned_array_params`) does not take memory ownership, whichever way
+    /// its element type was found.
+    ///
+    /// `-O2` was clean throughout, which is the reason this sat unnoticed: the
+    /// optimizer deletes buffers nothing observes, so the default `karac build`
+    /// passed and only the JIT — the first thing anyone runs — and an explicit
+    /// `-O0` aborted.
+    ///
+    /// Cells 6-9 are the shapes that were already correct: every bare rebind,
+    /// a scalar element (nothing to double-free), and the `Vec` container,
+    /// whose move disarms the source's cap and so was never affected.
+    #[test]
+    fn e2e_array_rebind_leaves_memory_with_one_owner() {
+        for (label, src, want) in [
+            // 1 — the minimal reproducer: no index, no read, no call.
+            (
+                "annotated-rebind-vec-element",
+                "fn main() {\n\
+                 \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+                 \x20   let b: Array[Vec[i64], 2] = a;\n\
+                 \x20   println(\"done\");\n\
+                 }\n",
+                "done\n",
+            ),
+            // 2 — a `String` element, so the class is "element owns heap" and
+            //     not anything specific to a nested `Vec`.
+            (
+                "annotated-rebind-string-element",
+                "fn main() {\n\
+                 \x20   let a: Array[String, 2] = [f\"aaaaaaaa0\", f\"bbbbbbbb1\"];\n\
+                 \x20   let b: Array[String, 2] = a;\n\
+                 \x20   println(\"done\");\n\
+                 }\n",
+                "done\n",
+            ),
+            // 3 — a user STRUCT element, the spelling B-2026-08-28-57's own
+            //     comment measured when it drew the bodies/memory line.
+            (
+                "annotated-rebind-struct-element",
+                "struct S { s: String }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[S, 2] = [S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }];\n\
+                 \x20   let b: Array[S, 2] = a;\n\
+                 \x20   println(\"done\");\n\
+                 }\n",
+                "done\n",
+            ),
+            // 4 — two levels of heap under the element. This one printed
+            //     NOTHING AT ALL on every compiled surface, not even the double
+            //     free message.
+            (
+                "annotated-rebind-vec-string-element",
+                "fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\"], [f\"bbbbbbbb1\"]];\n\
+                 \x20   let b: Array[Vec[String], 2] = a;\n\
+                 \x20   println(\"done\");\n\
+                 }\n",
+                "done\n",
+            ),
+            // 5 — the destination is then READ, so the stand-down has to leave
+            //     a live array behind rather than merely a balanced one.
+            (
+                "annotated-rebind-then-read",
+                "fn main() {\n\
+                 \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+                 \x20   let b: Array[Vec[i64], 2] = a;\n\
+                 \x20   println(f\"s:{b[0][1]}\");\n\
+                 }\n",
+                "s:11\n",
+            ),
+            // 6 — B-2026-09-09-9's rebind read, held back at the time because
+            //     admitting it while this bug was live turned a loud refusal
+            //     into a silent double free. It lands here, with its blocker.
+            (
+                "bare-rebind-then-read",
+                "fn main() {\n\
+                 \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+                 \x20   let b = a;\n\
+                 \x20   println(f\"s:{b[0][1]}\");\n\
+                 }\n",
+                "s:11\n",
+            ),
+            // 7 — CONTROL: the bare rebind was always clean, because the
+            //     element type simply did not resolve for it.
+            (
+                "bare-rebind-struct-control",
+                "struct S { s: String }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[S, 2] = [S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }];\n\
+                 \x20   let b = a;\n\
+                 \x20   println(\"done\");\n\
+                 }\n",
+                "done\n",
+            ),
+            // 8 — CONTROL: a scalar element has no heap for a second owner to
+            //     free, so it was correct either way.
+            (
+                "scalar-element-control",
+                "fn main() {\n\
+                 \x20   let a: Array[i64, 2] = [10, 11];\n\
+                 \x20   let b: Array[i64, 2] = a;\n\
+                 \x20   println(\"done\");\n\
+                 }\n",
+                "done\n",
+            ),
+            // 9 — CONTROL: the `Vec` container's move zeroes the source's cap,
+            //     so its rebind never had two owners to begin with.
+            (
+                "vec-container-control",
+                "fn main() {\n\
+                 \x20   let v: Vec[Vec[i64]] = [[10, 11], [20]];\n\
+                 \x20   let w: Vec[Vec[i64]] = v;\n\
+                 \x20   println(\"done\");\n\
+                 }\n",
+                "done\n",
+            ),
+        ] {
+            let Some(out) = run_program(src) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by

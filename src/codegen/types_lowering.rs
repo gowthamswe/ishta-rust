@@ -1291,6 +1291,45 @@ impl<'ctx> super::Codegen<'ctx> {
                     .get(idx)?;
                 super::helpers::array_inner_type_expr(field_te)
             }
+            // A BARE REBIND of an array-typed local (`let b = a;`) —
+            // B-2026-09-09-9, held back until B-2026-09-09-23. Every arm above
+            // answers a call, a literal or a field read, so the plainest RHS of
+            // all declined and the destination recorded no element type:
+            // `let b = a; b[i][j]` refused on both compiled backends while
+            // `--interp` ran it, and so did the `match`-arm form
+            // (`Some(t) => { let u = t; u[i][j] }`).
+            //
+            // This arm was written, measured and REVERTED once: with the array
+            // rebind still duplicating its element owners, making the read
+            // compile turned a loud refusal into a silent double free, which is
+            // the worse trade. -23 removed the duplicate owner, so the read is
+            // now safe to admit and lands with it.
+            //
+            // Reads the source's own entry rather than re-deriving a type, so
+            // it answers exactly for the sources the other registrars have
+            // already resolved and stays fail-closed everywhere else.
+            //
+            // NARROWED to a source that is a live array MEMORY owner
+            // (`owned_array_params`, the same set -23's stand-down consults).
+            // A `match`-arm-bound array payload also has an
+            // `array_elem_type_exprs` entry — B-2026-09-09-9 put it there — but
+            // its ownership is the arm's, not this set's, and admitting it
+            // makes `Some(t) => { let u = t; u[i][j] }` build and then double
+            // free at `-O2` and print nothing at all under the JIT and `-O0`.
+            // Measured on the fixed tree, so it is a SEPARATE residual and not
+            // the one -23 removed; the arm spelling keeps refusing until it has
+            // its own row.
+            ExprKind::Identifier(src)
+                if self
+                    .borrow_vars
+                    .owned_array_params
+                    .contains_key(src.as_str()) =>
+            {
+                self.var_types
+                    .array_elem_type_exprs
+                    .get(src.as_str())
+                    .cloned()
+            }
             _ => None,
         }
     }

@@ -9164,15 +9164,57 @@ impl<'ctx> super::Codegen<'ctx> {
                                             .cloned()?;
                                         Some((te, arr_ty.len()))
                                     });
+                                // B-2026-09-09-23 — "Bodies follow the move;
+                                // memory does not" is keyed on the RHS SHAPE,
+                                // not on where the element type was resolved.
+                                //
+                                // The bodies block below already states the
+                                // rule and honours it, but only by accident of
+                                // resolution: a BARE rebind (`let b = a;`) has
+                                // no annotation and no `array_elem_type_exprs`
+                                // entry for the destination, so `arr_parts` was
+                                // `None` and the memory registration here was
+                                // skipped. An ANNOTATED rebind
+                                // (`let b: Array[Vec[i64], 2] = a;`) resolves
+                                // `arr_parts` from the annotation and reached
+                                // this call, giving `b` a second `StructDrop`
+                                // over elements `a` still owns — precisely the
+                                // double free the bodies block's own comment
+                                // says it is avoiding, arriving by the one door
+                                // that comment does not cover.
+                                //
+                                // Measured: `let a: Array[String, 2] = [..];
+                                // let b: Array[String, 2] = a;` with nothing
+                                // else in the program aborts `free(): double
+                                // free detected in tcache 2` under the JIT and
+                                // at `KARAC_OPT_LEVEL=0` (clean at `=2`, where
+                                // the optimizer deletes the unobserved buffers)
+                                // while `--interp` is correct; the bare
+                                // spelling of the same program is clean on all
+                                // five surfaces, and a scalar element is clean
+                                // either way.
+                                //
+                                // `owned_array_params` is the set of array
+                                // bindings that already hold the memory drop,
+                                // so consulting it makes the annotated path
+                                // stand down exactly where the bare path
+                                // already did — and only there.
+                                let rebind_of_live_array_owner = matches!(
+                                    &value.kind,
+                                    ExprKind::Identifier(src)
+                                        if self.borrow_vars.owned_array_params.contains_key(src.as_str())
+                                );
                                 if let Some((elem_te, n)) = arr_parts.clone() {
-                                    let elem_ty = self.llvm_type_for_type_expr(&elem_te);
-                                    self.make_array_param_callee_owned(
-                                        var_name.as_str(),
-                                        &elem_te,
-                                        n,
-                                        elem_ty,
-                                        slot.ptr,
-                                    );
+                                    if !rebind_of_live_array_owner {
+                                        let elem_ty = self.llvm_type_for_type_expr(&elem_te);
+                                        self.make_array_param_callee_owned(
+                                            var_name.as_str(),
+                                            &elem_te,
+                                            n,
+                                            elem_ty,
+                                            slot.ptr,
+                                        );
+                                    }
                                 }
                                 // B-2026-08-28-57 — the elements' user `Drop`
                                 // BODIES, on the NLL channel, beside the memory

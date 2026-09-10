@@ -85037,4 +85037,84 @@ fn main() {
             "b1-bare-vec-argument-control",
         );
     }
+
+    /// B-2026-09-09-23 — an annotated rebind of an `Array[T, N]` with a
+    /// heap-owning element gave the destination a second memory drop over the
+    /// source's elements. ASAN is the gate that matters here: the failure is a
+    /// double free, and `-O2` hid it (the optimizer deletes buffers nothing
+    /// observes), so only an unoptimized run and the JIT ever aborted.
+    ///
+    /// The fix REMOVES a drop, so cells 4-6 carry the leak direction: a bare
+    /// rebind, a scalar element and the `Vec` container all still have to be
+    /// freed exactly once by whoever owns them.
+    #[test]
+    fn asan_array_rebind_leaves_memory_with_one_owner() {
+        // 1 — the minimal reproducer: no index, no read, no call.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+             \x20   let b: Array[Vec[i64], 2] = a;\n\
+             \x20   println(\"done\");\n\
+             }\n",
+            &["done"],
+            "b23-annotated-rebind-vec-element",
+        );
+        // 2 — a user struct element, the spelling B-2026-08-28-57's comment
+        //     measured when it drew the bodies/memory line.
+        assert_clean_asan_run(
+            "struct S { s: String }\n\
+             fn main() {\n\
+             \x20   let a: Array[S, 2] = [S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }];\n\
+             \x20   let b: Array[S, 2] = a;\n\
+             \x20   println(\"done\");\n\
+             }\n",
+            &["done"],
+            "b23-annotated-rebind-struct-element",
+        );
+        // 3 — the destination is read afterwards, so the stand-down has to
+        //     leave a LIVE array and not merely a balanced one.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+             \x20   let b: Array[Vec[i64], 2] = a;\n\
+             \x20   println(f\"s:{b[0][1]}\");\n\
+             }\n",
+            &["s:11"],
+            "b23-annotated-rebind-then-read",
+        );
+        // 4 — CONTROL, leak direction: the bare rebind never registered the
+        //     destination, and the source must still free its elements.
+        assert_clean_asan_run(
+            "struct S { s: String }\n\
+             fn main() {\n\
+             \x20   let a: Array[S, 2] = [S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }];\n\
+             \x20   let b = a;\n\
+             \x20   println(\"done\");\n\
+             }\n",
+            &["done"],
+            "b23-bare-rebind-control",
+        );
+        // 5 — CONTROL: B-2026-09-09-9's rebind read, admitted here now that
+        //     its blocker is gone.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+             \x20   let b = a;\n\
+             \x20   println(f\"s:{b[0][1]}\");\n\
+             }\n",
+            &["s:11"],
+            "b23-bare-rebind-then-read",
+        );
+        // 6 — CONTROL: the `Vec` container, whose move disarms the source's
+        //     cap and which must keep freeing exactly once.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let v: Vec[Vec[i64]] = [[10, 11], [20]];\n\
+             \x20   let w: Vec[Vec[i64]] = v;\n\
+             \x20   println(\"done\");\n\
+             }\n",
+            &["done"],
+            "b23-vec-container-control",
+        );
+    }
 }
