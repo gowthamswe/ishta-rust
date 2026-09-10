@@ -4910,14 +4910,26 @@ impl<'ctx> super::Codegen<'ctx> {
     /// construction with nobody to free the envelope. A scalar monomorph
     /// (`Opt[i64]`) fits and is likewise clean. B-2026-08-05-7.
     ///
-    /// Returns `(enum_name, variant_name, ())` per boxing variant. Deliberately
-    /// carries NO inner drop: the free this drives is BOX-ONLY. A match arm that
-    /// binds the payload owns the interior, and running a struct walk here would
-    /// free fields the binding also frees — the interior's ownership is decided
-    /// by the existing arm-consumption machinery and is untouched by this. An
-    /// UNBOUND interior still leaks exactly as it did before; this closes the
-    /// envelope leak only, which is what was measured.
-    pub(super) fn user_enum_boxed_payload_variants(&self, te: &TypeExpr) -> Vec<(String, String)> {
+    /// Returns `(enum_name, variant_name, concrete payload type)` per boxing
+    /// variant. The payload `TypeExpr` is the monomorph's — the substitution is
+    /// done here to decide boxing at all, so handing it back costs nothing and
+    /// is what lets a caller give the box drop an INTERIOR walk.
+    ///
+    /// B-2026-09-10-2 — this used to return the pair alone and every caller
+    /// passed `None` for the box drop's inner drop, documented as BOX-ONLY on
+    /// the reasoning that "a match arm that binds the payload owns the
+    /// interior". That reasoning holds for a BOUND interior and says nothing
+    /// about an unbound one, which this row measured: the envelope was freed
+    /// and the payload's own heap — 27 B for a three-`String` struct — was
+    /// stranded, exactly the remainder B-2026-08-05-7 recorded as still
+    /// leaking. Supplying the interior walk is the same repair
+    /// B-2026-08-06-31 made for the `Option` sibling; the arm-consumption
+    /// machinery still disarms the whole action on a move-out, so a bound
+    /// payload is unaffected.
+    pub(super) fn user_enum_boxed_payload_variants(
+        &self,
+        te: &TypeExpr,
+    ) -> Vec<(String, String, TypeExpr)> {
         let TypeKind::Path(p) = &te.kind else {
             return vec![];
         };
@@ -4971,7 +4983,7 @@ impl<'ctx> super::Codegen<'ctx> {
             let concrete = Self::subst_type_params(&tys[0], &subst);
             let ll = self.llvm_type_for_type_expr(&concrete);
             if Self::llvm_type_word_count(ll) > area {
-                out.push((enum_name.to_string(), vname));
+                out.push((enum_name.to_string(), vname, concrete));
             }
         }
         out

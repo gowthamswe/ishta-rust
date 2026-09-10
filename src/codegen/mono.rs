@@ -4097,13 +4097,29 @@ impl<'ctx> super::Codegen<'ctx> {
                 && nonescaping_params.contains(&param_name)
             {
                 let mono_ty = self.subst_monomorph_type_params(&param.ty);
-                for (enum_name, variant) in self.user_enum_boxed_payload_variants(&mono_ty) {
+                for (enum_name, variant, payload_te) in
+                    self.user_enum_boxed_payload_variants(&mono_ty)
+                {
+                    // B-2026-09-10-2 — the interior, as at the other two sites.
+                    let inner = self.enum_boxed_payload_interior_drop(&payload_te);
                     self.track_boxed_enum_var_with_inner_drop(
                         &param_name,
                         alloca,
                         &enum_name,
                         &variant,
-                        None,
+                        inner,
+                    );
+                }
+                // B-2026-09-10-2 — the bodies half, mirroring the
+                // `compile_function` sibling. Registered after the memory
+                // action so the LIFO drain runs bodies before the free.
+                if let Some(bodies) = self.emit_generic_enum_payload_user_drop_bodies_fn(&mono_ty) {
+                    self.track_user_drop_var_with_fn(
+                        "",
+                        &param_name,
+                        alloca,
+                        bodies,
+                        crate::codegen::state::UserDropKind::ContainerElemBodies,
                     );
                 }
             }

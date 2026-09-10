@@ -34140,6 +34140,15 @@ fn test_set_element_drop_bodies_fire() {
 /// quadrant.
 #[test]
 fn test_enum_return_discard_runs_payload_body() {
+    // B-2026-09-10-2 — the `e` quadrant's ORACLE CHANGED. The note above
+    // recorded that an erased-generic payload is one "codegen structurally
+    // cannot see", so both backends were made silent there and this string
+    // omitted `drop 7 g7` / `drop 8 g8`. Codegen can see it now: the
+    // instantiation-keyed walker resolves `MyBox[Res]` through the enum's own
+    // substitution, so a discarded generic return runs its payload body on all
+    // three backends and no longer strands 32 B per call. Same move
+    // B-2026-08-02-14 made one container over for a generic STRUCT FIELD —
+    // parity holds in the FIRING direction now, not the silent-leak one.
     assert_eq!(
         run("struct Res { id: i64, name: String }\n\
              impl Drop for Res {\n\
@@ -34193,7 +34202,7 @@ fn test_enum_return_discard_runs_payload_body() {
                  mk_empty();\n\
                  println(\"end\");\n\
              }\n"),
-        "a\ndrop 1 h1\nb\ndrop 2 h2\nc\ndrop 3 m3\ndrop 4 m4\nd\nloud drop\ndrop 5 l5\nloud drop\ndrop 6 l6\ne\nf\nend\n"
+        "a\ndrop 1 h1\nb\ndrop 2 h2\nc\ndrop 3 m3\ndrop 4 m4\nd\nloud drop\ndrop 5 l5\nloud drop\ndrop 6 l6\ne\ndrop 7 g7\ndrop 8 g8\nf\nend\n"
     );
 }
 

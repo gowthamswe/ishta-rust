@@ -9677,6 +9677,165 @@ impl<'ctx> super::Codegen<'ctx> {
             }
             _ => return None,
         };
+        self.emit_payload_user_drop_bodies_core(fn_name, layout_key, arms)
+    }
+
+    /// The MEMORY-only drop for the value inside a user enum's heap-boxed
+    /// payload — what `track_boxed_enum_var_with_inner_drop` wants as its
+    /// `inner_drop_fn` so the box free takes the payload's own heap with it
+    /// instead of freeing the envelope alone.
+    ///
+    /// Deliberately NOT [`Self::emit_drop_fn_for_type_expr`]: that dispatcher
+    /// resolves some shapes through a module-name lookup which can hand back
+    /// the user-drop WRAPPER (body + fields + memory), and the body is already
+    /// owned by the bodies walker registered alongside this. Naming the two
+    /// memory-only syntheses directly is what keeps the body from running
+    /// twice — the trap B-2026-07-30-11 and B-2026-08-28-58 leg A both record.
+    ///
+    /// `None` for anything not a bare non-shared user struct or enum, which
+    /// leaves those shapes exactly as they were rather than guessing: an
+    /// instantiated payload (`G[Wrap[R]]`) needs the per-monomorph synthesis
+    /// and a `String`/`Vec` payload its own channel, neither of which
+    /// B-2026-09-10-2 measured.
+    pub(super) fn enum_boxed_payload_interior_drop(
+        &mut self,
+        payload_te: &TypeExpr,
+    ) -> Option<FunctionValue<'ctx>> {
+        let TypeKind::Path(p) = &payload_te.kind else {
+            return None;
+        };
+        if p.generic_args.is_some() {
+            return None;
+        }
+        let [name] = p.segments.as_slice() else {
+            return None;
+        };
+        let name = name.clone();
+        if self.type_decls.shared_types.contains_key(name.as_str()) {
+            return None;
+        }
+        if self.type_decls.struct_types.contains_key(name.as_str()) {
+            return self.emit_struct_drop_synthesis(&name);
+        }
+        if self.type_decls.enum_layouts.contains_key(name.as_str()) {
+            return self.emit_enum_drop_switch(&name);
+        }
+        None
+    }
+
+    /// The instantiation-keyed sibling of
+    /// [`Self::emit_enum_payload_user_drop_bodies_fn_skipping`], and the exact
+    /// COMPLEMENT of that walker's generic-parameter skip.
+    ///
+    /// The name-keyed walker resolves a payload by the declared type's NAME, so
+    /// it must skip a payload declared as one of the enum's own generic params
+    /// (B-2026-08-03-5: resolving `T` by name matched a user type called `T` and
+    /// ran a body over the erased layout's words). That skip is load-bearing and
+    /// stays. What it leaves behind is every payload this one takes: keyed on the
+    /// INSTANTIATION (`G[R2]`), substituting the enum's params so the payload
+    /// resolves to the monomorph's concrete type rather than to a name.
+    ///
+    /// The two partition the variants — a payload declared as a generic param
+    /// reaches only this walker, a payload declared concretely only the
+    /// name-keyed one — so they can never both run a body over the same slot.
+    ///
+    /// B-2026-09-10-2. `enum G[T] { X(T), Y }` at `T = R2` ran no `Drop` body in
+    /// ANY position (discarded local, fresh-temp argument, named-local argument)
+    /// and stranded the payload's heap — 27 B per value — while the monomorphic
+    /// control `enum Mono { P(R2), Q }` in the same positions was correct and
+    /// clean. The boxing threshold is the enum's own erased payload area, the
+    /// same figure `user_enum_boxed_payload_variants` derives to decide that a
+    /// monomorph outgrew it; that row closed the ENVELOPE leak and documented
+    /// the interior as its remainder, which is what this closes.
+    pub(super) fn emit_generic_enum_payload_user_drop_bodies_fn(
+        &mut self,
+        te: &TypeExpr,
+    ) -> Option<FunctionValue<'ctx>> {
+        let TypeKind::Path(p) = &te.kind else {
+            return None;
+        };
+        let enum_name = p.segments.last()?.as_str();
+        // The seeded pair keeps its own hardcoded-area head above.
+        if matches!(enum_name, "Option" | "Result") {
+            return None;
+        }
+        if self.type_decls.shared_types.contains_key(enum_name) {
+            return None;
+        }
+        let layout = self.type_decls.enum_layouts.get(enum_name)?.clone();
+        if layout.is_shared {
+            return None;
+        }
+        // The erased payload area, in words: anything wider is heap-boxed by
+        // `coerce_to_payload_words`, which is exactly the threshold the core's
+        // walk needs to know whether word 0 is a box pointer or the value.
+        let area = (layout.llvm_type.count_fields() as usize).saturating_sub(1);
+        let args: Vec<TypeExpr> = p
+            .generic_args
+            .as_ref()?
+            .iter()
+            .filter_map(|g| match g {
+                GenericArg::Type(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        if args.is_empty() {
+            return None;
+        }
+        let params = self.enum_generic_param_names(enum_name);
+        if params.is_empty() {
+            return None;
+        }
+        let subst: std::collections::HashMap<String, TypeExpr> =
+            params.iter().cloned().zip(args).collect();
+        let mut arms: Vec<(u64, TypeExpr, usize)> = Vec::new();
+        for (tag, vname, tys) in self.enum_variant_field_type_exprs(enum_name) {
+            // Single-payload variants only, for the reason
+            // `user_enum_boxed_payload_variants` gives: a multi-field variant
+            // packs its fields ACROSS the area rather than boxing one value, so
+            // the box-pointer read below would be reading a field.
+            if tys.len() != 1 {
+                continue;
+            }
+            // The complement gate. A concretely-declared payload belongs to the
+            // name-keyed walker and must not be walked twice.
+            let TypeKind::Path(pp) = &tys[0].kind else {
+                continue;
+            };
+            let Some(declared) = pp.segments.first() else {
+                continue;
+            };
+            if !params.contains(declared) {
+                continue;
+            }
+            let _ = &vname;
+            arms.push((tag, Self::subst_type_params(&tys[0], &subst), area));
+        }
+        if arms.is_empty() {
+            return None;
+        }
+        let fn_name = format!("__karac_dropelems_genum_{}", Self::display_mangle_te(te));
+        self.emit_payload_user_drop_bodies_core(fn_name, enum_name, arms)
+    }
+
+    /// The shared emission core behind
+    /// [`Self::emit_optres_payload_user_drop_bodies_fn`] and
+    /// [`Self::emit_generic_enum_payload_user_drop_bodies_fn`]: given the walker's
+    /// symbol name, the enum layout to read the tag and payload area out of, and
+    /// one `(tag, concrete payload type, boxing threshold)` row per candidate
+    /// arm, emit the tag switch that runs each payload's user `Drop` bodies.
+    ///
+    /// Factored out rather than duplicated because the boxed/inline decision, the
+    /// null-box guard and the own-body-then-contents ordering are the parts most
+    /// easily got wrong, and a second copy would be free to drift from this one.
+    /// Every caller-visible filter still lives here, so the two heads decide only
+    /// WHICH arms exist, never what happens to one.
+    fn emit_payload_user_drop_bodies_core(
+        &mut self,
+        fn_name: String,
+        layout_key: &str,
+        arms: Vec<(u64, TypeExpr, usize)>,
+    ) -> Option<FunctionValue<'ctx>> {
         // Keep only payload arms whose type is a non-shared user struct OR
         // user enum that runs a user drop (own body or Drop-bearing content).
         //

@@ -8905,6 +8905,14 @@ impl<'ctx> super::Codegen<'ctx> {
         // one.
         if self.enum_pattern_consumes_user_drop_payload(&enum_name, pattern) {
             self.suppress_container_elem_bodies_for_var(scrut_name);
+            // B-2026-09-10-2 — the MEMORY half of the same move-out for a
+            // heap-BOXED generic payload. The arm's binding owns the interior;
+            // the box drop keeps the envelope and must give up the interior
+            // walk it was given at the let site, or both free the payload's
+            // heap. Downgrade to box-only, exactly what B-2026-08-05-3 does for
+            // the boxed TUPLE payload; a no-op for a box drop that carries no
+            // inner drop, which is every one of them before this row.
+            self.clear_boxed_enum_inner_drop(scrut_name);
         }
     }
 
@@ -11292,13 +11300,42 @@ impl<'ctx> super::Codegen<'ctx> {
         else {
             return false;
         };
+        // B-2026-09-10-2 — a payload declared as one of the enum's OWN generic
+        // params counts as consumed, and used to count as nothing. The name
+        // lookup below resolves `T` against no user type, so
+        // `type_runs_user_drop` answered false and the arm's binding was left
+        // beside a live payload-bodies walker. That was harmless only while
+        // NOTHING registered such a walker; the instantiation-keyed one now
+        // does, so an arm binding the payload out would run the body twice and
+        // — through the box drop's interior walk — free its heap twice.
+        //
+        // Unconditional for a generic-param position rather than gated on the
+        // monomorph running a user drop: this predicate has no instantiation in
+        // hand, and when no walker was registered the suppression it gates
+        // retracts nothing. Measured: `G.X(r)` takes the interior whether the
+        // arm consumes `r` or only reads it, exactly as the per-element
+        // destructure does in `boxed_tuple_payload_arm_takes_ownership`.
+        // The SEEDED pair is excluded, as it is from every sibling gate in this
+        // family: `Option`/`Result` are declared `enum Option[+T]` in the baked
+        // stdlib, so they DO have generic params by this test, and their
+        // payload bodies ride the separate instantiation-driven `optres`
+        // machinery rather than any walker this predicate gates. Admitting them
+        // here disarmed that machinery — 25 `Option`/`Result` boxed-payload and
+        // arm-consumption fixtures, caught by the suite.
+        let own_params = if matches!(enum_name, "Option" | "Result") {
+            Vec::new()
+        } else {
+            self.enum_generic_param_names(enum_name)
+        };
         consumed.into_iter().any(|pos| {
             tes.get(pos)
                 .and_then(|te| match &te.kind {
                     TypeKind::Path(p) => p.segments.first().cloned(),
                     _ => None,
                 })
-                .is_some_and(|n| self.type_runs_user_drop(&n, &mut Vec::new()))
+                .is_some_and(|n| {
+                    own_params.contains(&n) || self.type_runs_user_drop(&n, &mut Vec::new())
+                })
         })
     }
 

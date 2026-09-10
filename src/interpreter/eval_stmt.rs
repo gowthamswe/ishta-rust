@@ -2034,10 +2034,37 @@ impl<'a> super::Interpreter<'a> {
                 continue;
             };
             // Declared-type-driven, exactly like the struct-field walk: a
-            // payload declared as a bare generic param is erased at the point
-            // codegen emits its glue, so both backends skip it and the residual
-            // is a leak — the safe direction.
-            if declared_head.as_deref() != Some(tn.as_str()) {
+            // payload whose declared head names a DIFFERENT concrete type than
+            // the value carries is an inconsistency, and running a body over it
+            // would run the wrong one.
+            //
+            // B-2026-09-10-2 — the one admitted exception, and it used to be
+            // the rule. A payload declared as one of the enum's OWN generic
+            // params never equals the value's type name, so this skipped it,
+            // on the stated reasoning that codegen was erased there too and
+            // "both backends skip it — the safe direction". Codegen is no
+            // longer silent: the instantiation-keyed walker
+            // (`emit_generic_enum_payload_user_drop_bodies_fn`) runs the body
+            // for exactly these payloads, so keeping the skip here is what
+            // WOULD now be the divergence. The interpreter has the concrete
+            // value in hand and needs no instantiation to reach it; the
+            // narrowness matters, which is why this admits the enum's declared
+            // params by name rather than dropping the check.
+            //
+            // The SEEDED pair is excluded. `enum Option[+T]` IS declared with a
+            // parameter in the baked stdlib, so it answers YES to this test —
+            // and must not, because an `Option`/`Result` payload body rides the
+            // instantiation-driven `run_optres_payload_user_drops` and
+            // `run_discarded_value_user_drops` arms instead. Admitting it ran
+            // the body a SECOND time beside those, measured as `dW7 dW7` on a
+            // declined `if let Ok(w) = mkerr()`.
+            let declared_is_own_param = !matches!(enum_name.as_str(), "Option" | "Result")
+                && declared_head.as_deref().is_some_and(|h| {
+                    self.enum_generic_param_names(enum_name)
+                        .iter()
+                        .any(|p| p == h)
+                });
+            if !declared_is_own_param && declared_head.as_deref() != Some(tn.as_str()) {
                 continue;
             }
             if self.program.drop_method_keys.contains_key(tn) {
@@ -2046,6 +2073,32 @@ impl<'a> super::Interpreter<'a> {
             }
             self.drop_user_drop_fields_of_value(&payload);
         }
+    }
+
+    /// The names of `enum_name`'s own declared generic parameters, from the
+    /// user program then the baked stdlib — the same two sources
+    /// [`Self::variant_payload_decls`] scans, so the declared payload types it
+    /// returns and the parameter names checked against them come from one
+    /// declaration. Empty for a non-generic or unknown enum. B-2026-09-10-2.
+    pub(crate) fn enum_generic_param_names(&self, enum_name: &str) -> Vec<String> {
+        fn scan(items: &[Item], enum_name: &str) -> Option<Vec<String>> {
+            items.iter().find_map(|item| match item {
+                Item::EnumDef(e) if e.name == enum_name => Some(
+                    e.generic_params
+                        .as_ref()
+                        .map(|g| g.params.iter().map(|p| p.name.clone()).collect())
+                        .unwrap_or_default(),
+                ),
+                _ => None,
+            })
+        }
+        scan(&self.program.items, enum_name)
+            .or_else(|| {
+                crate::prelude::STDLIB_PROGRAMS
+                    .iter()
+                    .find_map(|(_, p)| scan(&p.items, enum_name))
+            })
+            .unwrap_or_default()
     }
 
     /// `(field name, declared type)` for each payload position of

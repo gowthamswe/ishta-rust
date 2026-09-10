@@ -5417,6 +5417,14 @@ impl<'ctx> super::Codegen<'ctx> {
         // that discover this used to `return`, and both `return`s sat ABOVE
         // `track_struct_var`, so the heap a body-less aggregate carries was
         // simply never registered.
+        // B-2026-09-10-2 — the discarded return's INSTANTIATION, when the tail
+        // is a direct call to a known free function. Resolved once, before the
+        // bodies decision that may need it and the memory registration that
+        // does, so the two cannot disagree about which monomorph this temp is.
+        let discarded_generic_enum_te: Option<TypeExpr> = is_enum
+            .then(|| self.untyped_let_boxed_enum_te(tail))
+            .flatten()
+            .map(|te| self.subst_monomorph_type_params(&te));
         let mut memory_only = false;
         let bodies_fn = if !field_bodies_only {
             None
@@ -5434,7 +5442,23 @@ impl<'ctx> super::Codegen<'ctx> {
             // variant carries a Drop-bearing payload: nothing to run.
             match self.emit_enum_payload_user_drop_bodies_fn(&ret_ty_name) {
                 Some(f) => Some((f, UserDropKind::ContainerElemBodies)),
-                None => return,
+                // B-2026-09-10-2 — the walker above is keyed on the enum NAME
+                // and skips a payload declared as one of the enum's own generic
+                // params, so a discarded `mk_gen(7)` returning `MyBox[Res]` got
+                // no walker and this arm returned before the slot below even
+                // existed: no body on any backend and 32 B stranded per call.
+                // The comment this replaces read "an erased-generic payload
+                // stays silent on both backends", which was true and is the
+                // premise that changed — the instantiation-keyed walker sees
+                // it, and the interpreter's discard walk now runs it, so
+                // returning here would be the divergence.
+                None => match discarded_generic_enum_te
+                    .as_ref()
+                    .and_then(|te| self.emit_generic_enum_payload_user_drop_bodies_fn(te))
+                {
+                    Some(f) => Some((f, UserDropKind::ContainerElemBodies)),
+                    None => return,
+                },
             }
         } else if !self.type_runs_user_drop(&ret_ty_name, &mut Vec::new()) {
             // B-2026-08-29-32 — `struct P { a: String, b: i64 }` with no
@@ -5480,6 +5504,25 @@ impl<'ctx> super::Codegen<'ctx> {
         // battery's frees").
         if is_enum && self.enum_has_heap_payload(&ret_ty_name) {
             self.track_enum_var(&ret_ty_name, slot);
+        }
+        // B-2026-09-10-2 — the MEMORY half for a discarded generic enum return.
+        // `enum_has_heap_payload` reads the ERASED layout, where a generic
+        // payload records no heap, so the call above is a no-op here and the
+        // envelope plus its interior were nobody's. Registered in the same
+        // memory-before-bodies position, for the same LIFO reason.
+        if let Some(te) = discarded_generic_enum_te.as_ref() {
+            for (enum_name, variant, payload_te) in
+                self.user_enum_boxed_payload_variants(&te.clone())
+            {
+                let inner = self.enum_boxed_payload_interior_drop(&payload_te);
+                self.track_boxed_enum_var_with_inner_drop(
+                    "__owned_agg_tmp",
+                    slot,
+                    &enum_name,
+                    &variant,
+                    inner,
+                );
+            }
         }
         // Struct sibling of the enum memory call above (b164 leg 2): the
         // field-bodies walk is BODIES ONLY and the generic owned-temp

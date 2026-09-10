@@ -1367,12 +1367,42 @@ impl<'a> super::Interpreter<'a> {
         pattern: &Pattern,
         f: impl Fn(&str) -> bool,
     ) -> bool {
-        if !self.program.drop_method_keys.contains_key(enum_name) {
+        // B-2026-09-10-2 — the enum's OWN `impl Drop` is not the question when
+        // the PAYLOAD is what owes a body. `enum G[T] { X(T), Y }` declares no
+        // `Drop`, so this bailed before the read-through verdict was reached
+        // and every arm over it counted as consuming — which, once the payload
+        // walk stopped skipping generic payloads, took the body away from a
+        // read-only arm that the compiled backends run. A generic enum is
+        // admitted on the strength of its parameters; the empty-names check
+        // below still decides whether this pattern binds anything out.
+        if !self.program.drop_method_keys.contains_key(enum_name)
+            && (matches!(enum_name, "Option" | "Result")
+                || self.enum_generic_param_names(enum_name).is_empty())
+        {
             return false;
         }
         let names = self.arm_moved_user_drop_payload_bindings(enum_name, pattern);
         // Nothing bound out: leave the caller's own gate to decide, unchanged.
         !names.is_empty() && names.iter().all(|n| f(n))
+    }
+
+    /// Is `te` — a declared payload type of `enum_name` — one of that enum's
+    /// OWN generic parameters? The one spelling of the complement rule this
+    /// row adds in several places, so they cannot drift apart. B-2026-09-10-2.
+    pub(super) fn type_expr_is_own_generic_param(&self, enum_name: &str, te: &TypeExpr) -> bool {
+        // `Option`/`Result` are declared `enum Option[+T]` in the baked stdlib,
+        // so they answer YES to this test — and must not, because their payload
+        // bodies ride the instantiation-driven `optres` machinery that every
+        // caller here excludes them from by hand.
+        if matches!(enum_name, "Option" | "Result") {
+            return false;
+        }
+        let crate::ast::TypeKind::Path(p) = &te.kind else {
+            return false;
+        };
+        p.segments.first().is_some_and(|n| {
+            p.generic_args.is_none() && self.enum_generic_param_names(enum_name).contains(n)
+        })
     }
 
     pub(super) fn arm_moved_user_drop_payload_bindings(
@@ -1426,9 +1456,22 @@ impl<'a> super::Interpreter<'a> {
                     // and still decides whether this position runs a body at
                     // all; only the set of names taken from the position that
                     // passes it is widened.
+                    // B-2026-09-10-2 — a payload declared as one of the enum's
+                    // OWN generic params. `type_expr_runs_user_drop` resolves
+                    // `T` against no user type and answered false, so an arm
+                    // binding a generic payload out collected NO name and the
+                    // read-through verdict below could never be reached for it.
+                    // Over-approximating here is the idiom this collector
+                    // already documents twice: the caller's runtime-value
+                    // filter is what keeps a scalar monomorph (`G[i64]`)
+                    // silent, so admitting the position costs nothing when the
+                    // instantiation carries no body.
                     if decls
                         .get(i)
-                        .map(|(_, te)| self.type_expr_runs_user_drop(te))
+                        .map(|(_, te)| {
+                            self.type_expr_is_own_generic_param(enum_name, te)
+                                || self.type_expr_runs_user_drop(te)
+                        })
                         .unwrap_or(false)
                     {
                         out.extend(crate::cfg::pattern_bindings(sub));
@@ -1440,7 +1483,10 @@ impl<'a> super::Interpreter<'a> {
                     let runs = decls
                         .iter()
                         .find(|(dn, _)| dn.as_deref() == Some(fp.name.as_str()))
-                        .map(|(_, te)| self.type_expr_runs_user_drop(te))
+                        .map(|(_, te)| {
+                            self.type_expr_is_own_generic_param(enum_name, te)
+                                || self.type_expr_runs_user_drop(te)
+                        })
                         .unwrap_or(false);
                     if !runs {
                         continue;
@@ -1518,10 +1564,27 @@ impl<'a> super::Interpreter<'a> {
                 .collect(),
             _ => return false,
         };
+        // B-2026-09-10-2 — the codegen twin of this predicate
+        // (`enum_pattern_consumes_user_drop_payload`) grew the same clause, and
+        // for the same reason: a payload declared as one of the enum's OWN
+        // generic params resolves to no user type, so `type_expr_runs_user_drop`
+        // answered false and an arm binding it out never disarmed the
+        // scrutinee's payload walk. That was invisible while the walk itself
+        // skipped generic payloads; it no longer does, and without this the
+        // body runs at the arm's binding AND at the scrutinee — measured as
+        // `d2:9 took d2:9` against the compiled backends' `d2:9 took`.
+        // The seeded pair never reaches here (it returned above), so this needs
+        // no exclusion of its own; `type_expr_is_own_generic_param` carries one
+        // for the collector, which does see it.
+        let own_params = self.enum_generic_param_names(enum_name);
         consumed.into_iter().any(|pos| {
             decls
                 .get(pos)
-                .map(|(_, te)| self.type_expr_runs_user_drop(te))
+                .map(|(_, te)| {
+                    matches!(&te.kind, crate::ast::TypeKind::Path(p)
+                        if p.segments.first().is_some_and(|n| own_params.contains(n)))
+                        || self.type_expr_runs_user_drop(te)
+                })
                 .unwrap_or(false)
         })
     }

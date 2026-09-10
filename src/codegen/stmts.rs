@@ -71,6 +71,31 @@ const BUILTIN_LEN_CALLEES: &[&str] = &[
 ];
 
 impl<'ctx> super::Codegen<'ctx> {
+    /// Recover a `let`'s user-generic-enum instantiation and emit the
+    /// instantiation-keyed payload-bodies walker for it, or `None` when the
+    /// binding is not one.
+    ///
+    /// The instantiation comes from the annotation when there is one and from
+    /// `enum_inst_type_exprs` (keyed on the RHS span) when there is not — the
+    /// same pair of sources, in the same order, that the box-drop registration
+    /// a few hundred lines up already reads, so the memory action and the
+    /// bodies action can never disagree about which monomorph this binding is.
+    /// B-2026-09-10-2.
+    fn let_generic_enum_payload_bodies_walker(
+        &mut self,
+        ty: Option<&TypeExpr>,
+        value: &Expr,
+    ) -> Option<inkwell::values::FunctionValue<'ctx>> {
+        let te = ty.cloned().or_else(|| {
+            self.type_decls
+                .enum_inst_type_exprs
+                .get(&(value.span.offset, value.span.length))
+                .cloned()
+        })?;
+        let te = self.subst_monomorph_type_params(&te);
+        self.emit_generic_enum_payload_user_drop_bodies_fn(&te)
+    }
+
     /// Reclaim the value a `mut ref` AGGREGATE parameter is about to have
     /// overwritten — B-2026-08-05-39.
     ///
@@ -8013,9 +8038,14 @@ impl<'ctx> super::Codegen<'ctx> {
                                 .then(|| self.variables.get(var_name.as_str()).copied())
                                 .flatten()
                             {
-                                for (enum_name, variant) in boxed {
+                                for (enum_name, variant, payload_te) in boxed {
+                                    // B-2026-09-10-2 — the INTERIOR this site
+                                    // passed as `None`. See the param site in
+                                    // `functions.rs` for why the resolver is
+                                    // the memory-only one.
+                                    let inner = self.enum_boxed_payload_interior_drop(&payload_te);
                                     self.track_boxed_enum_var_with_inner_drop(
-                                        var_name, slot.ptr, &enum_name, &variant, None,
+                                        var_name, slot.ptr, &enum_name, &variant, inner,
                                     );
                                 }
                             }
@@ -8644,6 +8674,24 @@ impl<'ctx> super::Codegen<'ctx> {
                             } else if let Some(bodies) = self
                                 .emit_enum_payload_user_drop_bodies_fn_skipping(&name, &view_slots)
                             {
+                                self.track_user_drop_var_with_fn(
+                                    "",
+                                    var_name,
+                                    alloca,
+                                    bodies,
+                                    UserDropKind::ContainerElemBodies,
+                                );
+                            } else if let Some(bodies) =
+                                self.let_generic_enum_payload_bodies_walker(ty.as_ref(), value)
+                            {
+                                // B-2026-09-10-2 — the walker above is keyed on
+                                // the enum NAME and skips a payload declared as
+                                // one of the enum's own generic params, so a
+                                // `let p = G.X(mkr(1));` over `enum G[T]` ran no
+                                // `Drop` body at all. Reached only when the
+                                // name-keyed walker declines, and the two
+                                // partition the variants, so neither slot can
+                                // be walked twice.
                                 self.track_user_drop_var_with_fn(
                                     "",
                                     var_name,

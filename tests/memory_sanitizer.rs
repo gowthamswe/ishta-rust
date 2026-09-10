@@ -84498,6 +84498,91 @@ fn main() {
         );
     }
 
+    /// B-2026-09-10-2 — a USER GENERIC enum's `Drop`-bearing payload, in every
+    /// position, on both the body channel and the memory one.
+    ///
+    /// `enum G[T] { X(T), Y }` at `T = R2` ran NO `Drop` body anywhere and
+    /// stranded the payload's own heap — 27 B per value, the three `String`s —
+    /// while the monomorphic control `enum Mono { P(R2), Q }` in the same
+    /// positions was correct and clean. Only the enum's genericity differs, and
+    /// that is the whole of it: the by-value param the row was filed against
+    /// was never the axis (a DISCARDED LOCAL that is passed nowhere loses the
+    /// body identically), and neither was boxing (a one-word `R3` payload that
+    /// never boxes loses it too).
+    ///
+    /// Three name-keyed gates each declined a generic-param payload, because a
+    /// generic enum's declared payload IS the parameter and resolving `T` by
+    /// name would match a user type called `T` (B-2026-08-03-5). That skip is
+    /// load-bearing and stays; what closes this is its exact COMPLEMENT, keyed
+    /// on the INSTANTIATION rather than the name, so the two partition the
+    /// variants and neither slot can be walked twice.
+    ///
+    /// The `k*` cells are the coordination this needed. An arm that binds the
+    /// payload out takes the interior — whether it CONSUMES it (`let z = r`) or
+    /// only READS it (`r.s.len()`) — so the box drop must give up the interior
+    /// walk and the payload-bodies walker must retract, or the two owners free
+    /// the same buffer: a `double free detected in tcache 2` on the first pass
+    /// at this fix, caught here and not by the leak count.
+    ///
+    /// `k1` is the row's own cell 4, a run-vs-build divergence that predates
+    /// this row's parent: it ran the body on the compiled backends and NOTHING
+    /// under `--interp`. It is fixed here rather than separately because the
+    /// interpreter mirrored the codegen gap ON PURPOSE — the two had to move
+    /// together or one of them would be wrong at every cell.
+    ///
+    /// NOTE ON THE CONTROLS: every payload is built from an f-string, never a
+    /// string LITERAL. A literal is static and never reaches the allocator, so
+    /// a cell built from one sits at the baseline alloc count and proves
+    /// nothing about a leak — the row records losing a wrong answer to exactly
+    /// that for a while, reporting 0 bytes lost and reading as already-fixed.
+    #[test]
+    fn asan_generic_enum_payload_runs_its_drop_and_frees_its_interior() {
+        assert_clean_asan_run(
+            r#"
+struct R2 { s: String, t: String, u: String }
+impl Drop for R2 { fn drop(mut ref self) { println(f"d2:{self.s.len()}") } }
+struct R3 { id: i64 }
+impl Drop for R3 { fn drop(mut ref self) { println(f"d3:{self.id}") } }
+
+enum G[T] { X(T), Y }
+enum Two[T] { A(T), B(T), C }
+enum Mono { P(R2), Q }
+
+fn mkr(n: i64) -> R2 { return R2 { s: f"aaaaaaaa{n}", t: f"bbbbbbbb{n}", u: f"cccccccc{n}" }; }
+fn holdgen(g: G[R2]) { println("hg"); }
+fn holdmono(m: Mono) { println("hm"); }
+
+fn main() {
+    let p = G.X(mkr(1));                    println("c1");
+    let q = Mono.P(mkr(2));                 println("c2");
+    holdgen(G.X(mkr(3)));                   println("c3");
+    holdmono(Mono.P(mkr(4)));               println("c4");
+    let a = G.X(mkr(5)); holdgen(a);        println("c5");
+    let b = Mono.P(mkr(6)); holdmono(b);    println("c6");
+
+    let r1 = G.X(mkr(7));
+    match r1 { G.X(r) => { println(f"k1:{r.s.len()}"); }, G.Y => { println("y"); } }
+    let r2 = G.X(mkr(8));
+    match r2 { G.X(r) => { let z = r; println("k2"); }, G.Y => { println("y"); } }
+    let r3 = G.X(mkr(9));
+    match r3 { G.X(_) => { println("k3"); }, G.Y => { println("y"); } }
+
+    let w = G.X(R3 { id: 7 });              println("k4");
+    let t1 = Two.A(mkr(10));
+    let t2 = Two.B(mkr(11));                println("k5");
+    let u: G[R2] = G.Y;                     println("k6");
+    println("end");
+}
+"#,
+            &[
+                "d2:9", "c1", "d2:9", "c2", "hg", "d2:9", "c3", "hm", "d2:9", "c4", "hg", "d2:9",
+                "c5", "hm", "d2:9", "c6", "k1:9", "d2:9", "d2:9", "k2", "k3", "d2:9", "d3:7", "k4",
+                "d2:10", "d2:10", "k5", "k6", "end",
+            ],
+            "asan_generic_enum_payload_runs_its_drop_and_frees_its_interior",
+        );
+    }
+
     /// B-2026-09-06-72 — a `shared` FIELD's 16-byte refcount block when the
     /// owning struct travels out of a function inside an AGGREGATE.
     ///

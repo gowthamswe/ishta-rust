@@ -2627,13 +2627,40 @@ impl<'ctx> super::Codegen<'ctx> {
                             .contains(&param_name))
                 {
                     let mono_ty = self.subst_monomorph_type_params(&param.ty);
-                    for (enum_name, variant) in self.user_enum_boxed_payload_variants(&mono_ty) {
+                    for (enum_name, variant, payload_te) in
+                        self.user_enum_boxed_payload_variants(&mono_ty)
+                    {
+                        // B-2026-09-10-2 — the INTERIOR, which this passed as
+                        // `None` while freeing the envelope around it. The
+                        // memory-only resolver is the right one: the payload's
+                        // user `Drop` BODY rides the separate bodies walker
+                        // registered below, and handing the wrapper here would
+                        // run that body twice.
+                        let inner = self.enum_boxed_payload_interior_drop(&payload_te);
                         self.track_boxed_enum_var_with_inner_drop(
                             &param_name,
                             alloca,
                             &enum_name,
                             &variant,
-                            None,
+                            inner,
+                        );
+                    }
+                    // B-2026-09-10-2 — the BODIES half of the same param. The
+                    // name-keyed walker skips a generic-param payload by
+                    // contract, so a by-value `G[R2]` param ran no `Drop` body
+                    // at all; the instantiation-keyed walker is its exact
+                    // complement. Registered AFTER the memory action so the
+                    // frame's LIFO drain runs the bodies BEFORE the free they
+                    // read through (the B-2026-08-01-2 rule).
+                    if let Some(bodies) =
+                        self.emit_generic_enum_payload_user_drop_bodies_fn(&mono_ty)
+                    {
+                        self.track_user_drop_var_with_fn(
+                            "",
+                            &param_name,
+                            alloca,
+                            bodies,
+                            crate::codegen::state::UserDropKind::ContainerElemBodies,
                         );
                     }
                     // B-2026-08-06-9 leg A — the SEEDED pair (`Option` /
