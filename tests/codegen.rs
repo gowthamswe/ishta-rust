@@ -153056,6 +153056,129 @@ fn main() {
         }
     }
 
+    /// B-2026-09-10-1 — passing `Some(<a Vec of heap-bearing structs>)` to a
+    /// function double freed on every compiled backend, at both opt levels and
+    /// either way on auto-par, while `--interp` was correct. No `match`, no
+    /// index, no second binding: `fn f(x: Option[Vec[S]]) { println("in") }`
+    /// with `f(Some([S { s: f".." }, ..]))` is the whole reproducer.
+    ///
+    /// The callee entry-copies an owned `Option[Vec[T]]` payload so the two
+    /// frames own separate buffers. That copy resolved its element `TypeExpr`
+    /// through `.filter(elem_te_needs_direct_recursive_drain)` — a NAME LIST
+    /// (`String`/`Vec`/`Map`/`Set`), and only the FALLBACK half of
+    /// `vec_element_drain_fn`, whose primary half
+    /// (`vec_elem_agg_drop_for_type_expr`) is what answers for a user struct.
+    /// So the DROP side drained a `Vec[S]` payload's elements while the COPY
+    /// side was handed no element type at all and skipped its entire element
+    /// chain — including the aggregate arm written for exactly this shape. The
+    /// "copy" was a flat memcpy of the element array, aliasing every element's
+    /// `String` with the caller's, and both frames then freed it.
+    ///
+    /// The user-ENUM sibling one function up already passes element depth
+    /// unconditionally, with the reason in its comment ("unconditional since
+    /// the drop side drains too"), which is why an enum payload of the same
+    /// type was always correct. The two envelope paths now match it.
+    ///
+    /// Cells 6-8 are the shapes that were already right, and each names a
+    /// different reason: a no-heap element has nothing to alias, a bare
+    /// `Vec[S]` argument never builds an envelope payload, and a local option
+    /// in one frame is never entry-copied because there is no callee.
+    #[test]
+    fn e2e_inline_optres_vec_payload_entry_copy_is_element_deep() {
+        const S: &str = "struct S { s: String }\n";
+        for (label, src, want) in [
+            // 1 — the minimal reproducer: the param is never even looked at.
+            (
+                "option-param-untouched",
+                "fn plainV(x: Option[Vec[S]]) { println(\"in\"); }\n\
+                 fn main() { plainV(Some([S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }])); }\n",
+                "in\n",
+            ),
+            // 2 — the `Result` half, which resolves its element type through
+            //     the same filter and said so in its own comment.
+            (
+                "result-ok-half",
+                "fn plainV(x: Result[Vec[S], i64]) {\n\
+                 \x20   match x { Ok(t) => { println(f\"s:{t.len()}\") } Err(e) => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() { plainV(Ok([S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }])); }\n",
+                "s:2\n",
+            ),
+            // 3 — a NAMED local as the payload source rather than a literal.
+            (
+                "named-local-source",
+                "fn plainV(x: Option[Vec[S]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[S] = [S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }];\n\
+                 \x20   plainV(Some(v));\n\
+                 }\n",
+                "s:2\n",
+            ),
+            // 4 — TWO fields, one of them scalar. Rules out the first guess,
+            //     that a single-field struct was being mistaken for a
+            //     `{ptr,len,cap}` vec-struct.
+            (
+                "two-field-struct",
+                "struct S2 { a: String, b: i64 }\n\
+                 fn plainV(x: Option[Vec[S2]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() { plainV(Some([S2 { a: f\"aaaaaaaa0\", b: 1 }, S2 { a: f\"bbbbbbbb1\", b: 2 }])); }\n",
+                "s:2\n",
+            ),
+            // 5 — the arm actually reads an element through, so the copy has
+            //     to be correct rather than merely balanced.
+            (
+                "arm-reads-element",
+                "fn plainV(x: Option[Vec[S]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[0].s}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[S] = [S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }];\n\
+                 \x20   plainV(Some(v));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 6 — CONTROL: a no-heap element has nothing to alias, so the flat
+            //     memcpy was always a complete copy for it.
+            (
+                "no-heap-element-control",
+                "struct S3 { n: i64 }\n\
+                 fn plainV(x: Option[Vec[S3]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() { plainV(Some([S3 { n: 1 }, S3 { n: 2 }])); }\n",
+                "s:2\n",
+            ),
+            // 7 — CONTROL: the same `Vec[S]` as a bare argument. No envelope,
+            //     so none of this machinery runs and it was always correct.
+            (
+                "bare-vec-argument-control",
+                "fn plainV(x: Vec[S]) { println(f\"s:{x.len()}\"); }\n\
+                 fn main() { plainV([S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }]); }\n",
+                "s:2\n",
+            ),
+            // 8 — CONTROL: one frame, no call. There is no entry copy to get
+            //     wrong, which is what made the call boundary the tell.
+            (
+                "local-option-one-frame-control",
+                "fn main() {\n\
+                 \x20   let v: Vec[S] = [S { s: f\"aaaaaaaa0\" }, S { s: f\"bbbbbbbb1\" }];\n\
+                 \x20   let o: Option[Vec[S]] = Some(v);\n\
+                 \x20   match o { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+                 }\n",
+                "s:2\n",
+            ),
+        ] {
+            let Some(out) = run_program(&format!("{S}{src}")) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by

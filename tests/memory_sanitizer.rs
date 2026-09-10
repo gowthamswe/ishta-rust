@@ -84672,4 +84672,74 @@ fn main() {
             "b22-scalar-inner-control",
         );
     }
+
+    /// B-2026-09-10-1 — the callee's entry copy of an owned
+    /// `Option`/`Result` `Vec[T]` payload was element-deep only for a
+    /// name-listed element (`String`/`Vec`/`Map`/`Set`), so a user-struct
+    /// element was flat-memcpy'd and both frames freed the same field heap.
+    ///
+    /// The fix ADDS a deep copy, which is the direction that trades a double
+    /// free for a leak — so the controls here matter as much as the failing
+    /// cells: cells 4 and 5 have no heap to duplicate and no envelope at all,
+    /// and LSan on the Linux CI leg is what keeps the new clone owned.
+    #[test]
+    fn asan_inline_optres_vec_payload_entry_copy_is_element_deep() {
+        const S: &str = "struct S { s: String }\n";
+        // 1 — the minimal reproducer: the param is never read.
+        assert_clean_asan_run(
+            &format!(
+                "{S}fn plainV(x: Option[Vec[S]]) {{ println(\"in\"); }}\n\
+                 fn main() {{ plainV(Some([S {{ s: f\"aaaaaaaa0\" }}, S {{ s: f\"bbbbbbbb1\" }}])); }}\n"
+            ),
+            &["in"],
+            "b1-option-param-untouched",
+        );
+        // 2 — the `Result` half, which shares the resolution.
+        assert_clean_asan_run(
+            &format!(
+                "{S}fn plainV(x: Result[Vec[S], i64]) {{\n\
+                 \x20   match x {{ Ok(t) => {{ println(f\"s:{{t.len()}}\") }} Err(e) => {{ println(\"n\") }} }}\n\
+                 }}\n\
+                 fn main() {{ plainV(Ok([S {{ s: f\"aaaaaaaa0\" }}, S {{ s: f\"bbbbbbbb1\" }}])); }}\n"
+            ),
+            &["s:2"],
+            "b1-result-ok-half",
+        );
+        // 3 — the arm reads an element through, so the copy must be correct
+        //     and not merely balanced.
+        assert_clean_asan_run(
+            &format!(
+                "{S}fn plainV(x: Option[Vec[S]]) {{\n\
+                 \x20   match x {{ Some(t) => {{ println(f\"s:{{t[0].s}}\") }} None => {{ println(\"n\") }} }}\n\
+                 }}\n\
+                 fn main() {{\n\
+                 \x20   let v: Vec[S] = [S {{ s: f\"aaaaaaaa0\" }}, S {{ s: f\"bbbbbbbb1\" }}];\n\
+                 \x20   plainV(Some(v));\n\
+                 }}\n"
+            ),
+            &["s:aaaaaaaa0"],
+            "b1-arm-reads-element",
+        );
+        // 4 — CONTROL, leak direction: a no-heap element must not gain a
+        //     clone it would then have to own.
+        assert_clean_asan_run(
+            "struct S3 { n: i64 }\n\
+             fn plainV(x: Option[Vec[S3]]) {\n\
+             \x20   match x { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() { plainV(Some([S3 { n: 1 }, S3 { n: 2 }])); }\n",
+            &["s:2"],
+            "b1-no-heap-element-control",
+        );
+        // 5 — CONTROL: the same payload with no envelope, which never reaches
+        //     the changed resolution.
+        assert_clean_asan_run(
+            &format!(
+                "{S}fn plainV(x: Vec[S]) {{ println(f\"s:{{x.len()}}\"); }}\n\
+                 fn main() {{ plainV([S {{ s: f\"aaaaaaaa0\" }}, S {{ s: f\"bbbbbbbb1\" }}]); }}\n"
+            ),
+            &["s:2"],
+            "b1-bare-vec-argument-control",
+        );
+    }
 }

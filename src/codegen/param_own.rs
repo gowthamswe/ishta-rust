@@ -3759,8 +3759,32 @@ impl<'ctx> super::Codegen<'ctx> {
             if self.is_string_type_expr(&payload_te) {
                 (self.context.i8_type().into(), None)
             } else if let Some(et) = self.extract_vec_elem_type(&payload_te) {
-                let inner = crate::codegen::helpers::vec_inner_type_expr(&payload_te)
-                    .filter(Self::elem_te_needs_direct_recursive_drain);
+                // B-2026-09-10-1 — element depth, UNCONDITIONAL, exactly as the
+                // user-enum sibling above already passes it ("element depth,
+                // unconditional since the drop side drains too").
+                //
+                // This used to `.filter(Self::elem_te_needs_direct_recursive_drain)`,
+                // which is a NAME LIST — `String`/`Vec`/`Map`/`Set` — and is only
+                // the FALLBACK half of `vec_element_drain_fn`, whose primary half
+                // (`vec_elem_agg_drop_for_type_expr`) is what answers for a user
+                // struct. So the drop side drained a `Vec[S]` payload's elements
+                // while the copy side was handed no element type at all, and
+                // `emit_vecstr_defensive_copy` skipped its whole element chain —
+                // including the aggregate arm written for exactly this shape.
+                //
+                // The callee's "copy" was then a flat memcpy of the element
+                // array, aliasing every element's heap field with the caller's.
+                // Both frames drained: `free(): double free detected in tcache 2`
+                // on every compiled backend, at both opt levels and either way on
+                // auto-par, for nothing more than `plainV(Some(vec_of_structs))`
+                // — no match, no index, no second binding. `--interp` was correct.
+                //
+                // Passing the element type unconditionally cannot over-copy: the
+                // copy's chain is a closed `if / else if` over weak, String/Vec,
+                // Map/Set, heap-owning aggregate and bare-`shared` elements with
+                // NO trailing `else`, so an element it has no arm for emits
+                // exactly what `None` emitted.
+                let inner = crate::codegen::helpers::vec_inner_type_expr(&payload_te);
                 (et, inner)
             } else {
                 // B-2026-07-04-7 — a non-shared struct/enum payload (BOXED when
@@ -3909,8 +3933,10 @@ impl<'ctx> super::Codegen<'ctx> {
                 if self.is_string_type_expr(&half_te) {
                     (self.context.i8_type().into(), None)
                 } else if let Some(et) = self.extract_vec_elem_type(&half_te) {
-                    let inner = crate::codegen::helpers::vec_inner_type_expr(&half_te)
-                        .filter(Self::elem_te_needs_direct_recursive_drain);
+                    // B-2026-09-10-1 — unconditional, for the reason spelled out
+                    // at the Option sibling this comment's neighbour points at.
+                    // `Result[Vec[S], E]` reproduced the same double free.
+                    let inner = crate::codegen::helpers::vec_inner_type_expr(&half_te);
                     (et, inner)
                 } else {
                     continue;
