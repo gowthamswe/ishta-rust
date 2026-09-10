@@ -4734,9 +4734,31 @@ impl<'ctx> super::Codegen<'ctx> {
     /// Mirrors the fan-out index computation in `functions.rs`'s deque-head
     /// gate: parallel groups with no captured-container mutation (those run
     /// sequentially anyway), plus recognized loop reductions and disjoint-write
-    /// loops. Answers `false` whenever no concurrency analysis was threaded in,
-    /// so a `KARAC_AUTO_PAR=0` build is byte-identical to not having this.
+    /// loops. Answers `false` whenever auto-par will emit no worker — either
+    /// because it is disabled or because no concurrency analysis was threaded
+    /// in — so a `KARAC_AUTO_PAR=0` build is byte-identical to not having this.
+    /// The disabled half is checked EXPLICITLY rather than inferred from an
+    /// empty analysis, because the analysis runs regardless (B-2026-09-07-21).
     fn expr_in_fanned_out_stmt(&self, e: &Expr) -> bool {
+        // B-2026-09-07-21 — `KARAC_AUTO_PAR=0` MUST answer `false`, and asking
+        // the analysis alone does not deliver that.
+        //
+        // The doc above used to claim this predicate is inert without auto-par
+        // "so a `KARAC_AUTO_PAR=0` build is byte-identical to not having this".
+        // It is not: `auto_par_disabled` short-circuits the EMISSION
+        // (`compile_function_body` returns `compile_block` before any
+        // parallel-group dispatch), while `concurrency_decisions` is populated
+        // by the analysis EITHER WAY. So the decline still fired in a build
+        // that emits no `__par_branch_*` worker at all, and the value it
+        // declined an owner for had no other one: 38 B in 1 block, on exactly
+        // the cell whose auto-par twin is clean.
+        //
+        // `functions.rs`'s deque-head gate — the gate this predicate's doc says
+        // it mirrors — carries this same check with the reason spelled out
+        // above it. The mirror dropped it; this restores it.
+        if self.conc.auto_par_disabled {
+            return false;
+        }
         let Some(dec) = self.parallel_groups_for_current_fn() else {
             return false;
         };

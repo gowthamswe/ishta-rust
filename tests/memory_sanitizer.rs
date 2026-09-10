@@ -29,7 +29,9 @@ mod common;
 
 #[cfg(feature = "llvm")]
 mod memory_sanitizer_tests {
-    use karac::codegen::{compile_to_object, link_executable_with_sanitizer};
+    use karac::codegen::{
+        compile_to_object, compile_to_object_sequential_lane, link_executable_with_sanitizer,
+    };
     use std::path::Path;
     use std::process::Command;
     use std::sync::OnceLock;
@@ -11045,6 +11047,24 @@ fn main() {
         count_allocs: bool,
         auto_par: bool,
     ) -> Option<(String, String, std::process::ExitStatus)> {
+        run_under_asan_lane(src, label, detect_leaks, count_allocs, auto_par, false)
+    }
+
+    /// [`run_under_asan_opts`] plus the SEQUENTIAL-LANE switch
+    /// (B-2026-09-07-21). `seq_lane` compiles through
+    /// `compile_to_object_sequential_lane`, which is what `KARAC_AUTO_PAR=0`
+    /// actually does: the analysis still runs and only the fan-out EMISSION is
+    /// gated. Passing `auto_par: false` is a DIFFERENT configuration — it
+    /// withholds the analysis altogether — and cannot reach the shapes whose
+    /// codegen is keyed on a populated `concurrency_decisions`.
+    fn run_under_asan_lane(
+        src: &str,
+        label: &str,
+        detect_leaks: bool,
+        count_allocs: bool,
+        auto_par: bool,
+        seq_lane: bool,
+    ) -> Option<(String, String, std::process::ExitStatus)> {
         // Compile on a FAT-STACK thread, matching how `karac` actually runs.
         //
         // This harness drives the compiler phases IN-PROCESS, and a cargo test
@@ -11079,7 +11099,14 @@ fn main() {
                 .name(thread_name)
                 .stack_size(16 * 1024 * 1024)
                 .spawn_scoped(scope, || {
-                    run_under_asan_opts_inner(src, label, detect_leaks, count_allocs, auto_par)
+                    run_under_asan_opts_inner(
+                        src,
+                        label,
+                        detect_leaks,
+                        count_allocs,
+                        auto_par,
+                        seq_lane,
+                    )
                 })
                 .expect("failed to spawn asan-harness compile thread")
                 .join()
@@ -11093,6 +11120,7 @@ fn main() {
         detect_leaks: bool,
         count_allocs: bool,
         auto_par: bool,
+        seq_lane: bool,
     ) -> Option<(String, String, std::process::ExitStatus)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -11179,12 +11207,22 @@ fn main() {
             let effects = karac::effectcheck(&parsed.program);
             karac::concurrency_analyze_typed(&parsed.program, &effects, Some(&typed))
         });
-        if let Err(e) = compile_to_object(
-            &parsed.program,
-            &obj_path,
-            Some(&ownership),
-            concurrency.as_ref(),
-        ) {
+        let compiled = if seq_lane {
+            compile_to_object_sequential_lane(
+                &parsed.program,
+                &obj_path,
+                Some(&ownership),
+                concurrency.as_ref(),
+            )
+        } else {
+            compile_to_object(
+                &parsed.program,
+                &obj_path,
+                Some(&ownership),
+                concurrency.as_ref(),
+            )
+        };
+        if let Err(e) = compiled {
             panic!(
                 "[{label}] CODEGEN FAILED — this is a real failure, not missing setup.\n                   {e}\n                   The program under test does not compile, so this fixture asserts nothing. \
                  Either fix the codegen gap, or mark the test `#[ignore = \"<gap>\"]` so it \
@@ -13154,6 +13192,38 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
     /// clean. The auto-par lane is still covered — for OUTPUT and EXIT STATUS,
     /// which is what the double free actually broke — by the `codegen.rs` and
     /// `par_codegen.rs` twins, neither of which inspects leaks.
+    /// Run a fixture in the SEQUENTIAL LANE — analysis on, fan-out emission
+    /// off — and assert it is clean. This is `KARAC_AUTO_PAR=0`
+    /// (B-2026-09-07-21).
+    ///
+    /// NOT interchangeable with [`assert_clean_asan_run_no_auto_par`], which
+    /// withholds the concurrency analysis entirely. Every codegen predicate
+    /// keyed on `concurrency_decisions` takes its no-analysis path there, so
+    /// that helper reports CLEAN for the whole class of defects that only
+    /// appear when the table is populated and the backend is gated — which is
+    /// exactly the configuration a real `KARAC_AUTO_PAR=0` build produces.
+    fn assert_clean_asan_run_seq_lane(src: &str, expected_stdout: &[&str], label: &str) {
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((stdout, _stderr, status)) =
+            run_under_asan_lane(src, label, true, true, true, true)
+        else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported a memory error (exit code {:?}) in the SEQUENTIAL lane. \
+             A `LeakSanitizer` report here with the auto-par lane clean means a registration \
+             was declined for a fan-out worker that this lane never emits.",
+            status.code()
+        );
+        let got: Vec<&str> = stdout.trim().lines().collect();
+        assert_eq!(got, expected_stdout, "[{label}] stdout mismatch");
+    }
+
     fn assert_clean_asan_run_no_auto_par(src: &str, expected_stdout: &[&str], label: &str) {
         if !asan_available() {
             eprintln!("[{label}] ASAN unavailable on this host — skipping");
@@ -68396,6 +68466,71 @@ fn main() { println(go()); }
             "discarded_literal_projected_field_if_else_read_after",
         );
     }
+    /// B-2026-09-07-21 cell 1 — the SEQUENTIAL lane of the `a statement
+    /// follows` shape, which auto-par's own fixture cannot see.
+    ///
+    /// The cell is already covered at `KARAC_AUTO_PAR=1` by
+    /// `asan_discarded_literal_projected_field_keeps_its_owner`, and passes
+    /// there. That is not a claim about this lane: the row was filed because
+    /// the same program at `KARAC_AUTO_PAR=0` stranded 38 B, and every
+    /// `assert_clean_asan_run` in this file runs with auto-par ON, so no
+    /// fixture in the suite exercised the leaking side.
+    ///
+    /// What made the two lanes disagree was a DROPPED GUARD rather than a
+    /// genuine conflict. `expr_in_fanned_out_stmt` declines the
+    /// discarded-literal registration for a statement auto-par fans out,
+    /// because the `__par_branch_*` worker already frees the value. Its own
+    /// doc claimed it answers `false` when no concurrency analysis was
+    /// threaded in — but `auto_par_disabled` gates only the EMISSION, and
+    /// `concurrency_decisions` is populated either way, exactly as
+    /// `functions.rs`'s deque-head gate says in the comment above its own
+    /// `auto_par_disabled` check. So at `KARAC_AUTO_PAR=0` the decline still
+    /// fired and no worker existed to free anything.
+    #[test]
+    fn asan_discarded_literal_projected_field_seq_lane_keeps_its_owner() {
+        assert_clean_asan_run_seq_lane(
+            "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn main() { println(go()); }\n\
+             fn go() -> i64 { let t = mkp(9);\n\
+             \x20 if seed() > 0 { P { a: t.a, b: 1 } } else { P { a: payload(), b: 2 } };\n\
+             \x20 let z = payload();\n\
+             \x20 z.len() - z.len() + 1 }\n",
+            &["1"],
+            "discarded_literal_projected_field_seq_lane",
+        );
+    }
+
+    /// B-2026-09-07-21 cell 2 — a `.clone()` field in a discarded STATEMENT
+    /// literal, which leaks on EVERY surface rather than in one lane.
+    ///
+    /// A `.clone()` MINTS: the literal holds its own fresh buffer and the
+    /// source keeps its own, which is exactly the population the discard
+    /// registrar is meant to own. It did not, and the row could not say
+    /// whether the registrar was never entered or declined further in. It
+    /// declines further in: `discard_tuple_elem_is_fresh_expr` had arms for
+    /// literals, tuples and `Call` but NONE for `MethodCall`, so the field
+    /// fell to the catch-all, failed the scalar test, and one non-fresh field
+    /// disqualified the whole literal.
+    ///
+    /// Both lanes are asserted because the row measured this one on every
+    /// surface, unlike cell 1.
+    #[test]
+    fn asan_discarded_literal_cloned_field_keeps_its_owner() {
+        const SRC: &str = "struct P { a: String, b: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn payload() -> String { f\"payload-{seed()}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }\n\
+             fn mkp(n: i64) -> P { return P { a: payload(), b: n }; }\n\
+             fn main() { println(go()); }\n\
+             fn go() -> i64 { let t = mkp(9);\n\
+             \x20 P { a: t.a.clone(), b: 1 };\n\
+             \x20 t.a.len() - t.a.len() + 1 }\n";
+        assert_clean_asan_run(SRC, &["1"], "discarded_literal_cloned_field");
+        assert_clean_asan_run_seq_lane(SRC, &["1"], "discarded_literal_cloned_field_seq");
+    }
+
     /// B-2026-09-01-21 — a DISCARDED struct literal MIXING a live-local source
     /// with a minted sibling now registers an owner on the compiled backends,
     /// where one non-fresh field used to decline the whole literal.

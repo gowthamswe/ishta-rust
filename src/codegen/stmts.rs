@@ -22810,6 +22810,39 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
                 _ => false,
             },
+            // B-2026-09-07-21 — a `.clone()` MINTS, so the literal's field is
+            // its own buffer and this registrar is exactly what should own it.
+            //
+            // Without this arm `P { a: t.a.clone(), b: 1 };` fell to the
+            // catch-all below, failed the scalar-slot test (a `String` slot is
+            // neither Int nor Float), and ONE non-fresh field declines the
+            // whole literal — so nothing owned the copy: 39 B lost, on every
+            // surface rather than in one lane.
+            //
+            // Narrow to `clone` DELIBERATELY, rather than admitting
+            // `MethodCall` the way `expr_yields_fresh_owned_temp` does. That
+            // predicate pairs its wider admission with
+            // `is_borrow_returning_call_expr`, which only inspects `Call` and
+            // would not turn away a user `ref`-returning METHOD; and
+            // `.unwrap()` / `.expect()` on an Option/Result receiver are a
+            // standing documented exception to "MethodCall ⇒ fresh"
+            // (`rhs_yields_fresh_ref`) precisely because they hand back an
+            // ALIAS of the receiver's payload. Registering an owner for an
+            // alias converts this leak into a double free, which is strictly
+            // worse, so the arm admits only the method whose independence from
+            // its receiver is definitional — the same reasoning, and the same
+            // one-method scope, as the `expr_cannot_carry_container_heap`
+            // arm that already reads `method == "clone"`.
+            //
+            // A `shared` receiver is excluded for that same reason: there
+            // `.clone()` RETAINS (`record_field_clone_option_shared_retain`)
+            // rather than minting a buffer, so the literal's field aliases a
+            // box that goes on owning it.
+            ExprKind::MethodCall { method, object, .. }
+                if method == "clone" && self.shared_type_for_expr(object).is_none() =>
+            {
+                true
+            }
             // A place / unknown shape: safe only when its type is a scalar
             // primitive (`Res { id: k }`, `(Res { .. }, n)` — `k`/`n` are
             // copies no cleanup can alias). A local's LLVM slot type is the

@@ -1435,6 +1435,37 @@ pub fn compile_to_object_with_hot_swap(
         .map_err(|e| CodegenError::new(format!("Failed to write object file: {}", e)))
 }
 
+/// [`compile_to_object_with_options`] pinned to the SEQUENTIAL lane, i.e.
+/// what `KARAC_AUTO_PAR=0` produces: the concurrency analysis is threaded in
+/// exactly as a normal build threads it, and only the auto-par EMISSION is
+/// gated (B-2026-09-07-21).
+///
+/// Exists for the leak fixtures, which otherwise cannot reach this
+/// configuration: passing `concurrency: None` removes the analysis rather than
+/// the fan-out, and flipping the env var would race every other test thread in
+/// the binary. See [`Codegen::set_auto_par_emission_disabled`].
+pub fn compile_to_object_sequential_lane(
+    program: &Program,
+    output_path: &str,
+    ownership: Option<&OwnershipCheckResult>,
+    concurrency: Option<&ConcurrencyAnalysis>,
+) -> Result<(), CodegenError> {
+    let context = Context::create();
+    let mut cg = Codegen::new(&context, "karac_module");
+    cg.load_rc_fallback(ownership);
+    cg.load_deque_head_locals(program);
+    cg.load_concurrency_analysis(concurrency);
+    cg.set_auto_par_emission_disabled(true);
+    cg.set_coro_enabled(false);
+    compile_program_spanned(&mut cg, program)?;
+
+    let target_machine = create_target_machine()?;
+    apply_optimization_passes(&cg.module, &target_machine, cg.bce.binsearch_assume_emitted)?;
+    target_machine
+        .write_to_file(&cg.module, FileType::Object, Path::new(output_path))
+        .map_err(|e| CodegenError::new(format!("Failed to write object file: {}", e)))
+}
+
 /// Compile the **threaded pass** of a `--features wasm-threads` build to
 /// a wasm32-wasip1-threads object (phase-10 "WASM concurrency lowering —
 /// `--features wasm-threads` opt-in"). The dual-artifact sibling of the
@@ -7071,6 +7102,27 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn set_wasm_threaded_pass(&mut self, threaded: bool) {
         self.conc.auto_par_disabled =
             !read_auto_par_env() || (crate::target::active_target_is_wasm() && !threaded);
+    }
+
+    /// Force this compile into the SEQUENTIAL lane — the in-process
+    /// equivalent of building with `KARAC_AUTO_PAR=0` (B-2026-09-07-21).
+    ///
+    /// The distinction this exists to express is not cosmetic. Handing
+    /// codegen `concurrency: None` looks like "auto-par off" and is NOT:
+    /// it removes the ANALYSIS, so every predicate keyed on
+    /// `concurrency_decisions` takes its no-analysis path. A real
+    /// `KARAC_AUTO_PAR=0` build still RUNS the analysis and gates only the
+    /// emission, so those predicates see a populated table and a disabled
+    /// backend — the exact configuration that stranded 38 B, and one no
+    /// fixture in `memory_sanitizer.rs` could construct before this.
+    ///
+    /// A plain-data setter for the same reason
+    /// [`Self::set_wasm_threaded_pass`] is one: the env var is read once at
+    /// construction, and a test binary that mutated it would be mutating
+    /// process-global state shared with every other test thread. Must run
+    /// before `compile_program`; nothing reads `auto_par_disabled` earlier.
+    pub(crate) fn set_auto_par_emission_disabled(&mut self, disabled: bool) {
+        self.conc.auto_par_disabled = disabled || !read_auto_par_env();
     }
 
     /// Whether `fn_key` is compiled as a coroutine this run (A2 slice 2b.3) —
