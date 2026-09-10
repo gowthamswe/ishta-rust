@@ -5346,6 +5346,40 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// B-2026-09-10-4 — does a `let` RHS name an array binding that ALREADY
+    /// holds its memory, so the destination must not register a second drop?
+    ///
+    /// The predicate behind B-2026-08-28-57's "Bodies follow the move; memory
+    /// does not". -23 stated it as `owned_array_params` membership, which is
+    /// the set the two `make_array_param_callee_owned` call sites populate —
+    /// a by-value array PARAM and a local array `let`. That covered the
+    /// spelling -23 was measuring and nothing else: a `match`-arm-bound
+    /// `Array` payload is registered by `bind_pattern_values` (which writes
+    /// `array_elem_type_exprs` and deliberately no memory table, because the
+    /// ARM frees the payload), so `Some(t) => { let u = t; … }` walked past
+    /// the guard and gave `u` a second `StructDrop` over elements the arm
+    /// still owns.
+    ///
+    /// Keyed on the SOURCE being a tracked array rather than on which
+    /// registrar tracked it, so a future registrar that owns its own cleanup
+    /// inherits the stand-down instead of re-opening this hole. Fail-open by
+    /// construction: an identifier codegen does not know to be an array is not
+    /// matched here, and such a binding cannot be the live owner of an array
+    /// drop.
+    pub(super) fn rebind_source_keeps_array_memory(&self, value: &Expr) -> bool {
+        let ExprKind::Identifier(src) = &value.kind else {
+            return false;
+        };
+        self.borrow_vars
+            .owned_array_params
+            .contains_key(src.as_str())
+            || self
+                .var_types
+                .array_elem_type_exprs
+                .contains_key(src.as_str())
+            || self.var_types.array_var_elem_te.contains_key(src.as_str())
+    }
+
     /// Call-site source suppression for a whole owned `Array[T, N]` passed BY
     /// VALUE into another callee (B-2026-08-22-18 follow-up). The callee takes
     /// ownership (transfer model — [`Self::make_array_param_callee_owned`]), so

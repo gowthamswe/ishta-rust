@@ -1309,27 +1309,26 @@ impl<'ctx> super::Codegen<'ctx> {
             // it answers exactly for the sources the other registrars have
             // already resolved and stays fail-closed everywhere else.
             //
-            // NARROWED to a source that is a live array MEMORY owner
-            // (`owned_array_params`, the same set -23's stand-down consults).
-            // A `match`-arm-bound array payload also has an
-            // `array_elem_type_exprs` entry — B-2026-09-09-9 put it there — but
-            // its ownership is the arm's, not this set's, and admitting it
-            // makes `Some(t) => { let u = t; u[i][j] }` build and then double
-            // free at `-O2` and print nothing at all under the JIT and `-O0`.
-            // Measured on the fixed tree, so it is a SEPARATE residual and not
-            // the one -23 removed; the arm spelling keeps refusing until it has
-            // its own row.
-            ExprKind::Identifier(src)
-                if self
-                    .borrow_vars
-                    .owned_array_params
-                    .contains_key(src.as_str()) =>
-            {
-                self.var_types
-                    .array_elem_type_exprs
-                    .get(src.as_str())
-                    .cloned()
-            }
+            // Landed NARROWED to `owned_array_params` and widened to every
+            // array source by B-2026-09-10-4. The narrowing was not about type
+            // resolution at all: this table's entry is read one statement later
+            // by the `let` path's `arr_parts`, so answering here is also what
+            // decides whether the destination registers a second MEMORY drop.
+            // A `match`-arm-bound array payload has an `array_elem_type_exprs`
+            // entry (B-2026-09-09-9 put it there) but no memory table entry,
+            // because the ARM frees the payload — so admitting it here while
+            // -23's stand-down still keyed on `owned_array_params` gave `u` a
+            // second drop and turned a refusal into a double free. -4 moved the
+            // stand-down onto the source binding itself
+            // (`rebind_source_keeps_array_memory`), which is where the question
+            // belonged, and this arm can then answer for every array source
+            // without deciding an ownership question it has no business
+            // deciding.
+            ExprKind::Identifier(src) => self
+                .var_types
+                .array_elem_type_exprs
+                .get(src.as_str())
+                .cloned(),
             _ => None,
         }
     }

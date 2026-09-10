@@ -153432,6 +153432,160 @@ fn main() {
         }
     }
 
+    /// B-2026-09-10-4 — the `match`-arm-bound sibling of
+    /// [`e2e_array_rebind_leaves_memory_with_one_owner`], and the half of that
+    /// family that was still live on `main`.
+    ///
+    /// -23 keyed its stand-down on `owned_array_params`, the set the two
+    /// `make_array_param_callee_owned` sites populate — a by-value array param
+    /// and a local array `let`. `bind_pattern_values` registers an arm-bound
+    /// `Array` payload in `array_elem_type_exprs` and DELIBERATELY in no memory
+    /// table, because the arm frees the payload, so the arm binding satisfied
+    /// neither half of the guard and its rebind took a second drop.
+    ///
+    /// The row that filed this described a refusal, not a corruption: the
+    /// UN-ANNOTATED spelling `Some(t) => { let u = t; u[0][0] }` does not build
+    /// on `main`, because nothing resolves the destination's element type and
+    /// the nested read has nothing to index through. That framing missed the
+    /// spelling that needs no resolution at all — an ANNOTATED rebind takes its
+    /// element type from the annotation, and on `main` it builds, runs and
+    /// corrupts. Cells 1-3 are that spelling: 1 and 3 double free under the JIT
+    /// and at `-O0`, and cell 2 prints NOTHING on any compiled surface against
+    /// `--interp`'s `held`, which is the one this fixture catches by output
+    /// alone.
+    ///
+    /// Cells 4-6 are the reads the fix newly admits, which is the part -9 held
+    /// back and -23 could only land narrowed; cells 7-9 are shapes that were
+    /// already right and have to stay right.
+    ///
+    /// Output-only, so it pins the run/build agreement rather than the memory —
+    /// `-O2` prints the right answer for most of these cells even when the
+    /// program is corrupt, which is exactly why the memory half lives in
+    /// `asan_arm_bound_array_rebind_leaves_memory_with_one_owner`.
+    #[test]
+    fn e2e_arm_bound_array_rebind_reads_back_on_every_surface() {
+        for (label, src, want) in [
+            // 1 — the annotated rebind, `String` element.
+            (
+                "annotated-arm-rebind-string-element",
+                "fn plainA(x: Option[Array[String, 2]]) {\n\
+                 \x20   match x { Some(t) => { let u: Array[String, 2] = t; println(f\"s:{u[0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[String, 2] = [f\"aaaaaaaa0\", f\"bbbbbbbb0\"];\n\
+                 \x20   plainA(Some(a));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 2 — the annotated rebind, `Vec[String]` element.
+            (
+                "annotated-arm-rebind-vec-string-element",
+                "fn plainAV(x: Option[Array[Vec[String], 2]]) {\n\
+                 \x20   match x { Some(t) => { let u: Array[Vec[String], 2] = t; println(\"held\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainAV(Some(a));\n\
+                 }\n",
+                "held\n",
+            ),
+            // 3 — the annotated rebind, user struct element.
+            (
+                "annotated-arm-rebind-struct-element",
+                "struct S5 { s: String }\n\
+                 fn plainAS(x: Option[Array[S5, 2]]) {\n\
+                 \x20   match x { Some(t) => { let u: Array[S5, 2] = t; println(f\"s:{u[0].s}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[S5, 2] = [S5 { s: f\"aaaaaaaa0\" }, S5 { s: f\"bbbbbbbb0\" }];\n\
+                 \x20   plainAS(Some(a));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 4 — the row's own repro: the bare rebind plus the NESTED read,
+            //     which refused to build on `main` with "nested indexed read on
+            //     'u' — element TypeExpr unknown".
+            (
+                "bare-arm-rebind-then-nested-read",
+                "fn plainV(x: Option[Array[Vec[String], 2]]) {\n\
+                 \x20   match x { Some(t) => { let u = t; println(f\"s:{u[0][0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainV(Some(a));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 5 — the `Result` spelling of cell 4.
+            (
+                "result-arm-rebind-then-nested-read",
+                "fn plainR(x: Result[Array[Vec[String], 2], i64]) {\n\
+                 \x20   match x { Ok(t) => { let u = t; println(f\"s:{u[0][0]}\") } Err(e) => { println(f\"e:{e}\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainR(Result.Ok(a));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 6 — two rebinds, then the read. The element type has to survive
+            //     both hops or the read refuses again at the second one.
+            (
+                "chained-arm-rebind-then-nested-read",
+                "fn plainC(x: Option[Array[Vec[String], 2]]) {\n\
+                 \x20   match x { Some(t) => { let u = t; let v = u; println(f\"s:{v[0][0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainC(Some(a));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 7 — CONTROL: the arm read with no rebind, which B-2026-09-09-9
+            //     already fixed and which must not move.
+            (
+                "plain-arm-nested-read-control",
+                "fn plainP(x: Option[Array[Vec[String], 2]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[0][0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainP(Some(a));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 8 — CONTROL: a scalar element, which owns no heap and so was
+            //     never part of this.
+            (
+                "scalar-element-control",
+                "fn plainI(x: Option[Array[i64, 2]]) {\n\
+                 \x20   match x { Some(t) => { let u = t; println(f\"s:{u[0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let a: Array[i64, 2] = [11, 22];\n\
+                 \x20   plainI(Some(a));\n\
+                 }\n",
+                "s:11\n",
+            ),
+            // 9 — CONTROL: -23's `let`-bound rebind read, which this fix's
+            //     wider guard must leave exactly where -23 put it.
+            (
+                "let-bound-rebind-read-control",
+                "fn main() {\n\
+                 \x20   let a: Array[Vec[i64], 2] = [[10, 11], [20]];\n\
+                 \x20   let b = a;\n\
+                 \x20   println(f\"s:{b[0][1]}\");\n\
+                 }\n",
+                "s:11\n",
+            ),
+        ] {
+            let Some(out) = run_program(src) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by

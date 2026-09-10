@@ -85145,4 +85145,153 @@ fn main() {
             "b23-vec-container-control",
         );
     }
+
+    /// B-2026-09-10-4 — the `match`-arm-bound sibling of
+    /// [`asan_array_rebind_leaves_memory_with_one_owner`]. -23 removed the
+    /// duplicate owner a `let`-bound array's rebind took, and keyed the
+    /// stand-down on `owned_array_params` — the set the two
+    /// `make_array_param_callee_owned` call sites populate. An arm-bound
+    /// `Array` payload is in neither, because the ARM frees it, so
+    /// `Some(t) => { let u: Array[String, 2] = t; … }` walked past the guard
+    /// and took a second drop over elements the arm still owns.
+    ///
+    /// THE ANNOTATION IS WHAT MADE THIS LIVE ON `main`, not a held-back read.
+    /// The row that filed it recorded the un-annotated spelling, which refused
+    /// to build for an unrelated reason (no element type resolved for the
+    /// destination, so the nested read had nothing to index through) and read
+    /// as "deliberately held back". The ANNOTATED spelling needs no such
+    /// resolution: it built, it ran, and it corrupted. On a pre-fix tree cells
+    /// 1 and 3 abort `free(): double free detected in tcache 2` under the JIT
+    /// and at `KARAC_OPT_LEVEL=0`, and are clean at `-O2` — the optimizer
+    /// deletes buffers nothing observes, so the default `karac build` passed
+    /// and only `karac run`, the first thing anyone tries, ever aborted.
+    ///
+    /// CELL 2 IS THE WORST OF THE THREE AND LOOKS THE MILDEST. Two levels of
+    /// heap under the element, and it prints NOTHING AT ALL on every compiled
+    /// surface — not the `println`, not an abort message — while `--interp`
+    /// prints `held`. valgrind reports 11 errors, invalid READS as well as
+    /// invalid frees, at `-O2` and `-O0` alike. It is also the cell this
+    /// fixture actually catches, since the ASAN harness builds at `-O2` where
+    /// cells 1 and 3 are clean.
+    ///
+    /// Cells 7-9 carry the leak direction, since the fix REMOVES a drop.
+    #[test]
+    fn asan_arm_bound_array_rebind_leaves_memory_with_one_owner() {
+        // 1 — the live bug: an ANNOTATED rebind of an arm-bound payload.
+        assert_clean_asan_run(
+            "fn plainA(x: Option[Array[String, 2]]) {\n\
+             \x20   match x { Some(t) => { let u: Array[String, 2] = t; println(f\"s:{u[0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[String, 2] = [f\"aaaaaaaa0\", f\"bbbbbbbb0\"];\n\
+             \x20   plainA(Some(a));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b4-annotated-arm-rebind-string-element",
+        );
+        // 2 — two levels of heap under the element. This is the cell that is
+        //     corrupt at EVERY opt level rather than only at `-O0`.
+        assert_clean_asan_run(
+            "fn plainAV(x: Option[Array[Vec[String], 2]]) {\n\
+             \x20   match x { Some(t) => { let u: Array[Vec[String], 2] = t; println(\"held\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainAV(Some(a));\n\
+             }\n",
+            &["held"],
+            "b4-annotated-arm-rebind-vec-string-element",
+        );
+        // 3 — a user STRUCT element that owns a String, the shape
+        //     B-2026-08-28-57's rule was written against.
+        assert_clean_asan_run(
+            "struct S4 { s: String }\n\
+             fn plainAS(x: Option[Array[S4, 2]]) {\n\
+             \x20   match x { Some(t) => { let u: Array[S4, 2] = t; println(f\"s:{u[0].s}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[S4, 2] = [S4 { s: f\"aaaaaaaa0\" }, S4 { s: f\"bbbbbbbb0\" }];\n\
+             \x20   plainAS(Some(a));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b4-annotated-arm-rebind-struct-element",
+        );
+        // 4 — the UN-annotated spelling the row actually recorded. It refused
+        //     to build before this fix, so it could not corrupt anything; it
+        //     builds now, and has to be single-owner too.
+        assert_clean_asan_run(
+            "fn plainV(x: Option[Array[Vec[String], 2]]) {\n\
+             \x20   match x { Some(t) => { let u = t; println(f\"s:{u[0][0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainV(Some(a));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b4-bare-arm-rebind-then-nested-read",
+        );
+        // 5 — the `Result` spelling of the same arm, so the fix is keyed on the
+        //     binding and not on `Option`.
+        assert_clean_asan_run(
+            "fn plainR(x: Result[Array[Vec[String], 2], i64]) {\n\
+             \x20   match x { Ok(t) => { let u = t; println(f\"s:{u[0][0]}\") } Err(e) => { println(f\"e:{e}\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainR(Result.Ok(a));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b4-result-arm-rebind",
+        );
+        // 6 — TWO rebinds in a row. Each hop has to stand down, or the last one
+        //     owns what the arm still owns.
+        assert_clean_asan_run(
+            "fn plainC(x: Option[Array[Vec[String], 2]]) {\n\
+             \x20   match x { Some(t) => { let u = t; let v = u; println(f\"s:{v[0][0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainC(Some(a));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b4-chained-arm-rebind",
+        );
+        // 7 — LEAK DIRECTION: the arm with no rebind at all still has to free
+        //     its payload exactly once.
+        assert_clean_asan_run(
+            "fn plainP(x: Option[Array[Vec[String], 2]]) {\n\
+             \x20   match x { Some(t) => { println(f\"s:{t[0][0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[Vec[String], 2] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainP(Some(a));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b4-plain-arm-no-rebind-control",
+        );
+        // 8 — CONTROL: a scalar element has no heap for a second owner to free,
+        //     so it was correct either way and must stay so.
+        assert_clean_asan_run(
+            "fn plainI(x: Option[Array[i64, 2]]) {\n\
+             \x20   match x { Some(t) => { let u = t; println(f\"s:{u[0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let a: Array[i64, 2] = [11, 22];\n\
+             \x20   plainI(Some(a));\n\
+             }\n",
+            &["s:11"],
+            "b4-scalar-element-control",
+        );
+        // 9 — CONTROL: -23's own shape. The `let`-bound rebind must not have
+        //     regressed into a leak now that the guard covers more sources.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let a: Array[String, 2] = [f\"aaaaaaaa0\", f\"bbbbbbbb0\"];\n\
+             \x20   let b: Array[String, 2] = a;\n\
+             \x20   println(f\"s:{b[0]}\");\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b4-let-bound-rebind-control",
+        );
+    }
 }

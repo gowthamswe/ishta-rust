@@ -9194,16 +9194,28 @@ impl<'ctx> super::Codegen<'ctx> {
                                 // five surfaces, and a scalar element is clean
                                 // either way.
                                 //
-                                // `owned_array_params` is the set of array
-                                // bindings that already hold the memory drop,
-                                // so consulting it makes the annotated path
-                                // stand down exactly where the bare path
-                                // already did — and only there.
-                                let rebind_of_live_array_owner = matches!(
-                                    &value.kind,
-                                    ExprKind::Identifier(src)
-                                        if self.borrow_vars.owned_array_params.contains_key(src.as_str())
-                                );
+                                // The stand-down asks whether the SOURCE
+                                // already holds the memory drop, which makes
+                                // the annotated path stand down exactly where
+                                // the bare path already did — and only there.
+                                //
+                                // B-2026-09-10-4 widened WHICH sources count.
+                                // -23 spelled the question as
+                                // `owned_array_params` membership — the set the
+                                // two `make_array_param_callee_owned` sites
+                                // populate — and a `match`-arm-bound `Array`
+                                // payload is in neither, because the ARM frees
+                                // it. So `Some(t) => { let u = t; … }` walked
+                                // straight past this guard and took the second
+                                // drop anyway, and it did so for EVERY element
+                                // type that owns heap, not only for the nested
+                                // read that could not resolve: `let u = t;` with
+                                // no read at all aborts `free(): double free
+                                // detected in tcache 2` under the JIT and at
+                                // `KARAC_OPT_LEVEL=0`. See
+                                // `rebind_source_keeps_array_memory`.
+                                let rebind_of_live_array_owner =
+                                    self.rebind_source_keeps_array_memory(value);
                                 if let Some((elem_te, n)) = arr_parts.clone() {
                                     if !rebind_of_live_array_owner {
                                         let elem_ty = self.llvm_type_for_type_expr(&elem_te);
