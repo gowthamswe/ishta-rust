@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 404 |
 | run-vs-build | 381 |
-| leak | 314 |
+| leak | 315 |
 | double-free | 222 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1645 |
+| codegen | 1646 |
 | interp | 412 |
 | typecheck | 295 |
 | other | 81 |
@@ -167,6 +167,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-10-9 | 2026-09-10 | codegen | medium | THE FIRST ELEMENT OF A BOXED TUPLE PAYLOAD RUNS ITS `Drop` BODY OVER THE WRONG POINTER -- `fn takeR(x: Option[(R, R)])` prints a pointer-shaped `id` for element 0 and the correct one for every later element, on every compiled surface, while `--interp` is correct; no sanitizer catches it because the read is a wrong OFFSET inside live memory | none |
 | B-2026-09-10-10 | 2026-09-10 | cli | low | SIGKILL TO `karac run` PERMANENTLY LEAKS THE HANDOFF IR FILE -- `/tmp/karac_run_<pid>_jit.ll` is still on disk 30 minutes after the run, so the 5-second poll in `signalling_karac_run_does_not_orphan_the_jit_runner` is not a tight budget but a real unlink that never happens; 2 failures in 4 full-gate runs, 0 in isolation | none |
 | B-2026-09-10-11 | 2026-09-10 | codegen | low | A SHARED-PAYLOAD ENUM ON THE RETURN ROUTE STRANDS ITS 16-BYTE REFCOUNT BLOCK -- `let z = passt(mket(3))` over `enum Et { A(Sh), B }` with `shared struct Sh` loses 16 B in 1 block at -O0, because the admission gate's `shared` clause asks whether the ENUM is shared and not whether its PAYLOAD is | — |
+| B-2026-09-10-12 | 2026-09-10 | codegen | medium | THE -O0 ASAN RATCHET IS RED ON `main`: `asan_arm_bound_array_rebind_leaves_memory_with_one_owner` (2d991e9's own fixture) leaks 48 B in 1 allocation at KARAC_OPT_LEVEL=0 while passing the default -O2 suite, so both required ratchet legs fail on a clean checkout | — |
 
 ### Relocated
 
