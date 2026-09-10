@@ -95,7 +95,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | miscompile | 403 |
 | run-vs-build | 380 |
 | leak | 309 |
-| double-free | 219 |
+| double-free | 220 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
 | diagnostics | 125 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1635 |
+| codegen | 1636 |
 | interp | 409 |
 | typecheck | 295 |
 | other | 81 |
@@ -124,7 +124,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | lexer | 8 |
 ## Current state
 
-_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-09). Do not edit this block by hand; edit the ledger and regenerate._
+_Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 2026-09-10). Do not edit this block by hand; edit the ledger and regenerate._
 
 ### Open
 
@@ -164,10 +164,10 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-19 | 2026-09-09 | codegen | low | A BOXED ENUM PAYLOAD'S INTERIOR IS UNOWNED ONE LEVEL DEEPER, INSIDE A STRUCT FIELD -- `fn show(h: Holder)` over `struct Holder { k: Option[K], n: i64 }` leaks the same 81 B in 9 blocks that B-2026-09-09-10 just closed for a bare `Option[K]` param, unchanged by that fix because a field-held payload registers through `struct_payload_boxed_field_variants` / `track_nested_boxed_enum_var_at_field` rather than the arg-site arm | — |
 | B-2026-09-09-20 | 2026-09-09 | codegen+interp | low | AN `Option` PAYLOAD THAT IS ITSELF A TUPLE RUNS ITS `Drop` BODY NOWHERE ON THE INTERPRETER AND TOO EARLY ON THE COMPILED BACKEND -- `fn f(r: R) -> Option[(R, i64)]` with `let z = f(mk(20)); println("ok")` prints `dR20` BEFORE `ok` when built (the body fires while `z` is still live and readable) and prints no `dR20` at all under `--interp`; correct is `ok` then `dR20`. The bare tuple and the bare `Option[R]` spellings are both correct, so it needs an Option/Result payload that is itself an aggregate. Memory is balanced on both, at both opt levels | — |
 | B-2026-09-09-21 | 2026-09-09 | codegen+interp | low | A DISCARDED TUPLE'S `Drop` BODY RUNS ON NEITHER BACKEND -- `f(mk(20));` over `fn f(r: R) -> (R, i64)` prints no `dR20` under `karac build` OR `--interp`, so the value dies with its destructor never running and the A/B rule passes because both surfaces are wrong the same way. The discarded BARE struct (`mk(20);`) does run its body, so the gap is the aggregate wrapper. a159b15e1 gave this shape its memory walk and deliberately left the body alone -- adding it on the compiled side alone would convert a silent agreed-wrong into a run-vs-build divergence | — |
-| B-2026-09-09-22 | 2026-09-09 | codegen | medium | A `Vec[Vec[String]]` PAYLOAD BOUND OUT OF AN `Option` OR `Result` ARM DOUBLE FREES ON EVERY COMPILED BACKEND -- `match x { Some(t) => t[0][0] }` aborts with `free(): double free detected in tcache 2` at both opt levels and either way on auto-par while `--interp` prints the answer; the SAME payload in a user enum is clean, and so is the same envelope over `Vec[Vec[i64]]`, so it is the built-in envelope over a HEAP-BEARING element | none |
 | B-2026-09-09-23 | 2026-09-09 | codegen | medium | REBINDING AN `Array[Vec[T], N]` DUPLICATES ITS ELEMENT OWNERS -- `let b: Array[Vec[i64], 2] = a;` with no index anywhere in the program aborts `free(): double free detected in tcache 2` under the JIT and at `KARAC_OPT_LEVEL=0`, clean at `=2` and under `--interp`; it is what blocks the rebind spelling of B-2026-09-09-9's nested read | none |
 | B-2026-09-09-24 | 2026-09-09 | codegen | low | AN `Array` PAYLOAD BINDING THAT IS INDEXED STRANDS ITS ELEMENTS AT `-O0` -- 18 B in 2 blocks for `Some(t) => t[0]` over `Option[Array[String, 2]]` and 48 B in 1 for a user enum's `Array[Vec[String], 2]` read two levels deep, while the same binding never indexed and the same index off a `let` are both clean | none |
 | B-2026-09-09-25 | 2026-09-09 | codegen | low | THE INDEX-STORE HALF OF B-2026-09-09-9 IS STILL REFUSED FOR AN `Array` OUTER -- `a[0][1] = 99` over `Array[Vec[i64], 2]` fails `codegen: Index assignment target must be a variable` on every compiled backend while `--interp` runs it and the `Vec` outer stores fine; the read half of the same declaration now agrees on all five surfaces | none |
+| B-2026-09-10-1 | 2026-09-10 | codegen | medium | AN `Option[Vec[<heap-bearing struct>]]` PASSED AS AN ARGUMENT STILL DOUBLE FREES AFTER B-2026-09-09-22 -- `plainV(Some([S { s: f".." }, ..]))` aborts on every compiled backend while the SAME payload in a local option in one frame is clean, and the doubled block is the struct's 9-byte STRING field rather than an element buffer; a no-heap struct element is clean and a two-field one aborts, so it is the heap FIELD, not the single-field layout | none |
 
 ### Relocated
 
@@ -2442,6 +2442,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-14 | codegen | low | FIVE OF THE SIX POSITIONS IN THIS ROW WERE NEVER REAL -- retracted: re-measured under a controlled build (`karac` AND both runtime archives rebuilt f… | a58e84e1d |
 | B-2026-09-09-15 | other | medium | THE INSTRUMENTED ASAN LEG CANNOT LINK ON macOS -- every fixture dies at `___asan_version_mismatch_check_v8` from `_asan.module_ctor`, karac's bundled… | scripts/asan-instrumented-leg.sh appends `-asan-guard-again… |
 | B-2026-09-09-16 | codegen | medium | THE STRUCT-PAYLOAD SPELLING OF B-2026-09-09-13 DOUBLE-FREES TOO, and it PREDATES the commit that row blames -- `fn f(value: Option[R2]) { let mut vv… | 4fb2adee0 |
+| B-2026-09-09-22 | codegen | medium | A `Vec[Vec[String]]` PAYLOAD BOUND OUT OF AN `Option` OR `Result` ARM DOUBLE FREES ON EVERY COMPILED BACKEND -- `match x { Some(t) => t[0][0] }` abor… | ce145d9 |
 
 </details>
 
