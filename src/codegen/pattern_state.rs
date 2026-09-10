@@ -110,6 +110,28 @@ pub(crate) struct PatternState<'ctx> {
     /// channel, and a second registration double-ran a mutating body
     /// (`self.buf.clear()` freed the buffer twice).
     pub(crate) pattern_binding_scrutinee_is_fresh_owning_temp: bool,
+    /// B-2026-09-09-19 — true while binding an arm whose
+    /// `suppress_struct_field_boxed_payload_match_out` disarm is about to fire
+    /// (same predicate, `struct_field_boxed_payload_match_out_applies`).
+    ///
+    /// That disarm zeroes the struct field's `Option` tag so the owning
+    /// struct's drop skips the boxed payload, on the stated assumption that
+    /// "the arm's binding owns the INTERIOR only". The assumption holds for a
+    /// `String` / `Vec` leaf, which the inline-payload machinery gives an
+    /// owner. It does NOT hold for a leaf bound out of a NESTED user-enum
+    /// variant inside the payload (`Option[K]` over `enum K { A(R2) }`, matched
+    /// `Some(K.A(r))`): `is_copy_supported_user_struct` refuses every
+    /// `Option`/`Result` scrutinee, so `r` got no `track_struct_var` and `R2`'s
+    /// heap fields were owned by nobody — 9 blocks over 3 calls, against a
+    /// clean `K.A(_)` arm on the same program.
+    ///
+    /// The exclusion this lifts is not wrong in general — its reason is that
+    /// the payload "is owned by the Option's inline/boxed cleanup" — it is
+    /// wrong exactly when that cleanup has been disarmed in the arm's favour,
+    /// which is what this flag names. Same shape as B-2026-09-07-38's transfer
+    /// arm and B-2026-09-07-44's fresh-temp arm: a source that is callee-owned
+    /// by construction, with no second owner for a use-after-free to race.
+    pub(crate) pattern_binding_field_boxed_payload_disarmed: bool,
     /// B-2026-08-01-13 — true while binding a pattern whose scrutinee is an
     /// OWNED (by-value) param of the current function. Under the
     /// caller-retains convention the param holds the callee's entry copy;

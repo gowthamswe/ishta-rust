@@ -83937,6 +83937,162 @@ fn main() {
         );
     }
 
+    /// B-2026-09-09-19 — a boxed enum payload's INTERIOR when the `Option`
+    /// lives in a struct FIELD and the arm destructures INTO it.
+    ///
+    /// `suppress_struct_field_boxed_payload_match_out` (B-2026-08-07-7) zeroes
+    /// the field's `Option` tag so the owning struct's drop skips the payload,
+    /// and parks the box so the ENVELOPE still gets freed. Its stated premise
+    /// is that "the arm's binding owns the INTERIOR only". That holds for a
+    /// `String` / `Vec` leaf, which the inline-payload machinery gives an
+    /// owner. It does NOT hold for a leaf bound out of a NESTED user-enum
+    /// variant inside the payload: `bind_pattern_values`'
+    /// `is_copy_supported_user_struct` refuses every `Option`/`Result`
+    /// scrutinee, so the leaf got no `track_struct_var` and the payload's heap
+    /// was owned by nobody once the tag was zeroed.
+    ///
+    /// Measured on this program: 243 B in 27 blocks at `-O0` (245 allocs / 218
+    /// frees) and 27 B in 3 blocks at `-O2`, clean at both after. `-O2` does
+    /// NOT hide it, unlike the sibling class B-2026-09-07-44 records.
+    ///
+    /// Eleven cells. The three that LEAKED — 9 blocks each, `R2`'s three
+    /// `String`s over three calls:
+    ///
+    ///   - `field`: the by-value param spelling the row was filed on;
+    ///   - `lo`: the same shape over a plain LOCAL, which is what proves the
+    ///     defect is not about params at all — the row was filed as a param bug
+    ///     and it is not one;
+    ///   - `handsout`: the arm binds the leaf and passes it to a CONSUMING
+    ///     call. Pinned because it looks like the double-free direction and is
+    ///     not: it leaked before this fix too, and the arm's own move-out
+    ///     retraction (`zero_struct_move_caps`) covers the new registration.
+    ///
+    /// The eight that were ALREADY CLEAN, every one a direction this fix could
+    /// plausibly have turned into a double free:
+    ///
+    ///   - `untouched`: the body never matches the field, so no disarm fires
+    ///     and the struct's own field drop does all of it;
+    ///   - `wildcard` (`Some(_)`) and `variantwild` (`Some(K.A(_))`): the pair
+    ///     that isolates the BINDING as the trigger — the same arm shapes
+    ///     differing only in whether a name is bound. `variantwild` is also the
+    ///     population an unconditional box-only drop broke (five LSan failures,
+    ///     recorded on B-2026-08-07-7);
+    ///   - `whole` (`Some(kk)` then an inner match): the division-of-ownership
+    ///     shape `asan_b04_7_option_heap_enum_struct_field_drop_no_leak` guards
+    ///     — the binding owns the payload and the struct's drop owns the box,
+    ///     and the suppressor's own comment says zeroing the tag there orphans
+    ///     both;
+    ///   - `stringpay`: a `String` leaf. Clean before AND after, and it is the
+    ///     cell that rules out the alternative fix: attaching the interior to
+    ///     the parked `boxenv` action would have double-freed here, because a
+    ///     `String` leaf already has an owner;
+    ///   - `bl`: a BARE `Option[K]` local with the identical arm. Clean
+    ///     throughout — its let-site keeps its own owner, which is why the
+    ///     defect needs the field;
+    ///   - `rebind` (`let m = r`): the rebind channel, retracted by name;
+    ///   - `w`/`f` at `-O2` as well as `-O0`, via the shared runner.
+    ///
+    /// DELIBERATELY NOT A CELL: the `Result` spelling
+    /// (`struct HolderR { k: Result[K, i64] }`) leaks 240 B in 3 blocks plus 36
+    /// B indirect, and is UNCHANGED by this fix — measured byte-identical on
+    /// the tree before and after. It is a different defect (the field gets no
+    /// drop registered at all, rather than one that is disarmed), the
+    /// suppressor above is `Option`-only by construction
+    /// (`option_payload_te` requires the head), and it is filed on its own row.
+    /// Pinning it here would fail this fixture for a defect it does not own.
+    #[test]
+    fn asan_struct_field_boxed_payload_arm_leaf_owns_its_interior() {
+        assert_clean_asan_run(
+            r#"
+struct R2 { s: String, t: String, u: String }
+enum K { A(R2), B }
+enum Ks { A(String), B }
+struct Holder { k: Option[K], n: i64 }
+struct HolderS { k: Option[Ks], n: i64 }
+
+fn mkr(i: i64) -> R2 { return R2 { s: f"ssssssss{i}", t: f"tttttttt{i}", u: f"uuuuuuuu{i}" }; }
+fn eat(r: R2) -> i64 { return r.s.len(); }
+
+fn field(h: Holder) {
+    match h.k { Option.Some(K.A(r)) => { println(f"f:{r.s}"); } Option.Some(K.B) => {} Option.None => {} }
+}
+fn untouched(h: Holder) { println(f"u:{h.n}"); }
+fn wildcard(h: Holder) {
+    match h.k { Option.Some(_) => { println("wc"); } Option.None => {} }
+}
+fn variantwild(h: Holder) {
+    match h.k { Option.Some(K.A(_)) => { println("vw"); } Option.Some(K.B) => {} Option.None => {} }
+}
+fn whole(h: Holder) {
+    match h.k { Option.Some(kk) => { match kk { K.A(r) => { println(f"w:{r.s}"); } K.B => {} } } Option.None => {} }
+}
+fn handsout(h: Holder) {
+    match h.k { Option.Some(K.A(r)) => { println(f"h:{eat(r)}"); } Option.Some(K.B) => {} Option.None => {} }
+}
+fn rebind(h: Holder) {
+    match h.k { Option.Some(K.A(r)) => { let m = r; println(f"rb:{m.s}"); } Option.Some(K.B) => {} Option.None => {} }
+}
+fn stringpay(h: HolderS) {
+    match h.k { Option.Some(Ks.A(s)) => { println(f"sp:{s}"); } Option.Some(Ks.B) => {} Option.None => {} }
+}
+
+fn main() {
+    let mut i = 0;
+    while i < 3 {
+        field(Holder { k: Option.Some(K.A(mkr(i))), n: i });
+        untouched(Holder { k: Option.Some(K.A(mkr(i))), n: i });
+        wildcard(Holder { k: Option.Some(K.A(mkr(i))), n: i });
+        variantwild(Holder { k: Option.Some(K.A(mkr(i))), n: i });
+        whole(Holder { k: Option.Some(K.A(mkr(i))), n: i });
+        handsout(Holder { k: Option.Some(K.A(mkr(i))), n: i });
+        rebind(Holder { k: Option.Some(K.A(mkr(i))), n: i });
+        stringpay(HolderS { k: Option.Some(Ks.A(f"pppppppp{i}")), n: i });
+        let lh = Holder { k: Option.Some(K.A(mkr(i))), n: i };
+        match lh.k { Option.Some(K.A(r)) => { println(f"lo:{r.s}"); } Option.Some(K.B) => {} Option.None => {} }
+        let bl: Option[K] = Option.Some(K.A(mkr(i)));
+        match bl { Option.Some(K.A(r)) => { println(f"bl:{r.s}"); } Option.Some(K.B) => {} Option.None => {} }
+        i = i + 1;
+    }
+    println("end");
+}
+"#,
+            &[
+                "f:ssssssss0",
+                "u:0",
+                "wc",
+                "vw",
+                "w:ssssssss0",
+                "h:9",
+                "rb:ssssssss0",
+                "sp:pppppppp0",
+                "lo:ssssssss0",
+                "bl:ssssssss0",
+                "f:ssssssss1",
+                "u:1",
+                "wc",
+                "vw",
+                "w:ssssssss1",
+                "h:9",
+                "rb:ssssssss1",
+                "sp:pppppppp1",
+                "lo:ssssssss1",
+                "bl:ssssssss1",
+                "f:ssssssss2",
+                "u:2",
+                "wc",
+                "vw",
+                "w:ssssssss2",
+                "h:9",
+                "rb:ssssssss2",
+                "sp:pppppppp2",
+                "lo:ssssssss2",
+                "bl:ssssssss2",
+                "end",
+            ],
+            "asan_struct_field_boxed_payload_arm_leaf_owns_its_interior",
+        );
+    }
+
     /// B-2026-09-06-72 — a `shared` FIELD's 16-byte refcount block when the
     /// owning struct travels out of a function inside an AGGREGATE.
     ///

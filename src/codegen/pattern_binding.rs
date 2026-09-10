@@ -984,9 +984,30 @@ impl<'ctx> super::Codegen<'ctx> {
                             // by the Option's inline/boxed cleanup, so tracking it here
                             // would double-free. `Response`/`HttpError` keep their
                             // by-name handling (their own move-suppression covers them).
-                            let is_copy_supported_user_struct = !self
+                            let is_copy_supported_user_struct = (!self
                                 .pattern_state
                                 .pattern_binding_scrutinee_is_option_result
+                                // B-2026-09-09-19 — the exclusion's own reason
+                                // is that an `Option`/`Result` payload "is
+                                // owned by the Option's inline/boxed cleanup".
+                                // That is true until this arm's
+                                // `suppress_struct_field_boxed_payload_match_out`
+                                // zeroes the field's tag, which takes the
+                                // field's drop — and with it that ownership —
+                                // off the table on the stated assumption that
+                                // "the arm's binding owns the INTERIOR only".
+                                // A `String`/`Vec` leaf does; a leaf bound out
+                                // of a NESTED user-enum variant in the payload
+                                // does not, because this very gate refused it.
+                                // Measured on `struct Holder { k: Option[K] }`
+                                // over `enum K { A(R2), B }` matched
+                                // `Some(K.A(r))`: `R2`'s three `String`s owned
+                                // by nobody, 9 blocks over 3 calls at -O0,
+                                // against a clean `K.A(_)` arm and a clean bare
+                                // `Option[K]` local on the same program.
+                                || self
+                                    .pattern_state
+                                    .pattern_binding_field_boxed_payload_disarmed)
                                 && !self.pattern_state.pattern_binding_scrutinee_is_shared_enum
                                 && self.type_decls.struct_types.contains_key(tn)
                                 && !self.type_decls.shared_types.contains_key(tn)
@@ -1053,7 +1074,20 @@ impl<'ctx> super::Codegen<'ctx> {
                                     // spellings compile to one identical binary.
                                     || self
                                         .pattern_state
-                                        .pattern_binding_scrutinee_is_fresh_owning_temp);
+                                        .pattern_binding_scrutinee_is_fresh_owning_temp
+                                    // B-2026-09-09-19 — the FOURTH callee-owned
+                                    // source, on the same argument as the two
+                                    // above. Once the field's tag is zeroed
+                                    // nothing else owns the payload's interior:
+                                    // the field's drop is disarmed and the
+                                    // parked `boxenv` action frees the ENVELOPE
+                                    // only (`inner_drop_fn: None`). So there is
+                                    // no second owner for a use-after-free to
+                                    // race, which is the property the
+                                    // copy-supported proxy stands in for.
+                                    || self
+                                        .pattern_state
+                                        .pattern_binding_field_boxed_payload_disarmed);
                             // B-2026-07-10-3: an `Option`/`Result` scrutinee whose
                             // INLINE struct payload (held as a value in the slot, not
                             // heap-boxed) is bound WHOLE as `e`. The dedicated inline

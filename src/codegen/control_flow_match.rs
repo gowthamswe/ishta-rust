@@ -724,6 +724,31 @@ impl<'ctx> super::Codegen<'ctx> {
                         })
                         .collect();
                 }
+                // B-2026-09-09-19 — ask, BEFORE binding, whether this arm's
+                // `suppress_struct_field_boxed_payload_match_out` disarm will
+                // fire below. That disarm zeroes the struct field's `Option`
+                // tag, so the field's drop stops owning the payload's interior
+                // and the arm's binding has to own it instead — but the binding
+                // happens first, so it cannot observe the disarm and must be
+                // told. Same predicate the suppressor itself uses, so the two
+                // cannot drift apart.
+                let saved_field_boxed_disarmed = self
+                    .pattern_state
+                    .pattern_binding_field_boxed_payload_disarmed;
+                self.pattern_state
+                    .pattern_binding_field_boxed_payload_disarmed = scrut_ref_ptr.is_none()
+                    // The suppressor is called only on the `else` of the
+                    // fresh-temp branches, so the flag must carry the same two
+                    // exclusions or it would promise a disarm that never fires.
+                    && freshtemp_enum.is_none()
+                    && freshtemp_struct.is_none()
+                    && self
+                        .struct_field_boxed_payload_match_out_applies(
+                            scrutinee,
+                            &arm.pattern,
+                            &arm.body,
+                        )
+                        .is_some();
                 let handled_via_ptr = if let Some((scrut_ptr, pointee_ty)) = scrut_ref_ptr {
                     self.bind_pattern_values_via_ptr(&arm.pattern, scrut_ptr, pointee_ty)?
                         .is_some()
@@ -734,12 +759,16 @@ impl<'ctx> super::Codegen<'ctx> {
                     self.pattern_state.pattern_binding_arm_only_borrows = saved_arm_borrows;
                     self.pattern_state.pattern_binding_arm_borrowed_only_names =
                         saved_arm_borrowed_names.clone();
+                    self.pattern_state
+                        .pattern_binding_field_boxed_payload_disarmed = saved_field_boxed_disarmed;
                 }
                 if !handled_via_ptr {
                     self.bind_pattern_values(&arm.pattern, scrut)?;
                     self.pattern_state.pattern_binding_arm_only_borrows = saved_arm_borrows;
                     self.pattern_state.pattern_binding_arm_borrowed_only_names =
                         saved_arm_borrowed_names.clone();
+                    self.pattern_state
+                        .pattern_binding_field_boxed_payload_disarmed = saved_field_boxed_disarmed;
                     self.pattern_state.current_variant_payload_bindings.clear();
                     self.pattern_state.current_bare_tuple_bindings.clear();
                     // B-2026-09-02-27 — record where each bare-tuple element
@@ -5588,11 +5617,54 @@ impl<'ctx> super::Codegen<'ctx> {
         pattern: &Pattern,
         arm_body: &Expr,
     ) {
-        if self.pattern_state.pattern_binding_is_borrow {
+        let Some(pt) =
+            self.struct_field_boxed_payload_match_out_applies(scrutinee, pattern, arm_body)
+        else {
             return;
+        };
+        if let Some(field_ptr) = self.field_chain_place_ptr(scrutinee) {
+            // Order matters: park the box pointer BEFORE the tag zero, which is
+            // what takes the field's drop — and with it the envelope free — off
+            // the table.
+            // B-2026-08-07-11 residue — the box this parks may itself hold
+            // further ENVELOPES (`Option[Option[Option[String]]]` as a field:
+            // the field's payload boxes, and so does the payload inside that
+            // box). Freeing only the parked one leaked 32 B per match.
+            //
+            // A FIRST owner here, not a second, and that is measured rather
+            // than argued: the field's own drop is about to be disarmed by the
+            // tag zero below, the arm's binding owns the INTERIOR only, and the
+            // pre-fix result was a LEAK — had anything else claimed these
+            // envelopes it would have been a double free. The comment this
+            // replaces deferred them to B-2026-08-07-6/-11 while those were in
+            // flight; all three of their legs have since landed and none of
+            // them reaches this path.
+            let deeper = self.nested_box_deeper_tag_chain(&pt);
+            self.own_boxed_option_field_envelope_at(field_ptr, deeper);
+            self.zero_option_field_tag_at(field_ptr);
+        }
+    }
+
+    /// The gate of [`Self::suppress_struct_field_boxed_payload_match_out`],
+    /// split out so the DISARM and the ownership HANDOVER that has to accompany
+    /// it are decided by one predicate rather than two that can drift.
+    ///
+    /// B-2026-09-09-19 — `bind_pattern_values` runs BEFORE the suppressor in the
+    /// arm loop, so the binding side cannot observe that the disarm happened; it
+    /// has to ask the same question up front. Returning `true` here means the
+    /// struct field's `Option` tag is about to be zeroed, i.e. the field's own
+    /// drop is about to stop owning the payload's interior.
+    pub(super) fn struct_field_boxed_payload_match_out_applies(
+        &self,
+        scrutinee: &Expr,
+        pattern: &Pattern,
+        arm_body: &Expr,
+    ) -> Option<TypeExpr> {
+        if self.pattern_state.pattern_binding_is_borrow {
+            return None;
         }
         let ExprKind::FieldAccess { object, field } = &scrutinee.kind else {
-            return;
+            return None;
         };
         // Only a sub-pattern that DESTRUCTURES INTO the payload — a nested
         // variant pattern that itself binds — and never a plain binding of the
@@ -5640,28 +5712,20 @@ impl<'ctx> super::Codegen<'ctx> {
             _ => false,
         };
         if !consumes {
-            return;
+            return None;
         }
-        let Some(obj_ty) = self.place_chain_type_name(object) else {
-            return;
-        };
-        let Some(idx) = self
+        let obj_ty = self.place_chain_type_name(object)?;
+        let idx = self
             .type_decls
             .struct_field_names
             .get(obj_ty.as_str())
-            .and_then(|ns| ns.iter().position(|n| n == field))
-        else {
-            return;
-        };
-        let Some(field_te) = self
+            .and_then(|ns| ns.iter().position(|n| n == field))?;
+        let field_te = self
             .type_decls
             .struct_field_type_exprs
             .get(obj_ty.as_str())
             .and_then(|tes| tes.get(idx))
-            .cloned()
-        else {
-            return;
-        };
+            .cloned()?;
         // The struct's drop must actually be the rival: an `Option` field whose
         // payload is BOXED and heap-owning is the only shape routed to the deep
         // drop with no suppression channel. An inline payload keeps the
@@ -5670,35 +5734,13 @@ impl<'ctx> super::Codegen<'ctx> {
             .option_inner_shared_type_for_type_expr(&field_te)
             .is_some()
         {
-            return;
+            return None;
         }
-        let Some(pt) = Self::option_payload_te(&field_te) else {
-            return;
-        };
+        let pt = Self::option_payload_te(&field_te)?;
         if !self.option_payload_is_boxed(&pt) || !self.option_payload_struct_or_enum_drop_ok(&pt) {
-            return;
+            return None;
         }
-        if let Some(field_ptr) = self.field_chain_place_ptr(scrutinee) {
-            // Order matters: park the box pointer BEFORE the tag zero, which is
-            // what takes the field's drop — and with it the envelope free — off
-            // the table.
-            // B-2026-08-07-11 residue — the box this parks may itself hold
-            // further ENVELOPES (`Option[Option[Option[String]]]` as a field:
-            // the field's payload boxes, and so does the payload inside that
-            // box). Freeing only the parked one leaked 32 B per match.
-            //
-            // A FIRST owner here, not a second, and that is measured rather
-            // than argued: the field's own drop is about to be disarmed by the
-            // tag zero below, the arm's binding owns the INTERIOR only, and the
-            // pre-fix result was a LEAK — had anything else claimed these
-            // envelopes it would have been a double free. The comment this
-            // replaces deferred them to B-2026-08-07-6/-11 while those were in
-            // flight; all three of their legs have since landed and none of
-            // them reaches this path.
-            let deeper = self.nested_box_deeper_tag_chain(&pt);
-            self.own_boxed_option_field_envelope_at(field_ptr, deeper);
-            self.zero_option_field_tag_at(field_ptr);
-        }
+        Some(pt)
     }
 
     /// Does `e` contain a `match <name> { … }` (or `if let … = <name>`) whose
