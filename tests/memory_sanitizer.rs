@@ -13019,6 +13019,34 @@ fn main() { let t = (Bag { xs: ["x", "y"] }, 7); println(f"{takes(t)}"); }
         );
     }
 
+    /// B-2026-09-10-5 — the moved-from-slot disarm zeroed `Option`'s FOUR
+    /// words into a slot that was only as wide as the binding's own enum, so a
+    /// named-local generic enum passed BY VALUE wrote 16 bytes past its alloca.
+    ///
+    /// ASAN is the right gate for it even though the row's headline symptom is
+    /// a SIGSEGV: the fault only reproduces where the overrun happens to land
+    /// on the saved return address, which is a frame-layout accident — it
+    /// crashed at `-O0` and ran clean at `-O2`, under the JIT and on
+    /// `--interp`. The stack redzone makes the WRITE itself the finding, at
+    /// whatever opt level the suite runs, so this pins the defect rather than
+    /// the crash it happened to cause.
+    ///
+    /// Plain POD on purpose — no `Drop` impl and no heap anywhere in `W9`. The
+    /// bug is in the move disarm, not in the drop machinery, and a fixture
+    /// carrying a `Drop`-bearing payload would have implied otherwise.
+    #[test]
+    fn asan_generic_enum_named_local_by_value_arg_does_not_overrun_its_slot() {
+        const SRC: &str = "struct W9 { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64 }\n\
+             enum G[T] { X(T), Y }\n\
+             fn hg(g: G[W9]) { println(\"ig\") }\n\
+             fn main() { let a = G.X(W9 { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 }); hg(a); println(\"end\") }\n";
+        assert_clean_asan_run(
+            SRC,
+            &["ig", "end"],
+            "generic-enum-named-local-by-value-arg-slot-overrun",
+        );
+    }
+
     fn assert_clean_asan_run(src: &str, expected_stdout: &[&str], label: &str) {
         if !asan_available() {
             eprintln!("[{label}] ASAN unavailable on this host — skipping");

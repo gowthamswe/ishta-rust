@@ -152542,6 +152542,116 @@ fn main() {
         }
     }
 
+    /// B-2026-09-10-5 — a NAMED LOCAL of a user generic enum passed BY VALUE
+    /// smashed the caller's stack, because the moved-from-slot disarm zeroed
+    /// `Option`'s four words into whatever the binding's slot actually was.
+    ///
+    /// `enum G[T] { X(T), Y }` lays `T` out erased at one word, so a `G[..]`
+    /// slot is TWO words; the disarm's store was sized to the seeded
+    /// `Option` layout and wrote 16 bytes past the end of the alloca. In a
+    /// small frame that is the saved return address, and `main`'s `ret`
+    /// jumped to 0 — a SIGSEGV with no output at all, on an ORDINARY build.
+    ///
+    /// The matrix below is the shape of the evidence, and each column is
+    /// load-bearing:
+    ///
+    ///  * PAYLOAD WIDTH is the discriminator. One word fits the erased area
+    ///    and was always clean; 2 / 3 / 6 / 9 words all crashed. That is what
+    ///    says the write was sized to a TYPE and the slot to a LAYOUT, rather
+    ///    than anything about the payload's contents.
+    ///  * NO `Drop` AND NO HEAP ARE NEEDED — `W2 { a: i64, b: i64 }` is plain
+    ///    POD. The bug lives in the move disarm, not the drop machinery, and a
+    ///    probe that reached for a `Drop`-bearing payload would have suggested
+    ///    otherwise.
+    ///  * THE ARGUMENT MUST BE A NAMED LOCAL. The same value as a fresh temp
+    ///    never reaches the disarm, and was clean before and after.
+    ///  * THE CALLEE IS IRRELEVANT — one that only prints crashed exactly like
+    ///    one that destructures its parameter.
+    ///
+    /// `--interp`, the JIT and `-O2` all printed correctly throughout: the
+    /// wider frames there put something other than the return address under
+    /// the overrun, so this was invisible to every surface but an unoptimised
+    /// AOT build. The `Option`/`Result` cells are the regression half — those
+    /// slots ARE the seeded layout, so they must keep emitting what they did
+    /// before.
+    ///
+    /// THIS TEST IS NOT THE GATE FOR THE CRASH, and saying so here is the
+    /// point of the paragraph. This harness compiles at the suite's default
+    /// opt level, where the overrun does not reproduce — every cell below
+    /// passes with the fix reverted, which is what a disable-and-rerun check
+    /// measured rather than assumed. What it pins is the OUTPUT of the shapes
+    /// involved, the seeded-pair controls included. The defect itself is
+    /// gated by `asan_generic_enum_named_local_by_value_arg_does_not_overrun_
+    /// its_slot` in `tests/memory_sanitizer.rs`, which catches the write in
+    /// the stack redzone and goes red with the fix reverted on the
+    /// `KARAC_OPT_LEVEL=0` leg.
+    #[test]
+    fn e2e_generic_enum_named_local_by_value_arg_does_not_smash_the_stack() {
+        const PRE: &str = "struct W2 { a: i64, b: i64 }\n\
+             struct W9 { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64 }\n\
+             enum G[T] { X(T), Y }\n";
+        for (label, body, want) in [
+            // One word — fits the erased payload area, so nothing is boxed and
+            // nothing was ever wrong here. The control that says width is the
+            // axis.
+            (
+                "one-word-payload-control",
+                "fn hg(g: G[i64]) { println(\"ig\"); }\n\
+                 fn main() { println(\"A\"); let a = G.X(7); hg(a); println(\"end\") }\n",
+                "A\nig\nend\n",
+            ),
+            // Two words — the narrowest crashing case, and plain POD.
+            (
+                "two-word-pod-payload",
+                "fn hg(g: G[W2]) { println(\"ig\"); }\n\
+                 fn main() { println(\"A\"); let a = G.X(W2 { a: 1, b: 2 }); hg(a); println(\"end\") }\n",
+                "A\nig\nend\n",
+            ),
+            // Three words, and heap-bearing rather than POD.
+            (
+                "three-word-string-payload",
+                "fn hg(g: G[String]) { println(\"ig\"); }\n\
+                 fn main() { println(\"A\"); let a = G.X(f\"zz{1}\"); hg(a); println(\"end\") }\n",
+                "A\nig\nend\n",
+            ),
+            // Nine words — well past the overrun, and the callee DESTRUCTURES,
+            // which is the spelling the shape was first seen in.
+            (
+                "nine-word-payload-destructuring-callee",
+                "fn hg(g: G[W9]) { match g { G.X(r) => { println(f\"in:{r.a}\"); }, G.Y => { println(\"y\"); } } }\n\
+                 fn main() { println(\"A\"); let a = G.X(W9 { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 }); hg(a); println(\"end\") }\n",
+                "A\nin:1\nend\n",
+            ),
+            // The fresh-temp spelling of the crashing cell: never reached the
+            // disarm, so it is what the named-local cells have to agree with.
+            (
+                "fresh-temp-spelling-control",
+                "fn hg(g: G[W9]) { println(\"ig\"); }\n\
+                 fn main() { println(\"A\"); hg(G.X(W9 { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 })); println(\"end\") }\n",
+                "A\nig\nend\n",
+            ),
+            // The seeded pair in the same position — their slots ARE the layout
+            // the store used, so these are the cells that must not move.
+            (
+                "option-wide-payload-regression-control",
+                "fn ho(o: Option[W9]) { println(\"ig\"); }\n\
+                 fn main() { println(\"A\"); let a = Option.Some(W9 { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 }); ho(a); println(\"end\") }\n",
+                "A\nig\nend\n",
+            ),
+            (
+                "result-wide-payload-regression-control",
+                "fn hr(r: Result[W9, i64]) { println(\"ig\"); }\n\
+                 fn main() { println(\"A\"); let a: Result[W9, i64] = Result.Ok(W9 { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 }); hr(a); println(\"end\") }\n",
+                "A\nig\nend\n",
+            ),
+        ] {
+            let Some(out) = run_program(&format!("{PRE}{body}")) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-09-11 — a nested pattern over a SHARED enum inside
     /// `Option`/`Result` matched NOTHING, so the arm fell through to `None` and
     /// the program was silently wrong on every compiled backend.

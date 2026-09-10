@@ -12763,9 +12763,43 @@ impl<'ctx> super::Codegen<'ctx> {
         let Some(layout) = self.type_decls.enum_layouts.get(layout_name) else {
             return;
         };
-        let _ = self
-            .builder
-            .build_store(slot.ptr, layout.llvm_type.const_zero());
+        // B-2026-09-10-5 — ZERO THE SLOT'S OWN TYPE, not the seeded layout's.
+        // The `layout_name` above can only ever say `Option` or `Result`, and
+        // for most of this suppressor's life those were the only enums whose
+        // bindings reached it. B-2026-08-05-7 then widened
+        // `boxed_enum_payload_vars`' PRODUCER to user generic enums — an
+        // instantiation of `enum G[T] { X(T), Y }` boxes its payload against
+        // the erased one-word area exactly as `Option[Wide]` does — without
+        // widening this CONSUMER with it. So a `G[T]` binding took the
+        // `else` branch, and the store wrote `Option`'s FOUR words into a slot
+        // holding two: 16 bytes past the end of the alloca, over main's saved
+        // return address, and `ret` jumped to 0.
+        //
+        // A crash rather than a sanitizer finding, and a plain-POD one — no
+        // `Drop` impl, no heap, nothing generic about the payload but its
+        // width: `let a = G.X(W2 { a: 1, b: 2 }); hg(a);` SIGSEGVs at -O0 while
+        // `--interp`, the JIT and -O2 all print correctly (the wider frames
+        // there put something other than the return address under the
+        // overrun). Measured across payload widths: 1 word clean, 2 / 3 / 6 / 9
+        // words all SIGSEGV. The one-word case is clean for a structural
+        // reason and not because the store happens to fit — a payload that
+        // does not outgrow the erased area is never boxed, so the binding
+        // never joins `boxed_enum_payload_vars` and never reaches this disarm
+        // at all. Everything wider boxes, joins that set, and takes a store
+        // sized to the SEEDED LAYOUT against a slot sized to the BINDING.
+        //
+        // The slot's own `ty` is the allocation's real width, so this is
+        // correct for every enum by construction rather than by keeping a list
+        // of heads in step. For a genuine `Option`/`Result` binding it IS the
+        // seeded layout, so those emit byte-identical IR to before; the seeded
+        // layout stays the fallback for a slot that is not a struct (an
+        // indirectly-held binding), where the old store is what has been
+        // tested.
+        let zero_val: inkwell::values::BasicValueEnum<'ctx> = match slot.ty {
+            inkwell::types::BasicTypeEnum::StructType(st) => st.const_zero().into(),
+            _ => layout.llvm_type.const_zero().into(),
+        };
+        let _ = self.builder.build_store(slot.ptr, zero_val);
     }
 
     /// B-2026-09-04-1's probe — an arm whose VALUE is one of its own payload
