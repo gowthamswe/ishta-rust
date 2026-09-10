@@ -165,7 +165,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-24 | 2026-09-09 | codegen | low | AN `Array` PAYLOAD BINDING THAT IS INDEXED STRANDS ITS ELEMENTS AT `-O0` -- 18 B in 2 blocks for `Some(t) => t[0]` over `Option[Array[String, 2]]` and 48 B in 1 for a user enum's `Array[Vec[String], 2]` read two levels deep, while the same binding never indexed and the same index off a `let` are both clean | none |
 | B-2026-09-09-25 | 2026-09-09 | codegen | low | THE INDEX-STORE HALF OF B-2026-09-09-9 IS STILL REFUSED FOR AN `Array` OUTER -- `a[0][1] = 99` over `Array[Vec[i64], 2]` fails `codegen: Index assignment target must be a variable` on every compiled backend while `--interp` runs it and the `Vec` outer stores fine; the read half of the same declaration now agrees on all five surfaces | none |
 | B-2026-09-10-2 | 2026-09-10 | codegen+interp | medium | A USER GENERIC ENUM'S `Drop`-BEARING PAYLOAD LOSES ITS BODY AND LEAKS AT A BY-VALUE PARAM -- `fn holdgen(g: G[R2])` over `enum G[T] { X(T), Y }` prints no `d:` line for EITHER the fresh-temp or the named-local argument and strands 27 B per call, while the monomorphic control `enum Mono { P(R2), Q }` in the same position is correct and clean; `emit_optres_payload_user_drop_bodies_fn` hardcodes its head to `Option`/`Result` and returns None for everything else, so an instantiation of `G` gets no bodies walker emitted anywhere, and separately a LOCAL `G[R2]` matched in place runs the body on both compiled backends and NOTHING under `--interp` | none |
-| B-2026-09-10-3 | 2026-09-10 | codegen | low | THE `Result` SPELLING OF B-2026-09-09-19 LOSES THE ENVELOPE AS WELL AS THE INTERIOR, AND LOSES IT ON A WHOLE-PAYLOAD BIND TOO -- `struct HolderR { k: Result[K, i64] }` over `enum K { A(R2), B }` leaks 240 B in 3 blocks plus 36 B indirect in 9 for `Ok(K.A(r))` AND for `Ok(kk)`, where the `Option` twin is clean on the second | — |
 
 ### Relocated
 
@@ -2445,6 +2444,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-19 | codegen | low | A BOXED ENUM PAYLOAD'S INTERIOR IS UNOWNED ONE LEVEL DEEPER, INSIDE A STRUCT FIELD -- `fn show(h: Holder)` over `struct Holder { k: Option[K], n: i64… | 827b31a |
 | B-2026-09-09-22 | codegen | medium | A `Vec[Vec[String]]` PAYLOAD BOUND OUT OF AN `Option` OR `Result` ARM DOUBLE FREES ON EVERY COMPILED BACKEND -- `match x { Some(t) => t[0][0] }` abor… | ce145d9 |
 | B-2026-09-10-1 | codegen | medium | AN `Option[Vec[<heap-bearing struct>]]` PASSED AS AN ARGUMENT STILL DOUBLE FREES AFTER B-2026-09-09-22 -- `plainV(Some([S { s: f".." }, ..]))` aborts… | fb5bdc4 |
+| B-2026-09-10-3 | codegen | low | THE `Result` SPELLING OF B-2026-09-09-19 LOSES THE ENVELOPE AS WELL AS THE INTERIOR, AND LOSES IT ON A WHOLE-PAYLOAD BIND TOO -- `struct HolderR { k:… | 818c3b4 |
 
 </details>
 
