@@ -93,9 +93,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 | class | total |
 |---|---|
 | miscompile | 403 |
-| run-vs-build | 380 |
-| leak | 311 |
-| double-free | 221 |
+| run-vs-build | 381 |
+| leak | 312 |
+| double-free | 222 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
 | diagnostics | 125 |
@@ -110,8 +110,8 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1640 |
-| interp | 411 |
+| codegen | 1643 |
+| interp | 412 |
 | typecheck | 295 |
 | other | 81 |
 | ownership | 74 |
@@ -164,7 +164,9 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-24 | 2026-09-09 | codegen | low | AN `Array` PAYLOAD BINDING THAT IS INDEXED STRANDS ITS ELEMENTS AT `-O0` -- 18 B in 2 blocks for `Some(t) => t[0]` over `Option[Array[String, 2]]` and 48 B in 1 for a user enum's `Array[Vec[String], 2]` read two levels deep, while the same binding never indexed and the same index off a `let` are both clean | none |
 | B-2026-09-09-25 | 2026-09-09 | codegen | low | THE INDEX-STORE HALF OF B-2026-09-09-9 IS STILL REFUSED FOR AN `Array` OUTER -- `a[0][1] = 99` over `Array[Vec[i64], 2]` fails `codegen: Index assignment target must be a variable` on every compiled backend while `--interp` runs it and the `Vec` outer stores fine; the read half of the same declaration now agrees on all five surfaces | none |
 | B-2026-09-10-2 | 2026-09-10 | codegen+interp | medium | A USER GENERIC ENUM'S `Drop`-BEARING PAYLOAD LOSES ITS BODY AND LEAKS AT A BY-VALUE PARAM -- `fn holdgen(g: G[R2])` over `enum G[T] { X(T), Y }` prints no `d:` line for EITHER the fresh-temp or the named-local argument and strands 27 B per call, while the monomorphic control `enum Mono { P(R2), Q }` in the same position is correct and clean; `emit_optres_payload_user_drop_bodies_fn` hardcodes its head to `Option`/`Result` and returns None for everything else, so an instantiation of `G` gets no bodies walker emitted anywhere, and separately a LOCAL `G[R2]` matched in place runs the body on both compiled backends and NOTHING under `--interp` | none |
-| B-2026-09-10-4 | 2026-09-10 | codegen | medium | A REBIND OF A `match`-ARM-BOUND `Array` PAYLOAD IS A SECOND, SEPARATE DOUBLE FREE -- `Some(t) => { let u = t; u[0][0] }` still refuses to build after B-2026-09-09-23, deliberately: the element-type carry that would admit it aborts at `-O2` and prints NOTHING under the JIT and `-O0`, the opposite opt-level split from -23, because an arm binding's memory is the arm's and not `owned_array_params`' | none |
+| B-2026-09-10-6 | 2026-09-10 | codegen | medium | AN ARM-BOUND `Array` PAYLOAD PASSED BY VALUE INTO A CALLEE DOUBLE FREES -- `Some(t) => { take(t) }` over `fn take(a: Array[String, 2])` aborts `free(): double free detected in tcache 2` under the JIT and at `-O0` (clean at `-O2`, correct on `--interp`), because `suppress_array_binding_move_arg` retracts the caller's array drop only for `owned_array_params` and a `match`-arm binding is not in that set | none |
+| B-2026-09-10-7 | 2026-09-10 | codegen+interp | low | AN ARM-BOUND `Array` PAYLOAD NEVER RUNS ITS ELEMENTS' `Drop` BODIES, and the rebind spelling runs them on the COMPILED backends only -- `Some(t) => { t[0].tag }` over `Array[S, 2]` prints no `drop:` line on any backend, while `Some(t) => { let u: Array[S, 2] = t; .. }` prints both on `karac build`/`karac run` and none on `--interp` | none |
+| B-2026-09-10-8 | 2026-09-10 | codegen | low | AN `Array[Array[T, N], M]` PAYLOAD LEAKS ITS INNER ARRAYS' ELEMENTS -- 36 B in 4 blocks at `-O0` for `Some(t) => t[0][0]` over `Array[Array[String, 2], 2]`, with or without a rebind, so the outer array's drop walk never recurses into the inner one | none |
 
 ### Relocated
 
@@ -2446,6 +2448,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-23 | codegen | medium | REBINDING AN `Array[Vec[T], N]` DUPLICATES ITS ELEMENT OWNERS -- `let b: Array[Vec[i64], 2] = a;` with no index anywhere in the program aborts `free(… | 1e4e74a |
 | B-2026-09-10-1 | codegen | medium | AN `Option[Vec[<heap-bearing struct>]]` PASSED AS AN ARGUMENT STILL DOUBLE FREES AFTER B-2026-09-09-22 -- `plainV(Some([S { s: f".." }, ..]))` aborts… | fb5bdc4 |
 | B-2026-09-10-3 | codegen | low | THE `Result` SPELLING OF B-2026-09-09-19 LOSES THE ENVELOPE AS WELL AS THE INTERIOR, AND LOSES IT ON A WHOLE-PAYLOAD BIND TOO -- `struct HolderR { k:… | 818c3b4 |
+| B-2026-09-10-4 | codegen | medium | A REBIND OF A `match`-ARM-BOUND `Array` PAYLOAD IS A SECOND, SEPARATE DOUBLE FREE -- `Some(t) => { let u = t; u[0][0] }` still refuses to build after… | 2d991e9 |
 | B-2026-09-10-5 | codegen | high | A NAMED-LOCAL GENERIC ENUM PASSED BY VALUE SMASHES THE CALLER'S STACK -- `let a = G.X(W2 { a: 1, b: 2 }); hg(a);` over `enum G[T] { X(T), Y }` SIGSEG… | 91bd67b01 |
 
 </details>
