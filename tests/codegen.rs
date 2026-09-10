@@ -4144,6 +4144,82 @@ done
     /// Memory was balanced throughout (valgrind: every block freed), so this is
     /// bodies-only. The one-level control (`Gd[R]` held directly) is what
     /// localized it to the nesting.
+    /// B-2026-09-09-18 — a FRESH-TEMP `Option`/`Result` argument at a by-value
+    /// param runs its payload's `Drop` body exactly once.
+    ///
+    /// The row was filed as "a boxed payload behind an `Option`/`Result` PARAM
+    /// never runs its body", and the param is not the axis: the NAMED-LOCAL
+    /// spelling of the identical call was always correct, because the caller's
+    /// let site owns a by-value optres argument's payload bodies (the rule
+    /// `stmts.rs`'s optres let arm states as its own reason for marking the
+    /// callee's leaves param views). A fresh temp has no let site, so the body
+    /// it owed ran in no frame at all.
+    ///
+    /// The six cells are the whole point and the three passing ones are not
+    /// padding: A/B/C are the named-local controls that were already correct
+    /// and must not double, and F is the escape control — a callee that hands
+    /// the argument back is owned by whatever binds the result, so registering
+    /// in the caller as well would run two bodies. Only D and E were missing,
+    /// and a fixture with just those could not tell the fix from a double
+    /// fire.
+    ///
+    /// Memory was balanced before the fix (valgrind: 0 bytes at exit, 0
+    /// errors) — the callee's own prologue owns the box and its interior — so
+    /// no sanitizer could see this and the missing line is the only witness.
+    /// B is what shows the callee's match is irrelevant: it binds the payload
+    /// out and still owes exactly one body, the caller's.
+    #[test]
+    fn e2e_freshtemp_optres_argument_runs_its_payload_drop_body_once() {
+        let Some(out) = run_program(
+            r#"struct R2 { s: String, t: String, u: String }
+impl Drop for R2 { fn drop(mut ref self) { println(f"d:{self.s.len()}") } }
+fn mkr(i: i64) -> R2 { return R2 { s: f"ssssssss{i}", t: f"tttttttt{i}", u: f"uuuuuuuu{i}" }; }
+fn ignore(x: Option[R2]) { println("  ig"); }
+fn matchit(x: Option[R2]) { match x { Option.Some(r) => { println(f"  m:{r.s}"); } Option.None => { println("  mn"); } } }
+fn giveback(x: Option[R2]) -> Option[R2] { println("  gb"); return x; }
+fn resig(x: Result[R2, i64]) { println("  rig"); }
+fn main() {
+    println("A named->ignore");   { let a = Option.Some(mkr(1)); ignore(a); }
+    println("B named->matchit");  { let b = Option.Some(mkr(2)); matchit(b); }
+    println("C named->giveback"); { let c = Option.Some(mkr(3)); let r = giveback(c); }
+    println("D temp->ignore");    ignore(Option.Some(mkr(4)));
+    println("E temp->matchit");   matchit(Option.Some(mkr(5)));
+    println("F temp->giveback");  { let r = giveback(Option.Some(mkr(6))); }
+    println("G temp->resig");     resig(Result.Ok(mkr(7)));
+    println("end");
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out,
+            r#"A named->ignore
+  ig
+d:9
+B named->matchit
+  m:ssssssss2
+d:9
+C named->giveback
+  gb
+d:9
+D temp->ignore
+  ig
+d:9
+E temp->matchit
+  m:ssssssss5
+d:9
+F temp->giveback
+  gb
+d:9
+G temp->resig
+  rig
+d:9
+end
+"#
+        );
+    }
+
     #[test]
     fn e2e_nested_generic_struct_field_runs_its_drop_body_on_every_spelling() {
         let Some(out) = run_program(
@@ -152413,12 +152489,44 @@ fn main() {
                  fn main() { let mut i = 0; while i < 3 { show(Option.Some(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
                 "s\ns\ns\nend\n",
             ),
+            // B-2026-09-09-18 — this cell's expectation was CHANGED, and it was
+            // wrong before rather than a decision this row overrode. Three `K`
+            // values are built and all three die inside `show` (a by-value
+            // param the callee does not let escape), and `K` declares
+            // `impl Drop`, so three `dK` lines are owed. The pin froze ZERO.
+            //
+            // What proves it is the `-named-local` cell added directly below,
+            // which this pin did not have: it differs from this one by binding
+            // the argument to a local first, and it printed `dK` three times
+            // BEFORE this row's fix as well as after (measured on both
+            // backends at `KARAC_OPT_LEVEL=0`). Two spellings of one program
+            // disagreed, and the pin happened to contain only the wrong one —
+            // which is exactly how an output pin freezes a bug rather than a
+            // behaviour. The two now agree.
+            //
+            // Same defect as the row's headline shape, one level up: there the
+            // lost body belongs to a `Drop`-bearing payload STRUCT, here to the
+            // payload ENUM's own `impl Drop`. Both ride
+            // `emit_optres_payload_user_drop_bodies_fn`, whose user-enum arm is
+            // B-2026-08-28-58 leg B, and both were missing for the same reason —
+            // a fresh temp has no let site to own them.
             (
                 "drop-bearing-payload-enum",
                 "impl Drop for K { fn drop(mut ref self) { println(\"dK\") } }\n\
                  fn show(x: Option[K]) { match x { Option.Some(K.A(r)) => { println(f\"a:{r.s}\"); }, Option.Some(K.B) => {}, Option.None => {} } }\n\
                  fn main() { let mut i = 0; while i < 3 { show(Option.Some(K.A(mkr(i)))); i = i + 1; } println(\"end\") }\n",
-                "a:s0\na:s1\na:s2\nend\n",
+                "a:s0\ndK\na:s1\ndK\na:s2\ndK\nend\n",
+            ),
+            // The control the pin was missing. One word different from the cell
+            // above — the argument is bound to a local before the call — and it
+            // is the spelling that was always correct, so it is what a future
+            // change to this family has to keep agreeing with.
+            (
+                "drop-bearing-payload-enum-named-local",
+                "impl Drop for K { fn drop(mut ref self) { println(\"dK\") } }\n\
+                 fn show(x: Option[K]) { match x { Option.Some(K.A(r)) => { println(f\"a:{r.s}\"); }, Option.Some(K.B) => {}, Option.None => {} } }\n\
+                 fn main() { let mut i = 0; while i < 3 { let q = Option.Some(K.A(mkr(i))); show(q); i = i + 1; } println(\"end\") }\n",
+                "a:s0\ndK\na:s1\ndK\na:s2\ndK\nend\n",
             ),
             (
                 "flows-into-return-control",

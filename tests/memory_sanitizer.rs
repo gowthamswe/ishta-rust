@@ -84488,6 +84488,67 @@ fn main() {
     /// 2. The second needs no part of this fix to build (a single index never
     /// reaches the nested-read path), which is what places both in the
     /// pre-existing Array-element-interior class rather than in this one.
+    /// B-2026-09-09-18 — the fresh-temp `Option`/`Result` argument now runs its
+    /// payload's `Drop` body in the CALLER's frame, and this is the guard on
+    /// the one way that could go wrong.
+    ///
+    /// The body itself is memory-safe by kind: it rides `ContainerElemBodies`,
+    /// which frees nothing. The hazard is the one
+    /// `freshtemp_payload_bodies_action` documents for the match-scrutinee
+    /// sibling — a `Drop` body that MUTATES a heap field (`self.xs.clear()`)
+    /// run against a reconstructed COPY of the payload's `{ptr,len,cap}` frees
+    /// the buffer and zeroes the copy's cap, while the real owner keeps the
+    /// stale pointer and frees it again.
+    ///
+    /// It does not arise here, and the reason is structural rather than lucky:
+    /// this registration stages the ARGUMENT AGGREGATE — the same words the
+    /// callee was handed — so for a boxed payload the staged slot holds the box
+    /// POINTER and the walker reaches the one heap object through it. No copy
+    /// of the payload words is made, so there is no second cap to zero.
+    ///
+    /// Cell 1 is the named-local control (correct before this row, and the
+    /// shape whose behaviour must not change), 2 and 3 the two fresh-temp
+    /// spellings the fix adds — no arm, and an arm that binds the payload out.
+    #[test]
+    fn asan_freshtemp_optres_arg_payload_body_mutating_heap_frees_once() {
+        let prog = |call: &str| {
+            format!(
+                "struct Rv {{ id: i64, xs: Vec[i64] }}\n\
+                 impl Drop for Rv {{\n\
+                 \x20   fn drop(mut ref self) {{\n\
+                 \x20       println(f\"dv:{{self.id}}:{{self.xs.len()}}\");\n\
+                 \x20       self.xs.clear();\n\
+                 \x20       println(f\"cleared:{{self.xs.len()}}\");\n\
+                 \x20   }}\n\
+                 }}\n\
+                 fn mkv(i: i64) -> Rv {{ return Rv {{ id: i, xs: [i, i + 1, i + 2, i + 3, i + 4, i + 5] }}; }}\n\
+                 fn ignore(x: Option[Rv]) {{ println(\"  ig\"); }}\n\
+                 fn matchit(x: Option[Rv]) {{ match x {{ Option.Some(r) => {{ println(f\"  m:{{r.id}}\"); }} Option.None => {{ println(\"  mn\"); }} }} }}\n\
+                 fn main() {{ {call} }}\n"
+            )
+        };
+        // 1 — named local: the caller's let site owns the bodies, as before.
+        assert_clean_asan_run(
+            &prog("let a = Option.Some(mkv(1)); ignore(a);"),
+            &["ig", "dv:1:6", "cleared:0"],
+            "b18-named-local-control",
+        );
+        // 2 — fresh temp, callee never matches. The row's base shape.
+        assert_clean_asan_run(
+            &prog("ignore(Option.Some(mkv(2)));"),
+            &["ig", "dv:2:6", "cleared:0"],
+            "b18-freshtemp-no-arm",
+        );
+        // 3 — fresh temp, callee binds the payload out. The arm is not the
+        //     axis (it was never the discriminator), but it is the shape where
+        //     a second owner would show up if the arm took one.
+        assert_clean_asan_run(
+            &prog("matchit(Option.Some(mkv(3)));"),
+            &["m:3", "dv:3:6", "cleared:0"],
+            "b18-freshtemp-consuming-arm",
+        );
+    }
+
     #[test]
     fn asan_nested_indexed_read_on_an_array_outer_owns_its_elements() {
         // 1 — the row's own shape: an `Array[Vec[String], N]` bound out of an

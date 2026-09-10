@@ -3893,6 +3893,40 @@ impl<'a> super::Interpreter<'a> {
             if self.callee_owns_arg_beyond_call(callee_name, method_owner, i, variant) {
                 continue;
             }
+            // B-2026-09-09-18 — the `Option`/`Result` fresh-temp argument, which
+            // the per-type walk below excludes by name ("Option/Result stay
+            // with their own machinery") without that machinery ever covering
+            // this shape. It is keyed on a BINDING (`optres_payload_bodies_tes`,
+            // recorded by the Let arm), so a NAMED local argument is correct
+            // today and a fresh temp — which has no binding to key on — ran the
+            // payload's `Drop` body nowhere.
+            //
+            // Codegen had the identical hole through the identical door and is
+            // fixed in this commit beside this: there the caller-side owner is
+            // a let-site registration too, so `f(Some(mkr(1)))` reached neither
+            // backend's owner. Both halves land together deliberately — the
+            // note on `stmts.rs`'s optres let arm records that fixing the
+            // interpreter alone once turned an agreed defect into a
+            // run-vs-build split and was backed out.
+            //
+            // The escape guard is the `callee_owns_arg_beyond_call` continue
+            // directly above, so a callee that hands the argument back
+            // (`fn giveback(x: Option[R2]) -> Option[R2] { return x; }`) never
+            // reaches here and its result's owner stays the only one.
+            //
+            // VALUE-driven, matching `run_discarded_value_user_drops`' built-in
+            // arm rather than the instantiation-driven table: the temp has no
+            // name to resolve a declared type through, and the live value
+            // already says which variant is present.
+            if Self::optres_freshtemp_scrutinee(&arg.value) {
+                if let Some(v @ Value::EnumVariant { enum_name, .. }) = arg_vals.get(i) {
+                    if enum_name == "Option" || enum_name == "Result" {
+                        let v = v.clone();
+                        self.run_optres_payload_user_drops_value(&v);
+                        continue;
+                    }
+                }
+            }
             // B-2026-07-30-11 (param-tuple leg, the A shape): a tuple
             // LITERAL arg (`take_tuple((Res { id: 41 }, 10))`) moved into
             // the callee's tuple param never ran its Drop-carrying

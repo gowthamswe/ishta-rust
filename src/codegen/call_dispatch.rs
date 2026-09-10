@@ -2625,6 +2625,50 @@ impl<'ctx> super::Codegen<'ctx> {
                         self.track_optres_arg_temp(val, &param_te, own_payload, own_envelope);
                     }
                 }
+                // B-2026-09-09-18 — the BODY channel for the same temp, which
+                // the memory registration above cannot carry and which no
+                // frame owned at all.
+                //
+                // The invariant this restores is the one the let site states
+                // in its own note (`stmts.rs`, B-2026-09-04-29): the CALLER
+                // retains a by-value `Option`/`Result` argument's payload
+                // bodies, which is why the callee's leaves are marked param
+                // views and take memory-only drops. A NAMED-LOCAL argument
+                // gets that from its let site and is correct today; a FRESH
+                // TEMP has no let site, so the body it owed ran nowhere.
+                //
+                // Measured over `fn ignore(x: Option[R2])` and
+                // `fn matchit(x: Option[R2])` with `impl Drop for R2`, at
+                // `KARAC_OPT_LEVEL=0` and on `--interp` alike: the named-local
+                // spelling printed one `d:` line per call and the fresh-temp
+                // spelling printed NONE, whether or not the callee matched.
+                // Memory was fully reclaimed in both (valgrind: 0 bytes at
+                // exit, 0 errors), which is what kept this out of every
+                // sanitizer — the box and its interior have an owner in the
+                // callee's own prologue, and only the user body was missing.
+                //
+                // NOT gated on the entry-copy predicate the memory sibling
+                // above uses. `optres_param_entry_copied_te` excludes a
+                // payload wider than the boxing limit, and a `Drop`-bearing
+                // struct payload is normally exactly that — `Option[R2]` for
+                // a 3-`String` `R2` boxes at 9 words against a 3-word area —
+                // so reusing that gate would decline the whole shape the row
+                // is about. Boxing decides who frees the memory; it says
+                // nothing about who runs the body.
+                //
+                // ESCAPE is the gate that matters, and it is the same question
+                // `callee_optres_param_entry_copied_and_owned` asks, on the
+                // same analysis: a param the callee RETURNS is owned by
+                // whatever binds the result, and registering here as well
+                // would run the body twice. Measured on
+                // `fn giveback(x: Option[R2]) -> Option[R2] { return x; }`,
+                // which is correct BEFORE this fix (the destination `let` owns
+                // it) and must stay at one body after.
+                if let Some(param_te) = self.callee_by_value_optres_param_nonescaping(&name, i) {
+                    if self.optres_arg_is_unowned_temp(&a.value) {
+                        self.track_optres_arg_temp_bodies(val, &param_te);
+                    }
+                }
                 // B-2026-08-07-2 shapes 1+2 — the NESTED-box sibling of the
                 // suppressor above. The callee's owned non-escaping param now
                 // registers a `NestedBoxedEnumDrop` of its own (functions.rs),
@@ -3635,6 +3679,110 @@ impl<'ctx> super::Codegen<'ctx> {
     /// [`Self::optres_arg_mints_field_envelope`] for why one answer cannot
     /// serve both. They share this one spill so a temp needing both does not
     /// get two slots holding the same value.
+    /// B-2026-09-09-18 — the by-value `Option`/`Result` parameter type of a
+    /// callee that does NOT let the parameter escape, for the caller-side
+    /// payload-BODY registration.
+    ///
+    /// Deliberately NOT [`Self::callee_optres_param_entry_copied_and_owned`]
+    /// with a different name: that predicate opens with
+    /// `optres_param_entry_copied_te`, whose whole job is to ask whether the
+    /// by-value entry copy can DUPLICATE the payload, and which therefore
+    /// declines a payload wider than the boxing limit. A `Drop`-bearing struct
+    /// payload is usually exactly that shape, so the two questions do not
+    /// overlap the way the shared escape half suggests: who frees the memory
+    /// depends on boxing, who runs the body does not.
+    ///
+    /// What IS shared is the escape half, and it is shared by construction —
+    /// both route through `by_value_nonescaping_param_names`, so a param the
+    /// callee returns or stores is refused here for the same reason and by the
+    /// same analysis.
+    ///
+    /// A `ref` / `mut ref` param is excluded by the `TypeKind::Path` match: a
+    /// borrow's payload is owned by whoever the caller borrowed it from, never
+    /// by the argument expression.
+    pub(super) fn callee_by_value_optres_param_nonescaping(
+        &self,
+        callee_name: &str,
+        arg_index: usize,
+    ) -> Option<TypeExpr> {
+        let program = self.program_snapshot.as_deref()?;
+        let bare = callee_name.rsplit('.').next().unwrap_or(callee_name);
+        let check = |f: &crate::ast::Function, ast_i: usize| -> Option<TypeExpr> {
+            let p = f.params.get(ast_i)?;
+            let TypeKind::Path(path) = &p.ty.kind else {
+                return None;
+            };
+            let head = path.segments.last()?.as_str();
+            if head != "Option" && head != "Result" {
+                return None;
+            }
+            let crate::ast::PatternKind::Binding(pname) = &p.pattern.kind else {
+                return None;
+            };
+            if !crate::result_escape::by_value_nonescaping_param_names(f).contains(pname.as_str()) {
+                return None;
+            }
+            Some(p.ty.clone())
+        };
+        program.items.iter().find_map(|item| match item {
+            crate::ast::Item::Function(f) if f.name == callee_name => check(f, arg_index),
+            crate::ast::Item::ImplBlock(b) => b.items.iter().find_map(|ii| match ii {
+                crate::ast::ImplItem::Method(f) if f.name == bare => {
+                    let ast_i = if f.self_param.is_some() {
+                        arg_index.checked_sub(1)?
+                    } else {
+                        arg_index
+                    };
+                    check(f, ast_i)
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+    }
+
+    /// B-2026-09-09-18 — spill a fresh-temp `Option`/`Result` argument and give
+    /// the caller's frame its payload's user `Drop` BODIES.
+    ///
+    /// Bodies only, on the `ContainerElemBodies` channel, which is what makes
+    /// this safe to add beside whatever already owns the memory: that kind
+    /// frees nothing (see `UserDropKind`), so it cannot become a second owner
+    /// of the box the callee's own prologue registered, and it is retracted as
+    /// a family by `suppress_container_elem_bodies_for_var` if a later
+    /// consumer takes the payload.
+    ///
+    /// The action is pushed onto the CURRENT scope frame rather than the
+    /// function's, so a call in a loop body runs one body per iteration — the
+    /// shape the row was reported in (`while i < 3 { show(Some(K.A(mkr(i)))); }`
+    /// owes three). The alloca is an entry-block one, reused across iterations,
+    /// exactly as `track_discarded_optres_payload_bodies` stages its temp.
+    pub(super) fn track_optres_arg_temp_bodies(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        param_te: &TypeExpr,
+    ) {
+        let Some(bodies) = self.emit_optres_payload_user_drop_bodies_fn(param_te) else {
+            return;
+        };
+        let inkwell::types::BasicTypeEnum::StructType(agg_ty) = val.get_type() else {
+            return;
+        };
+        let Some(cur_fn) = self.current_fn else {
+            return;
+        };
+        let slot = self.create_entry_alloca(cur_fn, "__optres_arg_bodies_tmp", agg_ty.into());
+        if self.builder.build_store(slot, val).is_err() {
+            return;
+        }
+        self.track_user_drop_var_with_fn(
+            "",
+            "__optres_arg_bodies_tmp",
+            slot,
+            bodies,
+            crate::codegen::state::UserDropKind::ContainerElemBodies,
+        );
+    }
+
     pub(super) fn track_optres_arg_temp(
         &mut self,
         val: BasicValueEnum<'ctx>,

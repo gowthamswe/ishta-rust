@@ -33556,6 +33556,53 @@ fn test_container_bodies_whole_value_move_single_fire() {
 /// both backends fire for the same set of bindings; the moved-out sets
 /// mirror codegen's compile-time retractions at the match/combinator/ctor
 /// sites.
+/// B-2026-09-09-18 — the interpreter half of the fresh-temp `Option`/`Result`
+/// argument's payload `Drop` body, landed in the same commit as the codegen
+/// half (`e2e_freshtemp_optres_argument_runs_its_payload_drop_body_once`).
+///
+/// Both backends had the SAME hole through the same door: the owner of a
+/// by-value optres argument's payload bodies is the caller's binding, keyed by
+/// NAME here (`optres_payload_bodies_tes`, recorded by the Let arm) and by a
+/// let-site registration in codegen. A fresh temp has no binding to key on, so
+/// neither backend ran the body — which is why the row recorded "every surface
+/// agrees" and no A/B check could see it.
+///
+/// The two halves must land together: the note on `stmts.rs`'s optres let arm
+/// records that fixing only the interpreter once turned an agreed defect into
+/// a run-vs-build split and was backed out. Same program as the codegen test
+/// on purpose, so a future divergence between the two shows up as one of them
+/// failing rather than as a silent drift.
+#[test]
+fn a_freshtemp_optres_argument_runs_its_payload_drop_body_once() {
+    assert_eq!(
+        run("struct R2 { s: String, t: String, u: String }\n\
+             impl Drop for R2 { fn drop(mut ref self) { println(f\"d:{self.s.len()}\") } }\n\
+             fn mkr(i: i64) -> R2 { return R2 { s: f\"ssssssss{i}\", t: f\"tttttttt{i}\", u: f\"uuuuuuuu{i}\" }; }\n\
+             fn ignore(x: Option[R2]) { println(\"  ig\"); }\n\
+             fn matchit(x: Option[R2]) { match x { Option.Some(r) => { println(f\"  m:{r.s}\"); } Option.None => { println(\"  mn\"); } } }\n\
+             fn giveback(x: Option[R2]) -> Option[R2] { println(\"  gb\"); return x; }\n\
+             fn resig(x: Result[R2, i64]) { println(\"  rig\"); }\n\
+             fn main() {\n\
+                 println(\"A named->ignore\");   { let a = Option.Some(mkr(1)); ignore(a); }\n\
+                 println(\"B named->matchit\");  { let b = Option.Some(mkr(2)); matchit(b); }\n\
+                 println(\"C named->giveback\"); { let c = Option.Some(mkr(3)); let r = giveback(c); }\n\
+                 println(\"D temp->ignore\");    ignore(Option.Some(mkr(4)));\n\
+                 println(\"E temp->matchit\");   matchit(Option.Some(mkr(5)));\n\
+                 println(\"F temp->giveback\");  { let r = giveback(Option.Some(mkr(6))); }\n\
+                 println(\"G temp->resig\");     resig(Result.Ok(mkr(7)));\n\
+                 println(\"end\");\n\
+             }\n"),
+        "A named->ignore\n  ig\nd:9\n\
+         B named->matchit\n  m:ssssssss2\nd:9\n\
+         C named->giveback\n  gb\nd:9\n\
+         D temp->ignore\n  ig\nd:9\n\
+         E temp->matchit\n  m:ssssssss5\nd:9\n\
+         F temp->giveback\n  gb\nd:9\n\
+         G temp->resig\n  rig\nd:9\n\
+         end\n"
+    );
+}
+
 #[test]
 fn test_optres_payload_runs_user_drop_bodies() {
     assert_eq!(
