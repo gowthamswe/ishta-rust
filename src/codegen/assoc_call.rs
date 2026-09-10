@@ -3412,14 +3412,24 @@ impl<'ctx> super::Codegen<'ctx> {
                     // The store clause resolves an enum-returning fn-call
                     // argument, which the return route's predicate cannot; the
                     // helper's doc says why the two are not merged.
-                    let store_entry_copied =
+                    // B-2026-09-07-36 — now BOTH clauses, not the store one
+                    // alone; the rationale and the -O2-only premise it replaces
+                    // are written out once on the FREE leg (`call_dispatch.rs`),
+                    // whose predicate this is. This leg leaks the same 3 B in
+                    // 1 block at -O0 without it, measured on its own cell.
+                    let entry_copied_any =
                         arg_entry_copied || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
                     // B-2026-09-07-4 — the fresh-temp half; see the method leg.
                     let callee_owns_handback_memory =
                         self.conditional_handback_memory_moves_to_callee(&qualified, i);
-                    if (!(always_handed_back || callee_owns_handback_memory) || arg_entry_copied)
-                        && (!stored_in_outliving_place || store_entry_copied)
-                    {
+                    // One condition, same shape as the free leg: declined
+                    // exactly when the value leaves the frame with no entry
+                    // copy behind it.
+                    let escapes_without_entry_copy = (always_handed_back
+                        || callee_owns_handback_memory
+                        || stored_in_outliving_place)
+                        && !entry_copied_any;
+                    if !escapes_without_entry_copy {
                         // B-2026-09-07-6 — the PARTS registrar, with the
                         // callee's declared element types, where this leg used
                         // to call the arity-3 form that has no element-types

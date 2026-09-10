@@ -2587,8 +2587,22 @@ impl<'ctx> super::Codegen<'ctx> {
             // free-fn gate, so whether a generic enum arg leaks the same way is
             // an unmeasured question, and guessing a caller-side free onto an
             // unmeasured path is how a leak fix becomes a double free.
+            // B-2026-09-07-36 — the enum siblings, admitted. The note above
+            // deferred them for want of a measurement ("whether a generic enum
+            // arg leaks the same way is an unmeasured question"); it is now
+            // measured, and the answer is yes on BOTH spellings. At -O0 over
+            // `fn passg[T](e: T) -> T`, `passg(mkes(71))` and
+            // `passg(Es.A(f"e{i}"))` each strand 3 B in 1 block (10 allocs /
+            // 9 frees) -- the same figure the three non-generic legs stranded
+            // before the same admission, and clean here after it.
+            //
+            // Both spellings are needed for the same reason the store clause
+            // below needs both: `enum_name_of_expr` resolves a variant
+            // CONSTRUCTOR and not a function returning the enum.
             let arg_entry_copied = self.arg_is_entry_copied_heap_struct(&a.value)
-                || self.arg_is_entry_copied_heap_tuple(&a.value, name, i);
+                || self.arg_is_entry_copied_heap_tuple(&a.value, name, i)
+                || self.arg_is_entry_copied_heap_enum(&a.value)
+                || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
             // B-2026-09-07-5 — the OUTLIVING-STORE half of the admission gate,
             // the monomorph leg. `escapes_frame` above already carries the
             // store route for the BODY half; nothing declined the registration,
@@ -2616,12 +2630,13 @@ impl<'ctx> super::Codegen<'ctx> {
             // definitely lost — the exact trade the other three legs refuse.
             // Both spellings are needed: the ctor one, and the fn-call one that
             // `enum_name_of_expr` cannot resolve (B-2026-09-07-5's helper).
-            let store_entry_copied = arg_entry_copied
-                || self.arg_is_entry_copied_heap_enum(&a.value)
-                || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
-            if (!flows_into_return || arg_entry_copied)
-                && (!stored_in_outliving_place || store_entry_copied)
-            {
+            // The two enum legs moved UP into `arg_entry_copied`, so both
+            // escape routes now carry the same carve-out and the separate
+            // `store_entry_copied` alias they used to need is gone. Same one
+            // condition as the other three legs.
+            let escapes_without_entry_copy =
+                (flows_into_return || stored_in_outliving_place) && !arg_entry_copied;
+            if !escapes_without_entry_copy {
                 let escaping_parts = self.callee_returned_param_parts(name, i);
                 let field_payload_paths = self.callee_escaping_field_payload_paths(name, i);
                 // B-2026-09-04-26 — the monomorph path reads the same declared

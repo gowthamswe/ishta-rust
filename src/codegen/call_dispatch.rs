@@ -2316,12 +2316,40 @@ impl<'ctx> super::Codegen<'ctx> {
                 self.call_arg_moves_into_outliving_place(&name, i, false);
             // The store clause resolves one shape the return route cannot; see
             // the helper's doc for why it is not folded into `arg_entry_copied`.
-            let store_entry_copied =
+            // B-2026-09-07-36 — one disjunction for BOTH escape clauses. It
+            // was store-only, on a premise that has not survived measurement:
+            // the helper's doc recorded `let z = passe(mkes(71))` as "clean
+            // today with the registration DECLINED", so admitting it to the
+            // return route would free a non-existent orphan. That reading was
+            // taken at -O2 ONLY, where LLVM elides a malloc nothing observes.
+            // At -O0 the orphan is real -- 3 B in 1 block, 10 allocs / 9 frees
+            // -- on all three legs of this gate.
+            //
+            // The two predicates answer the SAME question ("does the callee
+            // entry-copy this argument?") and differ only in which spelling
+            // they can resolve: `enum_name_of_expr`'s `Call` arm reaches a
+            // variant CONSTRUCTOR and not a function that returns the enum. So
+            // the CTOR spelling `passe(Es.A(f"e{i}"))` already takes this
+            // route and is clean at both opt levels (10 allocs / 10 frees),
+            // which is the direct evidence that
+            // admitting the call spelling is right rather than risky: same
+            // callee, same param, same entry copy, same division of ownership.
+            // Spell that control with an f-string payload, not `Es.A("x")`: a
+            // static literal never reaches the allocator, so the literal cell
+            // is clean at the BASELINE alloc count and proves nothing.
+            //
+            // The double-free the old comment feared needs the callee NOT to
+            // copy, and that case is already excluded -- the helper's fourth
+            // clause is `!enum_param_owned_by_transfer`, so a transfer-owned
+            // enum answers false here and the registration still declines.
+            let entry_copied_any =
                 arg_entry_copied || self.arg_is_entry_copied_heap_enum_via_call(&a.value);
-            if !arg_transfers
-                && (!flows_into_return || arg_entry_copied)
-                && (!stored_in_outliving_place || store_entry_copied)
-            {
+            // Both escape routes carry the SAME carve-out now, so the gate
+            // reads as one condition: the registration is declined exactly when
+            // the value leaves the frame with no entry copy behind it.
+            let escapes_without_entry_copy =
+                (flows_into_return || stored_in_outliving_place) && !entry_copied_any;
+            if !arg_transfers && !escapes_without_entry_copy {
                 let escaping_parts = self.callee_returned_param_parts(&name, i);
                 let declared_tes = self.callee_tuple_param_elem_type_exprs(&name, i);
                 // B-2026-09-02-24 — the enum-payload sibling of `escaping_parts`,

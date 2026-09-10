@@ -84395,6 +84395,109 @@ fn main() {
         );
     }
 
+    /// B-2026-09-07-36 — an enum argument on the RETURN route whose entry copy
+    /// the admission gate cannot see, across all FOUR legs of that gate.
+    ///
+    /// The gate admits the caller-side memory registration only when the callee
+    /// ENTRY-COPIES the argument, because then the callee returns the copy and
+    /// the caller's original is genuinely orphaned. Two predicates answer that
+    /// one question and differ only in which spelling they resolve:
+    /// `arg_is_entry_copied_heap_enum` routes through `enum_name_of_expr`,
+    /// whose `Call` arm reaches a variant CONSTRUCTOR and not a function that
+    /// returns the enum, so `passe(mkes(71))` answered false where
+    /// `passe(Es.A(..))` answered true — same type, same callee, same copy.
+    ///
+    /// The via-call sibling existed (B-2026-09-07-5) but fed the STORE clause
+    /// only, deliberately, on a premise its doc recorded: the return-route
+    /// spelling was "clean today with the registration DECLINED". That reading
+    /// was taken at -O2 ONLY, where LLVM elides a malloc nothing observes. At
+    /// -O0 the orphan is real, and the premise does not survive.
+    ///
+    /// FIVE shapes leaked 3 B in 1 block at -O0 (10 allocs / 9 frees each), one
+    /// per leg plus the mono leg's second spelling, and all five are clean
+    /// after:
+    ///
+    ///   - `p1` free fn, call-spelled arg — the cell the row was filed on;
+    ///   - `p3` static assoc fn (`assoc_call.rs`), `p4` method
+    ///     (`method_call.rs`) — the same gate, kept in step per B-2026-08-29-54;
+    ///   - `p5` / `p6` the GENERIC leg (`mono.rs`), which excluded BOTH enum
+    ///     predicates, not just the via-call one. Its note deferred them for
+    ///     want of a measurement — "whether a generic enum arg leaks the same
+    ///     way is an unmeasured question" — and the answer is yes on both
+    ///     spellings. That deferral is retired here rather than re-derived.
+    ///
+    /// FOUR controls, clean before AND after with identical alloc/free counts:
+    ///
+    ///   - `p2` the CTOR spelling on the free leg. It is the direct evidence
+    ///     that admitting the call spelling is right rather than risky: it
+    ///     already takes this route, with the same callee and the same entry
+    ///     copy. SPELL IT WITH AN F-STRING, not `Es.A("x")` — a static literal
+    ///     never reaches the allocator, so the literal cell sits at the
+    ///     BASELINE alloc count and is clean vacuously. The first draft of this
+    ///     fixture made that mistake and the cell proved nothing;
+    ///   - `p7` a generic callee that CONSUMES rather than returns, so no
+    ///     escape clause fires at all;
+    ///   - `p8` a generic STRUCT on the return route — the shape the mono leg
+    ///     already admitted, pinning that this change did not disturb it;
+    ///   - `p9` the generic STORE route (`stashg(mut v, mkes(56))`), the clause
+    ///     the via-call predicate was originally added for. It is the
+    ///     double-free direction: the store clause and the return clause now
+    ///     share one disjunction, so a regression there would show as an
+    ///     invalid free rather than a leak.
+    ///
+    /// DELIBERATELY NOT A CELL: a SHARED-payload enum (`enum Et { A(Sh) }` over
+    /// a `shared struct`) on the same return route strands its 16-byte refcount
+    /// block, measured byte-identical before and after this change (9 allocs /
+    /// 8 frees). Different mechanism — the helper's `shared` clause asks whether
+    /// the ENUM is shared, not whether its PAYLOAD is — and it is filed on its
+    /// own row. Pinning it here would fail this fixture for a defect it does
+    /// not own.
+    #[test]
+    fn asan_enum_arg_on_the_return_route_frees_its_orphan() {
+        assert_clean_asan_run(
+            r#"
+enum Es { A(String), B }
+impl Drop for Es { fn drop(mut ref self) { println("dEs") } }
+struct H { n: i64 }
+impl H {
+    fn spass(e: Es) -> Es { return e; }
+    fn mpass(ref self, e: Es) -> Es { return e; }
+}
+fn mkes(i: i64) -> Es { return Es.A(f"ee{i}"); }
+fn passe(e: Es) -> Es { return e; }
+fn passg[T](e: T) -> T { return e; }
+fn eatg[T](e: T) -> i64 { return 1; }
+fn stashg[T](v: mut ref Vec[T], x: T) { v.push(x); }
+
+struct Rs { id: i64, name: String }
+impl Drop for Rs { fn drop(mut ref self) { println(f"dR{self.id}") } }
+fn mkr(i: i64) -> Rs { return Rs { id: i, name: f"hh{i}" }; }
+
+fn main() {
+    let h = H { n: 1 };
+    let i = 71;
+
+    let z1 = passe(mkes(i));            println("p1");
+    let z2 = passe(Es.A(f"ee{i}"));     println("p2");
+    let z3 = H.spass(mkes(i));          println("p3");
+    let z4 = h.mpass(mkes(i));          println("p4");
+    let z5 = passg(mkes(i));            println("p5");
+    let z6 = passg(Es.A(f"ee{i}"));     println("p6");
+    let n7 = eatg(mkes(i));             println(f"p7={n7}");
+    let z8 = passg(mkr(9));             println("p8");
+    let mut v: Vec[Es] = Vec.new();
+    stashg(mut v, mkes(56));            println(f"p9={v.len()}");
+    println("end");
+}
+"#,
+            &[
+                "dEs", "p1", "dEs", "p2", "dEs", "p3", "dEs", "p4", "dEs", "p5", "dEs", "p6",
+                "dEs", "p7=1", "dR9", "p8", "p9=1", "dEs", "end",
+            ],
+            "asan_enum_arg_on_the_return_route_frees_its_orphan",
+        );
+    }
+
     /// B-2026-09-06-72 — a `shared` FIELD's 16-byte refcount block when the
     /// owning struct travels out of a function inside an AGGREGATE.
     ///
