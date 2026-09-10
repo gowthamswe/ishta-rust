@@ -94,7 +94,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 |---|---|
 | miscompile | 404 |
 | run-vs-build | 381 |
-| leak | 313 |
+| leak | 314 |
 | double-free | 222 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,7 +110,7 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1644 |
+| codegen | 1645 |
 | interp | 412 |
 | typecheck | 295 |
 | other | 81 |
@@ -151,7 +151,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-06-54 | 2026-09-06 | interp+codegen | low | AN OWNED-`self` ENUM RECEIVER'S PAYLOAD `Drop` BODY RUNS NOWHERE WHEN THE CALLEE BINDS NOTHING OUT -- `fn plain(self, c: bool) -> i64 { return 1; }` called on `E.A(mk(16))` prints `dE` and never `dR16`, on --interp / jit / aot / `KARAC_AUTO_PAR=0` alike, for a named receiver and a fresh temp; the same receiver prints `dR16 dE` the moment the callee matches on `self` | — |
 | B-2026-09-06-65 | 2026-09-06 | interp+codegen | low | A PLAIN OWNED-`self` METHOD ON A FRESH TEMP RUNS THE RECEIVER'S `Drop` BODY BEFORE THE CALL'S RESULT IS PRINTED ON THE INTERPRETER AND AFTER IT ON EVERY COMPILED BACKEND -- `println(f"v={mk(4).plain()}")` over `fn plain(self) -> i64 { return self.id; }` prints `dR4 v=4` under --interp and `v=4 dR4` on jit / aot / -O0, a stdout-visible A/B divergence with no memory difference | — |
 | B-2026-09-07-1 | 2026-09-07 | interp+codegen | low | A DEEP-CHAIN MOVE-OUT WHOSE HOP IS THEN BOUND OUT RUNS THE MOVED LEAF'S `Drop` BODY TWICE, AND THE SECOND FIRE READS A HUSK ON THE COMPILED BACKENDS -- `let x = o.h.r; let Outer { h, k } = o;` prints `dR1 dR2 dR1` on all four surfaces, and with a `String` field the compiled second fire is `dR1/` (empty name) against `--interp`'s `dR1/n1` | — |
-| B-2026-09-07-36 | 2026-09-07 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }` loses 3 B in 1 block at -O0 while the CTOR spelling `passe(Es.A("x"))` is clean, and -O2 hides it entirely by eliding the dead malloc | src/codegen/call_dispatch.rs (free-leg admission clause, arg_is_entry_copied_heap_enum vs _via_call on the return route) |
 | B-2026-09-07-53 | 2026-09-07 | codegen | high | AT EQUAL HASHING kara's Map IS NOW SLOWER THAN RUST'S, INVERTING A PUBLISHED HEADLINE: on 3 of 4 re-measured map katas kara went from 3-4x AHEAD of both rustc builds to 1.2-2.4x BEHIND (kata:146 0.31x -> 2.35x vs rust_ovf), and also lost its lead over Go -- so the 2026-06-15 equal-safety claim "parity with memory-safe Rust, BEATS IT ON COLLECTIONS" rested on comparing kara's compile-time-constant-seeded FxHash against Rust's per-process SipHash-1-3, and cannot be quoted until the collection set is re-run | BENCHMARKS.md + the 16 collection/pointer kata READMEs still publish the pre-59c8d30cd collection-superiority claim | corrects the unmeasured speculation in B-2026-09-07-42's COST DECOMPOSED section |
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
 | B-2026-09-09-5 | 2026-09-09 | other | low | THREE LOAD-SENSITIVE TESTS IN THE REQUIRED GATE SET ARE STILL UNEXPLAINED after B-2026-09-09-1's named one turned out NOT to be flaky -- that one was a deterministic watchdog race that never armed (fixed 32223a5a6, 2-in-6 permanent orphans under load -> 0 in 8), so its resolution transfers no conclusion to the rest. Leading hypothesis for the ASAN pair is the vacuous-fixture floor: n=102 against a per-process HOST FLOOR of 90 measured on a box running dozens of concurrent ASAN processes, a 12-allocation margin that a drifting floor would trip with nothing wrong in the compiler -- with the counter-argument that a shared OnceLock floor should fail many fixtures at once, and only one failed | — |
@@ -167,6 +166,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-10-8 | 2026-09-10 | codegen | low | AN `Array[Array[T, N], M]` PAYLOAD LEAKS ITS INNER ARRAYS' ELEMENTS -- 36 B in 4 blocks at `-O0` for `Some(t) => t[0][0]` over `Array[Array[String, 2], 2]`, with or without a rebind, so the outer array's drop walk never recurses into the inner one | none |
 | B-2026-09-10-9 | 2026-09-10 | codegen | medium | THE FIRST ELEMENT OF A BOXED TUPLE PAYLOAD RUNS ITS `Drop` BODY OVER THE WRONG POINTER -- `fn takeR(x: Option[(R, R)])` prints a pointer-shaped `id` for element 0 and the correct one for every later element, on every compiled surface, while `--interp` is correct; no sanitizer catches it because the read is a wrong OFFSET inside live memory | none |
 | B-2026-09-10-10 | 2026-09-10 | cli | low | SIGKILL TO `karac run` PERMANENTLY LEAKS THE HANDOFF IR FILE -- `/tmp/karac_run_<pid>_jit.ll` is still on disk 30 minutes after the run, so the 5-second poll in `signalling_karac_run_does_not_orphan_the_jit_runner` is not a tight budget but a real unlink that never happens; 2 failures in 4 full-gate runs, 0 in isolation | none |
+| B-2026-09-10-11 | 2026-09-10 | codegen | low | A SHARED-PAYLOAD ENUM ON THE RETURN ROUTE STRANDS ITS 16-BYTE REFCOUNT BLOCK -- `let z = passt(mket(3))` over `enum Et { A(Sh), B }` with `shared struct Sh` loses 16 B in 1 block at -O0, because the admission gate's `shared` clause asks whether the ENUM is shared and not whether its PAYLOAD is | — |
 
 ### Relocated
 
@@ -2391,6 +2391,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-07-33 | codegen | high | A CALLEE HANDING A BOXED PAYLOAD OUT OF A `match` ARM WRITES INTO THE ENVELOPE IT JUST FREED -- `fn payout(w: W) -> X1 { return match w { W.T(x) => x… | 63b0628 |
 | B-2026-09-07-34 | codegen | high | A SPEC'D 128-BIT f-STRING HOLE FAILED LLVM MODULE VERIFICATION -- `f"{x:44}"` on an `i128` did not compile at all after B-2026-09-07-25 routed spec'd… | f5f86c16e |
 | B-2026-09-07-35 | interp | medium | A SPEC'D 128-BIT f-STRING HOLE PANICS THE INTERPRETER -- `f"{big:44}"` on a `u128` aborts with "128-bit value reached an i64-only consumer" while bot… | 328908980 |
+| B-2026-09-07-36 | codegen | low | A FN-CALL-SPELLED ENUM ARGUMENT ON THE RETURN ROUTE STRANDS ITS PAYLOAD AT -O0 -- `let z = passe(mkes(71))` over `fn passe(e: Es) -> Es { return e; }… | 9b27533 |
 | B-2026-09-07-37 | other | medium | RUNNING THE GATE SUITE REPLACES THE CANONICAL RUNTIME ARCHIVE WITH A NON-DCE'D ONE -- `tests/par_codegen.rs` built it with the forbidden `cargo build… | 4bd617d8e |
 | B-2026-09-07-38 | codegen | medium | THE -O0 ASAN RATCHET IS RED ON `main`, WITH THREE UNLISTED LEAK FAILURES THAT ARRIVED WITH 6a4a86c78 -- one is that commit's OWN new fixture (`asan_b… | 8f3751b15 |
 | B-2026-09-07-39 | codegen | medium | FLOAT f-STRING INTERPOLATION IS STILL ON libc `snprintf` (spec'd holes) AND STILL ALLOCATES A `String` PER CALL (`karac_runtime_f64_to_str` / `_i128_… | 0e7ace131 |
