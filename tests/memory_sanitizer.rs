@@ -84093,6 +84093,145 @@ fn main() {
         );
     }
 
+    /// B-2026-09-10-3 — a BOXED `Result` field's envelope when a consuming site
+    /// zeroes the source, the `Result` half of B-2026-09-09-19.
+    ///
+    /// `place_optres_field_move_info_ex` admits a `Result` field whose payload
+    /// is heap-BOXED, so every consuming site zeroes the field's payload AREA
+    /// (`zero_result_payload_area`) to hand the value to the binding. For a
+    /// boxed payload that area IS the box word, so the field's own
+    /// `karac_drop_Result_<ok>_<err>` reads null and skips: the envelope is
+    /// neutralized and NOTHING takes it over. That arm's comment asserts the
+    /// opposite -- "the boxed `BoxedEnumDrop` guards on a non-null box word" --
+    /// and the guard is exactly what loses the box.
+    ///
+    /// The `Option` twin has been immune since B-2026-08-06-10, which excludes a
+    /// boxed payload from the same classifier for the same reason. This mirrors
+    /// that exclusion onto the `Result` arm; declining leaves the field's drop
+    /// armed, and `emit_result_drop_fn`'s slice-3u boxed branch already runs the
+    /// contents' drop and then frees the box.
+    ///
+    /// FOUR shapes leaked, 240 B in 3 blocks (the 80-byte envelopes) plus 36 B
+    /// INDIRECT in 9 (`R2`'s `String`s, reachable only through them) at -O0
+    /// each, and all four are clean after:
+    ///
+    ///   - `d`: the destructuring arm `Ok(K.A(r))`, the shape the row was
+    ///     filed on;
+    ///   - `wb`: the WHOLE-payload bind `Ok(kk)`. This is the one that separates
+    ///     the `Result` side from the `Option` side rather than merely lagging
+    ///     it: the `Option` spelling `Some(kk)` is CLEAN and is pinned as
+    ///     correct by `asan_b04_7_option_heap_enum_struct_field_drop_no_leak`,
+    ///     whose own comment calls it a correct division of one allocation each.
+    ///     The `ow` cell holds that twin here so the two are read together;
+    ///   - `am`: the ARG-MOVE `eat(f2.k)`, through the whole-move sibling
+    ///     `place_optres_field_whole_move_info`. Not in the row -- found by
+    ///     probing the other callers of the classifier this exclusion sits in;
+    ///   - `be`: the boxed `Err` SIDE (`Result[i64, K]`), likewise not in the
+    ///     row. The exclusion tests both halves because the zero is of the
+    ///     shared payload area, so whichever side is live is the one lost.
+    ///
+    /// FIVE controls, clean before AND after with identical alloc/free counts,
+    /// each a direction this exclusion could have turned into a double free by
+    /// leaving a source armed that something else already owns:
+    ///
+    ///   - `vw` / `wc`: non-binding arms (`Ok(K.A(_))`, `Ok(_)`). No consuming
+    ///     site fires, so the field's drop always owned it -- these are what
+    ///     show the source zero is the cause rather than a missing registration;
+    ///   - `lm`: the LET-MOVE `let lm = e2.k`. The load-bearing control: it
+    ///     binds the field to a local whose own cleanup runs, so if the arm
+    ///     binding were a second owner this is where the double free would
+    ///     appear. 23 allocs / 23 frees, 0 invalid, both before and after;
+    ///   - `ub`: an UNBOXED `Result[String, i64]` field. The inline width keeps
+    ///     the old behaviour exactly -- its buffer really is the binding's to
+    ///     free and the source zero really is required -- which is what makes
+    ///     the exclusion narrow rather than a blanket retreat;
+    ///   - `ow`: the `Option` twin of `wb`, unchanged.
+    #[test]
+    fn asan_boxed_result_field_keeps_an_owner_for_its_envelope() {
+        assert_clean_asan_run(
+            r#"
+struct R2 { s: String, t: String, u: String }
+enum K { A(R2), B }
+struct HolderR { k: Result[K, i64], n: i64 }
+struct HolderE { k: Result[i64, K], n: i64 }
+struct HolderS { k: Result[String, i64], n: i64 }
+struct HolderO { k: Option[K], n: i64 }
+
+fn mkr(i: i64) -> R2 { return R2 { s: f"ssssssss{i}", t: f"tttttttt{i}", u: f"uuuuuuuu{i}" }; }
+fn eat(x: Result[K, i64]) -> i64 {
+    match x { Result.Ok(K.A(r)) => { return r.s.len(); } Result.Ok(K.B) => { return 0; } Result.Err(e) => { return e; } }
+}
+
+fn main() {
+    let mut i = 0;
+    while i < 3 {
+        let a = HolderR { k: Result.Ok(K.A(mkr(i))), n: i };
+        match a.k { Result.Ok(K.A(r)) => { println(f"d:{r.s}"); } Result.Ok(K.B) => {} Result.Err(e) => {} }
+
+        let b = HolderR { k: Result.Ok(K.A(mkr(i))), n: i };
+        match b.k { Result.Ok(kk) => { println("wb"); } Result.Err(e) => {} }
+
+        let c = HolderR { k: Result.Ok(K.A(mkr(i))), n: i };
+        match c.k { Result.Ok(K.A(_)) => { println("vw"); } Result.Ok(K.B) => {} Result.Err(e) => {} }
+
+        let d = HolderR { k: Result.Ok(K.A(mkr(i))), n: i };
+        match d.k { Result.Ok(_) => { println("wc"); } Result.Err(e) => {} }
+
+        let e2 = HolderR { k: Result.Ok(K.A(mkr(i))), n: i };
+        let lm = e2.k;
+        match lm { Result.Ok(K.A(r)) => { println(f"lm:{r.s}"); } Result.Ok(K.B) => {} Result.Err(e) => {} }
+
+        let f2 = HolderR { k: Result.Ok(K.A(mkr(i))), n: i };
+        println(f"am:{eat(f2.k)}");
+
+        let g = HolderE { k: Result.Err(K.A(mkr(i))), n: i };
+        match g.k { Result.Ok(v) => {} Result.Err(K.A(r)) => { println(f"be:{r.s}"); } Result.Err(K.B) => {} }
+
+        let h = HolderS { k: Result.Ok(f"pppppppp{i}"), n: i };
+        match h.k { Result.Ok(s) => { println(f"ub:{s}"); } Result.Err(e) => {} }
+
+        let o = HolderO { k: Option.Some(K.A(mkr(i))), n: i };
+        match o.k { Option.Some(kk) => { println("ow"); } Option.None => {} }
+
+        i = i + 1;
+    }
+    println("end");
+}
+"#,
+            &[
+                "d:ssssssss0",
+                "wb",
+                "vw",
+                "wc",
+                "lm:ssssssss0",
+                "am:9",
+                "be:ssssssss0",
+                "ub:pppppppp0",
+                "ow",
+                "d:ssssssss1",
+                "wb",
+                "vw",
+                "wc",
+                "lm:ssssssss1",
+                "am:9",
+                "be:ssssssss1",
+                "ub:pppppppp1",
+                "ow",
+                "d:ssssssss2",
+                "wb",
+                "vw",
+                "wc",
+                "lm:ssssssss2",
+                "am:9",
+                "be:ssssssss2",
+                "ub:pppppppp2",
+                "ow",
+                "end",
+            ],
+            "asan_boxed_result_field_keeps_an_owner_for_its_envelope",
+        );
+    }
+
     /// B-2026-09-06-72 — a `shared` FIELD's 16-byte refcount block when the
     /// owning struct travels out of a function inside an AGGREGATE.
     ///

@@ -5360,6 +5360,39 @@ impl<'ctx> super::Codegen<'ctx> {
                 {
                     return None;
                 }
+                // B-2026-09-10-3 — the `Option` arm's B-2026-08-06-10 exclusion,
+                // which this arm never got. The paragraph above claims
+                // `zero_result_payload_area` "neutralizes both widths … the
+                // boxed `BoxedEnumDrop` guards on a non-null box word". The
+                // guard is real and that is exactly the problem: the payload
+                // area IS the box word, so zeroing it makes the field's own
+                // `karac_drop_Result_<ok>_<err>` read null and skip — the box is
+                // neutralized and NOTHING takes it over. An inline width is
+                // cap-guarded and its buffer is the arm binding's to free, so
+                // the reasoning holds there and only there.
+                //
+                // Measured on `struct HolderR { k: Result[K, i64] }` over
+                // `enum K { A(R2), B }`: 240 B in 3 blocks (the 80-byte
+                // envelopes) PLUS 36 B indirect in 9 (`R2`'s `String`s, reachable
+                // only through them) at -O0, for `Ok(K.A(r))` AND for the
+                // whole-payload `Ok(kk)` — where the `Option` twin `Some(kk)` is
+                // clean precisely because that exclusion keeps its source armed.
+                // The non-binding `Ok(K.A(_))` / `Ok(_)` arms were clean
+                // throughout, which is what shows the source zero is the cause
+                // rather than a missing registration.
+                //
+                // Declining leaves the field's drop armed, and it already frees
+                // both halves correctly (`emit_result_drop_fn`'s slice-3u boxed
+                // branch runs the contents' drop and then frees the box). The
+                // arm's binding is a DEBOXED bit copy, so it is not a second
+                // owner — the same division the `Option` side has relied on
+                // since B-2026-08-06-10.
+                let boxed_side = Self::result_payload_tes(&field_te).is_some_and(|(ok, err)| {
+                    self.result_payload_is_boxed(&ok) || self.result_payload_is_boxed(&err)
+                });
+                if boxed_side {
+                    return None;
+                }
                 true
             }
             _ => return None,
