@@ -92,9 +92,9 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | class | total |
 |---|---|
-| miscompile | 403 |
+| miscompile | 404 |
 | run-vs-build | 381 |
-| leak | 312 |
+| leak | 313 |
 | double-free | 222 |
 | missing-feature | 194 |
 | codegen-gap | 169 |
@@ -110,12 +110,12 @@ distinguish "bugs flattening" from "we stopped writing them down."
 
 | surface | total |
 |---|---|
-| codegen | 1643 |
+| codegen | 1644 |
 | interp | 412 |
 | typecheck | 295 |
 | other | 81 |
 | ownership | 74 |
-| cli | 72 |
+| cli | 73 |
 | autopar | 56 |
 | parser | 46 |
 | runtime | 42 |
@@ -156,7 +156,6 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-08-3 | 2026-09-08 | codegen+interp | medium | A METHOD-SIDE `self.f = <new>` CANNOT SEE THE CALLER'S MOVE-OUT OF `f`, so the displacement fires over a husk the caller already handed away -- `let taken = g.one; g.set(mks(7));` prints `dS1` twice on ALL FIVE surfaces including `--interp`, the cross-frame half B-2026-09-07-63 split out when it fixed the direct spelling | — |
 | B-2026-09-09-5 | 2026-09-09 | other | low | THREE LOAD-SENSITIVE TESTS IN THE REQUIRED GATE SET ARE STILL UNEXPLAINED after B-2026-09-09-1's named one turned out NOT to be flaky -- that one was a deterministic watchdog race that never armed (fixed 32223a5a6, 2-in-6 permanent orphans under load -> 0 in 8), so its resolution transfers no conclusion to the rest. Leading hypothesis for the ASAN pair is the vacuous-fixture floor: n=102 against a per-process HOST FLOOR of 90 measured on a box running dozens of concurrent ASAN processes, a 12-allocation margin that a drifting floor would trip with nothing wrong in the compiler -- with the counter-argument that a shared OnceLock floor should fail many fixtures at once, and only one failed | — |
 | B-2026-09-09-7 | 2026-09-09 | other | medium | A FULL DISK FAILS THE GATE SET AS AN LLVM CRASH, A LINKER BUS ERROR, OR A LOST OUTPUT STREAM -- never as a named test -- and it hit ELEVEN times across seven unrelated slices in one session. The session allowance is ~38 GiB (df's '252G size' is the host volume and is meaningless), ONE leg of `cargo test --no-run` costs 19.6 GiB in test binaries (134 executables x ~250 MiB at the default debug=2), so the SECOND feature leg cannot start. The obvious suspect is wrong: both clippy legs together cost 1.19 GiB. `CARGO_PROFILE_TEST_DEBUG=line-tables-only` cuts a test binary 252 -> 97 MiB and makes both legs fit | — |
-| B-2026-09-09-8 | 2026-09-09 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-49 STILL LEAKS ITS INLINE-BUILT `Array` INTERIOR -- `plainR(Result.Ok([f"a{i}", f"b{i}"]))` over `Result[Array[String, 2], i64]` loses 54 B in 6 blocks after the Option half was fixed, because the param-site arm that owns the payload reads it through `option_generic_arg_type_expr` and no `Result` sibling exists | none |
 | B-2026-09-09-12 | 2026-09-09 | runtime | medium | kara's MAP PROBE WALKS ONE CONTROL BYTE PER STEP WITH A DATA-DEPENDENT BRANCH, and an 8-byte SWAR group scan is 2.03x FASTER IN CYCLES WHILE EXECUTING 30% MORE INSTRUCTIONS (36.0 -> 17.7 cyc/lookup, IPC 1.15 -> 3.05) -- the cost is mispredicts, not work, which is why no instruction-count fix on B-2026-09-07-53 reached it. Prototyped and validated against the reference walk on every key; not shipped, because the win needs the same scan in find_insert_slot and in the CODEGEN MONO probes, not just the runtime's lookup | docs/investigations/hash-cost/README.md |
 | B-2026-09-09-20 | 2026-09-09 | codegen+interp | low | AN `Option` PAYLOAD THAT IS ITSELF A TUPLE RUNS ITS `Drop` BODY NOWHERE ON THE INTERPRETER AND TOO EARLY ON THE COMPILED BACKEND -- `fn f(r: R) -> Option[(R, i64)]` with `let z = f(mk(20)); println("ok")` prints `dR20` BEFORE `ok` when built (the body fires while `z` is still live and readable) and prints no `dR20` at all under `--interp`; correct is `ok` then `dR20`. The bare tuple and the bare `Option[R]` spellings are both correct, so it needs an Option/Result payload that is itself an aggregate. Memory is balanced on both, at both opt levels | — |
 | B-2026-09-09-21 | 2026-09-09 | codegen+interp | low | A DISCARDED TUPLE'S `Drop` BODY RUNS ON NEITHER BACKEND -- `f(mk(20));` over `fn f(r: R) -> (R, i64)` prints no `dR20` under `karac build` OR `--interp`, so the value dies with its destructor never running and the A/B rule passes because both surfaces are wrong the same way. The discarded BARE struct (`mk(20);`) does run its body, so the gap is the aggregate wrapper. a159b15e1 gave this shape its memory walk and deliberately left the body alone -- adding it on the compiled side alone would convert a silent agreed-wrong into a run-vs-build divergence | — |
@@ -166,6 +165,8 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-10-6 | 2026-09-10 | codegen | medium | AN ARM-BOUND `Array` PAYLOAD PASSED BY VALUE INTO A CALLEE DOUBLE FREES -- `Some(t) => { take(t) }` over `fn take(a: Array[String, 2])` aborts `free(): double free detected in tcache 2` under the JIT and at `-O0` (clean at `-O2`, correct on `--interp`), because `suppress_array_binding_move_arg` retracts the caller's array drop only for `owned_array_params` and a `match`-arm binding is not in that set | none |
 | B-2026-09-10-7 | 2026-09-10 | codegen+interp | low | AN ARM-BOUND `Array` PAYLOAD NEVER RUNS ITS ELEMENTS' `Drop` BODIES, and the rebind spelling runs them on the COMPILED backends only -- `Some(t) => { t[0].tag }` over `Array[S, 2]` prints no `drop:` line on any backend, while `Some(t) => { let u: Array[S, 2] = t; .. }` prints both on `karac build`/`karac run` and none on `--interp` | none |
 | B-2026-09-10-8 | 2026-09-10 | codegen | low | AN `Array[Array[T, N], M]` PAYLOAD LEAKS ITS INNER ARRAYS' ELEMENTS -- 36 B in 4 blocks at `-O0` for `Some(t) => t[0][0]` over `Array[Array[String, 2], 2]`, with or without a rebind, so the outer array's drop walk never recurses into the inner one | none |
+| B-2026-09-10-9 | 2026-09-10 | codegen | medium | THE FIRST ELEMENT OF A BOXED TUPLE PAYLOAD RUNS ITS `Drop` BODY OVER THE WRONG POINTER -- `fn takeR(x: Option[(R, R)])` prints a pointer-shaped `id` for element 0 and the correct one for every later element, on every compiled surface, while `--interp` is correct; no sanitizer catches it because the read is a wrong OFFSET inside live memory | none |
+| B-2026-09-10-10 | 2026-09-10 | cli | low | SIGKILL TO `karac run` PERMANENTLY LEAKS THE HANDOFF IR FILE -- `/tmp/karac_run_<pid>_jit.ll` is still on disk 30 minutes after the run, so the 5-second poll in `signalling_karac_run_does_not_orphan_the_jit_runner` is not a tight budget but a real unlink that never happens; 2 failures in 4 full-gate runs, 0 in isolation | none |
 
 ### Relocated
 
@@ -2434,6 +2435,7 @@ _Generated from `bug-ledger.jsonl` by `scripts/bug-curve.py` (2026-05-20 → 202
 | B-2026-09-09-2 | codegen | high | AN RC-PROMOTED BY-VALUE PARAM THAT IS ACTUALLY STORED SEGFAULTS ON EVERY COMPILED BACKEND -- `fn m(mut ref self, r: R, k: bool) { if k { self.xs.push… | 33c5c25 |
 | B-2026-09-09-3 | codegen | low | B-2026-09-06-66's BY-VALUE REMAINDER IS STILL OPEN AFTER B-2026-09-08-13 CLOSED ITS PRECONDITION -- a self-referential struct's `Option` payload box… | 4ef36450e |
 | B-2026-09-09-4 | other | low | THE `rc_fb_twin_shape_both_boxed` VACUITY GUARD FAILS INTERMITTENTLY ON A GREEN TREE -- `min_allocs = 60` against an x86_64-Linux count of 65-72 that… | fb05f38 |
+| B-2026-09-09-8 | codegen | low | THE `Result` SPELLING OF B-2026-09-06-49 STILL LEAKS ITS INLINE-BUILT `Array` INTERIOR -- `plainR(Result.Ok([f"a{i}", f"b{i}"]))` over `Result[Array[… | 92eeb8a84 |
 | B-2026-09-09-9 | codegen | low | A NESTED INDEXED READ ON AN `Array` BOUND OUT OF A `match` ARM IS REJECTED BY CODEGEN WHILE `--interp` RUNS IT -- `match x { Some(t) => t[0][0] }` ov… | 4857220 |
 | B-2026-09-09-10 | codegen | low | A BOXED USER ENUM PAYLOAD'S INTERIOR IS STILL UNOWNED WHEN THE ARM BINDS THROUGH A NESTED PATTERN -- `match x { Some(K.A(r)) => . | 1347735 |
 | B-2026-09-09-11 | codegen | medium | A `shared enum` WITH A BOXED STRUCT PAYLOAD PRINTS NOTHING ON EVERY COMPILED BACKEND AND STACK-OVERFLOWS THE JIT, while `--interp` prints the right t… | 768a9be |
