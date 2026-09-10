@@ -9631,7 +9631,26 @@ impl<'ctx> super::Codegen<'ctx> {
         // data buffer. Same shape as `FreeVecBuffer`'s inner loop; `i8`
         // (String) / primitive elements skip it. Deeper nesting still leaks
         // the innermost buffers (the documented `FreeVecBuffer` limitation).
-        if let Some(et) = payload_elem_ty {
+        //
+        // B-2026-09-09-22 — SUPERSEDED by the aggregate drain above whenever
+        // that drain ran, exactly as `FreeVecBuffer` orders the same pair
+        // (`if agg_drop { … } else if …`, "running both would double-free the
+        // direct heap fields"). The two loops here were written as independent
+        // `if`s on the strength of the claim in `payload_elem_agg_drop`'s doc
+        // that they are "disjoint by construction" — true when leg B landed,
+        // because `vec_elem_agg_drop_for_type_expr` then answered `None` for
+        // every element this loop handles. It no longer does: a `Vec[Vec[T]]`
+        // element now resolves an agg drop AND is a vec-struct, so both loops
+        // ran and each element's buffer was released twice — `free(): double
+        // free detected in tcache 2` on every compiled backend, at both opt
+        // levels and either way on auto-par, for `match o { Some(t) => … }`
+        // over an `Option[Vec[Vec[String]]]`, while `--interp` was correct.
+        //
+        // The drain is strictly the more complete of the two (it runs the
+        // element's own `karac_drop_*`, which frees that element's buffer AND
+        // everything beneath it, where this loop frees only the buffer), so
+        // skipping this one when the drain fired loses nothing.
+        if let (Some(et), None) = (payload_elem_ty, payload_elem_agg_drop) {
             if self.llvm_ty_is_vec_struct(et) {
                 let vstruct = self.vec_struct_type();
                 let len_ptr = self

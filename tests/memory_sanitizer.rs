@@ -84380,4 +84380,80 @@ fn main() {
             "b9-array-of-array",
         );
     }
+
+    /// B-2026-09-09-22 — an `Option`/`Result` payload of `Vec[<element owning
+    /// heap>]` released its elements twice. ASAN is the right gate for this
+    /// one: the failure is a double free, so a regression aborts here rather
+    /// than producing a wrong answer.
+    ///
+    /// The fix REMOVES a free, which is the direction that trades a double
+    /// free for a leak — so every cell is also valgrind-clean at
+    /// `KARAC_OPT_LEVEL=0` and `2`, and LSan on the Linux CI leg is what keeps
+    /// that true.
+    #[test]
+    fn asan_inline_optres_vec_payload_drains_its_elements_once() {
+        // 1 — the row's own shape.
+        assert_clean_asan_run(
+            "fn plainV(x: Option[Vec[Vec[String]]]) {\n\
+             \x20   match x { Some(t) => { println(f\"s:{t[0][0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let v: Vec[Vec[String]] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainV(Some(v));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b22-option-arm-indexed",
+        );
+        // 2 — the `Result` half, which shares the overlay emitter.
+        assert_clean_asan_run(
+            "fn plainV(x: Result[Vec[Vec[String]], i64]) {\n\
+             \x20   match x { Ok(t) => { println(f\"s:{t[0][0]}\") } Err(e) => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let v: Vec[Vec[String]] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+             \x20   plainV(Ok(v));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b22-result-ok-arm",
+        );
+        // 3 — one frame, no call, no index: the minimal reproducer, where a
+        //     SINGLE cleanup action was performing both frees.
+        assert_clean_asan_run(
+            "fn main() {\n\
+             \x20   let o: Option[Vec[Vec[String]]] = Some([[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]]);\n\
+             \x20   match o { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+             }\n",
+            &["s:2"],
+            "b22-local-option-one-frame",
+        );
+        // 4 — CONTROL, and the leak direction: a `String` element resolves no
+        //     drain, so only the one-level recursion runs. If the supersede
+        //     gate were widened to skip that recursion unconditionally, this
+        //     cell would leak both element buffers.
+        assert_clean_asan_run(
+            "fn plainV(x: Option[Vec[String]]) {\n\
+             \x20   match x { Some(t) => { println(f\"s:{t[0]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let v: Vec[String] = [f\"aaaaaaaa0\", f\"bbbbbbbb1\"];\n\
+             \x20   plainV(Some(v));\n\
+             }\n",
+            &["s:aaaaaaaa0"],
+            "b22-string-element-control",
+        );
+        // 5 — CONTROL, same leak direction one level deeper: a `Vec[i64]`
+        //     element also has no drain, and its inner buffers are freed by
+        //     the recursion alone.
+        assert_clean_asan_run(
+            "fn plainV(x: Option[Vec[Vec[i64]]]) {\n\
+             \x20   match x { Some(t) => { println(f\"s:{t[0][1]}\") } None => { println(\"n\") } }\n\
+             }\n\
+             fn main() {\n\
+             \x20   let v: Vec[Vec[i64]] = [[10, 11], [20]];\n\
+             \x20   plainV(Some(v));\n\
+             }\n",
+            &["s:11"],
+            "b22-scalar-inner-control",
+        );
+    }
 }

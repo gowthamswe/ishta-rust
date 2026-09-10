@@ -152812,6 +152812,142 @@ fn main() {
         }
     }
 
+    /// B-2026-09-09-22 — an `Option`/`Result` payload of `Vec[<element that
+    /// owns heap of its own>]` had its elements released TWICE, so
+    /// `match o { Some(t) => … }` aborted with `free(): double free detected in
+    /// tcache 2` on every compiled backend, at both opt levels and either way
+    /// on auto-par, while `--interp` printed the right answer.
+    ///
+    /// ONE owner, two loops. `emit_free_inline_payload_overlay` ran an
+    /// aggregate DRAIN over the payload's elements (B-2026-08-14-15 leg B) and
+    /// then, as a separate `if`, its older one-level `{ptr,len,cap}` recursion
+    /// over the same elements. Leg B's own doc argued the two were "disjoint by
+    /// construction", and when it landed that was true —
+    /// `vec_elem_agg_drop_for_type_expr` answered `None` for every element the
+    /// recursion handles. It stopped being true once a `Vec[Vec[T]]` element
+    /// resolved a drain: such an element is a vec-struct AND has an agg drop,
+    /// so both loops ran over it.
+    ///
+    /// `FreeVecBuffer` orders the identical pair correctly and says why —
+    /// `if agg_drop { … } else if …`, "running both would double-free the
+    /// direct heap fields" (B-2026-06-12-6). The overlay now matches it.
+    ///
+    /// Cells 6-8 are the shapes that were already correct and say why the bug
+    /// hid: an element with NO drain (`Vec[String]`, `Vec[Vec[i64]]`) only ever
+    /// ran the recursion, and a USER enum reaches its payload through
+    /// `EnumDrop` rather than this overlay at all — so the whole `Vec`/`Option`
+    /// surface looked fine unless the element itself owned heap.
+    #[test]
+    fn e2e_inline_optres_vec_payload_drains_its_elements_once() {
+        for (label, src, want) in [
+            // 1 — the row's own shape, read two levels deep.
+            (
+                "option-arm-indexed",
+                "fn plainV(x: Option[Vec[Vec[String]]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[0][0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[Vec[String]] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainV(Some(v));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 2 — `Result` reaches the same overlay through its `Ok` arm, so a
+            //     fix keyed on `Option` alone would leave this half aborting.
+            (
+                "result-ok-arm",
+                "fn plainV(x: Result[Vec[Vec[String]], i64]) {\n\
+                 \x20   match x { Ok(t) => { println(f\"s:{t[0][0]}\") } Err(e) => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[Vec[String]] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainV(Ok(v));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 3 — NO index anywhere. The binding alone was enough; the index
+            //     never had anything to do with it.
+            (
+                "option-arm-no-index",
+                "fn plainV(x: Option[Vec[Vec[String]]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[Vec[String]] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainV(Some(v));\n\
+                 }\n",
+                "s:2\n",
+            ),
+            // 4 — no named local at all, so the caller's own binding cannot be
+            //     one of the two frees.
+            (
+                "inline-literal-argument",
+                "fn plainV(x: Option[Vec[Vec[String]]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() { plainV(Some([[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]])); }\n",
+                "s:2\n",
+            ),
+            // 5 — one frame, no call: the minimal reproducer, whose single
+            //     cleanup action was doing both frees by itself.
+            (
+                "local-option-one-frame",
+                "fn main() {\n\
+                 \x20   let o: Option[Vec[Vec[String]]] = Some([[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]]);\n\
+                 \x20   match o { Some(t) => { println(f\"s:{t.len()}\") } None => { println(\"n\") } }\n\
+                 }\n",
+                "s:2\n",
+            ),
+            // 6 — CONTROL: a `String` element has no drain, so only the
+            //     recursion ever ran and this shape was always correct. It is
+            //     also the shape leg B's disjointness claim was written for.
+            (
+                "string-element-control",
+                "fn plainV(x: Option[Vec[String]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[0]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[String] = [f\"aaaaaaaa0\", f\"bbbbbbbb1\"];\n\
+                 \x20   plainV(Some(v));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+            // 7 — CONTROL: a SCALAR inner element resolves no drain either, so
+            //     the nesting on its own was never the trigger.
+            (
+                "scalar-inner-control",
+                "fn plainV(x: Option[Vec[Vec[i64]]]) {\n\
+                 \x20   match x { Some(t) => { println(f\"s:{t[0][1]}\") } None => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[Vec[i64]] = [[10, 11], [20]];\n\
+                 \x20   plainV(Some(v));\n\
+                 }\n",
+                "s:11\n",
+            ),
+            // 8 — CONTROL: the same payload in a USER enum never reaches this
+            //     overlay (it drops through `EnumDrop`), which is what made the
+            //     envelope look like the discriminator.
+            (
+                "user-enum-control",
+                "enum E { A(Vec[Vec[String]]), B }\n\
+                 fn plainE(x: E) {\n\
+                 \x20   match x { E.A(t) => { println(f\"s:{t[0][0]}\") } E.B => { println(\"n\") } }\n\
+                 }\n\
+                 fn main() {\n\
+                 \x20   let v: Vec[Vec[String]] = [[f\"aaaaaaaa0\", f\"aaaaaaaa1\"], [f\"bbbbbbbb0\"]];\n\
+                 \x20   plainE(E.A(v));\n\
+                 }\n",
+                "s:aaaaaaaa0\n",
+            ),
+        ] {
+            let Some(out) = run_program(src) else {
+                return;
+            };
+            assert_eq!(out, want, "[{label}]");
+        }
+    }
+
     /// B-2026-09-07-51 — the GENERIC leg of this family. `compile_function`
     /// gates B-2026-08-30-28's conditional-store registration on
     /// `func.generic_params.is_none()`, and a generic callee is compiled by
