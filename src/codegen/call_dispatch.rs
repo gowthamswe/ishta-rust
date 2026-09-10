@@ -3139,11 +3139,12 @@ impl<'ctx> super::Codegen<'ctx> {
     /// it when the local is reassigned or leaves scope. A caller that ALSO
     /// registers the box frees it twice.
     ///
-    /// Asks `param_rebound_into_mut_local`, NOT the `param_whole_aliases`
-    /// closure beside it: that one admits only IMMUTABLE rebinds, because an
-    /// alias that can be reassigned is not a stable alias — and a mutable
-    /// rebind is precisely the shape at issue here, since the reassignment is
-    /// what frees the displaced box.
+    /// Asks `param_rebound_into_local`, NOT the `param_whole_aliases` closure
+    /// beside it: that one admits only IMMUTABLE rebinds, because an alias that
+    /// can be reassigned is not a stable alias. The ownership question needs
+    /// BOTH kinds — B-2026-09-09-17. The reassignment is one way the local
+    /// frees the box; scope exit is the other and needs no `mut`, so
+    /// `let y = value;` double-frees exactly as `let mut vv = value;` did.
     pub(super) fn callee_rebinds_param_whole(&self, callee_name: &str, arg_index: usize) -> bool {
         let Some(program) = self.program_snapshot.as_deref() else {
             return false;
@@ -3156,7 +3157,7 @@ impl<'ctx> super::Codegen<'ctx> {
             let PatternKind::Binding(pname) = &p.pattern.kind else {
                 return false;
             };
-            crate::ast::param_rebound_into_mut_local(f, pname)
+            crate::ast::param_rebound_into_local(f, pname)
         };
         program.items.iter().any(|item| match item {
             Item::Function(f) if f.name == callee_name => check(f, arg_index),
@@ -3212,11 +3213,11 @@ impl<'ctx> super::Codegen<'ctx> {
             .last()
             .filter(|s| self.boxed_param_payload_owns_its_box(s.as_str()))?;
         // B-2026-09-09-13 — a callee that rebinds the param whole already owns
-        // the box, and registering the caller too frees it twice. ENUM payloads
-        // only: a struct payload's whole-payload binding is DISARMED by
-        // `register_boxed_payload_alias`, so its callee-side local does not free
-        // the box and the caller is still the only owner. Widening this to
-        // structs would re-open the leak B-2026-09-06-56 closed.
+        // the box, and registering the caller too frees it twice. NOT enum
+        // payloads only: 4fb2adee (B-2026-09-09-16) dropped that exclusion
+        // after measuring the struct spelling double-free the same way, and
+        // B-2026-09-06-56's leak stayed closed — the `-O0` ratchet leg carries
+        // its fixtures.
         if self.callee_rebinds_param_whole(name, i) {
             return None;
         }
@@ -3269,6 +3270,16 @@ impl<'ctx> super::Codegen<'ctx> {
         }) else {
             return Vec::new();
         };
+        // B-2026-09-09-17 — the same rebind stand-down the `Option` arm makes,
+        // which this peer never had: B-2026-09-09-13 added it to
+        // `owned_boxed_option_param_struct` alone, so a callee that rebinds a
+        // `Result` param whole kept both owners under EITHER kind of rebind.
+        // Measured `fn show(x: Result[K, i64]) { let y = x; .. }` over three
+        // calls: 3 excess frees, unchanged by widening the predicate, because
+        // control never reached a gate.
+        if self.callee_rebinds_param_whole(name, i) {
+            return Vec::new();
+        }
         self.boxed_enum_payload_variants(&param_te)
             .into_iter()
             .filter(|(enum_lit, _, _)| *enum_lit == "Result")

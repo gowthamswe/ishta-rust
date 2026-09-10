@@ -1884,9 +1884,11 @@ struct RebindWalk {
     rebinds: Vec<(String, String)>,
     /// B-2026-09-09-13 — `let MUT x = y`, which [`rebinds`] deliberately does
     /// NOT record: an alias that can be reassigned is not a stable alias, so
-    /// every ALIASING predicate here is right to ignore it. It is exactly the
-    /// shape an OWNERSHIP question needs, though — a mutable rebind is the one
-    /// that gets overwritten, and the overwrite frees what it displaced.
+    /// every ALIASING predicate here is right to ignore it. An OWNERSHIP
+    /// predicate needs the two sets TOGETHER (B-2026-09-09-17): a mutable
+    /// rebind frees the displaced box when it is overwritten, an immutable one
+    /// frees it at scope exit, and either way the local is an owner. See
+    /// [`param_rebound_into_local`], the one predicate that reads this.
     mut_rebinds: Vec<(String, String)>,
     /// B-2026-09-06-19 — `let x = S { f: y, .. }` / `let x = (y, ..)`: `x` WRAPS
     /// `y` at `path`. A wrap is not a rebind (the types differ), but it is the
@@ -2110,24 +2112,40 @@ fn rebind_walk(f: &Function) -> RebindWalk {
     w
 }
 
-/// B-2026-09-09-13 — is `param_name` rebound whole into a MUTABLE local
-/// (`fn f(value: Option[Val]) { let mut vv = value; .. }`), directly or through
-/// a chain of immutable aliases?
+/// B-2026-09-09-13, widened by B-2026-09-09-17 — is `param_name` rebound whole
+/// into a local (`fn f(value: Option[Val]) { let mut vv = value; .. }`, or the
+/// bare `let y = value;`), directly or through a chain of aliases?
 ///
 /// This is an OWNERSHIP question, not an aliasing one, which is why it does not
-/// go through [`param_whole_aliases`]: that closure deliberately admits only
-/// immutable rebinds, because a name that can be reassigned is no longer a
-/// reliable alias of the param. For ownership the mutable case is the whole
-/// point — the local holds the param's heap, and reassigning it frees what it
-/// displaced, so a CALLER that also owns that heap frees it twice.
+/// go through [`param_whole_aliases`]: that closure admits only immutable
+/// rebinds, because a name that can be reassigned is no longer a reliable alias
+/// of the param. Ownership does not care which kind it is — either way the
+/// local holds the param's heap, so a CALLER that also owns that heap frees it
+/// twice.
+///
+/// B-2026-09-09-13 ASKED `mut_rebinds` ALONE, reasoning that "a mutable rebind
+/// is precisely the shape at issue, since the reassignment is what frees the
+/// displaced box". The reassignment is ONE way the local frees the box; SCOPE
+/// EXIT is the other, and it needs no `mut`. `let y = x;` gives the local a
+/// drop that runs at the end of the frame over a box the caller also
+/// registered — the same two-owner shape with a different trigger. Reproduced
+/// at f6f5818e with both earlier rows fixed, `KARAC_OPT_LEVEL=0`,
+/// `KARAC_AUTO_PAR=0`, valgrind, three calls: `fn show(x: Option[K])` with
+/// `let y = x;` frees 3 more blocks than it allocates, and the STRUCT payload
+/// `Option[R2]` frees 12 more — 1 and 4 per call respectively, and the count
+/// does not scale with the number of rebindings.
+///
+/// Both rebind sets are read against the SAME alias closure, so a chain mixing
+/// the two (`let y = x; let mut z = y;`) is caught at either link.
 ///
 /// Over-approximates on purpose. A false positive stands the caller down and
 /// costs at most a leak; a false negative is a double free.
-pub fn param_rebound_into_mut_local(f: &Function, param_name: &str) -> bool {
+pub fn param_rebound_into_local(f: &Function, param_name: &str) -> bool {
     let w = rebind_walk(f);
     let aliases = close_rebind_aliases(&w, param_name);
-    w.mut_rebinds
+    w.rebinds
         .iter()
+        .chain(w.mut_rebinds.iter())
         .any(|(_, y)| aliases.iter().any(|a| a == y))
 }
 

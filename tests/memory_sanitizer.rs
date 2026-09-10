@@ -84224,6 +84224,161 @@ fn main() {
         );
     }
 
+    /// B-2026-09-09-17 — the same two-owner shape as
+    /// [`asan_caller_owned_boxed_param_payload_rebound_to_a_local_is_freed_once`],
+    /// in the spelling that carries no `mut`.
+    ///
+    /// B-2026-09-09-13 gated the caller's stand-down on `mut_rebinds` alone,
+    /// reasoning that "the reassignment is what frees the displaced box". True,
+    /// and not the only way: SCOPE EXIT frees it too and needs no `mut`, so a
+    /// bare `let y = x;` gives the callee-side local a drop over a box the
+    /// caller also registered. Measured at f6f5818e with -13 and -16 both
+    /// fixed, three calls, `KARAC_OPT_LEVEL=0` + `KARAC_AUTO_PAR=0` under
+    /// valgrind — frees MINUS allocs, which is stable where valgrind's
+    /// per-stack error count is not:
+    ///
+    ///   Option[K]     let y = x               +3   (1 per call)
+    ///   Result[K,i64] let y = x               +3
+    ///   Option[R2]    let y = x              +12   (4 per call)
+    ///   Option[K]     let y = x; let z = y;   +3   — does NOT scale with the
+    ///                                              number of rebindings
+    ///
+    /// The struct payload is the loud one for the same reason it was under -16:
+    /// its three `String` fields each get a second free, where the enum
+    /// spelling loses only the box.
+    ///
+    /// CELL 2 FAILS FOR A DIFFERENT REASON THAN THE REST, and that is why it is
+    /// here rather than folded into cell 1. Widening the predicate fixed cells
+    /// 1, 3 and 4 and left cell 2 byte-identical at +3, because B-2026-09-09-13
+    /// wired the stand-down into `owned_boxed_option_param_struct` ALONE: its
+    /// peer `owned_boxed_result_param_structs` never asked
+    /// `callee_rebinds_param_whole` at all, so on that path the `mut`-versus-
+    /// immutable distinction was never reached. The fix is therefore two
+    /// changes, and this cell is what tells them apart — it stays red if only
+    /// the predicate is widened.
+    ///
+    /// `-16`'s own `Result` cell could not catch that: it is `Result[Val, i64]`
+    /// with an ENUM payload, which the arm's `boxed_param_payload_owns_its_box`
+    /// filter declines to register in the first place. It was passing because
+    /// the arm never fires for that shape, not because the arm stands down
+    /// correctly — coverage in appearance only. Both of `-16`'s mutable cells
+    /// were re-measured against the Result-side stand-down and stay clean
+    /// (17/17 and 18/18 allocs/frees), which is the check that says this change
+    /// does not convert them into leaks.
+    ///
+    /// THE THREE CONTROLS ARE THE POINT OF THIS FIXTURE, not the four cells
+    /// above. Widening the predicate makes the caller stand down more often,
+    /// and the error direction that buys is a LEAK — nobody owns the box. Each
+    /// control was clean before the fix and must stay clean after:
+    ///
+    ///   * a NO-REBIND struct payload, String-bearing, which is exactly the
+    ///     shape a blanket stand-down would strand;
+    ///   * a NO-REBIND POD payload, where there is no interior to muddy the
+    ///     reading;
+    ///   * a LOCAL-source immutable rebind, which says the axis is the source
+    ///     being a PARAM and not the rebind itself — both registrations are in
+    ///     one frame there, where the rebind disarms its source.
+    #[test]
+    fn asan_caller_owned_boxed_param_payload_rebound_immutably_is_freed_once() {
+        const PRE: &str = "struct R2 { s: String, t: String, u: String }\n\
+             enum K { A(R2), B }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn mkr(i: i64) -> R2 { return R2 { s: f\"ssssssss{i}{seed()}\", t: f\"tttttttt{i}\", u: f\"uuuuuuuu{i}\" }; }\n";
+
+        // 1 — the row's cell: a boxed user ENUM payload, immutably rebound.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn show(x: Option[K]) {{ let y = x;\n\
+                 \x20  match y {{ Option.Some(K.A(r)) => {{ println(f\"a:{{r.s}}\"); }} _ => {{ println(\"other\"); }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{ show(Option.Some(K.A(mkr(i)))); i = i + 1; }} }}\n"
+            ),
+            &["a:ssssssss01", "a:ssssssss11"],
+            "b17-option-enum-immutable-rebind",
+        );
+
+        // 2 — the `Result` spelling, which asks the same arg-site question.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn show(x: Result[K, i64]) {{ let y = x;\n\
+                 \x20  match y {{ Result.Ok(K.A(r)) => {{ println(f\"a:{{r.s}}\"); }} _ => {{ println(\"other\"); }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{ show(Result.Ok(K.A(mkr(i)))); i = i + 1; }} }}\n"
+            ),
+            &["a:ssssssss01", "a:ssssssss11"],
+            "b17-result-enum-immutable-rebind",
+        );
+
+        // 3 — the STRUCT payload, four times louder: each `String` field is
+        //     freed twice, not just the box.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn show(x: Option[R2]) {{ let y = x;\n\
+                 \x20  match y {{ Option.Some(r) => {{ println(f\"a:{{r.s}}\"); }} _ => {{ println(\"other\"); }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{ show(Option.Some(mkr(i))); i = i + 1; }} }}\n"
+            ),
+            &["a:ssssssss01", "a:ssssssss11"],
+            "b17-option-struct-immutable-rebind",
+        );
+
+        // 4 — a CHAIN of immutable rebinds. `close_rebind_aliases` already
+        //     walked this set to build the alias chain; only the last step
+        //     discarded it, so this cell fails identically without the fix.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn show(x: Option[K]) {{ let y = x; let z = y;\n\
+                 \x20  match z {{ Option.Some(K.A(r)) => {{ println(f\"a:{{r.s}}\"); }} _ => {{ println(\"other\"); }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{ show(Option.Some(K.A(mkr(i)))); i = i + 1; }} }}\n"
+            ),
+            &["a:ssssssss01", "a:ssssssss11"],
+            "b17-chained-immutable-rebind",
+        );
+
+        // 5 — CONTROL, no rebind, String-bearing struct payload. The caller
+        //     must KEEP its registration here; a stand-down that fired without
+        //     a rebind would leak all three fields and the box.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn show(x: Option[R2]) {{\n\
+                 \x20  match x {{ Option.Some(r) => {{ println(f\"a:{{r.s}}\"); }} _ => {{ println(\"other\"); }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{ show(Option.Some(mkr(i))); i = i + 1; }} }}\n"
+            ),
+            &["a:ssssssss01", "a:ssssssss11"],
+            "b17-no-rebind-struct-control",
+        );
+
+        // 6 — CONTROL, no rebind, POD payload: no interior at all, so this one
+        //     reads the box's ownership on its own.
+        assert_clean_asan_run(
+            "struct W { a: i64, b: i64, c: i64, d: i64, e: i64, g: i64 }\n\
+             fn seed() -> i64 { env.args().len() }\n\
+             fn show(x: Option[W]) {\n\
+             \x20  match x { Option.Some(w) => { println(f\"a:{w.a}\"); } _ => { println(\"other\"); } } }\n\
+             fn main() { let mut i = 0; while i < 2 { show(Option.Some(W { a: seed(), b: 2, c: 3, d: 4, e: 5, g: 6 })); i = i + 1; } }\n",
+            &["a:1", "a:1"],
+            "b17-no-rebind-pod-control",
+        );
+
+        // 7 — CONTROL, the rebind source is a LOCAL rather than the param. Both
+        //     registrations are in one frame, the rebind disarms its source,
+        //     and this was clean throughout: it is what says the axis is the
+        //     PARAM.
+        assert_clean_asan_run(
+            &format!(
+                "{PRE}\
+                 fn mko(i: i64) -> Option[K] {{ return Option.Some(K.A(mkr(i))); }}\n\
+                 fn show(i: i64) {{ let x = mko(i); let y = x;\n\
+                 \x20  match y {{ Option.Some(K.A(r)) => {{ println(f\"a:{{r.s}}\"); }} _ => {{ println(\"other\"); }} }} }}\n\
+                 fn main() {{ let mut i = 0; while i < 2 {{ show(i); i = i + 1; }} }}\n"
+            ),
+            &["a:ssssssss01", "a:ssssssss11"],
+            "b17-local-source-control",
+        );
+    }
+
     /// B-2026-09-09-14 — a DISCARDED tuple temp (`f(mk(20));`) owns its whole
     /// interior and nothing was freeing it.
     ///
